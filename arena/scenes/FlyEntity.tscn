@@ -1,0 +1,53 @@
+[gd_scene load_steps=6 format=3 uid="uid://bvyg7k4nfly01"]
+
+[ext_resource type="Script" path="res://scripts/FlyPhysics.gd" id="1_fly"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_body"]
+radius = 0.4
+height = 1.4
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_spike"]
+radius = 0.25
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_thorax"]
+radius = 0.45
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_wing"]
+size = Vector3(1.2, 0.1, 0.8)
+
+[node name="FlyEntity" type="CharacterBody3D"]
+script = ExtResource("1_fly")
+
+[node name="BodyCollision" type="CollisionShape3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, -4.37114e-08, 1, 0, -1, -4.37114e-08, 0, 0, 0)
+shape = SubResource("CapsuleShape3D_body")
+
+[node name="FrontSpikeArea" type="Area3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -1.2)
+
+[node name="SpikeCollision" type="CollisionShape3D" parent="FrontSpikeArea"]
+shape = SubResource("SphereShape3D_spike")
+
+[node name="ThoraxHurtbox" type="Area3D" parent="."]
+[node name="ThoraxCollision" type="CollisionShape3D" parent="ThoraxHurtbox"]
+shape = SubResource("SphereShape3D_thorax")
+
+[node name="LeftWingHurtbox" type="Area3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.9, 0.1, -0.1)
+
+[node name="LeftWingCollision" type="CollisionShape3D" parent="LeftWingHurtbox"]
+shape = SubResource("BoxShape3D_wing")
+
+[node name="RightWingHurtbox" type="Area3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.9, 0.1, -0.1)
+
+[node name="RightWingCollision" type="CollisionShape3D" parent="RightWingHurtbox"]
+shape = SubResource("BoxShape3D_wing")
+
+[node name="VisualModel" type="Node3D" parent="."]
+
+[node name="LeftWing" type="Node3D" parent="VisualModel"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.26, 0.24, -0.02)
+
+[node name="RightWing" type="Node3D" parent="VisualModel"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.26, 0.24, -0.02)

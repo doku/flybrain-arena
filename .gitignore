@@ -1,0 +1,31 @@
+# FlyBrain - version code and config, never data.
+# Everything below is either raw source data, a regenerable derived
+# cache, a large binary, or per-run runtime state. The vault (brains/),
+# checkpoints, and tournaments live outside version control; back them
+# up by copying the folders, not via git.
+
+# Raw + archived source data (10+ GB, never commit)
+/archived_flywire783/
+/connectome_data/
+
+# Derived caches (regenerated on first run if missing)
+/malecns_csr_base.npz
+/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Trained weights, checkpoints, vault contents (user data, GBs)
+/checkpoints/
+/brains/
+*.flybrain
+*.npz
+
+# Runtime state: tournament brackets, training jobs, logs
+/tournaments/
+server_log.txt
+*.tmp
+*.log
+
+# Godot editor import cache + engine binaries (170+ MB)
+/tools/
+arena/.godot/
