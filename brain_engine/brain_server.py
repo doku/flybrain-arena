@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import socket
+from copy import deepcopy
 import numpy as np
 
 from connectome_loader import load_or_build_csr, load_or_extract_populations
@@ -54,42 +55,36 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
                                    battle_id="", battle_key=None):
     """Tournament battle verdict. Identities survive: no clone/mutate, no
     generation++. Updated weights + records are persisted straight back
-    to the vault (the arena/GDScript side can't write zips). The verdict
-    is also persisted to tournaments/_last_battle_verdict.json BEFORE the
-    reply goes out, so a resent round_over (same battle_key) is answered
+    to the vault (the arena/GDScript side can't write zips). Persistence
+    is journal-first: the full transaction (post-learning weights + bumped
+    records + reply verdict) is fsynced to tournaments/_pending_battle.npz
+    and then replayed by _recover_pending_battle, which saves both vault
+    files and only afterwards persists the verdict to
+    tournaments/_last_battle_verdict.json BEFORE the reply goes out. A
+    crash anywhere mid-save leaves the journal behind, and the next
+    message (or server boot) replays the SAME record bumps instead of
+    re-banking, so a resent round_over (same battle_key) is answered
     from the stored verdict and never banked twice."""
     import brain_package as vault_pkg
     arena_draw = bool(msg.get("arena_draw", False))
-    if arena_draw:
-        battle_winner = "draw"
-        for side in ("a", "b"):
-            st = tourney_a if side == "a" else tourney_b
-            if st["rec"] is not None:
-                vault_pkg.record_battle_result(st["rec"], "draw")
-                vault_pkg.save_brain(st["rec"], st["brain"].weights,
-                                     backup=False, fast=True)
-    else:
-        battle_winner = winner
-        win_st = tourney_a if winner == "alpha" else tourney_b
-        lose_st = tourney_b if winner == "alpha" else tourney_a
-        if win_st["rec"] is not None:
-            vault_pkg.record_battle_result(win_st["rec"], "win")
+    battle_winner = "draw" if arena_draw else winner
+    records = []
+    weights = {}
+    for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
+        if st["rec"] is None:
+            continue
+        rec = deepcopy(st["rec"])
+        outcome = "draw" if arena_draw else ("win" if side == winner else "loss")
+        vault_pkg.record_battle_result(rec, outcome)
+        if not arena_draw:
             vault_pkg.log_training_session(
-                win_st["rec"], 0,
+                rec, 0,
                 {"lr_scale": tournament_lr_scale,
-                 "pulse": pulse, "outcome": "win"},
-                f"tournament battle win ({tourney_note()})")
-            vault_pkg.save_brain(win_st["rec"], win_st["brain"].weights,
-                                 backup=False, fast=True)
-        if lose_st["rec"] is not None:
-            vault_pkg.record_battle_result(lose_st["rec"], "loss")
-            vault_pkg.log_training_session(
-                lose_st["rec"], 0,
-                {"lr_scale": tournament_lr_scale,
-                 "pulse": -0.8 * pulse, "outcome": "loss"},
-                f"tournament battle loss ({tourney_note()})")
-            vault_pkg.save_brain(lose_st["rec"], lose_st["brain"].weights,
-                                 backup=False, fast=True)
+                 "pulse": pulse if outcome == "win" else -0.8 * pulse,
+                 "outcome": outcome},
+                f"tournament battle {outcome} ({tourney_note()})")
+        records.append({"side": side, "record": rec})
+        weights[side] = st["brain"].weights
     fit_a, fit_b = _sanitize_fit(fit_a), _sanitize_fit(fit_b)
     print(f"[Server] Tournament battle done id={battle_id or '?'} "
           f"({tourney_note()}) winner={battle_winner} "
@@ -101,8 +96,8 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         "fitness_beta": fit_b,
         "battle_id": battle_id,
     }
-    if battle_key is not None:
-        _write_last_verdict(battle_key, resp)
+    _write_pending_battle(battle_key, resp, records, weights)
+    _recover_pending_battle((tourney_a, tourney_b))
     try:
         sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
     except OSError as e:
@@ -189,15 +184,107 @@ def _read_last_verdict():
 
 
 def _write_last_verdict(key, result):
+    os.makedirs(os.path.dirname(_last_verdict_path()), exist_ok=True)
+    tmp = _last_verdict_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"key": key, "result": result}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _last_verdict_path())
+
+
+def _pending_battle_path():
+    return os.path.join(PROJECT_ROOT, "tournaments", "_pending_battle.npz")
+
+
+def _write_pending_battle(key, result, records, weights):
+    path = _pending_battle_path()
+    if os.path.exists(path):
+        raise RuntimeError("An unfinished battle must be recovered first")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     try:
-        os.makedirs(os.path.dirname(_last_verdict_path()), exist_ok=True)
-        tmp = _last_verdict_path() + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"key": key, "result": result}, f)
-        os.replace(tmp, _last_verdict_path())
-    except OSError as e:
-        print(f"[Server] WARNING: could not persist battle verdict: {e}",
-              flush=True)
+        with open(tmp, "wb") as f:
+            np.savez(f, metadata=json.dumps(
+                {"key": key, "result": result, "records": records}), **weights)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _recover_pending_battle(states=()):
+    import brain_package as vault_pkg
+    path = _pending_battle_path()
+    if not os.path.exists(path):
+        return
+    # Phase 1: load + validate the journal. A file that fails here is
+    # undecodable (torn write, bitrot) and can never be replayed, so
+    # quarantine it loudly instead of crash-looping on every boot/message.
+    try:
+        with np.load(path, allow_pickle=False) as pending:
+            transaction = json.loads(str(pending["metadata"].item()))
+            if not isinstance(transaction, dict) \
+                    or not isinstance(transaction.get("records"), list) \
+                    or not isinstance(transaction.get("result"), dict):
+                raise ValueError("pending battle journal has bad shape")
+            payload = {}
+            for entry in transaction["records"]:
+                if not isinstance(entry, dict) \
+                        or entry.get("side") not in ("alpha", "beta") \
+                        or not isinstance(entry.get("record"), dict) \
+                        or entry["side"] not in pending:
+                    raise ValueError("pending battle journal has bad entry")
+                payload[entry["side"]] = np.array(pending[entry["side"]])
+    except Exception as e:
+        bad = path + ".corrupt-%d" % int(time.time())
+        try:
+            os.replace(path, bad)
+        except OSError:
+            pass
+        print(f"[Server] QUARANTINED unreadable pending battle journal -> "
+              f"{bad} ({e}). Vault files may be half-written; reconcile "
+              f"before resuming.", flush=True)
+        raise
+    # Phase 2: replay. Failures here (vault/verdict IO) leave the journal
+    # in place so the next message or boot retries the SAME record bumps.
+    for entry in transaction["records"]:
+        rec = entry["record"]
+        weights = payload[entry["side"]]
+        vault_pkg.save_brain(rec, weights, backup=False, fast=True)
+        for st in states:
+            if st["rec"] is not None and st["rec"]["filename"] == rec["filename"]:
+                st["rec"] = deepcopy(rec)
+                st["brain"].weights = weights.copy()
+    # Only keyed battles participate in retry idempotency. An
+    # unkeyed journal must still replay its vault saves, but writing
+    # a key=None verdict here would clobber the previous battle's
+    # real verdict and reopen it to double-banking.
+    if transaction.get("key") is not None:
+        _write_last_verdict(transaction["key"], transaction["result"])
+    os.remove(path)
+
+
+def _apply_round_learning(dopamine_rl, brain_alpha, brain_beta, winner,
+                          sens_a, sens_b, ctrl_a, ctrl_b, pulse,
+                          schemes_a, schemes_b, legacy_a, legacy_b,
+                          arena_draw=False):
+    """Post-battle dopamine + gain pinning. Arena-declared draws skip the
+    whole block: no plasticity for either side and no gain pinning, so a
+    draw leaves learned weights byte-identical while only the vault
+    draw counters advance."""
+    if arena_draw:
+        return
+    if winner == "alpha":
+        dopamine_rl.apply_plasticity(brain_alpha, sens_a, ctrl_a, pulse, schemes_a)
+        dopamine_rl.apply_plasticity(brain_beta, sens_b, ctrl_b, -0.8 * pulse, schemes_b)
+    else:
+        dopamine_rl.apply_plasticity(brain_beta, sens_b, ctrl_b, pulse, schemes_b)
+        dopamine_rl.apply_plasticity(brain_alpha, sens_a, ctrl_a, -0.8 * pulse, schemes_a)
+    dopamine_rl.pin_gains(brain_alpha, legacy=legacy_a)
+    dopamine_rl.pin_gains(brain_beta, legacy=legacy_b)
 
 
 def _sanitize_fit(x):
@@ -215,6 +302,13 @@ def run_brain_server(host="127.0.0.1", port=9999):
     print("=" * 60)
     print("   BATTLE FLY ARENA - DUAL CONNECTOME NEURO-SERVER")
     print("=" * 60)
+
+    try:
+        _recover_pending_battle()
+    except Exception as e:
+        # Journal-quarantine already logged loudly inside; transient IO
+        # here only delays vault writes until the next message's recovery.
+        print(f"[Server] Boot battle recovery deferred: {e}", flush=True)
 
     # 1. Load connectome & populations
     csr = load_or_build_csr()
@@ -352,6 +446,13 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 data, client_addr = sock.recvfrom(65535)
             msg = json.loads(data.decode("utf-8"))
             msg_type = msg.get("type", "step")
+            try:
+                _recover_pending_battle((tourney_a, tourney_b))
+            except Exception as e:
+                sock.sendto(json.dumps(
+                    {"status": "error", "error": f"battle recovery: {e}"}
+                ).encode("utf-8"), client_addr)
+                continue
             if msg_type == "step":
                 # Collapse the burst: keep draining while steps arrive and
                 # integrate only the newest. A non-step found mid-drain is
@@ -425,6 +526,7 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # (no tournament_battle / generation_advanced reply) wedges
                 # the game at a stale banner with live animations and no
                 # error text. The inner except reports visibly instead.
+                original_weights = None
                 try:
                     stats_a = msg.get("stats_alpha", {})
                     stats_b = msg.get("stats_beta", {})
@@ -485,18 +587,18 @@ def run_brain_server(host="127.0.0.1", port=9999):
                         else:
                             schemes_a, schemes_b = (), ()
                             legacy_a, legacy_b = False, False
-                        if winner == "alpha":
-                            dopamine_rl.apply_plasticity(brain_alpha, last_sens_a, last_ctrl_a, +1.0 * pulse, schemes_a)
-                            dopamine_rl.apply_plasticity(brain_beta, last_sens_b, last_ctrl_b, -0.8 * pulse, schemes_b)
-                        else:
-                            dopamine_rl.apply_plasticity(brain_beta, last_sens_b, last_ctrl_b, +1.0 * pulse, schemes_b)
-                            dopamine_rl.apply_plasticity(brain_alpha, last_sens_a, last_ctrl_a, -0.8 * pulse, schemes_a)
-                        # Pool-aware gain pinning (both fighters): preserve
-                        # learned ratios, pin magnitudes to the reference
-                        # wiring so localized runaway cannot compound.
-                        # Legacy brains pin runaway pools only (see above).
-                        dopamine_rl.pin_gains(brain_alpha, legacy=legacy_a)
-                        dopamine_rl.pin_gains(brain_beta, legacy=legacy_b)
+                        if tournament_mode:
+                            original_weights = (brain_alpha.weights.copy(),
+                                                brain_beta.weights.copy())
+                        # Arena-declared draws carry no dopamine in any mode:
+                        # evaluate_match still names a fitness "winner" on
+                        # ties, and banking +pulse/-0.8*pulse on that basis
+                        # would teach a win/loss split for a drawn fight.
+                        _apply_round_learning(
+                            dopamine_rl, brain_alpha, brain_beta, winner,
+                            last_sens_a, last_sens_b, last_ctrl_a, last_ctrl_b,
+                            pulse, schemes_a, schemes_b, legacy_a, legacy_b,
+                            arena_draw=bool(msg.get("arena_draw", False)))
                     finally:
                         dopamine_rl.lr = base_lr
                     if tournament_mode:
@@ -515,6 +617,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     }
                     sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
                 except Exception as e:
+                    if original_weights is not None and not os.path.exists(_pending_battle_path()):
+                        brain_alpha.weights, brain_beta.weights = original_weights
                     print(f"[Server Error] round_over failed: {e}")
                     try:
                         sock.sendto(json.dumps(
@@ -522,6 +626,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                              "error": f"round_over: {e}"}).encode("utf-8"), client_addr)
                     except Exception:
                         pass
+                finally:
+                    original_weights = None
 
             elif msg_type == "tournament_load":
                 # Load two managed brains by weight array (base64-free: the

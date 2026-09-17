@@ -352,6 +352,11 @@ class MotorDecoder:
         # as empty, which contributes zero votes).
         mn_thrust = populations.get("motor_flight_thrust", {})
         self.mn_thrust_ids = set(mn_thrust.get("all", []))
+        # Mouth-motor readout (spear lunge; stale-cache safe). Silent
+        # pools read 0 = no lunge, so brains without the spear_lunge
+        # wiring are unaffected by this readout existing.
+        mouth = populations.get("motor_mouth", {})
+        self.mouth_ids = set(mouth.get("all", []))
         # Retina feature readout pools (stale-cache safe like the rest).
         lc11 = populations.get("visual_lc11", {})
         self.lc11_left = set(lc11.get("left", []))
@@ -392,7 +397,8 @@ class MotorDecoder:
                 "roll_torque": 0.0,     # Wings-level hold (no flow signal)
                 "approach_bias": 0.0,   # No learned value without spikes
                 "ram_burst": False,
-                "emergency_evade": False
+                "emergency_evade": False,
+                "spear_thrust": 0.0
             }
             if sensory_hint is None:
                 return base
@@ -405,7 +411,8 @@ class MotorDecoder:
                 "approach_bias": 0.0,
                 "ram_burst": False,
                 "emergency_evade": bool(self.reflex_evade(sensory_hint)
-                                        or self.reflex_evade_tree(sensory_hint))
+                                        or self.reflex_evade_tree(sensory_hint)),
+                "spear_thrust": 0.0
             }
 
         counts = {}
@@ -476,6 +483,21 @@ class MotorDecoder:
         ram_spikes = sum(counts.get(s, 0) for s in self.dnpe017_ids)
         ram_burst = ram_spikes >= 2
 
+        # 3b. Spear thrust (MNxm mouth motor readout). Fires the couched
+        # lance forward when the mouth circuit votes strongly AND the
+        # rival is visibly frontal (aim gate shared with the GF evade, so
+        # rear tracking can never trigger a lunge). Read for every brain;
+        # pools without the spear_lunge wiring stay silent and read 0.
+        mouth_spikes = sum(counts.get(s, 0) for s in self.mouth_ids)
+        spear_thrust = 0.0
+        if mouth_spikes >= 3:
+            aimed = True
+            if sensory_hint is not None:
+                aimed = bool(sensory_hint.get("visual_target_visible", False)) \
+                    and abs(float(sensory_hint.get("visual_target_azimuth", 0.0))) < 50.0
+            if aimed:
+                spear_thrust = float(np.clip((mouth_spikes - 2) * 0.15, 0.0, 1.0))
+
         # 4. Emergency Evasive Roll / Dive (Giant Fiber + looming reflexes).
         # The connectome LC4 -> GF path fires (both GF cells, sustained;
         # verified after the LIF continuity fix); parallel reflexes stay as
@@ -533,7 +555,8 @@ class MotorDecoder:
             "roll_torque": float(roll_torque),
             "approach_bias": float(approach_bias),
             "ram_burst": bool(ram_burst),
-            "emergency_evade": bool(emergency_evade)
+            "emergency_evade": bool(emergency_evade),
+            "spear_thrust": float(spear_thrust)
         }
 
     @staticmethod

@@ -230,6 +230,7 @@ func _build_gen_column() -> VBoxContainer:
 	gen_experiment.add_item("base")
 	gen_experiment.add_item("lplc2_contra_dn")
 	gen_experiment.add_item("retina_wide")
+	gen_experiment.add_item("spear_lunge")
 	gen_experiment.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	wirerow.add_child(gen_experiment)
 	c.add_child(wirerow)

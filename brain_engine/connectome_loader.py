@@ -126,6 +126,12 @@ def load_or_extract_populations(force_regen=False):
     motor_giant_fiber = get_indices(types.str.contains("DNp01", na=False))
     motor_ram_dnpe017 = get_indices(types.str.contains("DNpe017", na=False))
 
+    # Mouthpart motor readout (spear lunge): MNxm01-03 maxillary muscles,
+    # clean bilateral 3L/3R. Centrally near-silent (0-7 weak inputs), so
+    # the spear_lunge wiring drives them; the decoder reads them for all
+    # brains (silent pools read 0 = no lunge, safe by default).
+    motor_mouth = get_indices(types.str.match(r"^MNxm", na=False))
+
     # --- Dopaminergic Reinforcement & Mushroom Body ---
     dopamine_pam = get_indices(types.str.contains("PAM", na=False))
     dopamine_ppl1 = get_indices(types.str.contains("PPL1", na=False))
@@ -167,6 +173,8 @@ def load_or_extract_populations(force_regen=False):
         "motor_turn_dnp20": motor_turn_dnp20,
         "motor_giant_fiber": motor_giant_fiber,
         "motor_ram_dnpe017": motor_ram_dnpe017,
+        # Mouthpart motor readout (spear lunge)
+        "motor_mouth": motor_mouth,
         # Reinforcement
         "dopamine_pam": dopamine_pam,
         "dopamine_ppl1": dopamine_ppl1,
@@ -191,7 +199,8 @@ def load_or_extract_populations(force_regen=False):
           f"MN-steer: {len(pops['motor_steer']['all'])}, "
           f"JO: {len(pops['gyro_jo']['all'])}, "
           f"VS/HS: {len(pops['flow_vs']['all'])}/{len(pops['flow_hs']['all'])}, "
-          f"MBON app/av: {len(pops['mbon_app']['all'])}/{len(pops['mbon_av']['all'])}")
+          f"MBON app/av: {len(pops['mbon_app']['all'])}/{len(pops['mbon_av']['all'])}, "
+          f"MN-mouth: {len(pops['motor_mouth']['all'])}")
 
     with open(POPULATIONS_CACHE_FILE, "w") as f:
         json.dump(pops, f, indent=2)

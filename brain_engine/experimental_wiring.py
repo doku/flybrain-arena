@@ -95,6 +95,41 @@ def retina_wide(pops, fanout=6, weight=200.0):
             np.concatenate(w).astype(np.float32))
 
 
+@_register("spear_lunge")
+def spear_lunge(pops, fanout=3, weight=200.0):
+    """Mouth-motor drive for the spear attack.
+
+    MNxm (maxillary mouthpart motor neurons, 3L/3R) are centrally
+    near-silent (0-7 weak inputs each), so nothing ever reads them.
+    This overlay routes lobula feature volleys (LC11 presence/size,
+    LC15/17/18 loom) onto all six MNxm cells, giving the decoder a
+    genuine mouth-motor signal to fire the spear thrust from. Aimed in
+    the decoder (visible + frontal gate), so rear tracking never lunges.
+    """
+    pre, post, w = [], [], []
+    rng = np.random.default_rng(21)  # deterministic wiring across runs
+    mx = np.asarray(pops.get("motor_mouth", {}).get("all", []), dtype=np.int64)
+    if len(mx) == 0:
+        return None
+    drivers = []
+    for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
+        pool = pops.get(key, {})
+        drivers += list(pool.get("left", [])) + list(pool.get("right", []))
+    drivers = np.asarray(drivers, dtype=np.int64)
+    if len(drivers) == 0:
+        return None
+    for s in drivers:
+        picks = rng.choice(mx, size=min(fanout, len(mx)), replace=False)
+        pre.append(np.full(len(picks), s))
+        post.append(picks)
+        w.append(np.full(len(picks), float(weight)))
+    if not pre:
+        return None
+    return (np.concatenate(pre).astype(np.int32),
+            np.concatenate(post).astype(np.int32),
+            np.concatenate(w).astype(np.float32))
+
+
 def apply_overlay(csr, pre, post, w):
     """Merges added edges into the base CSR. Returns contiguous int32
     indptr/indices + float32 data ready for FlyBrain."""

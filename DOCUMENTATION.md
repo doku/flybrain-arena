@@ -86,6 +86,7 @@ side-unknown and never driven. Cross-checked against FlyWire/MANC publications
 | `motor_turn_dnp20` | 2 | 1 / 1 | DNp20 steering pair |
 | `motor_giant_fiber` | 2 | 1 / 1 | DNp01 escape dive (gated: visible + frontal) |
 | `motor_ram_dnpe017` | 2 | 1 / 1 | Ram burst (≥2 spikes) |
+| `motor_mouth` | 6 | 3 / 3 | MNxm01–03 maxillary mouth motor neurons; centrally near-silent, driven by the `spear_lunge` wiring, read as spear-thrust lunge |
 | `motor_flight_thrust` | 24 | 12 / 12 | DLMn/DVMn wing-power (muscles_up) |
 | `motor_steer` | 214 | 107 / 107 | MNad steering muscles (muscles_up) |
 | `flow_vs` | 34 | 16 / 18 | VS optic flow → roll (gyro_flow; per-side normalized) |
@@ -133,7 +134,8 @@ fallbacks to the excitatory default).
 - **Pitch:** reflex-driven (elevation tracking + altitude hold).
 - **Roll:** VS/HS balance, gyro_flow only.
 - **Bursts:** ram (DNpe017 ≥ 2), emergency evade (giant fiber gated on visible
-  frontal rival, plus looming reflexes).
+  frontal rival, plus looming reflexes), spear thrust (MNxm ≥ 3 spikes +
+  visible frontal aim gate → 0..1 lunge command; unwired brains read 0).
 - **Approach bias:** MBON balance, mbon only (scales thrust/yaw, never flips).
 - Empty spike sets fall back to pure reflex so the fly still homes.
 
@@ -170,6 +172,10 @@ arity end-to-end; mixed brackets supported.
   *ipsilateral* DNs (pursuit-toward). Tuned by measurement: base wiring
   carries ~0 visual→DN spikes per volley (vs ~36/tick odor-driven); the
   overlay recruits tens per volley — comparable, far from saturating.
+- **spear_lunge** (fanout 3, weight 200): frontal LC11/15/17/18 volleys onto
+  all six MNxm mouth motor neurons. Measured: ~0 MNxm spikes base wiring vs
+  ~6/tick (all cells) on strong frontal input — clean strike signal with
+  its own checkpoint namespace.
 
 ## 8. Dopamine learning (`dopamine_learning.py`)
 
@@ -216,7 +222,8 @@ combat rules, 6 s episodes vs 40 s rounds, no roll axis (JO-roll learns live).
   >6.5 clip + 15), health/bleed-out KOs.
 - **Jousting spear:** couched right-side lance (shaft + steel tip +
   crossguard); FrontSpikeArea sphere sits on the tip — what you see is
-  what hits.
+  what hits. Fires forward on mouth-motor command: short velocity impulse
+  plus a visible 0.35 m thrust animation on a 1.2 s cooldown.
 - **Forest:** 16 procedural trunks (seed 777) + 4 hand-placed + horizon ring +
   underbrush; camera-following fade keeps the fight visible; PiP eye views.
 

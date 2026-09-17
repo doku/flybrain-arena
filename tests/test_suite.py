@@ -1517,7 +1517,8 @@ class TestMappingMatrix(unittest.TestCase):
     (legacy ignores split keys, mapped schemes compose). Includes the
     mirror-direction readouts the old suite only tested one-sided."""
     CTRL_KEYS = {"thrust", "yaw_torque", "pitch_torque", "roll_torque",
-                 "approach_bias", "ram_burst", "emergency_evade"}
+                 "approach_bias", "ram_burst", "emergency_evade",
+                 "spear_thrust"}
 
     @classmethod
     def setUpClass(cls):
@@ -1561,7 +1562,7 @@ class TestMappingMatrix(unittest.TestCase):
                 "angular_pitch_rate": 0.2, "visual_sec_presence": _pres,
                 "visual_sec_size": _size, "visual_sec_loom": _loom,
                 "visual_sec_tree": _wood}
-        for exp in (None, "lplc2_contra_dn", "retina_wide"):
+        for exp in (None, "lplc2_contra_dn", "retina_wide", "spear_lunge"):
             indptr, indices, wbasis = experiment_arrays(
                 exp, self.csr, self.pops)
             for mapping in (None, "muscles_up", "gyro_flow", "mbon",
@@ -2029,6 +2030,98 @@ class TestRetinaWiring(unittest.TestCase):
         self.assertLess(tot, 400)
 
 
+class TestSpearLunge(unittest.TestCase):
+    """Mouth-motor spear attack: MNxm pool registration, spear_lunge
+    wiring (deterministic, mouth-targeted), decoder readout with aim
+    gate, and safety (unwired brains read exactly 0)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.csr = load_or_build_csr()
+        cls.pops = load_or_extract_populations()
+
+    def test_mouth_pool_registered(self):
+        m = self.pops["motor_mouth"]
+        self.assertEqual(len(m["all"]), 6)
+        self.assertEqual((len(m["left"]), len(m["right"])), (3, 3))
+        from connectome_loader import _retained_annotations
+        df = _retained_annotations()
+        types = set(df["type"].iloc[i] for i in m["all"])
+        for t in types:
+            self.assertTrue(t.startswith("MNxm"), t)
+
+    def test_wiring_registered_deterministic_mouth_only(self):
+        from experimental_wiring import EXPERIMENTS, experiment_suffix
+        self.assertIn("spear_lunge", EXPERIMENTS)
+        self.assertEqual(experiment_suffix("spear_lunge"), "__exp_spear_lunge")
+        a = EXPERIMENTS["spear_lunge"](self.pops)
+        b = EXPERIMENTS["spear_lunge"](self.pops)
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+        pre, post, w = a
+        self.assertEqual(len(pre), len(post))
+        self.assertEqual(len(pre), len(w))
+        self.assertTrue((w > 0).all())
+        mx = set(self.pops["motor_mouth"]["all"])
+        feat = set()
+        for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
+            feat |= set(self.pops[key]["all"])
+        for s, q in zip(pre.tolist(), post.tolist()):
+            self.assertIn(q, mx)
+            self.assertIn(s, feat)
+
+    def test_decoder_spear_gating(self):
+        dec = MotorDecoder(self.pops)
+        mx = list(self.pops["motor_mouth"]["all"])
+        frontal = {"visual_target_visible": True, "visual_target_azimuth": 10.0}
+        rear = {"visual_target_visible": False, "visual_target_azimuth": 170.0}
+        blind = {"visual_target_visible": True, "visual_target_azimuth": 120.0}
+        self.assertEqual(dec.decode(mx[:2], sensory_hint=frontal)["spear_thrust"], 0.0)
+        full = dec.decode(mx, sensory_hint=frontal)["spear_thrust"]
+        self.assertGreater(full, 0.0)
+        self.assertLessEqual(full, 1.0)
+        self.assertEqual(dec.decode(mx, sensory_hint=rear)["spear_thrust"], 0.0)
+        self.assertEqual(dec.decode(mx, sensory_hint=blind)["spear_thrust"], 0.0)
+        # Hint-less diagnostic calls keep the raw readout (like GF evade).
+        self.assertAlmostEqual(dec.decode(mx)["spear_thrust"], 0.6)
+        # Key present in every output shape, including empty/reflex paths.
+        for ctrl in (dec.decode([]),
+                     dec.decode([], sensory_hint=frontal)):
+            self.assertIn("spear_thrust", ctrl)
+            self.assertEqual(ctrl["spear_thrust"], 0.0)
+
+    def test_unwired_brains_read_zero(self):
+        # Base wiring drives ~0 MNxm spikes: the readout exists for every
+        # brain but only spear_lunge-wired brains can ever fire it.
+        from experimental_wiring import experiment_arrays
+        from lif_brain import FlyBrain
+        from sensory_motor import SensoryEncoder
+        for exp in (None, "spear_lunge"):
+            indptr, indices, wbasis = experiment_arrays(
+                exp, self.csr, self.pops)
+            brain = FlyBrain(indptr, indices, np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32)).copy())
+            enc = SensoryEncoder(self.pops, mapping="retina")
+            mx = set(self.pops["motor_mouth"]["all"])
+            tot = 0
+            pres = [0.0] * 21
+            size = [0.0] * 21
+            loom = [0.0] * 21
+            wood = [0.0] * 21
+            pres[10] = 1.0
+            size[10] = 0.8
+            loom[10] = 0.8
+            stim = {"visual_sec_presence": pres, "visual_sec_size": size,
+                    "visual_sec_loom": loom, "visual_sec_tree": wood,
+                    "visual_target_visible": True, "visual_target_azimuth": 0.0}
+            for _ in range(4):
+                sp = brain.integrate_50ms(enc.encode(stim))
+                tot += len(set(int(x) for x in sp) & mx)
+            if exp is None:
+                self.assertEqual(tot, 0)
+            else:
+                self.assertGreater(tot, 4)
+
+
 class TestGodotArenaHeadless(unittest.TestCase):
     """Verifies that Godot 4 compiles all GDScripts and runs each scene without errors."""
     def _run_headless(self, scene=""):
@@ -2062,6 +2155,229 @@ class TestGodotArenaHeadless(unittest.TestCase):
                 out = self._run_headless(scene)
                 self.assertNotIn("SCRIPT ERROR", out, f"Godot raised script error:\n{out}")
                 self.assertNotIn("Parse Error", out, f"Godot raised parse error:\n{out}")
+
+
+class TestBattleTransaction(unittest.TestCase):
+    """Isolated battle persistence: draw learning skip + journaled saves.
+
+    No connectome, no UDP server: tiny synthetic weights in a temp vault
+    plus a temp tournaments dir, so these run in milliseconds."""
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        import brain_server as srv
+        cls.srv = srv
+        cls._real_root = srv.PROJECT_ROOT
+        cls._real_vault = vault_pkg.VAULT_DIR
+        cls._real_index = vault_pkg.VAULT_INDEX
+        cls.tmp = tempfile.mkdtemp(prefix="battle_txn_")
+        srv.PROJECT_ROOT = cls.tmp
+        vault_pkg.VAULT_DIR = os.path.join(cls.tmp, "brains")
+        vault_pkg.VAULT_INDEX = os.path.join(cls.tmp, "brains", "vault_index.json")
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        cls.srv.PROJECT_ROOT = cls._real_root
+        vault_pkg.VAULT_DIR = cls._real_vault
+        vault_pkg.VAULT_INDEX = cls._real_index
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def tearDown(self):
+        for f in (self.srv._pending_battle_path(), self.srv._last_verdict_path()):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    def _two_fighters(self):
+        import copy
+        from types import SimpleNamespace
+        rec_a = vault_pkg.new_record("TxnA", {})
+        rec_b = vault_pkg.new_record("TxnB", {})
+        # new_record ids are millisecond timestamps: back-to-back calls
+        # can collide, and id-prefix lookup would then resolve both to
+        # the same file. Regenerate until distinct.
+        while rec_b["id"] == rec_a["id"]:
+            time.sleep(0.002)
+            rec_b = vault_pkg.new_record("TxnB", {})
+        wa = np.arange(32, dtype=np.float32)
+        wb = -np.arange(32, dtype=np.float32)
+        vault_pkg.save_brain(rec_a, wa)
+        vault_pkg.save_brain(rec_b, wb)
+        sta = {"rec": copy.deepcopy(rec_a),
+               "brain": SimpleNamespace(weights=wa.copy())}
+        stb = {"rec": copy.deepcopy(rec_b),
+               "brain": SimpleNamespace(weights=wb.copy())}
+        return rec_a, rec_b, wa, wb, sta, stb
+
+    def test_draw_skips_all_learning(self):
+        class _FakeRL:
+            def __init__(self):
+                self.calls = []
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                self.calls.append(("plastic", sig))
+            def pin_gains(self, brain, legacy=False):
+                self.calls.append(("pin", legacy))
+
+        class _FakeBrain:
+            def __init__(self, n=8):
+                self.weights = np.arange(n, dtype=np.float32)
+
+        rl, ba, bb = _FakeRL(), _FakeBrain(), _FakeBrain()
+        wa, wb = ba.weights.copy(), bb.weights.copy()
+        self.srv._apply_round_learning(
+            rl, ba, bb, "alpha", {}, {}, {"yaw_torque": 0.0},
+            {"yaw_torque": 0.0}, 0.5, (), (), False, False,
+            arena_draw=True)
+        self.assertEqual(rl.calls, [])
+        np.testing.assert_array_equal(ba.weights, wa)
+        np.testing.assert_array_equal(bb.weights, wb)
+        # A decided battle still teaches both sides and pins both.
+        rl2 = _FakeRL()
+        self.srv._apply_round_learning(
+            rl2, ba, bb, "alpha", {}, {}, {"yaw_torque": 0.0},
+            {"yaw_torque": 0.0}, 0.5, (), (), False, False,
+            arena_draw=False)
+        self.assertEqual(len(rl2.calls), 4)
+
+    def test_pending_roundtrip_and_retry_idempotent(self):
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "win")
+        vault_pkg.record_battle_result(rb, "loss")
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "B1", "draw": False}
+        resp = {"status": "tournament_battle", "battle_winner": "alpha",
+                "fitness_alpha": 1.0, "fitness_beta": 0.0,
+                "battle_id": "B1"}
+        self.srv._write_pending_battle(
+            key, resp,
+            [{"side": "alpha", "record": ra},
+             {"side": "beta", "record": rb}],
+            {"alpha": wa, "beta": wb})
+        # Crash before any vault save: wipe both packages.
+        os.remove(vault_pkg.package_path(rec_a))
+        os.remove(vault_pkg.package_path(rec_b))
+        self.srv._recover_pending_battle((sta, stb))
+        la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        lb, wb2 = vault_pkg.load_brain(rec_b["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        np.testing.assert_array_equal(wa2, wa)
+        np.testing.assert_array_equal(wb2, wb)
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"], key)
+        self.assertEqual(stored["result"], resp)
+        self.assertEqual(sta["rec"]["record"]["wins"], 1)
+        np.testing.assert_array_equal(sta["brain"].weights, wa)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+        # A second replay is a no-op: counters are not banked twice.
+        self.srv._recover_pending_battle((sta, stb))
+        la2, _ = vault_pkg.load_brain(rec_a["id"])
+        self.assertEqual(la2["record"]["battles"], 1)
+
+    def test_interrupted_second_save_replays(self):
+        import copy
+        rec_a, rec_b, wa, wb, _sta, _stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "win")
+        vault_pkg.record_battle_result(rb, "loss")
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "B2", "draw": False}
+        resp = {"status": "tournament_battle", "battle_winner": "alpha",
+                "fitness_alpha": 2.0, "fitness_beta": 1.0,
+                "battle_id": "B2"}
+        self.srv._write_pending_battle(
+            key, resp,
+            [{"side": "alpha", "record": ra},
+             {"side": "beta", "record": rb}],
+            {"alpha": wa, "beta": wb})
+        # Crash between the two vault saves: alpha persisted, beta stale,
+        # no verdict yet.
+        vault_pkg.save_brain(ra, wa, backup=False, fast=True)
+        self.assertIsNone(self.srv._read_last_verdict())
+        self.srv._recover_pending_battle()
+        lb, wb2 = vault_pkg.load_brain(rec_b["id"])
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        np.testing.assert_array_equal(wb2, wb)
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"], key)
+        self.assertEqual(stored["result"], resp)
+
+    def test_unkeyed_journal_preserves_previous_verdict(self):
+        import copy
+        seed_key = {"tournament_id": "T", "match": "M",
+                    "battle_id": "B0", "draw": False}
+        seed_resp = {"status": "tournament_battle",
+                     "battle_winner": "alpha", "fitness_alpha": 1.0,
+                     "fitness_beta": 0.0, "battle_id": "B0"}
+        self.srv._write_last_verdict(seed_key, seed_resp)
+        rec_a, rec_b, wa, wb, _sta, _stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "draw")
+        vault_pkg.record_battle_result(rb, "draw")
+        resp = {"status": "tournament_battle", "battle_winner": "draw",
+                "fitness_alpha": 0.0, "fitness_beta": 0.0, "battle_id": ""}
+        self.srv._write_pending_battle(
+            None, resp,
+            [{"side": "alpha", "record": ra},
+             {"side": "beta", "record": rb}],
+            {"alpha": wa, "beta": wb})
+        self.srv._recover_pending_battle()
+        la, _ = vault_pkg.load_brain(rec_a["id"])
+        self.assertEqual(la["record"]["draws"], 1)
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"], seed_key)
+        self.assertEqual(stored["result"], seed_resp)
+
+    def test_handle_draw_records_draws_without_sessions(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BD", "draw": True}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), {"arena_draw": True},
+            "alpha", 5.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BD", battle_key=key)
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["battle_winner"], "draw")
+        la, wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((la["record"]["draws"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["draws"], lb["record"]["battles"]), (1, 1))
+        self.assertEqual(la["training"]["sessions"], [])
+        self.assertEqual(lb["training"]["sessions"], [])
+        np.testing.assert_array_equal(wla, wa)
+        np.testing.assert_array_equal(wlb, wb)
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"], key)
+        self.assertEqual(stored["result"]["battle_winner"], "draw")
+
+    def test_corrupt_journal_quarantined(self):
+        p = self.srv._pending_battle_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"not a zip at all")
+        with self.assertRaises(Exception):
+            self.srv._recover_pending_battle()
+        self.assertFalse(os.path.exists(p))
+        quarantined = [f for f in os.listdir(os.path.dirname(p))
+                       if f.startswith("_pending_battle.npz.corrupt-")]
+        self.assertTrue(quarantined)
+        for f in quarantined:
+            os.remove(os.path.join(os.path.dirname(p), f))
 
 
 if __name__ == "__main__":

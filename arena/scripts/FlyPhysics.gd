@@ -37,6 +37,18 @@ var is_emergency_evade: bool = false
 var left_wing_intact: bool = true
 var right_wing_intact: bool = true
 var wing_flutter_time: float = 0.0
+
+# Spear lunge attack (mouth-motor driven): a short forward impulse plus
+# a visible spear extension. Gated by cooldown so strikes stay discrete.
+var spear_thrust_cmd: float = 0.0
+var lunge_cooldown: float = 0.0
+var lunge_t: float = 0.0
+var spear_root: Node3D = null
+const LUNGE_COOLDOWN: float = 1.2
+const LUNGE_TIME: float = 0.35
+const LUNGE_DIST: float = 0.35
+const LUNGE_KICK: float = 7.0
+const SPIKE_BASE_POS := Vector3(0.32, -0.12, -1.35)
 # A torn wing forfeits the fight immediately (round ends, rival credited).
 # There's no crawling state: any wing loss is a loss.
 
@@ -93,6 +105,7 @@ func apply_brain_controls(ctrl: Dictionary) -> void:
 	current_roll_torque = ctrl.get("roll_torque", 0.0)
 	is_ram_burst = ctrl.get("ram_burst", false)
 	is_emergency_evade = ctrl.get("emergency_evade", false)
+	spear_thrust_cmd = clampf(float(ctrl.get("spear_thrust", 0.0)), 0.0, 1.0)
 
 func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	if not is_instance_valid(rival):
@@ -342,6 +355,23 @@ func _physics_process(delta: float) -> void:
 	if is_emergency_evade:
 		rotate_z(8.0 * delta)
 		velocity.y -= 25.0 * delta
+
+	# Spear lunge attack (mouth-motor driven): a forward impulse plus a
+	# visible spear thrust, one discrete strike per cooldown.
+	lunge_cooldown = maxf(0.0, lunge_cooldown - delta)
+	if spear_thrust_cmd > 0.4 and lunge_cooldown <= 0.0:
+		velocity += (-global_transform.basis.z).normalized() * LUNGE_KICK * spear_thrust_cmd
+		lunge_cooldown = LUNGE_COOLDOWN
+		lunge_t = LUNGE_TIME
+	if lunge_t > 0.0:
+		lunge_t = maxf(0.0, lunge_t - delta)
+		var ext := LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
+		if is_instance_valid(spear_root):
+			spear_root.position.z = -ext
+		front_spike_area.position = SPIKE_BASE_POS + Vector3(0, 0, -ext)
+	elif is_instance_valid(spear_root) and spear_root.position.z != 0.0:
+		spear_root.position.z = 0.0
+		front_spike_area.position = SPIKE_BASE_POS
 
 	# Forward motion with frame-rate-independent damping. The old per-frame
 	# *= drag made the fly's glide depend on fps (heavy/oily below 60),
@@ -598,6 +628,12 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	current_roll_torque = 0.0
 	is_ram_burst = false
 	is_emergency_evade = false
+	spear_thrust_cmd = 0.0
+	lunge_cooldown = 0.0
+	lunge_t = 0.0
+	if is_instance_valid(spear_root):
+		spear_root.position.z = 0.0
+	front_spike_area.position = SPIKE_BASE_POS
 	obstacle_hit_cooldown = 0.0
 	clash_cooldown = 0.0
 	basis_init = false
@@ -706,13 +742,18 @@ func _spear(vm: Node3D) -> void:
 	var wood := _vmat(Color(0.35, 0.24, 0.12), 0.70, 0.0)
 	var steel := _vmat(Color(0.65, 0.68, 0.72), 0.30, 0.85)
 	var brass := _vmat(Color(0.55, 0.45, 0.20), 0.45, 0.60)
+	# All spear parts hang under one sliding root so the lunge animation
+	# can thrust the whole weapon forward (see _physics_process).
+	spear_root = Node3D.new()
+	spear_root.name = "SpearRoot"
+	vm.add_child(spear_root)
 	var grip := Vector3(0.32, -0.12, 0.0)
 	# Shaft: butt behind the grip to tip base, couched level forward.
-	_segment(vm, grip + Vector3(0, 0, 0.55), grip + Vector3(0, 0, -1.05), 0.035, wood)
-	# Steel tip cone to z=-1.65.
-	_cone(vm, grip + Vector3(0, 0, -1.05), Vector3(0, 0, -1), 0.05, 0.30, steel)
+	_segment(spear_root, grip + Vector3(0, 0, 0.55), grip + Vector3(0, 0, -1.05), 0.035, wood)
+	# Steel tip cone to z=-1.35, centered in the spike hitbox sphere.
+	_cone(spear_root, grip + Vector3(0, 0, -1.05), Vector3(0, 0, -1), 0.05, 0.30, steel)
 	# Crossguard bar just behind the tip cone.
-	_segment(vm, grip + Vector3(-0.12, 0, -1.00), grip + Vector3(0.12, 0, -1.00), 0.022, brass)
+	_segment(spear_root, grip + Vector3(-0.12, 0, -1.00), grip + Vector3(0.12, 0, -1.00), 0.022, brass)
 	# Real wing membranes + veins hung under the gameplay pivots; pivots
 	# move to the scan hinge positions from the manifest.
 	var membrane_mat := _vmat(Color(0.90, 0.93, 1.0, 0.42), 0.08, 0.15)
