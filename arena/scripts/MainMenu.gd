@@ -229,6 +229,7 @@ func _build_gen_column() -> VBoxContainer:
 	gen_experiment = OptionButton.new()
 	gen_experiment.add_item("base")
 	gen_experiment.add_item("lplc2_contra_dn")
+	gen_experiment.add_item("retina_wide")
 	gen_experiment.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	wirerow.add_child(gen_experiment)
 	c.add_child(wirerow)
@@ -236,7 +237,9 @@ func _build_gen_column() -> VBoxContainer:
 	# stackable - tick any combination (none ticked = base behavior).
 	# muscles_up adds the flight-muscle readout; gyro_flow adds the JO gyro
 	# input + VS/HS roll output; mbon adds the mushroom-body learned-will
-	# readout (approach/avoid value).
+	# readout (approach/avoid value); retina adds the panoramic 21-sector
+	# eye (LC11 tracking + LC15/17/18 loom features, needs retina_wide
+	# wiring for the downstream path).
 	var maprow := HBoxContainer.new()
 	var mapl := Label.new()
 	mapl.text = "Neuro mapping"
@@ -247,7 +250,7 @@ func _build_gen_column() -> VBoxContainer:
 	mapchecks.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	maprow.add_child(mapchecks)
 	gen_map_checks.clear()
-	for scheme in ["muscles_up", "gyro_flow", "mbon"]:
+	for scheme in ["muscles_up", "gyro_flow", "mbon", "retina"]:
 		var cb := CheckButton.new()
 		cb.text = scheme
 		mapchecks.add_child(cb)

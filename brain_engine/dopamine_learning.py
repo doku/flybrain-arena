@@ -39,6 +39,16 @@ class DopamineReinforcement:
         # pools (their efferents were falling into untracked bulk).
         self.lc4_left = list(populations["visual_lc4"]["left"])
         self.lc4_right = list(populations["visual_lc4"]["right"])
+        # Retina feature pools (stale-cache safe): LC11 presence/size
+        # learns pursuit; LC15/17/18 loom features are pinned/guarded
+        # (their outcomes aren't scored, so no active branches for them).
+        lc11 = populations.get("visual_lc11", {})
+        self.lc11_left = list(lc11.get("left", []))
+        self.lc11_right = list(lc11.get("right", []))
+        self._retina_feat = []
+        for _rk in ("visual_lc15", "visual_lc17", "visual_lc18"):
+            _rp = populations.get(_rk, {})
+            self._retina_feat += list(_rp.get("left", [])) + list(_rp.get("right", []))
         # Tree-looming pools (LPLC2, side-gated wood). With the experimental
         # contralateral wiring, a LEFT tree fires LPLC2-L which steers right
         # (yaw>0 = away); these branches train that mapping up/down.
@@ -80,7 +90,8 @@ class DopamineReinforcement:
             self.da1_left + self.da1_right + self.va1v_left
             + self.va1v_right + self.lc10_left + self.lc10_right
             + self.lc4_left + self.lc4_right + self.lplc2_left
-            + self.lplc2_right)
+            + self.lplc2_right + self.lc11_left + self.lc11_right
+            + self._retina_feat)
         self._jo_pref = frozenset(self.jo_left + self.jo_right)
         # Depression floor: refuse to scale a pool that is already at or
         # below this fraction of its reference mean. Potentiation (factor
@@ -117,7 +128,15 @@ class DopamineReinforcement:
                     + list(populations["visual_lc4"]["left"])
                     + list(populations["visual_lc4"]["right"])
                     + list(populations["visual_lplc2"]["left"])
-                    + list(populations["visual_lplc2"]["right"]))
+                    + list(populations["visual_lplc2"]["right"])
+                    + list(populations.get("visual_lc11", {}).get("left", []))
+                    + list(populations.get("visual_lc11", {}).get("right", []))
+                    + list(populations.get("visual_lc15", {}).get("left", []))
+                    + list(populations.get("visual_lc15", {}).get("right", []))
+                    + list(populations.get("visual_lc17", {}).get("left", []))
+                    + list(populations.get("visual_lc17", {}).get("right", []))
+                    + list(populations.get("visual_lc18", {}).get("left", []))
+                    + list(populations.get("visual_lc18", {}).get("right", [])))
         jo_ids = list(populations.get("gyro_jo", {}).get("left", [])) \
             + list(populations.get("gyro_jo", {}).get("right", []))
         n = len(bindptr) - 1
@@ -175,7 +194,8 @@ class DopamineReinforcement:
             sens_ids = self.da1_left + self.da1_right + self.va1v_left \
                 + self.va1v_right + self.lc10_left + self.lc10_right \
                 + self.lc4_left + self.lc4_right + self.lplc2_left \
-                + self.lplc2_right
+                + self.lplc2_right + self.lc11_left + self.lc11_right \
+                + self._retina_feat
             jo_ids = self.jo_left + self.jo_right
             cached = (len(brain.weights),
                       self._row_positions(indptr, sens_ids),
@@ -409,6 +429,27 @@ class DopamineReinforcement:
                 if right_active:
                     self._scale_outgoing(brain, self.da1_right, dep)
                     self._scale_outgoing(brain, self.va1v_right, dep)
+
+        # Retina channel (LC11 small-object pursuit, retina scheme only):
+        # mirrors the LC10 lateralized structure - correct turns toward
+        # the seen side potentiate under signed DA, wrong-way turns are
+        # depressed. LC15/17/18 loom features have no scored outcome, so
+        # they are pinned/guarded but never actively scaled here.
+        if "retina" in schemes:
+            if left_active and not right_active:
+                if yaw < -0.05:
+                    self._scale_outgoing(brain, self.lc11_left,
+                                         1.0 + self.lr * da_signal)
+                elif yaw > 0.05:
+                    dep = 1.0 - self.lr * abs(da_signal) * 0.5
+                    self._scale_outgoing(brain, self.lc11_left, dep)
+            elif right_active and not left_active:
+                if yaw > 0.05:
+                    self._scale_outgoing(brain, self.lc11_right,
+                                         1.0 + self.lr * da_signal)
+                elif yaw < -0.05:
+                    dep = 1.0 - self.lr * abs(da_signal) * 0.5
+                    self._scale_outgoing(brain, self.lc11_right, dep)
 
         # Tree channel (LPLC2): side-gated avoidance. With the contra wiring a
         # lever, steering AWAY from the looming side is the correct answer -

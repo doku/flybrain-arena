@@ -1,7 +1,7 @@
 import numpy as np
 
 
-KNOWN_MAPPINGS = ("base", "muscles_up", "gyro_flow", "mbon")
+KNOWN_MAPPINGS = ("base", "muscles_up", "gyro_flow", "mbon", "retina")
 
 # Schemes that add encoder/decoder behavior. "base" is the absence of all
 # schemes. Mappings stack: a brain may declare any combination, e.g.
@@ -70,6 +70,22 @@ class SensoryEncoder:
         # a tree on the LEFT fires LPLC2-L, right fires LPLC2-R.
         self.lplc2_left = np.array(populations["visual_lplc2"]["left"], dtype=np.int32)
         self.lplc2_right = np.array(populations["visual_lplc2"]["right"], dtype=np.int32)
+        # Retina feature pools (stale-cache safe: absent pools read empty
+        # and contribute nothing, so old caches keep working).
+        lc11 = populations.get("visual_lc11", {})
+        self.lc11_left = np.array(lc11.get("left", []), dtype=np.int32)
+        self.lc11_right = np.array(lc11.get("right", []), dtype=np.int32)
+        lc15 = populations.get("visual_lc15", {})
+        self.lc15_left = np.array(lc15.get("left", []), dtype=np.int32)
+        self.lc15_right = np.array(lc15.get("right", []), dtype=np.int32)
+        lc17 = populations.get("visual_lc17", {})
+        self.lc17_left = np.array(lc17.get("left", []), dtype=np.int32)
+        self.lc17_right = np.array(lc17.get("right", []), dtype=np.int32)
+        lc18 = populations.get("visual_lc18", {})
+        self.lc18_left = np.array(lc18.get("left", []), dtype=np.int32)
+        self.lc18_right = np.array(lc18.get("right", []), dtype=np.int32)
+        # Panoramic column centers shared with the arena/trainer grids.
+        self.sec_az = (-150.0, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0)
         # Reference pool sizes: stimulus spike counts scale to the LARGER
         # sibling pool (sampling with replacement past pool size). MaleCNS
         # leaves some pools asymmetric (e.g. ORN_DA1 51L/105R with the rest
@@ -185,9 +201,12 @@ class SensoryEncoder:
         tree_l = np.clip(sensory_dict.get("visual_tree_left_looming", 0.0), 0.0, 1.0)
         tree_r = np.clip(sensory_dict.get("visual_tree_right_looming", 0.0), 0.0, 1.0)
         tree_a = np.clip(sensory_dict.get("visual_tree_ahead_looming", 0.0), 0.0, 1.0)
+        # Retina brains read wood from the panoramic sector grid instead
+        # (7 rays, full circle); the 3-ray fan stays for all other regimes.
+        use_sector_wood = "retina" in self.schemes and not self.legacy
         if self.legacy:
             tree_l = tree_r = tree_a = 0.0
-        if tree_l + tree_r + tree_a > 0.1:
+        if tree_l + tree_r + tree_a > 0.1 and not use_sector_wood:
             k_l = int((tree_l + 0.5 * tree_a) * 0.4 * self.lplc2_ref)
             k_r = int((tree_r + 0.5 * tree_a) * 0.4 * self.lplc2_ref)
             if k_l > 0 and len(self.lplc2_left) > 0:
@@ -196,6 +215,62 @@ class SensoryEncoder:
             if k_r > 0 and len(self.lplc2_right) > 0:
                 spikes.extend(np.random.choice(
                     self.lplc2_right, size=min(k_r, len(self.lplc2_right)), replace=False))
+
+        # 3d. Panoramic sector grid (retina scheme only): 7 azimuth
+        # columns x 3 elevation bands = 21 cells (bands 0/1/2 = up/level/
+        # down, columns match sec_az). Rival presence+size drives LC11
+        # (small-object tracking, side-gated, rear included); frontal
+        # loom (|col| <= 100) drives the LC15/17/18 loom-feature pools;
+        # wood occupancy drives LPLC2 sides (max per hemifield). Rear
+        # cells track only: nothing here feeds evade gates.
+        if "retina" in self.schemes and not self.legacy:
+            pres = list(sensory_dict.get("visual_sec_presence", []) or [])
+            size = list(sensory_dict.get("visual_sec_size", []) or [])
+            loom = list(sensory_dict.get("visual_sec_loom", []) or [])
+            wood = list(sensory_dict.get("visual_sec_tree", []) or [])
+            if len(pres) == 21 and len(size) == 21 \
+                    and len(loom) == 21 and len(wood) == 21:
+                for band in range(3):
+                    for ci in range(7):
+                        idx = band * 7 + ci
+                        col = self.sec_az[ci]
+                        frontal = abs(col) <= 100.0
+                        pools_l = [(self.lc11_left, size[idx], 30),
+                                   (self.lc15_left, loom[idx] if frontal else 0.0, 20),
+                                   (self.lc17_left, loom[idx] if frontal else 0.0, 20),
+                                   (self.lc18_left, loom[idx] if frontal else 0.0, 20)]
+                        pools_r = [(self.lc11_right, size[idx], 30),
+                                   (self.lc15_right, loom[idx] if frontal else 0.0, 20),
+                                   (self.lc17_right, loom[idx] if frontal else 0.0, 20),
+                                   (self.lc18_right, loom[idx] if frontal else 0.0, 20)]
+                        if pres[idx] > 0.5:
+                            if col < 0:
+                                targets = pools_l
+                            elif col > 0:
+                                targets = pools_r
+                            else:
+                                targets = pools_l + pools_r
+                            for pool, mag, gain in targets:
+                                if len(pool) > 0 and mag > 0.01:
+                                    k = min(int(mag * gain), len(pool))
+                                    if k > 0:
+                                        spikes.extend(np.random.choice(
+                                            pool, size=k, replace=False))
+                        _w = wood[idx]
+                        if _w > 0.05:
+                            if col < 0:
+                                tgts = (self.lplc2_left,)
+                            elif col > 0:
+                                tgts = (self.lplc2_right,)
+                            else:
+                                tgts = (self.lplc2_left, self.lplc2_right)
+                            for tgt in tgts:
+                                if len(tgt) > 0:
+                                    k = min(int(_w * (37 if len(tgts) == 1 else 18)),
+                                            len(tgt))
+                                    if k > 0:
+                                        spikes.extend(np.random.choice(
+                                            tgt, size=k, replace=False))
 
         # 3c. Antennal gyroscope (JO) - body angular rates, gyro_flow only.
         # Real JO afferents are bilateral with ipsilateral dominance: a
@@ -277,6 +352,14 @@ class MotorDecoder:
         # as empty, which contributes zero votes).
         mn_thrust = populations.get("motor_flight_thrust", {})
         self.mn_thrust_ids = set(mn_thrust.get("all", []))
+        # Retina feature readout pools (stale-cache safe like the rest).
+        lc11 = populations.get("visual_lc11", {})
+        self.lc11_left = set(lc11.get("left", []))
+        self.lc11_right = set(lc11.get("right", []))
+        self.lc11_all = set(lc11.get("all", []))
+        self.lc_loom_ids = set()
+        for _lk in ("visual_lc15", "visual_lc17", "visual_lc18"):
+            self.lc_loom_ids |= set(populations.get(_lk, {}).get("all", []))
         mn_steer = populations.get("motor_steer", {})
         self.mn_steer_left = set(mn_steer.get("left", []))
         self.mn_steer_right = set(mn_steer.get("right", []))
@@ -341,6 +424,14 @@ class MotorDecoder:
         if "muscles_up" in self.schemes and not self.legacy:
             mn_thrust_spikes = sum(counts.get(s, 0) for s in self.mn_thrust_ids)
             thrust += np.clip(mn_thrust_spikes * 0.015, 0.0, 0.25)
+        if "retina" in self.schemes and not self.legacy:
+            # Panoramic feature drive: LC11 presence/size pushes pursuit
+            # thrust, loom-feature spikes add urgency. Pursuit-only path:
+            # nothing here touches evade, so rear tracking stays safe.
+            lc11_spikes = sum(counts.get(s, 0) for s in self.lc11_all)
+            thrust += np.clip(lc11_spikes * 0.006, 0.0, 0.2)
+            loom_spikes = sum(counts.get(s, 0) for s in self.lc_loom_ids)
+            thrust += np.clip(loom_spikes * 0.004, 0.0, 0.15)
         thrust = float(np.clip(thrust, 0.0, 1.0))
 
         # 2. Steering / Yaw Torque: normalized DN population vector + DNp20.
@@ -364,6 +455,13 @@ class MotorDecoder:
             mn_l = sum(counts.get(s, 0) for s in self.mn_steer_left)
             yaw_mn = float(np.tanh((mn_r - mn_l) / 8.0) * 0.5)
             brain_yaw = float(np.clip(brain_yaw + yaw_mn, -1.0, 1.0))
+        if "retina" in self.schemes and not self.legacy:
+            # Small-object fixation: LC11-R minus LC11-L steers toward the
+            # seen object (sign-correct pursuit, rear-safe: never evades).
+            lc11_r = sum(counts.get(s, 0) for s in self.lc11_right)
+            lc11_l = sum(counts.get(s, 0) for s in self.lc11_left)
+            yaw_lc = float(np.tanh((lc11_r - lc11_l) / 8.0) * 0.5)
+            brain_yaw = float(np.clip(brain_yaw + yaw_lc, -1.0, 1.0))
         if sensory_hint is not None:
             # Parallel olfactory/visual reflex (antenna tropotaxis + visual
             # fixation), blended 30/70 with brain readout. Reflex dominates

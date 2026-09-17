@@ -106,7 +106,11 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 			"angular_yaw_rate": 0.0,
 			"angular_pitch_rate": 0.0,
 			"angular_roll_rate": 0.0,
-			"tail_chase": 0.0
+			"tail_chase": 0.0,
+			"visual_sec_presence": [],
+			"visual_sec_size": [],
+			"visual_sec_loom": [],
+			"visual_sec_tree": []
 		}
 
 	# 0. Antennal-gyro rates: attitude delta since the last read, axis by
@@ -197,6 +201,48 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	var behind_rival = rival_local.z > 0.15
 	var tail_chase = 1.0 if (behind_rival and is_visible and absf(azimuth_deg) < 35.0) else 0.0
 
+	# 5. Panoramic sector grid (retina scheme): 7 azimuth columns over the
+	# full circle x 3 elevation bands = 21 cells. Rival occupies exactly
+	# one cell (presence + angular size + loom); tree rays fan all 7
+	# columns (elevation ignored for wood). Rear cells track only.
+	var sec_presence: Array = []
+	var sec_size: Array = []
+	var sec_loom: Array = []
+	var sec_tree: Array = []
+	sec_presence.resize(21)
+	sec_size.resize(21)
+	sec_loom.resize(21)
+	sec_tree.resize(21)
+	sec_presence.fill(0.0)
+	sec_size.fill(0.0)
+	sec_loom.fill(0.0)
+	sec_tree.fill(0.0)
+	var az_cols: Array = [-150.0, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0]
+	var wrapped_az := wrapf(azimuth_deg, -180.0, 180.0)
+	var best_col := 3
+	var best_d := 999.0
+	for ci in range(7):
+		var dd := absf(wrapf(wrapped_az - az_cols[ci], -180.0, 180.0))
+		if dd < best_d:
+			best_d = dd
+			best_col = ci
+	var band := 1
+	if elevation_deg > 20.0:
+		band = 0
+	elif elevation_deg < -20.0:
+		band = 2
+	var rcell := band * 7 + best_col
+	sec_presence[rcell] = 1.0
+	sec_size[rcell] = clampf(1.1 / maxf(dist, 0.5), 0.0, 1.0)
+	sec_loom[rcell] = rival_looming
+	for ci in range(7):
+		var ray_dir: Vector3 = Basis(Vector3.UP, deg_to_rad(-az_cols[ci])) * fwd
+		var wood := _ray_loom(ray_dir)
+		# Nose rays carry no elevation: same occupancy in all 3 bands.
+		sec_tree[ci] = wood
+		sec_tree[7 + ci] = wood
+		sec_tree[14 + ci] = wood
+
 	return {
 		"pheromone_conc_left": c_left,
 		"pheromone_conc_right": c_right,
@@ -213,7 +259,11 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 		"angular_yaw_rate": yaw_rate,
 		"angular_pitch_rate": pitch_rate_now,
 		"angular_roll_rate": roll_rate_now,
-		"tail_chase": tail_chase
+		"tail_chase": tail_chase,
+		"visual_sec_presence": sec_presence,
+		"visual_sec_size": sec_size,
+		"visual_sec_loom": sec_loom,
+		"visual_sec_tree": sec_tree
 	}
 
 func _ray_loom(ray_dir: Vector3) -> float:
@@ -592,23 +642,6 @@ func _segment(parent: Node3D, a: Vector3, b: Vector3, r: float, mat: Material) -
 	mi.basis = _yaw_along(dir)
 
 
-func _cone(parent: Node3D, base: Vector3, dir: Vector3, base_r: float, len: float, mat: Material) -> MeshInstance3D:
-	# Spike with its tip at base + dir * len (bristles, combat horn).
-	var mi := MeshInstance3D.new()
-	var cm := CylinderMesh.new()
-	cm.top_radius = 0.004
-	cm.bottom_radius = base_r
-	cm.height = len
-	cm.radial_segments = 8
-	cm.material = mat
-	mi.mesh = cm
-	parent.add_child(mi)
-	var d := dir.normalized()
-	mi.position = base + d * (len * 0.5)
-	mi.basis = _yaw_along(d)
-	return mi
-
-
 func _yaw_along(d: Vector3) -> Basis:
 	# Rotation mapping +Y onto d (for Y-axis primitives).
 	var x := d.cross(Vector3.UP)
@@ -645,12 +678,41 @@ func _build_visual_model() -> void:
 			var hz: float = hip_z[k]
 			_segment(vm, Vector3(side * 0.20, -0.14, hz), Vector3(side * 0.40, -0.40, hz + 0.10), 0.022, leg_mat)
 			_segment(vm, Vector3(side * 0.40, -0.40, hz + 0.10), Vector3(side * 0.32, -0.64, hz + 0.34), 0.015, leg_mat)
-	# Combat horn rooted in the scan face, same envelope as before so the
-	# spike Area still matches the visible tip.
-	_cone(vm, Vector3(0, 0.02, -0.40), Vector3(0, 0, -1), 0.12, 0.55,
-		_vmat(Color(0.30, 0.22, 0.08), 0.35, 0.60)).name = "SpikeBase"
-	_cone(vm, Vector3(0, 0.02, -0.95), Vector3(0, 0, -1), 0.055, 0.50,
-		_vmat(Color(0.85, 0.80, 0.20), 0.20, 0.80)).name = "FrontSpikeMesh"
+	# Jousting spear, couched on the fly's right like a lance: wooden
+	# shaft, steel tip, small crossguard. Aligned with the FrontSpikeArea
+	# sphere at (0.32, -0.12, -1.35) r=0.35 in FlyEntity.tscn, so what you
+	# see is what hits (steel tip at z=-1.35, centered in the sphere).
+	_spear(vm)
+
+
+func _cone(parent: Node3D, base: Vector3, dir: Vector3, base_r: float, len: float, mat: Material) -> MeshInstance3D:
+	# Spike with its tip at base + dir * len.
+	var mi := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.004
+	cm.bottom_radius = base_r
+	cm.height = len
+	cm.radial_segments = 8
+	cm.material = mat
+	mi.mesh = cm
+	parent.add_child(mi)
+	var d := dir.normalized()
+	mi.position = base + d * (len * 0.5)
+	mi.basis = _yaw_along(d)
+	return mi
+
+
+func _spear(vm: Node3D) -> void:
+	var wood := _vmat(Color(0.35, 0.24, 0.12), 0.70, 0.0)
+	var steel := _vmat(Color(0.65, 0.68, 0.72), 0.30, 0.85)
+	var brass := _vmat(Color(0.55, 0.45, 0.20), 0.45, 0.60)
+	var grip := Vector3(0.32, -0.12, 0.0)
+	# Shaft: butt behind the grip to tip base, couched level forward.
+	_segment(vm, grip + Vector3(0, 0, 0.55), grip + Vector3(0, 0, -1.05), 0.035, wood)
+	# Steel tip cone to z=-1.65.
+	_cone(vm, grip + Vector3(0, 0, -1.05), Vector3(0, 0, -1), 0.05, 0.30, steel)
+	# Crossguard bar just behind the tip cone.
+	_segment(vm, grip + Vector3(-0.12, 0, -1.00), grip + Vector3(0.12, 0, -1.00), 0.022, brass)
 	# Real wing membranes + veins hung under the gameplay pivots; pivots
 	# move to the scan hinge positions from the manifest.
 	var membrane_mat := _vmat(Color(0.90, 0.93, 1.0, 0.42), 0.08, 0.15)

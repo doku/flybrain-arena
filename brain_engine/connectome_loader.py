@@ -93,6 +93,12 @@ def load_or_extract_populations(force_regen=False):
     visual_lc4 = get_indices(types.str.match(r"^LC4$", na=False))
     visual_lplc2 = get_indices(types.str.contains("LPLC2", na=False))
     visual_lc10 = get_indices(types.str.contains("LC10", na=False))
+    # Retina-scheme feature pools (exact matches, all clean bilateral):
+    # LC11 small-object presence/size, LC15/17/18 loom-feature readouts.
+    visual_lc11 = get_indices(types.str.match(r"^LC11$", na=False))
+    visual_lc15 = get_indices(types.str.match(r"^LC15$", na=False))
+    visual_lc17 = get_indices(types.str.match(r"^LC17$", na=False))
+    visual_lc18 = get_indices(types.str.match(r"^LC18$", na=False))
 
     # --- Neuro-mapping pools (Stage 1: muscles_up + gyro_flow) ---
     # Flight-muscle motor readout: DLMn/DVMn wing power (thrust), MNad
@@ -144,6 +150,10 @@ def load_or_extract_populations(force_regen=False):
         "visual_lc4": visual_lc4,
         "visual_lplc2": visual_lplc2,
         "visual_lc10": visual_lc10,
+        "visual_lc11": visual_lc11,
+        "visual_lc15": visual_lc15,
+        "visual_lc17": visual_lc17,
+        "visual_lc18": visual_lc18,
         # Neuro-mapping readout/injection pools (muscles_up + gyro_flow)
         "motor_flight_thrust": motor_flight_thrust,
         "motor_steer": motor_steer,
@@ -170,6 +180,10 @@ def load_or_extract_populations(force_regen=False):
     print(f"[Loader] Mapped populations: "
           f"DA1 ORNs: {len(pops['pheromone_da1']['all'])}, "
           f"LC10: {len(pops['visual_lc10']['all'])}, "
+          f"LC11/15/17/18: {len(pops['visual_lc11']['all'])}/"
+          f"{len(pops['visual_lc15']['all'])}/"
+          f"{len(pops['visual_lc17']['all'])}/"
+          f"{len(pops['visual_lc18']['all'])}, "
           f"DN-Left: {len(dn_left_ids)}, DN-Right: {len(dn_right_ids)}, "
           f"PAM DA: {len(pops['dopamine_pam']['all'])}, "
           f"MBON: {len(pops['mbon']['all'])}, "

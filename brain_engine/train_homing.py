@@ -242,6 +242,46 @@ def compute_agent_senses(agent, target, prev_dist=None):
             else:
                 tree_right = loom
 
+    # Panoramic sector grid (retina scheme; mirrors the arena's
+    # FlyPhysics grid cell-for-cell): 7 azimuth columns x 3 elevation
+    # bands = 21 cells. Rival occupies one cell (presence + angular size
+    # + loom); 7 column rays fan the full circle for wood (no elevation).
+    az_cols = (-150.0, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0)
+    wrapped_az = (azimuth_deg + 180.0) % 360.0 - 180.0
+    best_col = min(range(7),
+                   key=lambda ci: abs((wrapped_az - az_cols[ci] + 180.0) % 360.0 - 180.0))
+    if apparent_elev_deg > 20.0:
+        band = 0
+    elif apparent_elev_deg < -20.0:
+        band = 2
+    else:
+        band = 1
+    sec_presence = [0.0] * 21
+    sec_size = [0.0] * 21
+    sec_loom = [0.0] * 21
+    sec_tree = [0.0] * 21
+    rcell = band * 7 + best_col
+    sec_presence[rcell] = 1.0
+    sec_size[rcell] = float(np.clip(1.1 / max(dist, 0.5), 0.0, 1.0))
+    sec_loom[rcell] = rival_looming
+    if TREES:
+        fw = np.array([np.cos(agent.heading), 0.0, np.sin(agent.heading)], dtype=np.float32)
+
+        def _rot2(dir3, ang):
+            x, z = float(dir3[0]), float(dir3[2])
+            return np.array([x * np.cos(ang) + z * np.sin(ang), 0.0,
+                             -x * np.sin(ang) + z * np.cos(ang)], dtype=np.float32)
+
+        for ci, acol in enumerate(az_cols):
+            hit = ray_trunk_distance(agent.pos, _rot2(fw, np.radians(acol)))
+            wood = 0.0
+            if hit is not None:
+                wood = float(np.clip(
+                    (OBSTACLE_RAY_LENGTH - hit) / OBSTACLE_RAY_LENGTH, 0.0, 1.0))
+            sec_tree[ci] = wood
+            sec_tree[7 + ci] = wood
+            sec_tree[14 + ci] = wood
+
     return {
         "pheromone_conc_left": c_left,
         "pheromone_conc_right": c_right,
@@ -257,6 +297,10 @@ def compute_agent_senses(agent, target, prev_dist=None):
                                    tree_right),
         "altitude": float(agent.pos[1]),
         "tail_chase": tail_chase,
+        "visual_sec_presence": sec_presence,
+        "visual_sec_size": sec_size,
+        "visual_sec_loom": sec_loom,
+        "visual_sec_tree": sec_tree,
         # JO-gyro synth: trainer-frame angular rates normalized like the
         # arena (yaw/turn_rate, pitch/pitch_rate). No roll axis in 2D.
         # Sign: trainer heading DECREASES on right turns (heading -= yaw

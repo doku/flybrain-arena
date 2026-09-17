@@ -513,8 +513,17 @@ class TestMbonMapping(unittest.TestCase):
         rl = DopamineReinforcement(
             self.pops, base=(csr.indptr, csr.indices, csr.data.copy()))
         # Artificially inflate left-sensory rows 40x with a lateral bias.
+        # Covers the full sens pool definition (DA1+VA1v+LC10+LC4+LPLC2+
+        # LC11/15/17/18 left) so the inflated mean still reads runaway.
         left_ids = (self.pops["pheromone_da1"]["left"]
-                    + self.pops["visual_lc10"]["left"])
+                    + self.pops["pheromone_va1v"]["left"]
+                    + self.pops["visual_lc10"]["left"]
+                    + self.pops["visual_lc4"]["left"]
+                    + self.pops["visual_lplc2"]["left"]
+                    + self.pops["visual_lc11"]["left"]
+                    + self.pops["visual_lc15"]["left"]
+                    + self.pops["visual_lc17"]["left"]
+                    + self.pops["visual_lc18"]["left"])
         for pre in left_ids:
             s, e = int(brain.indptr[pre]), int(brain.indptr[pre + 1])
             if e > s:
@@ -1536,17 +1545,27 @@ class TestMappingMatrix(unittest.TestCase):
     def test_wiring_x_regime_integrate_and_decode(self):
         import brain_server as bs
         from experimental_wiring import experiment_arrays
+        _pres = [0.0] * 21
+        _size = [0.0] * 21
+        _loom = [0.0] * 21
+        _wood = [0.0] * 21
+        _pres[9] = 1.0
+        _size[9] = 0.4
+        _loom[9] = 0.5
+        _wood[11] = 0.6
         stim = {"pheromone_conc_left": 0.7, "pheromone_conc_right": 0.2,
                 "visual_target_visible": True, "visual_target_azimuth": -20.0,
                 "visual_rival_looming": 0.3, "visual_tree_left_looming": 0.4,
                 "visual_tree_looming": 0.4, "visual_looming_rate": 0.4,
                 "angular_yaw_rate": 0.5, "angular_roll_rate": -0.3,
-                "angular_pitch_rate": 0.2}
-        for exp in (None, "lplc2_contra_dn"):
+                "angular_pitch_rate": 0.2, "visual_sec_presence": _pres,
+                "visual_sec_size": _size, "visual_sec_loom": _loom,
+                "visual_sec_tree": _wood}
+        for exp in (None, "lplc2_contra_dn", "retina_wide"):
             indptr, indices, wbasis = experiment_arrays(
                 exp, self.csr, self.pops)
             for mapping in (None, "muscles_up", "gyro_flow", "mbon",
-                            ["muscles_up", "gyro_flow", "mbon"]):
+                            ["muscles_up", "gyro_flow", "mbon"], "retina"):
                 with self.subTest(wiring=exp or "base", mapping=mapping):
                     rec = self._rec(exp, mapping=mapping, use_mapping=True)
                     brain = bs._bind_brain(
@@ -1677,7 +1696,9 @@ class TestTrainerArenaContract(unittest.TestCase):
                   "visual_tree_left_looming", "visual_tree_ahead_looming",
                   "visual_tree_right_looming", "visual_tree_looming",
                   "visual_looming_rate", "altitude", "angular_yaw_rate",
-                  "angular_pitch_rate", "angular_roll_rate", "tail_chase"}
+                  "angular_pitch_rate", "angular_roll_rate", "tail_chase",
+                  "visual_sec_presence", "visual_sec_size",
+                  "visual_sec_loom", "visual_sec_tree"}
 
     def test_trainer_covers_arena_keys(self):
         from train_homing import KinematicFly, compute_agent_senses
@@ -1739,6 +1760,31 @@ class TestTrainerArenaContract(unittest.TestCase):
         self.assertEqual(musc.decode(stim)["yaw_torque"],
                          base.decode(stim)["yaw_torque"])
 
+    def test_sector_grid_consistent(self):
+        # The panoramic grid: rival occupies exactly one cell with matching
+        # presence/size/loom, tree rays fan all 7 columns, geometry maps
+        # to the documented cell (front band, center column here).
+        from train_homing import KinematicFly, compute_agent_senses
+        import train_homing as th
+        fly = KinematicFly(x=0.0, z=0.0, heading_rad=0.0)
+        tgt = KinematicFly(x=20.0, z=0.0, heading_rad=np.pi)
+        th.TREES = []
+        senses, _ = compute_agent_senses(fly, tgt, prev_dist=25.0)
+        for k in ("visual_sec_presence", "visual_sec_size",
+                  "visual_sec_loom", "visual_sec_tree"):
+            self.assertEqual(len(senses[k]), 21)
+        self.assertEqual(sum(senses["visual_sec_presence"]), 1.0)
+        cell = senses["visual_sec_presence"].index(1.0)
+        self.assertEqual(cell, 1 * 7 + 3)  # level band, 0-deg column
+        self.assertGreater(senses["visual_sec_size"][cell], 0.0)
+        self.assertGreater(senses["visual_sec_loom"][cell], 0.0)
+        self.assertEqual(sum(senses["visual_sec_tree"]), 0.0)
+        # Rear rival lands in a rear column (tracking only, never evade).
+        tgt_back = KinematicFly(x=-20.0, z=0.0, heading_rad=0.0)
+        back, _ = compute_agent_senses(fly, tgt_back, prev_dist=25.0)
+        rear_cell = back["visual_sec_presence"].index(1.0)
+        self.assertIn(rear_cell % 7, (0, 6))
+
     def test_gyro_full_scale(self):
         # Full right deflection must span the full JO range (regression:
         # the trainer clip capped it at ~0.375 while live reaches 1.0).
@@ -1748,6 +1794,239 @@ class TestTrainerArenaContract(unittest.TestCase):
         fly.step(thrust=0.5, yaw_torque=1.0, pitch_cmd=0.0, dt=0.05)
         senses, _ = compute_agent_senses(fly, tgt)
         self.assertAlmostEqual(senses["angular_yaw_rate"], 1.0, places=5)
+
+
+class TestRetinaVision(unittest.TestCase):
+    """Panoramic 21-sector eye: grid geometry, side-gated feature drive,
+    rear tracking without evade, and opt-in isolation (other regimes
+    never see the sector keys)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.pops = load_or_extract_populations()
+
+    def _grid(self, band, col, size=0.0, loom=0.0, wood=0.0):
+        pres = [0.0] * 21
+        size_a = [0.0] * 21
+        loom_a = [0.0] * 21
+        wood_a = [0.0] * 21
+        idx = band * 7 + col
+        pres[idx] = 1.0
+        size_a[idx] = size
+        loom_a[idx] = loom
+        wood_a[idx] = wood
+        return {"visual_sec_presence": pres, "visual_sec_size": size_a,
+                "visual_sec_loom": loom_a, "visual_sec_tree": wood_a}
+
+    def test_sector_isolation(self):
+        # One frontal-left cell drives LC pools on the left only.
+        enc = SensoryEncoder(self.pops, mapping="retina")
+        lc11_l = set(self.pops["visual_lc11"]["left"])
+        lc11_r = set(self.pops["visual_lc11"]["right"])
+        sp = set(int(s) for s in enc.encode(
+            dict(self._grid(1, 1, size=0.5),
+                 visual_target_visible=True)))
+        self.assertGreater(len(sp & lc11_l), 0)
+        self.assertEqual(len(sp & lc11_r), 0)
+
+    def test_rear_tracks_never_evades(self):
+        # Rear cells (cols 0 and 6) drive LC11 tracking but no loom
+        # pools, and the decoder never evades on rear input.
+        enc = SensoryEncoder(self.pops, mapping="retina")
+        dec = MotorDecoder(self.pops, mapping="retina")
+        loom_pools = (set(self.pops["visual_lc15"]["all"])
+                      | set(self.pops["visual_lc17"]["all"])
+                      | set(self.pops["visual_lc18"]["all"]))
+        for col in (0, 6):
+            with self.subTest(col=col):
+                d = dict(self._grid(0, col, size=0.8, loom=0.9),
+                         visual_target_visible=False,
+                         visual_target_azimuth=170.0 if col == 0 else -170.0)
+                sp = list(enc.encode(d))
+                self.assertEqual(
+                    len(set(int(s) for s in sp) & loom_pools), 0)
+                ctrl = dec.decode(sp, sensory_hint=d)
+                self.assertFalse(ctrl["emergency_evade"])
+
+    def test_retina_lateralizes_both_ways(self):
+        enc = SensoryEncoder(self.pops, mapping="retina")
+        dec = MotorDecoder(self.pops, mapping="retina")
+        hint_l = {"visual_target_visible": True, "visual_target_azimuth": -50.0}
+        hint_r = {"visual_target_visible": True, "visual_target_azimuth": 50.0}
+        dl = dict(self._grid(1, 1, size=0.5), **hint_l)
+        dr = dict(self._grid(1, 5, size=0.5), **hint_r)
+        y_l = dec.decode(enc.encode(dl), sensory_hint=hint_l)["yaw_torque"]
+        y_r = dec.decode(enc.encode(dr), sensory_hint=hint_r)["yaw_torque"]
+        self.assertLess(y_l, 0.0)
+        self.assertGreater(y_r, 0.0)
+
+    def test_other_regimes_ignore_sectors(self):
+        d = dict(self._grid(1, 1, size=0.9, loom=0.9, wood=0.9),
+                 visual_target_visible=False)
+        for kwargs in ({}, {"mapping": "base"}, {"mapping": "muscles_up"},
+                       {"legacy": True}):
+            with self.subTest(kwargs=kwargs):
+                enc = SensoryEncoder(self.pops, **kwargs)
+                lc_all = (set(self.pops["visual_lc11"]["all"])
+                          | set(self.pops["visual_lc15"]["all"])
+                          | set(self.pops["visual_lc17"]["all"])
+                          | set(self.pops["visual_lc18"]["all"]))
+                sp = set(int(s) for s in enc.encode(d))
+                self.assertEqual(len(sp & lc_all), 0)
+
+    def test_retina_pursuit_smoke(self):
+        # Closed loop: a fresh retina brain must make progress toward the
+        # target (deterministic seed; generous margin, not a performance
+        # benchmark). Catches wiring regressions that unit probes miss
+        # (dead downstream paths, sign flips, silent channels).
+        import os
+        from train_homing import run_training, CHECKPOINTS_DIR
+        os.makedirs(os.path.join(CHECKPOINTS_DIR, "tmp"), exist_ok=True)
+        out = os.path.join(CHECKPOINTS_DIR, "tmp", "retina_smoke.npz")
+        self.addCleanup(lambda: os.path.exists(out) and os.remove(out))
+        _save, _w, summary = run_training(
+            num_episodes=3, variant="custom", seed=11,
+            target_evasion=0.2, learning_rate=0.008, dist_gain=0.15,
+            experiment="retina_wide", mapping="retina", init_weights=None,
+            save_name=os.path.join("tmp", "retina_smoke.npz"),
+            return_brain=True)
+        self.assertEqual(summary["episodes"], 3)
+        self.assertGreater(summary["avg_closed"], 5.0)
+
+    def test_sector_wood_drives_lplc2(self):
+        enc = SensoryEncoder(self.pops, mapping="retina")
+        lplc2_l = set(self.pops["visual_lplc2"]["left"])
+        d = self._grid(1, 1)
+        d["visual_sec_tree"][1 * 7 + 1] = 0.8
+        sp = set(int(s) for s in enc.encode(
+            dict(d, visual_target_visible=False)))
+        self.assertGreater(len(sp & lplc2_l), 0)
+
+
+class TestRetinaWiring(unittest.TestCase):
+    """retina_wide overlay: registered, deterministic, ipsilateral
+    (pursuit-toward), sized to recruit tens (not hundreds) of DNs, with
+    its own checkpoint namespace."""
+    @classmethod
+    def setUpClass(cls):
+        cls.csr = load_or_build_csr()
+        cls.pops = load_or_extract_populations()
+
+    def test_registered_and_shaped(self):
+        from experimental_wiring import EXPERIMENTS, experiment_suffix
+        self.assertIn("retina_wide", EXPERIMENTS)
+        self.assertEqual(experiment_suffix("retina_wide"), "__exp_retina_wide")
+        a = EXPERIMENTS["retina_wide"](self.pops)
+        b = EXPERIMENTS["retina_wide"](self.pops)
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+        pre, post, w = a
+        self.assertEqual(len(pre), len(post))
+        self.assertEqual(len(pre), len(w))
+        self.assertTrue((w > 0).all())
+
+    def test_ipsilateral_pursuit_direction(self):
+        # Every injected edge runs same-side (feature-L -> DN-L):
+        # pursuit toward, never away.
+        from experimental_wiring import EXPERIMENTS
+        pre, post, _w = EXPERIMENTS["retina_wide"](self.pops)
+        dn_l = set(self.pops["descending_all"]["left"])
+        dn_r = set(self.pops["descending_all"]["right"])
+        feat_l, feat_r = set(), set()
+        for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
+            feat_l |= set(self.pops[key]["left"])
+            feat_r |= set(self.pops[key]["right"])
+        for s, q in zip(pre.tolist(), post.tolist()):
+            if s in feat_l:
+                self.assertIn(q, dn_l)
+            elif s in feat_r:
+                self.assertIn(q, dn_r)
+            else:
+                self.fail(f"injected pre {s} is not a retina feature cell")
+
+    def test_retina_dopamine_branch(self):
+        # Retina-scheme LC11 pursuit learns laterally (mirrors LC10);
+        # base schemes leave LC11 weights untouched.
+        from dopamine_learning import DopamineReinforcement
+        rng = np.random.default_rng(11)
+        n, deg = 200, 6
+        indptr = np.arange(n + 1, dtype=np.int32) * deg
+        indices = rng.integers(0, n, size=n * deg).astype(np.int32)
+        base_w = rng.normal(4.0, 0.5, size=n * deg).astype(np.float32)
+        lc11_l = list(range(0, 10))
+        lc11_r = list(range(10, 20))
+        fake_pops = {
+            "pheromone_da1": {"left": [], "right": []},
+            "pheromone_va1v": {"left": [], "right": []},
+            "visual_lc10": {"left": [], "right": []},
+            "visual_lc4": {"left": [], "right": []},
+            "visual_lplc2": {"left": [], "right": []},
+            "visual_lc11": {"left": lc11_l, "right": lc11_r},
+            "dopamine_pam": {"all": []}, "dopamine_ppl1": {"all": []},
+            "motor_turn_dnp20": {"left": [100], "right": [101]},
+            "motor_thrust_dnp09": {"all": [102]},
+            "motor_ram_dnpe017": {"all": [103]},
+            "motor_giant_fiber": {"all": [104]},
+            "descending_all": {"left": [100], "right": [101],
+                               "all": [100, 101, 102]},
+            "mushroom_body_kc": [], "mbon_app": {"all": []},
+            "mbon_av": {"all": []},
+        }
+        rl = DopamineReinforcement(
+            fake_pops, base=(indptr, indices, base_w.copy()))
+
+        class _Brain:
+            pass
+
+        def _make():
+            b = _Brain()
+            b.indptr = indptr
+            b.indices = indices
+            b.weights = base_w.copy()
+            return b
+
+        pos_l = DopamineReinforcement._row_positions(indptr, lc11_l)
+        sens = {"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.1,
+                "visual_target_azimuth": -40.0}
+        motor = {"yaw_torque": -0.5, "thrust": 0.3}
+        b = _make()
+        w0 = b.weights.copy()
+        rl.apply_plasticity(b, sens, motor, 1.0, schemes=("retina",))
+        self.assertFalse(bool((b.weights[pos_l] == w0[pos_l]).all()))
+        b2 = _make()
+        w02 = b2.weights.copy()
+        rl.apply_plasticity(b2, sens, motor, 1.0, schemes=())
+        # Base schemes never touch LC11 rows (DN-incoming steering may
+        # still learn, which is the point of the shared base branches).
+        np.testing.assert_array_equal(b2.weights[pos_l], w02[pos_l])
+
+    def test_recruitment_band(self):
+        # A full frontal-cell volley must recruit a useful but bounded
+        # DN volley through the overlay (measured tuning: tens/tick,
+        # comparable to odor drive, far from saturating).
+        from experimental_wiring import experiment_arrays
+        from sensory_motor import SensoryEncoder
+        from lif_brain import FlyBrain
+        indptr, indices, wbasis = experiment_arrays(
+            "retina_wide", self.csr, self.pops)
+        brain = FlyBrain(indptr, indices, np.ascontiguousarray(
+            np.asarray(wbasis, dtype=np.float32)).copy())
+        enc = SensoryEncoder(self.pops, mapping="retina")
+        pres = [0.0] * 21
+        size = [0.0] * 21
+        loom = [0.0] * 21
+        wood = [0.0] * 21
+        pres[10] = 1.0
+        size[10] = 0.5
+        loom[10] = 0.6
+        stim = {"visual_sec_presence": pres, "visual_sec_size": size,
+                "visual_sec_loom": loom, "visual_sec_tree": wood}
+        dn = set(self.pops["descending_all"]["all"])
+        tot = 0
+        for _ in range(4):
+            sp = brain.integrate_50ms(enc.encode(stim))
+            tot += len(set(int(x) for x in sp) & dn)
+        self.assertGreater(tot, 10)
+        self.assertLess(tot, 400)
 
 
 class TestGodotArenaHeadless(unittest.TestCase):

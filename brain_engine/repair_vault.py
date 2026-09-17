@@ -54,7 +54,11 @@ def main(dust_only=False, runaway_only=False):
                     np.ascontiguousarray(csr.data, dtype=np.float32)))
     sens_ids = (pops["pheromone_da1"]["all"] + pops["pheromone_va1v"]["all"]
                 + pops["visual_lc10"]["all"] + pops["visual_lc4"]["all"]
-                + pops["visual_lplc2"]["all"])
+                + pops["visual_lplc2"]["all"]
+                + pops.get("visual_lc11", {}).get("all", [])
+                + pops.get("visual_lc15", {}).get("all", [])
+                + pops.get("visual_lc17", {}).get("all", [])
+                + pops.get("visual_lc18", {}).get("all", []))
     jo_ids = pops["gyro_jo"]["all"]
     # Native reference weights per wiring (for dust restoration below).
     wbase_cache = {}
@@ -136,10 +140,18 @@ def main(dust_only=False, runaway_only=False):
                      "dn_right": rl._base_means.get("dn_in", 0.0)}
         sens_l_ids = (pops["pheromone_da1"]["left"] + pops["pheromone_va1v"]["left"]
                       + pops["visual_lc10"]["left"] + pops["visual_lc4"]["left"]
-                      + pops["visual_lplc2"]["left"])
+                      + pops["visual_lplc2"]["left"]
+                      + pops.get("visual_lc11", {}).get("left", [])
+                      + pops.get("visual_lc15", {}).get("left", [])
+                      + pops.get("visual_lc17", {}).get("left", [])
+                      + pops.get("visual_lc18", {}).get("left", []))
         sens_r_ids = (pops["pheromone_da1"]["right"] + pops["pheromone_va1v"]["right"]
                       + pops["visual_lc10"]["right"] + pops["visual_lc4"]["right"]
-                      + pops["visual_lplc2"]["right"])
+                      + pops["visual_lplc2"]["right"]
+                      + pops.get("visual_lc11", {}).get("right", [])
+                      + pops.get("visual_lc15", {}).get("right", [])
+                      + pops.get("visual_lc17", {}).get("right", [])
+                      + pops.get("visual_lc18", {}).get("right", []))
         pool_base["sens_left"] = pool_base["sens"]
         pool_base["sens_right"] = pool_base["sens"]
         pools = [("sens", sens_ids), ("jo", jo_ids), ("dn", None),

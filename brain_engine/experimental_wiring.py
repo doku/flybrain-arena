@@ -59,6 +59,42 @@ def lplc2_contra_dn(pops, fanout=16, weight=260.0):
             np.concatenate(w).astype(np.float32))
 
 
+@_register("retina_wide")
+def retina_wide(pops, fanout=6, weight=200.0):
+    """Ipsilateral feature->DN assist for the retina scheme.
+
+    Lobula feature pools (LC11 presence/size, LC15/17/18 loom) barely
+    recruit descending neurons through base wiring (measured ~0 DN spikes
+    per volley vs ~36/tick odor-driven), so the panoramic field would be
+    mute downstream. This overlay gives every LC11/15/17/18 cell a small
+    excitatory fanout to SAME-side DNs: left-field features drive DN-L
+    (yaw left, toward the object), right-field DN-R. Same-side keeps
+    pursuit toward (contrast the contra tree-avoidance wiring), and the
+    overlay is small enough that the standard DN readout and dopamine
+    keep working on top.
+    """
+    pre, post, w = [], [], []
+    rng = np.random.default_rng(7)  # deterministic wiring across runs
+    dn_l = np.asarray(pops["descending_all"]["left"], dtype=np.int64)
+    dn_r = np.asarray(pops["descending_all"]["right"], dtype=np.int64)
+    for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
+        pool = pops.get(key, {})
+        for src, tgt in ((np.asarray(pool.get("left", []), dtype=np.int64), dn_l),
+                         (np.asarray(pool.get("right", []), dtype=np.int64), dn_r)):
+            if len(src) == 0 or len(tgt) == 0:
+                continue
+            for s in src:
+                picks = rng.choice(tgt, size=min(fanout, len(tgt)), replace=False)
+                pre.append(np.full(len(picks), s))
+                post.append(picks)
+                w.append(np.full(len(picks), float(weight)))
+    if not pre:
+        return None
+    return (np.concatenate(pre).astype(np.int32),
+            np.concatenate(post).astype(np.int32),
+            np.concatenate(w).astype(np.float32))
+
+
 def apply_overlay(csr, pre, post, w):
     """Merges added edges into the base CSR. Returns contiguous int32
     indptr/indices + float32 data ready for FlyBrain."""
