@@ -2,6 +2,9 @@ extends Node3D
 
 const BrainClientScript = preload("res://scripts/BrainClient.gd")
 const FlyPhysicsScript = preload("res://scripts/FlyPhysics.gd")
+const BrainViewScript = preload("res://scripts/BrainView.gd")
+const BrainRasterScript = preload("res://scripts/BrainRaster.gd")
+const BrainCloudScript = preload("res://scripts/BrainCloud.gd")
 const BracketView = preload("res://scripts/TournamentBracket.gd")
 
 @export var round_time_limit: float = 40.0
@@ -11,6 +14,110 @@ var is_round_active: bool = true
 
 var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
+
+# Brain-view L0 pool-rate bars (key, short label, bar-full count).
+# Updated on every motor reply (~5 Hz) with EMA smoothing; always-on
+# capable (toggled by menu setting, B key, BRAIN button).
+const BV_POOLS := [
+	["pheromone_da1", "DA1", 120.0], ["pheromone_va1v", "VA1v", 80.0],
+	["visual_lc10", "LC10", 40.0], ["visual_lc4", "LC4", 60.0],
+	["visual_lplc2", "LPLC2", 60.0], ["visual_lc11", "LC11", 40.0],
+	["visual_lc15", "LC15", 40.0], ["visual_lc17", "LC17", 40.0],
+	["visual_lc18", "LC18", 40.0], ["gyro_jo", "JO", 60.0],
+	["mbon_app", "MBONap", 30.0], ["mbon_av", "MBONav", 30.0],
+	["dn_left", "dnL", 120.0], ["dn_right", "dnR", 120.0],
+	["motor_thrust_dnp09", "DNp09", 4.0], ["motor_turn_dnp20", "DNp20", 4.0],
+	["motor_giant_fiber", "GF", 3.0], ["motor_ram_dnpe017", "RAM", 3.0],
+	["motor_mouth", "MOUTH", 8.0], ["motor_flight_thrust", "MN", 30.0],
+	["motor_steer", "STEER", 60.0], ["flow_vs", "VS", 30.0],
+	["flow_hs", "HS", 15.0],
+]
+var bv_panel_alpha: VBoxContainer
+var bv_panel_beta: VBoxContainer
+var bv_rows_alpha := {}
+var bv_rows_beta := {}
+var bv_ema_alpha := {}
+var bv_ema_beta := {}
+# Flow-diagram layer (L1): one BrainView overlay per fly, fed by the
+# shared bar EMAs + per-side wiring/mapping labels from the server.
+var bv_flow_alpha: Control
+var bv_flow_beta: Control
+var bv_wiring_alpha: Array = []
+var bv_wiring_beta: Array = []
+var bv_mapping_alpha: Array = []
+var bv_mapping_beta: Array = []
+var bv_caps := {}
+# Raster drill-down (L2): one view + selection per side. Selecting a
+# pool node auto-escalates the UDP detail to 2 (spike ids) and drops
+# back to the menu level on deselect.
+var bv_raster_alpha: Control
+var bv_raster_beta: Control
+var bv_sel_alpha := ""
+var bv_sel_beta := ""
+var bv_menu_detail := 1
+# 3D soma cloud (L5): one MultiMesh holder per fly, parented to the
+# camera so the brain floats in view. Spike ids flash cells via the
+# shader; holders slow-spin for depth while visible.
+var bv_cloud_alpha: Node3D
+var bv_cloud_beta: Node3D
+var bv_cloud_asset := {}
+var bv_cloud_centroids := {}
+# 3D network edges: from-pool, to-pool, kind (same gating as the 2D
+# flow diagram: base always, overlays/schemes per fighter config).
+const BV_NETS := [
+	["pheromone_da1", "dn_left", "base"], ["pheromone_da1", "dn_right", "base"],
+	["pheromone_va1v", "dn_left", "base"], ["pheromone_va1v", "dn_right", "base"],
+	["visual_lc10", "dn_left", "base"], ["visual_lc10", "dn_right", "base"],
+	["visual_lc4", "motor_giant_fiber", "base"],
+	["visual_lplc2", "dn_left", "base"], ["visual_lplc2", "dn_right", "base"],
+	["visual_lplc2", "dn_left", "contra"], ["visual_lplc2", "dn_right", "contra"],
+	["visual_lc11", "dn_left", "wide"], ["visual_lc11", "dn_right", "wide"],
+	["visual_lc15", "dn_left", "wide"], ["visual_lc15", "dn_right", "wide"],
+	["visual_lc17", "dn_left", "wide"], ["visual_lc17", "dn_right", "wide"],
+	["visual_lc18", "dn_left", "wide"], ["visual_lc18", "dn_right", "wide"],
+	["visual_lc11", "motor_mouth", "spear"], ["visual_lc15", "motor_mouth", "spear"],
+	["visual_lc17", "motor_mouth", "spear"], ["visual_lc18", "motor_mouth", "spear"],
+	["gyro_jo", "flow_vs", "gyro"], ["gyro_jo", "flow_hs", "gyro"],
+	["mbon_app", "dn_left", "value"], ["mbon_app", "dn_right", "value"],
+	["mbon_av", "dn_left", "value"], ["mbon_av", "dn_right", "value"],
+	["dn_left", "motor_steer", "base"], ["dn_right", "motor_steer", "base"],
+	["dn_left", "motor_flight_thrust", "base"], ["dn_right", "motor_flight_thrust", "base"],
+]
+const BV_NET_WIRING := {"contra": "lplc2_contra_dn", "wide": "retina_wide",
+	"spear": "spear_lunge"}
+const BV_NET_SCHEME := {"gyro": "gyro_flow"}
+const BV_NET_COLORS := {
+	"pheromone_da1": Color(0.4, 1.0, 0.4), "pheromone_va1v": Color(0.5, 0.9, 0.3),
+	"visual_lc10": Color(1.0, 0.9, 0.3), "visual_lc4": Color(1.0, 0.5, 0.2),
+	"visual_lplc2": Color(1.0, 0.6, 0.9), "visual_lc11": Color(1.0, 1.0, 0.4),
+	"visual_lc15": Color(1.0, 0.8, 0.2), "visual_lc17": Color(1.0, 0.7, 0.2),
+	"visual_lc18": Color(0.9, 0.8, 0.3), "gyro_jo": Color(0.4, 0.8, 1.0),
+	"mbon_app": Color(0.7, 0.4, 1.0), "mbon_av": Color(0.5, 0.2, 0.8),
+	"dn_left": Color(1.0, 0.6, 0.15), "dn_right": Color(1.0, 0.6, 0.15),
+}
+# Replay (L4): per-battle pool-rate stream. One count array per motor
+# reply (~5 Hz), capped; banked into the tournament JSON `flights`
+# entry when the menu record toggle is on, plus an in-memory copy for
+# the post-battle scrubber. ~50 KB per 40 s battle — toggle-gated.
+const BV_STREAM_MAX := 600
+var bv_stream_alpha: Array = []
+var bv_stream_beta: Array = []
+var bv_replay_mode := false
+var bv_replay_idx := 0
+var bv_replay_playing := false
+var bv_replay_accum := 0.0
+var bv_replay_panel: PanelContainer
+var bv_replay_slider: HSlider
+var bv_replay_playbtn: Button
+var bv_replay_label: Label
+var bv_replay_prior_bars: Array = []
+
+# Per-battle flight telemetry (answered by control step): altitude profile,
+# thrust/pitch command means, evade/ram exposure, spear demand. Reported
+# with the battle verdict and banked per-battle in the tournament JSON so
+# flight-style questions ("why won't it climb?") have recorded evidence.
+var flight_alpha := {}
+var flight_beta := {}
 
 # Session win tally (natural + restarted rounds, server-judged)
 var wins_alpha: int = 0
@@ -105,7 +212,9 @@ func _slot_name(slot: String) -> String:
 
 func refresh_slot_names() -> void:
 	# Pushes current display names into every static battle-UI label.
-	# Called whenever a new match's brains are known.
+	# Called whenever a new match's brains are known. New fighters means
+	# a new session tally (only called on tournament match load, so the
+	# free-battle running tally is untouched).
 	var na := _slot_name("alpha")
 	var nb := _slot_name("beta")
 	if is_instance_valid(alpha_row_name):
@@ -116,7 +225,18 @@ func refresh_slot_names() -> void:
 		pip_alpha_label.text = na + " EYES - raw (pre-brain)"
 	if is_instance_valid(pip_beta_label):
 		pip_beta_label.text = nb + " EYES - raw (pre-brain)"
+	wins_alpha = 0
+	wins_beta = 0
 	_update_win_label()
+	# New fighters: raster selections reference the old brains' pools.
+	bv_sel_alpha = ""
+	bv_sel_beta = ""
+	if is_instance_valid(bv_flow_alpha):
+		bv_flow_alpha.set("selected", "")
+	if is_instance_valid(bv_flow_beta):
+		bv_flow_beta.set("selected", "")
+	_apply_bv_detail()
+	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 
 var brain_tick_timer: float = 0.0
 const BRAIN_TICK_DT: float = 0.05 # 50 ms (20 Hz)
@@ -159,6 +279,7 @@ func _ready() -> void:
 	brain_client.merged.connect(_on_merged)
 	brain_client.restarted.connect(_on_restarted)
 	brain_client.tournament_battle_received.connect(_on_tournament_battle)
+	brain_client.raster_map_received.connect(_on_raster_map)
 	brain_client.brains_loaded.connect(_on_brains_loaded)
 	brain_client.match_ready_received.connect(_on_match_ready)
 	brain_client.server_error_received.connect(_on_server_error)
@@ -174,6 +295,7 @@ func _ready() -> void:
 	_build_health_hud()
 	_build_hit_flash()
 	_build_winner_overlay()
+	_build_brainview()
 	_generate_forest()
 	_setup_dynamic_tree_opacity()
 	# Tournament battles are sequenced by the director (brains load first);
@@ -225,6 +347,12 @@ func _build_menu_bar(tournament: bool) -> void:
 		bracket_button = _menu_bar_button("BRACKET", "Show/hide the tournament bracket.")
 		bracket_button.pressed.connect(_on_bracket_toggle)
 		bar.add_child(bracket_button)
+		var brain_b := _menu_bar_button("BRAIN", "Cycle brain views: bars, flow, raster, 3D.")
+		brain_b.pressed.connect(_on_brain_button)
+		bar.add_child(brain_b)
+		var replay_bt := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
+		replay_bt.pressed.connect(_toggle_replay)
+		bar.add_child(replay_bt)
 	else:
 		if is_instance_valid(merge_button):
 			merge_button.visible = false
@@ -236,6 +364,38 @@ func _build_menu_bar(tournament: bool) -> void:
 		var restart_b := _menu_bar_button("RESTART", "Restart the round (banks rewards).")
 		restart_b.pressed.connect(_on_restart_pressed)
 		bar.add_child(restart_b)
+		var brain_b := _menu_bar_button("BRAIN", "Cycle brain views: bars, flow, raster, 3D.")
+		brain_b.pressed.connect(_on_brain_button)
+		bar.add_child(brain_b)
+		var replay_b2 := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
+		replay_b2.pressed.connect(_toggle_replay)
+		bar.add_child(replay_b2)
+
+
+const BV_LAYERS := ["bars", "flow", "raster", "brain3d"]
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo:
+		if (event as InputEventKey).keycode == KEY_B:
+			_toggle_brainview()
+		elif (event as InputEventKey).keycode == KEY_N:
+			_cycle_bv_layer()
+
+
+func _cycle_bv_layer() -> void:
+	# Live layer cycling (no menu round-trip): bars -> flow ->
+	# raster -> brain3d. Syncs back to the menu bus.
+	var director := _director()
+	var cur := "bars"
+	if director != null:
+		cur = str(director.brainview_layer)
+	var nxt: String = BV_LAYERS[(BV_LAYERS.find(cur) + 1) % BV_LAYERS.size()]
+	if director != null:
+		director.brainview_layer = nxt
+	_apply_bv_detail()
+	_apply_bv_layer(nxt)
+	if is_instance_valid(status_label):
+		status_label.text = "BRAIN VIEW layer: %s (N cycles)" % nxt
 
 
 func _menu_bar_button(text: String, tip: String) -> Button:
@@ -417,7 +577,8 @@ func _on_server_error(error: String) -> void:
 			status_label.text = "BATTLE ERROR - RETRYING %s ..." % _seq_battle_id
 		brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 			bool(q.get("draw", false)), _seq_battle_id,
-			str(q.get("tournament_id", "")), str(q.get("match", "")))
+			str(q.get("tournament_id", "")), str(q.get("match", "")),
+			q.get("flight_a", {}), q.get("flight_b", {}))
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
@@ -854,6 +1015,15 @@ func _reset_round() -> void:
 	is_round_active = true
 	stats_alpha = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 	stats_beta  = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
+	flight_alpha = {}
+	flight_beta = {}
+	bv_stream_alpha.clear()
+	bv_stream_beta.clear()
+	_exit_replay()
+	if is_instance_valid(bv_raster_alpha):
+		bv_raster_alpha.clear()
+	if is_instance_valid(bv_raster_beta):
+		bv_raster_beta.clear()
 
 	# Head-on joust spawn: forward is -Z, so yaw -90 faces +X (toward beta)
 	# and yaw +90 faces -X (toward alpha). Previously swapped (back-to-back).
@@ -1025,6 +1195,546 @@ func _update_wing_label(label: Label, intact: bool) -> void:
 	if label == null:
 		return
 	label.modulate = Color(0.45, 1.0, 0.45) if intact else Color(1.0, 0.25, 0.25)
+
+
+func _build_brainview() -> void:
+	# L0 pool-rate bars: one slim panel per fly, screen edges, always-on
+	# capable. 23 rows x 2 panels of tiny bars is trivial draw load; the
+	# values arrive inside the existing motor reply (no extra packets).
+	var hud: CanvasLayer = $HUD
+	bv_panel_alpha = _make_bv_panel(hud, "BrainAlpha", Control.PRESET_BOTTOM_LEFT,
+		Color(1.0, 0.55, 0.3), "ALPHA", bv_rows_alpha)
+	bv_panel_beta = _make_bv_panel(hud, "BrainBeta", Control.PRESET_BOTTOM_RIGHT,
+		Color(0.4, 0.75, 1.0), "BETA", bv_rows_beta)
+	bv_flow_alpha = _make_bv_flow(hud, "FlowAlpha", Control.PRESET_BOTTOM_LEFT,
+		Color(1.0, 0.55, 0.3))
+	bv_flow_beta = _make_bv_flow(hud, "FlowBeta", Control.PRESET_BOTTOM_RIGHT,
+		Color(0.4, 0.75, 1.0))
+	_build_brain_clouds()
+	_build_replay_panel(hud)
+	_apply_brainview_settings()
+
+
+func _build_brain_clouds() -> void:
+	# Soma clouds ride the camera (always in frame, out of the fight's
+	# way): alpha left, beta right, slow-spinning while visible.
+	bv_cloud_asset = BrainCloudScript.load_asset()
+	if (bv_cloud_asset as Dictionary).is_empty():
+		print("[Arena] BrainView: no brain_cloud.json (run brain_engine/export_brain_cloud.py).")
+		return
+	if not is_instance_valid(arena_camera):
+		return
+	bv_cloud_alpha = _make_bv_cloud("CloudAlpha", Vector3(-1.5, 0.7, -3.2))
+	bv_cloud_beta = _make_bv_cloud("CloudBeta", Vector3(1.5, 0.7, -3.2))
+	# Centroid lookup for the network overlay (asset unit-box coords
+	# scaled like the cell instances).
+	bv_cloud_centroids.clear()
+	var raw: Dictionary = (bv_cloud_asset as Dictionary).get("centroids", {})
+	for key in raw.keys():
+		var c: Array = raw[key]
+		bv_cloud_centroids[str(key)] = Vector3(
+			float(c[0]) * 1.1, float(c[1]) * 1.1, float(c[2]) * 1.1)
+
+
+func _make_bv_cloud(cname: String, campos: Vector3) -> Node3D:
+	var holder := Node3D.new()
+	holder.name = cname
+	holder.position = campos
+	holder.visible = false
+	arena_camera.add_child(holder)
+	var cloud := BrainCloudScript.new()
+	holder.add_child(cloud)
+	if not cloud.build(bv_cloud_asset, 1.1):
+		holder.queue_free()
+		return null
+	return holder
+
+
+func _build_replay_panel(hud: CanvasLayer) -> void:
+	# Post-battle scrubber: play/pause + slider over the banked
+	# pool-rate stream, rendered through the same bars + diagram.
+	bv_replay_panel = PanelContainer.new()
+	bv_replay_panel.name = "ReplayPanel"
+	bv_replay_panel.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	bv_replay_panel.offset_left = -320.0
+	bv_replay_panel.offset_right = 320.0
+	bv_replay_panel.offset_top = -104.0
+	bv_replay_panel.offset_bottom = -56.0
+	bv_replay_panel.visible = false
+	hud.add_child(bv_replay_panel)
+	var hb := HBoxContainer.new()
+	hb.add_theme_constant_override("separation", 8)
+	bv_replay_panel.add_child(hb)
+	var tag := Label.new()
+	tag.text = "REPLAY"
+	tag.add_theme_font_size_override("font_size", 12)
+	hb.add_child(tag)
+	bv_replay_playbtn = Button.new()
+	bv_replay_playbtn.text = "Play"
+	bv_replay_playbtn.pressed.connect(_on_replay_play)
+	hb.add_child(bv_replay_playbtn)
+	bv_replay_slider = HSlider.new()
+	bv_replay_slider.min_value = 0.0
+	bv_replay_slider.max_value = 1.0
+	bv_replay_slider.step = 1.0
+	bv_replay_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bv_replay_slider.value_changed.connect(_on_replay_scrub)
+	hb.add_child(bv_replay_slider)
+	bv_replay_label = Label.new()
+	bv_replay_label.text = "0/0"
+	bv_replay_label.add_theme_font_size_override("font_size", 12)
+	hb.add_child(bv_replay_label)
+	var close_b := Button.new()
+	close_b.text = "X"
+	close_b.pressed.connect(_exit_replay)
+	hb.add_child(close_b)
+
+
+func _toggle_replay() -> void:
+	if bv_replay_mode:
+		_exit_replay()
+		return
+	if is_round_active:
+		if is_instance_valid(status_label):
+			status_label.text = "REPLAY available between battles."
+		return
+	if bv_stream_alpha.is_empty():
+		if is_instance_valid(status_label):
+			status_label.text = "No recorded stream (menu record toggle?)."
+		return
+	bv_replay_mode = true
+	bv_replay_idx = 0
+	bv_replay_playing = false
+	bv_replay_playbtn.text = "Play"
+	bv_replay_slider.max_value = float(bv_stream_alpha.size() - 1)
+	bv_replay_slider.value = 0.0
+	bv_replay_panel.visible = true
+	# Replay forces the bars visible; prior state restores on exit.
+	bv_replay_prior_bars = [
+		is_instance_valid(bv_panel_alpha) and bv_panel_alpha.visible,
+		is_instance_valid(bv_panel_beta) and bv_panel_beta.visible]
+	if is_instance_valid(bv_panel_alpha):
+		bv_panel_alpha.visible = true
+	if is_instance_valid(bv_panel_beta):
+		bv_panel_beta.visible = true
+	_render_replay_frame()
+
+
+func _exit_replay() -> void:
+	bv_replay_mode = false
+	bv_replay_playing = false
+	if is_instance_valid(bv_replay_panel):
+		bv_replay_panel.visible = false
+	if bv_replay_prior_bars.size() == 2:
+		if is_instance_valid(bv_panel_alpha):
+			bv_panel_alpha.visible = bool(bv_replay_prior_bars[0])
+		if is_instance_valid(bv_panel_beta):
+			bv_panel_beta.visible = bool(bv_replay_prior_bars[1])
+		bv_replay_prior_bars.clear()
+
+
+func _on_replay_play() -> void:
+	bv_replay_playing = not bv_replay_playing
+	bv_replay_playbtn.text = "Pause" if bv_replay_playing else "Play"
+
+
+func _on_replay_scrub(value: float) -> void:
+	if not bv_replay_mode:
+		return
+	bv_replay_idx = int(value)
+	_render_replay_frame()
+
+
+func _render_replay_frame() -> void:
+	var n := bv_stream_alpha.size()
+	if n == 0:
+		return
+	bv_replay_idx = clampi(bv_replay_idx, 0, n - 1)
+	bv_replay_label.text = "%d/%d" % [bv_replay_idx + 1, n]
+	var keys: Array = []
+	for spec in BV_POOLS:
+		keys.append(str(spec[0]))
+	_render_replay_side(bv_rows_alpha, bv_ema_alpha, bv_stream_alpha[bv_replay_idx], keys)
+	_render_replay_side(bv_rows_beta, bv_ema_beta, bv_stream_beta[bv_replay_idx], keys)
+	if is_instance_valid(bv_flow_alpha):
+		bv_flow_alpha.refresh(_replay_emas(bv_stream_alpha[bv_replay_idx], keys),
+			bv_caps, bv_wiring_alpha, bv_mapping_alpha)
+	if is_instance_valid(bv_flow_beta):
+		bv_flow_beta.refresh(_replay_emas(bv_stream_beta[bv_replay_idx], keys),
+			bv_caps, bv_wiring_beta, bv_mapping_beta)
+
+
+func _replay_emas(row: Array, keys: Array) -> Dictionary:
+	var emas := {}
+	for i in range(mini(row.size(), keys.size())):
+		emas[keys[i]] = float(row[i])
+	return emas
+
+
+func _render_replay_side(rows: Dictionary, _live_emas: Dictionary, row: Array, keys: Array) -> void:
+	_render_bv_side(rows, _replay_emas(row, keys))
+
+
+func _make_bv_flow(hud: CanvasLayer, vname: String, anchor: Control.LayoutPreset,
+		tint: Color) -> Control:
+	# Flow diagram overlay (L1): same side as its bar panel, wider and
+	# taller, hidden unless the menu layer is "flow". Click a node to
+	# arm the raster drill-down (Phase 3 consumes the selection).
+	var view := BrainViewScript.new()
+	view.name = vname
+	view.set_anchors_preset(anchor)
+	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
+	view.offset_left = 204.0 if left_side else -560.0
+	view.offset_right = 560.0 if left_side else -204.0
+	view.offset_top = -520.0
+	view.offset_bottom = -60.0
+	view.tint = tint
+	view.mouse_filter = Control.MOUSE_FILTER_STOP
+	hud.add_child(view)
+	var side := "alpha" if vname == "FlowAlpha" else "beta"
+	view.pool_selected.connect(_on_bv_pool_selected.bind(side))
+	var raster := BrainRasterScript.new()
+	raster.name = "RasterAlpha" if side == "alpha" else "RasterBeta"
+	raster.set_anchors_preset(anchor)
+	raster.offset_left = view.offset_left
+	raster.offset_right = view.offset_right
+	raster.offset_top = view.offset_top
+	raster.offset_bottom = view.offset_bottom
+	raster.visible = false
+	hud.add_child(raster)
+	if side == "alpha":
+		bv_raster_alpha = raster
+	else:
+		bv_raster_beta = raster
+	return view
+
+
+func _on_bv_pool_selected(pool: String, side: String) -> void:
+	# Click toggles (BrainView emits "" on re-click of the same node).
+	if side == "alpha":
+		bv_sel_alpha = pool
+	else:
+		bv_sel_beta = pool
+	if pool == "":
+		_apply_bv_detail()
+		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+		return
+	brain_client.request_raster_map(side, pool)
+	brain_client.detail_level = 2
+	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+
+
+func _on_raster_map(side: String, pool: String, ids: Array, total: int) -> void:
+	var sel := bv_sel_alpha if side == "alpha" else bv_sel_beta
+	if sel == "" or sel != pool:
+		return
+	var raster: Control = bv_raster_alpha if side == "alpha" else bv_raster_beta
+	if not is_instance_valid(raster):
+		return
+	raster.setup(pool, ids, total,
+		Color(1.0, 0.55, 0.3) if side == "alpha" else Color(0.4, 0.75, 1.0))
+	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+
+
+func _apply_bv_detail() -> void:
+	# Detail 2 while a raster selection is live or the 3D cloud shows
+	# (both consume spike ids); otherwise the menu level keeps UDP small.
+	var detail := bv_menu_detail
+	if bv_sel_alpha != "" or bv_sel_beta != "":
+		detail = 2
+	elif _bv_layer_is_3d():
+		detail = 2
+	brain_client.detail_level = detail
+
+
+func _bv_layer_is_3d() -> bool:
+	var director := _director()
+	return director != null and str(director.brainview_layer) == "brain3d"
+
+
+static func _parse_wiring_label(label: String) -> Array:
+	# Server canonical labels: "base" or "a+b" (sorted).
+	var s := label.strip_edges()
+	if s == "" or s.to_lower() == "base":
+		return []
+	return s.split("+")
+
+
+static func _parse_mapping(m) -> Array:
+	if m is Array:
+		return (m as Array).duplicate()
+	var s := str(m).strip_edges().to_lower()
+	if s in ["", "none", "base", "null"]:
+		return []
+	return [s]
+
+
+func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPreset,
+		tint: Color, title: String, rows: Dictionary) -> VBoxContainer:
+	var panel := VBoxContainer.new()
+	panel.name = pname
+	panel.set_anchors_preset(anchor)
+	# Bottom-anchored: sits above the menu bar, clear of the top-corner
+	# PiP eye views on every resolution.
+	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
+	panel.offset_left = 8.0 if left_side else -196.0
+	panel.offset_right = 196.0 if left_side else -8.0
+	panel.offset_top = -470.0
+	panel.offset_bottom = -60.0
+	panel.add_theme_constant_override("separation", 1)
+	hud.add_child(panel)
+	var head := Label.new()
+	head.text = title + " BRAIN"
+	head.add_theme_font_size_override("font_size", 12)
+	head.add_theme_color_override("font_color", tint)
+	panel.add_child(head)
+	for spec in BV_POOLS:
+		bv_caps[str(spec[0])] = float(spec[2])
+	for spec in BV_POOLS:
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 3)
+		panel.add_child(row)
+		var nm := Label.new()
+		nm.text = spec[1]
+		nm.custom_minimum_size = Vector2(52, 0)
+		nm.add_theme_font_size_override("font_size", 10)
+		nm.add_theme_color_override("font_color", tint)
+		row.add_child(nm)
+		var bar := ProgressBar.new()
+		bar.min_value = 0.0
+		bar.max_value = 100.0
+		bar.show_percentage = false
+		bar.custom_minimum_size = Vector2(80, 12)
+		bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		row.add_child(bar)
+		var num := Label.new()
+		num.text = "0"
+		num.custom_minimum_size = Vector2(30, 0)
+		num.add_theme_font_size_override("font_size", 10)
+		row.add_child(num)
+		rows[str(spec[0])] = [bar, num, float(spec[2])]
+	return panel
+
+
+func _apply_brainview_settings() -> void:
+	var director := _director()
+	var enabled := true
+	var detail := 1
+	var layer := "bars"
+	if director != null:
+		# Direct property access (the autoload carries these vars);
+		# .get() on a Node-typed ref would bind Object.get (1 arg).
+		enabled = bool(director.brainview_enabled)
+		detail = int(director.brainview_detail)
+		layer = str(director.brainview_layer)
+	bv_menu_detail = detail
+	_apply_bv_detail()
+	if is_instance_valid(bv_panel_alpha):
+		bv_panel_alpha.visible = enabled
+	if is_instance_valid(bv_panel_beta):
+		bv_panel_beta.visible = enabled
+	_apply_bv_layer(layer)
+
+
+func _apply_bv_layer(layer: String) -> void:
+	# Bars always ride along when enabled. Flow shows on "flow", or on
+	# "raster" until a pool is selected — then the raster takes its
+	# rect (click again to deselect and return to the diagram).
+	_apply_bv_side_layer("alpha", layer)
+	_apply_bv_side_layer("beta", layer)
+
+
+func _bv_panels_on(side: String) -> bool:
+	var panel: Control = bv_panel_alpha if side == "alpha" else bv_panel_beta
+	return is_instance_valid(panel) and panel.visible
+
+
+func _apply_bv_side_layer(side: String, layer: String) -> void:
+	var flow: Control = bv_flow_alpha if side == "alpha" else bv_flow_beta
+	var raster: Control = bv_raster_alpha if side == "alpha" else bv_raster_beta
+	var cloud: Node3D = bv_cloud_alpha if side == "alpha" else bv_cloud_beta
+	var sel := bv_sel_alpha if side == "alpha" else bv_sel_beta
+	var on := _bv_panels_on(side)
+	var show_raster := on and layer == "raster" and sel != ""
+	if is_instance_valid(raster):
+		raster.visible = show_raster
+	if is_instance_valid(flow):
+		flow.visible = on and (layer == "flow" or (layer == "raster" and not show_raster))
+	if is_instance_valid(cloud):
+		cloud.visible = on and layer == "brain3d"
+
+
+func _on_brain_button() -> void:
+	# BRAIN button cycles every representation (bars/flow/raster/3D)
+	# so the views are discoverable without knowing the keys; B
+	# still toggles visibility outright.
+	var any_hidden := false
+	if is_instance_valid(bv_panel_alpha) and not bv_panel_alpha.visible:
+		any_hidden = true
+	if is_instance_valid(bv_panel_beta) and not bv_panel_beta.visible:
+		any_hidden = true
+	if any_hidden:
+		if is_instance_valid(bv_panel_alpha):
+			bv_panel_alpha.visible = true
+		if is_instance_valid(bv_panel_beta):
+			bv_panel_beta.visible = true
+		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+	else:
+		_cycle_bv_layer()
+
+
+func _toggle_brainview() -> void:
+	# Master visibility switch: bars flip here, every other layer
+	# re-resolves from the menu layer underneath.
+	var show_now := true
+	if is_instance_valid(bv_panel_alpha):
+		show_now = not bv_panel_alpha.visible
+		bv_panel_alpha.visible = show_now
+	if is_instance_valid(bv_panel_beta):
+		bv_panel_beta.visible = show_now
+	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+
+
+func _bv_layer_is_flow() -> bool:
+	var director := _director()
+	if director == null:
+		return false
+	var layer := str(director.brainview_layer)
+	return layer == "flow" or layer == "raster"
+
+
+func _update_brainview(st_a: Dictionary, st_b: Dictionary, stats: Dictionary) -> void:
+	# Per-layer gating: hiding the bars must not freeze the diagram,
+	# raster, cloud, or stream recording behind them.
+	if is_instance_valid(bv_panel_alpha) and bv_panel_alpha.visible:
+		_update_bv_side(st_a, bv_rows_alpha, bv_ema_alpha)
+	if is_instance_valid(bv_panel_beta) and bv_panel_beta.visible:
+		_update_bv_side(st_b, bv_rows_beta, bv_ema_beta)
+	_record_bv_stream(st_a, st_b)
+	# Wiring/mapping labels ride the stats envelope (server adds them
+	# every step; cached per side so edges keep resolving regardless).
+	var sw: Dictionary = stats.get("wiring", {})
+	var sm: Dictionary = stats.get("mapping", {})
+	if not sw.is_empty():
+		bv_wiring_alpha = _parse_wiring_label(str(sw.get("alpha", "base")))
+		bv_wiring_beta = _parse_wiring_label(str(sw.get("beta", "base")))
+	if not sm.is_empty():
+		bv_mapping_alpha = _parse_mapping(sm.get("alpha", []))
+		bv_mapping_beta = _parse_mapping(sm.get("beta", []))
+	if is_instance_valid(bv_flow_alpha) and bv_flow_alpha.visible:
+		bv_flow_alpha.refresh(bv_ema_alpha, bv_caps, bv_wiring_alpha, bv_mapping_alpha)
+	if is_instance_valid(bv_flow_beta) and bv_flow_beta.visible:
+		bv_flow_beta.refresh(bv_ema_beta, bv_caps, bv_wiring_beta, bv_mapping_beta)
+	_push_bv_raster(st_a, "alpha")
+	_push_bv_raster(st_b, "beta")
+	_push_bv_cloud(st_a, "alpha")
+	_push_bv_cloud(st_b, "beta")
+
+
+func _push_bv_cloud(st: Dictionary, side: String) -> void:
+	var cloud: Node3D = bv_cloud_alpha if side == "alpha" else bv_cloud_beta
+	if not is_instance_valid(cloud) or not cloud.visible:
+		return
+	for child in cloud.get_children():
+		if child.has_method("push_spikes"):
+			child.push_spikes(st.get("spike_ids", []))
+	_update_bv_nets(side)
+
+
+func _update_bv_nets(side: String) -> void:
+	# Network overlay: pool-to-pool flow lines at real centroid
+	# positions, lit by presynaptic drive, gated on this fighter's
+	# wiring mix + mapping (mirrors the 2D flow diagram).
+	var cloud: Node3D = bv_cloud_alpha if side == "alpha" else bv_cloud_beta
+	if not is_instance_valid(cloud):
+		return
+	var emas: Dictionary = bv_ema_alpha if side == "alpha" else bv_ema_beta
+	var wiring: Array = bv_wiring_alpha if side == "alpha" else bv_wiring_beta
+	var mapping: Array = bv_mapping_alpha if side == "alpha" else bv_mapping_beta
+	var edges: Array = []
+	for e in BV_NETS:
+		var kind := str(e[2])
+		var on := true
+		if kind in BV_NET_WIRING:
+			on = BV_NET_WIRING[kind] in wiring
+		elif kind in BV_NET_SCHEME:
+			on = BV_NET_SCHEME[kind] in mapping
+		elif kind == "value":
+			on = "mbon" in mapping
+		if not on:
+			continue
+		if not bv_cloud_centroids.has(e[0]) or not bv_cloud_centroids.has(e[1]):
+			continue
+		var cap := float(bv_caps.get(str(e[0]), 30.0))
+		var drive := 0.0
+		if cap > 0.0:
+			drive = clampf(float(emas.get(str(e[0]), 0.0)) / cap, 0.0, 1.0)
+		if drive < 0.02:
+			continue
+		edges.append([bv_cloud_centroids[e[0]], bv_cloud_centroids[e[1]],
+			drive, BV_NET_COLORS.get(str(e[0]), Color(0.7, 0.7, 0.75))])
+	for child in cloud.get_children():
+		if child.has_method("set_nets"):
+			child.set_nets(edges)
+
+
+func _bv_stream_row(st: Dictionary) -> Array:
+	# Fixed BV_POOLS order (dn splits read top-level like the bars).
+	# Ints, not floats: pool counts serialize ~2x smaller into the
+	# banked JSON (600 steps x 23 pools x 2 flies).
+	var pools: Dictionary = st.get("pools", {})
+	var row: Array = []
+	row.resize(BV_POOLS.size())
+	for i in range(BV_POOLS.size()):
+		var key := str(BV_POOLS[i][0])
+		row[i] = int(st.get(key, pools.get(key, 0.0)))
+	return row
+
+
+func _record_bv_stream(st_a: Dictionary, st_b: Dictionary) -> void:
+	if not is_round_active:
+		return
+	var director := _director()
+	if director == null or not bool(director.brainview_replay):
+		return
+	if bv_stream_alpha.size() >= BV_STREAM_MAX:
+		return
+	bv_stream_alpha.append(_bv_stream_row(st_a))
+	bv_stream_beta.append(_bv_stream_row(st_b))
+
+
+func _bv_stream_packet() -> Dictionary:
+	var keys: Array = []
+	for spec in BV_POOLS:
+		keys.append(str(spec[0]))
+	return {"pools": keys, "alpha": bv_stream_alpha, "beta": bv_stream_beta}
+
+
+func _push_bv_raster(st: Dictionary, side: String) -> void:
+	var raster: Control = bv_raster_alpha if side == "alpha" else bv_raster_beta
+	if not is_instance_valid(raster) or not raster.visible:
+		return
+	raster.push_step(st.get("spike_ids", []))
+
+
+func _update_bv_side(st: Dictionary, rows: Dictionary, emas: Dictionary) -> void:
+	var pools: Dictionary = st.get("pools", {})
+	for key in rows.keys():
+		# dn_left/dn_right ride at stats top level (legacy HUD keys);
+		# everything else lives in the pools dict.
+		var count := float(st.get(key, pools.get(key, 0.0)))
+		emas[key] = lerpf(float(emas.get(key, 0.0)), count, 0.35)
+	_render_bv_side(rows, emas)
+
+
+func _render_bv_side(rows: Dictionary, emas: Dictionary) -> void:
+	# Bar painter shared by live EMA and replay frames (replay passes
+	# throwaway EMA dicts so live smoothing is never polluted).
+	for key in rows.keys():
+		var slot: Array = rows[key]
+		var ema := float(emas.get(key, 0.0))
+		(slot[0] as ProgressBar).value = clampf(ema / float(slot[2]), 0.0, 1.0) * 100.0
+		(slot[1] as Label).text = str(int(ema))
 
 func _build_hit_flash() -> void:
 	# Full-height left/right low-alpha overlays for instant hit feedback.
@@ -1216,11 +1926,16 @@ func _report_battle(draw: bool) -> void:
 	# keeps a copy for one safe retry, and arms the battle watchdog.
 	_seq_battle_id = _current_battle_id()
 	_tourney_awaiting_battle = true
+	var fa := _flight_summary(flight_alpha, fly_alpha)
+	var fb := _flight_summary(flight_beta, fly_beta)
 	_seq_last_round = {
 		"stats_a": stats_alpha.duplicate(), "stats_b": stats_beta.duplicate(),
-		"draw": draw, "tournament_id": _tourney_id(), "match": tourney_match_label}
+		"draw": draw, "tournament_id": _tourney_id(), "match": tourney_match_label,
+		"flight_a": fa, "flight_b": fb}
 	brain_client.send_round_over(stats_alpha, stats_beta, draw, _seq_battle_id,
-		_tourney_id(), tourney_match_label)
+		_tourney_id(), tourney_match_label, fa, fb)
+	_print_flight_line("alpha", fa)
+	_print_flight_line("beta", fb)
 	_arm_seq("battle")
 	var kind := "DRAW - " if draw else ""
 	_show_loading("%s %sREPORTING" % [tourney_match_label, kind],
@@ -1287,6 +2002,24 @@ func _setup_dynamic_tree_opacity() -> void:
 		})
 
 func _process(delta: float) -> void:
+	# Soma-cloud slow spin for depth while visible.
+	if is_instance_valid(bv_cloud_alpha) and bv_cloud_alpha.visible:
+		bv_cloud_alpha.rotate_y(0.25 * delta)
+	if is_instance_valid(bv_cloud_beta) and bv_cloud_beta.visible:
+		bv_cloud_beta.rotate_y(0.25 * delta)
+	# Replay playback: 5 Hz frame advance through the banked stream.
+	if bv_replay_mode and bv_replay_playing and not bv_stream_alpha.is_empty():
+		bv_replay_accum += delta
+		while bv_replay_accum >= 0.2:
+			bv_replay_accum -= 0.2
+			if bv_replay_idx < bv_stream_alpha.size() - 1:
+				bv_replay_idx += 1
+				bv_replay_slider.value = float(bv_replay_idx)
+				_render_replay_frame()
+			else:
+				bv_replay_playing = false
+				bv_replay_playbtn.text = "Play"
+				break
 	# Update tree transparency every rendered frame.
 	if tree_sight_entries.is_empty():
 		return
@@ -1328,6 +2061,9 @@ func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int,
 		gen_label.text = "GENERATION: %04d" % gen
 	fly_alpha.apply_brain_controls(ctrl_alpha)
 	fly_beta.apply_brain_controls(ctrl_beta)
+	_accum_flight(flight_alpha, fly_alpha, ctrl_alpha)
+	_accum_flight(flight_beta, fly_beta, ctrl_beta)
+	_update_brainview(stats.get("alpha", {}), stats.get("beta", {}), stats)
 	# Brain activation readout: spikes + descending-neuron balance per fly.
 	var st_a = stats.get("alpha", {})
 	var st_b = stats.get("beta", {})
@@ -1345,6 +2081,65 @@ func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int,
 			int(st_b.get("lplc2", 0)), int(st_b.get("mn_thrust", 0)), int(st_b.get("vs_flow", 0)),
 			float(ctrl_beta.get("thrust", 0.2)), float(ctrl_beta.get("yaw_torque", 0.0)),
 			float(ctrl_beta.get("pitch_torque", 0.0)), float(ctrl_beta.get("roll_torque", 0.0))]
+
+func _new_flight_accum() -> Dictionary:
+	return {"n": 0, "alt_sum": 0.0, "alt_min": 999.0, "alt_max": -999.0,
+		"thrust_sum": 0.0, "pitch_sum": 0.0, "yaw_abs_sum": 0.0,
+		"evade_steps": 0, "ram_steps": 0, "spear_max": 0.0}
+
+
+func _accum_flight(acc: Dictionary, fly: CharacterBody3D, ctrl: Dictionary) -> void:
+	if acc.is_empty():
+		acc.merge(_new_flight_accum())
+	acc["n"] = int(acc["n"]) + 1
+	var alt := (fly as Node3D).global_position.y
+	acc["alt_sum"] = float(acc["alt_sum"]) + alt
+	acc["alt_min"] = minf(float(acc["alt_min"]), alt)
+	acc["alt_max"] = maxf(float(acc["alt_max"]), alt)
+	acc["thrust_sum"] = float(acc["thrust_sum"]) + float(ctrl.get("thrust", 0.2))
+	acc["pitch_sum"] = float(acc["pitch_sum"]) + float(ctrl.get("pitch_torque", 0.0))
+	acc["yaw_abs_sum"] = float(acc["yaw_abs_sum"]) + absf(float(ctrl.get("yaw_torque", 0.0)))
+	if bool(ctrl.get("emergency_evade", false)):
+		acc["evade_steps"] = int(acc["evade_steps"]) + 1
+	if bool(ctrl.get("ram_burst", false)):
+		acc["ram_steps"] = int(acc["ram_steps"]) + 1
+	acc["spear_max"] = maxf(float(acc["spear_max"]), float(ctrl.get("spear_thrust", 0.0)))
+
+
+func _flight_summary(acc: Dictionary, fly: CharacterBody3D) -> Dictionary:
+	if acc.is_empty() or int(acc.get("n", 0)) == 0:
+		return {"samples": 0}
+	var n := float(acc["n"])
+	# FlyPhysics carries lunge_count (`in` and two-arg .get() are
+	# both invalid on Objects and would abort battle reporting here).
+	var lunges := 0
+	if fly != null and fly is FlyPhysicsScript:
+		lunges = int((fly as FlyPhysicsScript).lunge_count)
+	return {
+		"samples": int(acc["n"]),
+		"alt_mean": snappedf(float(acc["alt_sum"]) / n, 0.01),
+		"alt_min": snappedf(float(acc["alt_min"]), 0.01),
+		"alt_max": snappedf(float(acc["alt_max"]), 0.01),
+		"thrust_mean": snappedf(float(acc["thrust_sum"]) / n, 0.001),
+		"pitch_mean": snappedf(float(acc["pitch_sum"]) / n, 0.001),
+		"yaw_abs_mean": snappedf(float(acc["yaw_abs_sum"]) / n, 0.001),
+		"evade_frac": snappedf(float(acc["evade_steps"]) / n, 0.001),
+		"ram_frac": snappedf(float(acc["ram_steps"]) / n, 0.001),
+		"spear_max": snappedf(float(acc["spear_max"]), 0.01),
+		"lunges": lunges,
+	}
+
+
+func _print_flight_line(slot: String, f: Dictionary) -> void:
+	if f.is_empty() or int(f.get("samples", 0)) == 0:
+		return
+	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples)" % [
+		slot, float(f.get("alt_mean", 0.0)), float(f.get("alt_min", 0.0)),
+		float(f.get("alt_max", 0.0)), float(f.get("thrust_mean", 0.0)),
+		float(f.get("pitch_mean", 0.0)), float(f.get("yaw_abs_mean", 0.0)),
+		100.0 * float(f.get("evade_frac", 0.0)), 100.0 * float(f.get("ram_frac", 0.0)),
+		float(f.get("spear_max", 0.0)), int(f.get("lunges", 0)), int(f.get("samples", 0))])
+
 
 func _on_strike_landed(attacker_id: String, target_part: String) -> void:
 	# Wing hits pay 60 (plus the tear + 15 wound in FlyPhysics): hits register
@@ -1402,7 +2197,11 @@ func _end_round() -> void:
 	if tournament_active:
 		_report_battle(false)
 		return
-	brain_client.send_round_over(stats_alpha, stats_beta)
+	var fa := _flight_summary(flight_alpha, fly_alpha)
+	var fb := _flight_summary(flight_beta, fly_beta)
+	_print_flight_line("alpha", fa)
+	_print_flight_line("beta", fb)
+	brain_client.send_round_over(stats_alpha, stats_beta, false, "", "", "", fa, fb)
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
 	# Server already banked dopamine + records + weights to the vault.
@@ -1422,18 +2221,29 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	if director == null:
 		return
 	_update_health_hud()
+	# Session wins tally: _record_win previously only ran on the
+	# free-battle paths, so tournament/quick battle wins never moved the
+	# WINS label. Draws record nothing (no winner).
+	if battle_winner == "alpha" or battle_winner == "beta":
+		_record_win(battle_winner)
 	if battle_winner == "draw":
 		if is_instance_valid(status_label):
 			status_label.text = "%s DRAW - REPLAYING" % tourney_match_label
 		_show_callout("DRAW", Color(0.78, 0.78, 0.82),
 			"%s STALEMATE - REPLAY" % tourney_match_label, "REMATCH", false)
 		await get_tree().create_timer(5.0).timeout
-		director.on_battle_result("draw")
+		director.on_battle_result("draw",
+			_flight_summary(flight_alpha, fly_alpha),
+			_flight_summary(flight_beta, fly_beta),
+			_bv_stream_packet())
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 		return
 	var winner_name := tourney_a_name if battle_winner == "alpha" else tourney_b_name
-	var res: Dictionary = director.on_battle_result(battle_winner)
+	var res: Dictionary = director.on_battle_result(battle_winner,
+		_flight_summary(flight_alpha, fly_alpha),
+		_flight_summary(flight_beta, fly_beta),
+		_bv_stream_packet())
 	var action := str(res.get("action", "next_battle"))
 	print("[Arena] Battle result: winner=", battle_winner, " action=", action)
 	var score := "%d - %d" % [int(res.get("score_a", 0)), int(res.get("score_b", 0))]

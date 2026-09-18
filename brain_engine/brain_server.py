@@ -11,7 +11,8 @@ from lif_brain import FlyBrain
 from sensory_motor import SensoryEncoder, MotorDecoder, normalize_mapping, is_legacy_record
 from evolution_engine import EvolutionManager
 from dopamine_learning import DopamineReinforcement
-from experimental_wiring import experiment_arrays, experiment_suffix
+from experimental_wiring import (experiment_arrays, experiment_suffix,
+                                   normalize_experiment, mix_label)
 
 
 def _load_variant_weights(checkpoints_dir, names, fallback):
@@ -24,22 +25,67 @@ def _load_variant_weights(checkpoints_dir, names, fallback):
     return fallback, None
 
 
-def _spike_stats(spikes, pops):
-    """Compact brain-activation summary for the HUD."""
+def _pool_index(pops):
+    """Named-pool id sets for the brain-view stream (built once per boot;
+    stale-cache safe: absent pools read empty)."""
+    idx = {}
+    for key in ("pheromone_da1", "pheromone_va1v", "visual_lc10",
+                "visual_lc4", "visual_lplc2", "visual_lc11", "visual_lc15",
+                "visual_lc17", "visual_lc18", "gyro_jo",
+                "motor_thrust_dnp09", "motor_turn_dnp20",
+                "motor_giant_fiber", "motor_ram_dnpe017", "motor_mouth",
+                "motor_flight_thrust", "motor_steer", "flow_vs", "flow_hs",
+                "mbon_app", "mbon_av"):
+        p = pops.get(key, {})
+        ids = set(p.get("all", [])) if isinstance(p, dict) else set()
+        idx[key] = ids
+    dn = pops.get("descending_all", {})
+    idx["dn_left"] = set(dn.get("left", []))
+    idx["dn_right"] = set(dn.get("right", []))
+    return idx
+
+
+RASTER_CAP = 128
+
+
+def _raster_ids(pool_idx, pool, cap=RASTER_CAP):
+    """Deterministic neuron-id slice for raster drill-down: sorted ids,
+    capped (big pools show the first N cells), plus the pool total."""
+    ids = sorted(pool_idx.get(pool, set()))
+    return ids[:cap], len(ids)
+
+
+def _spike_stats(spikes, pops, pool_idx=None, detail=0):
+    """Compact brain-activation summary for the HUD + brain view.
+
+    Always carries the legacy HUD keys plus a per-pool count dict
+    (~20 ints, cheap). detail>=2 additionally carries capped raw spike
+    ids for raster drill-down (truncation-guarded for UDP size).
+    """
     if len(spikes) == 0:
-        return {"spikes": 0, "dn_left": 0, "dn_right": 0, "lplc2": 0,
-                "mn_thrust": 0, "vs_flow": 0}
-    dn_left = set(pops.get("descending_all", {}).get("left", []))
-    dn_right = set(pops.get("descending_all", {}).get("right", []))
-    lplc2 = set(pops.get("visual_lplc2", {}).get("all", []))
-    mn_thrust = set(pops.get("motor_flight_thrust", {}).get("all", []))
-    vs_flow = set(pops.get("flow_vs", {}).get("all", [])) | set(
-        pops.get("flow_hs", {}).get("all", []))
+        base = {"spikes": 0, "dn_left": 0, "dn_right": 0, "lplc2": 0,
+                "mn_thrust": 0, "vs_flow": 0, "pools": {}}
+        if detail >= 2:
+            base["spike_ids"] = []
+        return base
+    if pool_idx is None:
+        dn_left = set(pops.get("descending_all", {}).get("left", []))
+        dn_right = set(pops.get("descending_all", {}).get("right", []))
+        lplc2 = set(pops.get("visual_lplc2", {}).get("all", []))
+        mn_thrust = set(pops.get("motor_flight_thrust", {}).get("all", []))
+        vs_flow = set(pops.get("flow_vs", {}).get("all", [])) | set(
+            pops.get("flow_hs", {}).get("all", []))
+    else:
+        dn_left = pool_idx["dn_left"]
+        dn_right = pool_idx["dn_right"]
+        lplc2 = pool_idx["visual_lplc2"]
+        mn_thrust = pool_idx["motor_flight_thrust"]
+        vs_flow = pool_idx["flow_vs"] | pool_idx["flow_hs"]
     counts = {}
     for s in spikes:
         s = int(s)
         counts[s] = counts.get(s, 0) + 1
-    return {
+    out = {
         "spikes": int(len(spikes)),
         "dn_left": int(sum(counts.get(s, 0) for s in dn_left)),
         "dn_right": int(sum(counts.get(s, 0) for s in dn_right)),
@@ -47,6 +93,22 @@ def _spike_stats(spikes, pops):
         "mn_thrust": int(sum(counts.get(s, 0) for s in mn_thrust)),
         "vs_flow": int(sum(counts.get(s, 0) for s in vs_flow)),
     }
+    if pool_idx is not None:
+        pools = {}
+        for key, ids in pool_idx.items():
+            if key in ("dn_left", "dn_right"):
+                continue
+            pools[key] = int(sum(counts.get(s, 0) for s in ids))
+        out["pools"] = pools
+    else:
+        out["pools"] = {}
+    if detail >= 2:
+        # Truncation guard: UDP packets cap at 64 KB; spike ids are
+        # small ints but a hot tick could still overflow it.
+        ids = [int(s) for s in spikes[:3000]]
+        out["spike_ids"] = ids
+        out["spike_ids_truncated"] = bool(len(spikes) > 3000)
+    return out
 
 
 def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
@@ -108,11 +170,9 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
 
 
 def _norm_experiment(value):
-    """Canonical wiring key: None for base, else the experiment name."""
-    if value is None:
-        return None
-    s = str(value).strip()
-    return None if s.lower() in ("", "none") else s
+    """Canonical wiring key: None for base, else a sorted tuple of names
+    (additive mixes; see experimental_wiring.normalize_experiment)."""
+    return normalize_experiment(value)
 
 
 def _bind_brain(rec, weights, csr, pops, struct_cache):
@@ -124,11 +184,11 @@ def _bind_brain(rec, weights, csr, pops, struct_cache):
         indptr, indices, _data = experiment_arrays(exp, csr, pops)
         struct_cache[exp] = (indptr, indices)
         print(f"[Server] Cached {len(indices):,} synapse wiring for "
-              f"experiment={exp or 'base'}")
+              f"experiment={mix_label(exp)}")
     indptr, indices = struct_cache[exp]
     if len(weights) != len(indices):
         raise ValueError(
-            f"brain '{rec.get('name')}' declares wiring '{exp or 'base'}' "
+            f"brain '{rec.get('name')}' declares wiring '{mix_label(exp)}' "
             f"but carries arity {len(weights)} != {len(indices)}; "
             f"file corrupt or mislabeled")
     return FlyBrain(indptr, indices, np.ascontiguousarray(weights, dtype=np.float32).copy())
@@ -313,11 +373,16 @@ def run_brain_server(host="127.0.0.1", port=9999):
     # 1. Load connectome & populations
     csr = load_or_build_csr()
     pops = load_or_extract_populations()
+    # Named-pool index for the brain-view stream (built once; detail
+    # level arrives per step message from the arena menu setting).
+    pool_idx = _pool_index(pops)
 
-    # Experimental wiring (env EXPERIMENT=lplc2_contra_dn): injected edges
+    # Experimental wiring (env EXPERIMENT=lplc2_contra_dn, or additive
+    # mixes like retina_wide+spear_lunge / comma-separated): injected edges
     # change the brain's arity, so experiment flags load experiment-named
     # checkpoints and NEVER mix base-arity weight arrays into experiment brains.
     experiment = os.environ.get("EXPERIMENT") or None
+    wire_boot = mix_label(experiment)
     suffix = experiment_suffix(experiment)
     indptr, indices, wbase = experiment_arrays(experiment, csr, pops)
 
@@ -339,7 +404,7 @@ def run_brain_server(host="127.0.0.1", port=9999):
             f"Checkpoint {file_b} has wrong arity ({len(weights_b)} != {len(wbase)}); "
             "experimental brains need experiment-named checkpoints.")
     print(f"[Server] Alpha <- {file_a or 'fresh injected base'}, "
-          f"Beta <- {file_b or 'fresh injected base'}, experiment={experiment or 'base'}")
+          f"Beta <- {file_b or 'fresh injected base'}, experiment={mix_label(experiment)}")
 
     print("[Server] Loading dual independent connectomes into RAM...")
     brain_alpha = FlyBrain(indptr, indices, weights_a.copy())
@@ -504,14 +569,33 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 last_sens_a, last_sens_b = sens_a, sens_b
                 last_ctrl_a, last_ctrl_b = ctrl_a, ctrl_b
 
+                try:
+                    detail = int(msg.get("detail", 0))
+                except (TypeError, ValueError):
+                    detail = 0
+                detail = max(0, min(detail, 2))
+                # Wiring/mapping labels are bound once per fighter (see
+                # tournament_load / boot); the hot loop only reads them.
+                if tournament_mode:
+                    wire_a = tourney_a.get("wiring", mix_label(experiment))
+                    wire_b = tourney_b.get("wiring", mix_label(experiment))
+                    map_a = tourney_a.get("mapping", [])
+                    map_b = tourney_b.get("mapping", [])
+                else:
+                    wire_a = wire_b = wire_boot
+                    map_a = map_b = []
                 response = {
                     "status": "ok",
                     "alpha": ctrl_a,
                     "beta": ctrl_b,
                     "generation": evo_mgr.generation,
                     "stats": {
-                        "alpha": _spike_stats(spikes_a, pops),
-                        "beta": _spike_stats(spikes_b, pops),
+                        "alpha": _spike_stats(spikes_a, pops, pool_idx,
+                                              detail),
+                        "beta": _spike_stats(spikes_b, pops, pool_idx,
+                                             detail),
+                        "wiring": {"alpha": wire_a, "beta": wire_b},
+                        "mapping": {"alpha": map_a, "beta": map_b},
                     },
                 }
                 sock.sendto(json.dumps(response).encode("utf-8"), client_addr)
@@ -520,6 +604,21 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     print(f"[Server] step ~{step_ms / 50.0:.0f}ms "
                           f"(dropped {step_dropped} stale)", flush=True)
                     step_ms = 0.0
+
+            elif msg_type == "raster_map":
+                # Brain-view drill-down: id list for one pool so the
+                # arena can render per-neuron rasters. Mode-independent,
+                # read-only (never touches brains or weights).
+                pool = str(msg.get("pool", ""))
+                side = str(msg.get("side", ""))
+                ids, total = _raster_ids(pool_idx, pool)
+                sock.sendto(json.dumps({
+                    "status": "raster_map",
+                    "side": side,
+                    "pool": pool,
+                    "ids": ids,
+                    "total": total,
+                }).encode("utf-8"), client_addr)
 
             elif msg_type == "round_over":
                 # Any failure here must still answer the arena: a silent drop
@@ -663,10 +762,16 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     ).encode("utf-8"), client_addr)
                     continue
                 brain_alpha, brain_beta = new_alpha, new_beta
+                # Brain-view labels bound once here (never in the step
+                # hot loop): wiring mix + mapping per fighter.
                 tourney_a.update(rec=rec_a, path=msg["alpha_path"], brain=brain_alpha,
-                                 enc=enc_a, dec=dec_a)
+                                 enc=enc_a, dec=dec_a,
+                                 wiring=mix_label((rec_a.get("generator_params", {}) or {}).get("experiment", None)),
+                                 mapping=list(normalize_mapping(((rec_a.get("generator_params", {}) or {})).get("mapping", None))))
                 tourney_b.update(rec=rec_b, path=msg["beta_path"], brain=brain_beta,
-                                 enc=enc_b, dec=dec_b)
+                                 enc=enc_b, dec=dec_b,
+                                 wiring=mix_label((rec_b.get("generator_params", {}) or {}).get("experiment", None)),
+                                 mapping=list(normalize_mapping(((rec_b.get("generator_params", {}) or {})).get("mapping", None))))
                 if "tournament_id" in msg:
                     tourney_tag["tournament_id"] = str(msg["tournament_id"])
                 if "match" in msg:

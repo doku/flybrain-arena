@@ -12,14 +12,23 @@ var brain_list: ItemList
 var detail_label: Label
 var log_label: Label
 
+var bv_enable: CheckButton
+var bv_layer: OptionButton
+var bv_detail: OptionButton
+var bv_replay: CheckButton
 var gen_name: LineEdit
 var gen_variant: OptionButton
 var gen_seed: SpinBox
 var gen_lr: SpinBox
 var gen_gain: SpinBox
 var gen_evasion: SpinBox
-var gen_experiment: OptionButton
+# Additive wiring selection (replaces the old single-choice dropdown):
+# checked wiring names, e.g. ["retina_wide", "spear_lunge"]; empty = base.
+var gen_wiring: Array = []
+var gen_wire_checks: Array = []
 var gen_map_checks: Array = []
+var gen_config_summary: Label
+var gen_config_dlg: Window
 var gen_episodes: SpinBox
 var job_bar: ProgressBar
 var job_label: Label
@@ -125,6 +134,7 @@ func _build_layout() -> void:
 	cols.add_child(_build_vault_column())
 	cols.add_child(_build_gen_column())
 	cols.add_child(_build_tourney_column())
+	vbox.add_child(_build_brainview_row())
 
 	var bottom := HBoxContainer.new()
 	bottom.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -143,6 +153,54 @@ func _build_layout() -> void:
 	log_label.add_theme_font_size_override("font_size", 13)
 	log_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vbox.add_child(log_label)
+
+
+func _build_brainview_row() -> HBoxContainer:
+	# In-arena neural activation overlay settings (menu -> arena via the
+	# TournamentDirector bus). Always-on capable; every heavy layer can
+	# drop to bars-only or off.
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 10)
+	var h := Label.new()
+	h.text = "BRAIN VIEW"
+	h.add_theme_font_size_override("font_size", 15)
+	row.add_child(h)
+	bv_enable = CheckButton.new()
+	bv_enable.text = "show"
+	bv_enable.button_pressed = true
+	bv_enable.toggled.connect(_push_brainview_settings)
+	row.add_child(bv_enable)
+	var ll := Label.new()
+	ll.text = "layer"
+	row.add_child(ll)
+	bv_layer = OptionButton.new()
+	for layer in ["bars", "flow", "raster", "brain3d"]:
+		bv_layer.add_item(layer)
+	bv_layer.item_selected.connect(_push_brainview_settings)
+	row.add_child(bv_layer)
+	var dl := Label.new()
+	dl.text = "detail"
+	row.add_child(dl)
+	bv_detail = OptionButton.new()
+	for d in ["0 counts", "1 rates", "2 raster"]:
+		bv_detail.add_item(d)
+	bv_detail.selected = 1
+	bv_detail.item_selected.connect(_push_brainview_settings)
+	row.add_child(bv_detail)
+	bv_replay = CheckButton.new()
+	bv_replay.text = "record replay"
+	bv_replay.toggled.connect(_push_brainview_settings)
+	row.add_child(bv_replay)
+	_push_brainview_settings()
+	return row
+
+
+func _push_brainview_settings(_arg = null) -> void:
+	TournamentDirector.brainview_enabled = bv_enable.button_pressed
+	TournamentDirector.brainview_layer = bv_layer.get_item_text(bv_layer.selected)
+	TournamentDirector.brainview_detail = bv_detail.selected
+	TournamentDirector.brainview_replay = bv_replay.button_pressed
 
 
 func _col(title_text: String) -> VBoxContainer:
@@ -217,46 +275,21 @@ func _build_gen_column() -> VBoxContainer:
 	for v in ["charger", "flanker", "custom"]:
 		gen_variant.add_item(v)
 	c.add_child(gen_variant)
-	gen_seed = _spin("Seed", c, 0, 9999, 1, 11)
-	gen_lr = _spin("Learning rate", c, 0.001, 0.05, 0.001, 0.008)
-	gen_gain = _spin("Dist gain", c, 0.0, 1.0, 0.01, 0.15)
-	gen_evasion = _spin("Evasion bias", c, 0.0, 1.0, 0.05, 0.2)
-	var wirerow := HBoxContainer.new()
-	var wirel := Label.new()
-	wirel.text = "Wiring"
-	wirel.custom_minimum_size = Vector2(150, 0)
-	wirerow.add_child(wirel)
-	gen_experiment = OptionButton.new()
-	gen_experiment.add_item("base")
-	gen_experiment.add_item("lplc2_contra_dn")
-	gen_experiment.add_item("retina_wide")
-	gen_experiment.add_item("spear_lunge")
-	gen_experiment.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	wirerow.add_child(gen_experiment)
-	c.add_child(wirerow)
-	# Neuro mapping: sensorimotor control schemes, orthogonal to wiring and
-	# stackable - tick any combination (none ticked = base behavior).
-	# muscles_up adds the flight-muscle readout; gyro_flow adds the JO gyro
-	# input + VS/HS roll output; mbon adds the mushroom-body learned-will
-	# readout (approach/avoid value); retina adds the panoramic 21-sector
-	# eye (LC11 tracking + LC15/17/18 loom features, needs retina_wide
-	# wiring for the downstream path).
-	var maprow := HBoxContainer.new()
-	var mapl := Label.new()
-	mapl.text = "Neuro mapping"
-	mapl.custom_minimum_size = Vector2(150, 0)
-	maprow.add_child(mapl)
-	var mapchecks := HBoxContainer.new()
-	mapchecks.add_theme_constant_override("separation", 8)
-	mapchecks.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	maprow.add_child(mapchecks)
-	gen_map_checks.clear()
-	for scheme in ["muscles_up", "gyro_flow", "mbon", "retina"]:
-		var cb := CheckButton.new()
-		cb.text = scheme
-		mapchecks.add_child(cb)
-		gen_map_checks.append(cb)
-	c.add_child(maprow)
+	# One summary row + configurator dialog (the column was getting
+	# crowded): wiring is additive multi-select, mapping stackable, and
+	# the training hyperparams live in the dialog too.
+	var confrow := HBoxContainer.new()
+	gen_config_summary = Label.new()
+	gen_config_summary.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gen_config_summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	confrow.add_child(gen_config_summary)
+	var confbtn := Button.new()
+	confbtn.text = "Configure..."
+	confbtn.pressed.connect(_open_config_dialog)
+	confrow.add_child(confbtn)
+	c.add_child(confrow)
+	_build_config_dialog()
+	_update_config_summary()
 	gen_episodes = _spin("Episodes", c, 1, 500, 1, 50)
 	var grow := HBoxContainer.new()
 	grow.add_theme_constant_override("separation", 6)
@@ -279,6 +312,139 @@ func _build_gen_column() -> VBoxContainer:
 	job_label.add_theme_font_size_override("font_size", 13)
 	c.add_child(job_label)
 	return c
+
+
+# Brain configurator dialog: additive wiring multi-select, stackable
+# mapping schemes, and training hyperparams in one place so the main
+# column stays a slim Name / Variant / Config-summary / Episodes stack.
+const WIRING_OPTIONS := [
+	["lplc2_contra_dn", "Tree avoidance: LPLC2 loom steers AWAY via contralateral DNs."],
+	["retina_wide", "Visual pursuit assist: LC feature pools drive same-side DNs."],
+	["spear_lunge", "Spear attack: frontal LC volleys drive the mouth motor neurons."],
+]
+const MAPPING_OPTIONS := [
+	["muscles_up", "Flight-muscle readout: MN thrust/steering votes."],
+	["gyro_flow", "Antennal gyro input (JO) + VS/HS roll output."],
+	["mbon", "Mushroom-body learned-will readout (approach/avoid value)."],
+	["retina", "Panoramic 21-sector eye (pairs with retina_wide wiring)."],
+]
+
+
+func _build_config_dialog() -> void:
+	gen_config_dlg = Window.new()
+	gen_config_dlg.title = "Brain configuration"
+	gen_config_dlg.size = Vector2i(620, 700)
+	gen_config_dlg.min_size = Vector2i(480, 400)
+	gen_config_dlg.visible = false
+	add_child(gen_config_dlg)
+	# Scrollable content: the wiring/mapping/training sections are taller
+	# than any fixed window, so they scroll instead of getting cut off.
+	var scroll := ScrollContainer.new()
+	scroll.set_anchors_preset(Control.PRESET_FULL_RECT)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	gen_config_dlg.add_child(scroll)
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 6)
+	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(vb)
+	var wh := Label.new()
+	wh.text = "WIRING (additive - tick any combination, empty = base)"
+	wh.add_theme_font_size_override("font_size", 15)
+	vb.add_child(wh)
+	gen_wire_checks.clear()
+	for opt in WIRING_OPTIONS:
+		var cb := CheckButton.new()
+		cb.text = opt[0]
+		cb.toggled.connect(_sync_config_from_dialog)
+		vb.add_child(cb)
+		gen_wire_checks.append(cb)
+		var d := Label.new()
+		d.text = "      " + opt[1]
+		d.add_theme_font_size_override("font_size", 12)
+		d.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		vb.add_child(d)
+	var mh := Label.new()
+	mh.text = "NEURO MAPPING (stackable, empty = base)"
+	mh.add_theme_font_size_override("font_size", 15)
+	vb.add_child(mh)
+	gen_map_checks.clear()
+	for opt in MAPPING_OPTIONS:
+		var cb := CheckButton.new()
+		cb.text = opt[0]
+		cb.toggled.connect(_sync_config_from_dialog)
+		vb.add_child(cb)
+		gen_map_checks.append(cb)
+		var d := Label.new()
+		d.text = "      " + opt[1]
+		d.add_theme_font_size_override("font_size", 12)
+		d.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		vb.add_child(d)
+	var th := Label.new()
+	th.text = "TRAINING"
+	th.add_theme_font_size_override("font_size", 15)
+	vb.add_child(th)
+	gen_seed = _spin("Seed", vb, 0, 9999, 1, 11)
+	gen_lr = _spin("Learning rate", vb, 0.001, 0.05, 0.001, 0.008)
+	gen_gain = _spin("Dist gain", vb, 0.0, 1.0, 0.01, 0.15)
+	gen_evasion = _spin("Evasion bias", vb, 0.0, 1.0, 0.05, 0.2)
+	var closerow := HBoxContainer.new()
+	closerow.alignment = BoxContainer.ALIGNMENT_CENTER
+	vb.add_child(closerow)
+	var closeb := Button.new()
+	closeb.text = "Done"
+	closeb.pressed.connect(func(): gen_config_dlg.visible = false)
+	closerow.add_child(closeb)
+
+
+func _open_config_dialog() -> void:
+	_sync_dialog_from_state()
+	gen_config_dlg.visible = true
+
+
+func _sync_dialog_from_state() -> void:
+	for cb in gen_wire_checks:
+		(cb as CheckButton).set_pressed_no_signal(gen_wiring.has((cb as CheckButton).text))
+	var active: Array = []
+	for cb in gen_map_checks:
+		if (cb as CheckButton).button_pressed:
+			active.append((cb as CheckButton).text)
+	_update_config_summary()
+
+
+func _sync_config_from_dialog(_on: bool = true) -> void:
+	gen_wiring.clear()
+	for cb in gen_wire_checks:
+		if (cb as CheckButton).button_pressed:
+			gen_wiring.append((cb as CheckButton).text)
+	_update_config_summary()
+
+
+func _update_config_summary() -> void:
+	var schemes: Array = []
+	for cb in gen_map_checks:
+		if (cb as CheckButton).button_pressed:
+			schemes.append((cb as CheckButton).text)
+	var wtext := "base" if gen_wiring.is_empty() else " + ".join(gen_wiring)
+	var mtext := "base" if schemes.is_empty() else ", ".join(schemes)
+	if is_instance_valid(gen_config_summary):
+		gen_config_summary.text = "Wiring: %s\nMap: %s" % [wtext, mtext]
+
+
+static func _mix_text(v) -> String:
+	# Stored experiment values across eras: null, "base", a single name,
+	# a plus-joined mix, or an Array of names.
+	if v == null:
+		return "base"
+	if v is Array:
+		return "base" if (v as Array).is_empty() else " + ".join(v)
+	var s := str(v).strip_edges()
+	if s.begins_with("__exp_"):
+		s = s.trim_prefix("__exp_")
+	if s.contains("__"):
+		s = "+".join(s.split("__"))
+	if s.to_lower() in ["", "none", "base"]:
+		return "base"
+	return s
 
 
 func _build_tourney_column() -> VBoxContainer:
@@ -392,14 +558,13 @@ func _on_brain_selected(idx: int) -> void:
 		"e": int(t.get("episodes", 0)), "s": (t.get("sessions", []) as Array).size(),
 		"v": str(p.get("variant", "?")), "sd": str(p.get("seed", "?")),
 		"lr": str(p.get("learning_rate", "?")), "g": str(p.get("dist_gain", "?")),
-		"ev": str(p.get("evasion", "?")), "x": str(p.get("experiment", "base")),
+		"ev": str(p.get("evasion", "?")), "x": _mix_text(p.get("experiment", "base")),
 		"mp": mv_text,
 		"lin": str(selected_brain.get("lineage", {}).get("source", "?"))})
 	_prefill_train_widgets(p)
 
 
 func _gen_params() -> Dictionary:
-	var exp_idx := gen_experiment.selected
 	var schemes: Array = []
 	for cb in gen_map_checks:
 		if (cb as CheckButton).button_pressed:
@@ -411,7 +576,7 @@ func _gen_params() -> Dictionary:
 		"dist_gain": gen_gain.value,
 		"evasion": gen_evasion.value,
 		"align_bonus": [0.5, 0.2, -0.3],
-		"experiment": null if exp_idx == 0 else gen_experiment.get_item_text(exp_idx),
+		"experiment": gen_wiring.duplicate() if not gen_wiring.is_empty() else null,
 		"mapping": schemes if not schemes.is_empty() else null,
 	}
 
@@ -483,12 +648,32 @@ func _prefill_train_widgets(p: Dictionary) -> void:
 	gen_gain.value = float(p.get("dist_gain", gen_gain.value))
 	gen_evasion.value = float(p.get("evasion", gen_evasion.value))
 	var exp = p.get("experiment", null)
-	if exp == null or str(exp).strip_edges().to_lower() in ["", "none", "base"]:
-		gen_experiment.selected = 0
-	else:
-		for i in range(gen_experiment.item_count):
-			if gen_experiment.get_item_text(i) == str(exp):
-				gen_experiment.selected = i
+	var raw: Array = []
+	if exp is Array:
+		raw = (exp as Array).duplicate()
+	elif exp != null:
+		var s := str(exp).strip_edges()
+		if s.begins_with("__exp_"):
+			s = s.trim_prefix("__exp_")
+		if s.contains("__"):
+			for part in s.split("__"):
+				raw.append(part)
+		elif s.contains("+"):
+			for part in s.split("+"):
+				raw.append(part)
+		elif s.to_lower() not in ["", "none", "base"]:
+			raw.append(s)
+	var known: Array = []
+	for opt in WIRING_OPTIONS:
+		known.append(opt[0])
+	gen_wiring.clear()
+	for n in raw:
+		var t := str(n).strip_edges()
+		if known.has(t) and not gen_wiring.has(t):
+			gen_wiring.append(t)
+	for cb in gen_wire_checks:
+		(cb as CheckButton).set_pressed_no_signal(gen_wiring.has((cb as CheckButton).text))
+	_update_config_summary()
 	var mv = p.get("mapping", null)
 	var active: Array = []
 	if mv is Array:

@@ -260,6 +260,77 @@ class TestSensoryMotor(unittest.TestCase):
         })
         self.assertFalse(ctrl["emergency_evade"])
 
+    def test_brainview_stream_keys_and_detail(self):
+        # Brain-view stream: legacy HUD keys intact, per-pool dict
+        # present, spike ids gated on detail with truncation guard.
+        import brain_server as bs
+        idx = bs._pool_index(self.pops)
+        da1 = list(self.pops["pheromone_da1"]["left"][:5])
+        dn = list(self.pops["descending_all"]["left"][:4])
+        st = bs._spike_stats(np.array(da1 + dn, dtype=np.int32),
+                             self.pops, idx, 0)
+        for k in ("spikes", "dn_left", "dn_right", "lplc2",
+                  "mn_thrust", "vs_flow", "pools"):
+            self.assertIn(k, st)
+        self.assertNotIn("spike_ids", st)
+        self.assertEqual(st["pools"]["pheromone_da1"], 5)
+        self.assertEqual(st["dn_left"], 4)
+        # dn splits ride top-level (legacy HUD keys), not in pools.
+        self.assertNotIn("dn_left", st["pools"])
+        self.assertNotIn("dn_right", st["pools"])
+        st2 = bs._spike_stats(np.array(da1 + dn, dtype=np.int32),
+                              self.pops, idx, 2)
+        self.assertIn("spike_ids", st2)
+        self.assertFalse(st2["spike_ids_truncated"])
+        self.assertEqual(len(st2["spike_ids"]), 9)
+        big = bs._spike_stats(np.arange(3100, dtype=np.int32),
+                              self.pops, idx, 2)
+        self.assertEqual(len(big["spike_ids"]), 3000)
+        self.assertTrue(big["spike_ids_truncated"])
+        empty = bs._spike_stats(np.empty(0, dtype=np.int32),
+                                self.pops, idx, 2)
+        self.assertEqual(empty["spikes"], 0)
+        self.assertEqual(empty["spike_ids"], [])
+
+    def test_brain_cloud_asset_schema(self):
+        # 3D soma-cloud asset: unit-box cells with pool keys, centroids,
+        # bbox; regenerate with brain_engine/export_brain_cloud.py.
+        path = os.path.join(PROJECT_ROOT, "arena", "models",
+                            "brain_cloud.json")
+        self.assertTrue(os.path.isfile(path), "missing brain_cloud.json")
+        with open(path) as f:
+            asset = json.load(f)
+        self.assertIn("cells", asset)
+        self.assertIn("pools", asset)
+        self.assertIn("centroids", asset)
+        self.assertGreater(len(asset["cells"]), 1000)
+        seen = set()
+        for c in asset["cells"][:500]:
+            self.assertEqual(len(c), 5)
+            for x in c[1:4]:
+                self.assertGreaterEqual(x, -0.51)
+                self.assertLessEqual(x, 0.51)
+            self.assertIn(c[4], asset["pools"])
+            seen.add(c[4])
+        self.assertGreater(len(seen), 10)
+
+    def test_raster_ids_deterministic_capped(self):
+        # Raster drill-down: sorted ids, capped rows, unknown pools empty.
+        import brain_server as bs
+        idx = bs._pool_index(self.pops)
+        ids, total = bs._raster_ids(idx, "pheromone_da1")
+        self.assertEqual(total, len(self.pops["pheromone_da1"]["all"]))
+        self.assertEqual(ids, sorted(ids))
+        self.assertLessEqual(len(ids), bs.RASTER_CAP)
+        dn_ids, dn_total = bs._raster_ids(idx, "descending_all")
+        self.assertEqual(dn_ids, [])
+        self.assertEqual(dn_total, 0)
+        big_ids, big_total = bs._raster_ids(idx, "dn_left")
+        self.assertEqual(big_total, len(self.pops["descending_all"]["left"]))
+        self.assertLessEqual(len(big_ids), bs.RASTER_CAP)
+        self.assertEqual(big_ids, sorted(
+            self.pops["descending_all"]["left"])[:bs.RASTER_CAP])
+
 
 class TestNeuroMapping(unittest.TestCase):
     """Verifies the Stage 1 neuro-mapping schemes (muscles_up + gyro_flow):
@@ -1187,6 +1258,92 @@ class TestLegacyCompat(unittest.TestCase):
         pos = DopamineReinforcement._row_positions(indptr, sens)
         return rl, _make, pos, sens
 
+    def test_spear_branch_credit_assignment(self):
+        # Aimed lunges with positive DA potentiate the lobula-feature
+        # efferents; punished lunges depress them; sub-threshold or
+        # un-aimed spear commands leave weights untouched.
+        from dopamine_learning import DopamineReinforcement
+        rng = np.random.default_rng(11)
+        n, deg = 200, 6
+        indptr = np.arange(n + 1, dtype=np.int32) * deg
+        indices = rng.integers(0, n, size=n * deg).astype(np.int32)
+        base_w = rng.normal(4.0, 0.5, size=n * deg).astype(np.float32)
+        feat = list(range(0, 20))
+        fake_pops = {
+            "pheromone_da1": {"left": [], "right": []},
+            "pheromone_va1v": {"left": [], "right": []},
+            "visual_lc10": {"left": [], "right": []},
+            "visual_lc4": {"left": [], "right": []},
+            "visual_lplc2": {"left": [], "right": []},
+            "visual_lc11": {"left": feat[:10], "right": feat[10:]},
+            "visual_lc15": {"left": [], "right": []},
+            "visual_lc17": {"left": [], "right": []},
+            "visual_lc18": {"left": [], "right": []},
+            "gyro_jo": {"left": [], "right": []},
+            "dopamine_pam": {"all": []}, "dopamine_ppl1": {"all": []},
+            "motor_turn_dnp20": {"left": [100], "right": [101]},
+            "motor_thrust_dnp09": {"all": [102]},
+            "motor_ram_dnpe017": {"all": [103]},
+            "motor_giant_fiber": {"all": [104]},
+            "descending_all": {"left": [100], "right": [101],
+                               "all": [100, 101, 102]},
+            "mushroom_body_kc": [], "mbon_app": {"all": []},
+            "mbon_av": {"all": []},
+        }
+        rl = DopamineReinforcement(fake_pops)
+
+        class _Brain:
+            pass
+
+        def _make():
+            b = _Brain()
+            b.indptr = indptr
+            b.indices = indices
+            b.weights = base_w.copy()
+            return b
+
+        pos = DopamineReinforcement._row_positions(indptr, feat)
+        frontal = {"visual_target_visible": True, "visual_target_azimuth": 5.0,
+                   "pheromone_conc_left": 0.0, "pheromone_conc_right": 0.0}
+        hot = _make()
+        rl.apply_plasticity(hot, frontal, {"yaw_torque": 0.0,
+                                           "roll_torque": 0.0,
+                                           "spear_thrust": 0.6},
+                            1.0, gain_cap=0.3)
+        self.assertGreater(float(np.abs(hot.weights[pos]).mean()),
+                           float(np.abs(base_w[pos]).mean()))
+        cold = _make()
+        rl.apply_plasticity(cold, frontal, {"yaw_torque": 0.0,
+                                            "roll_torque": 0.0,
+                                            "spear_thrust": 0.6},
+                            -1.0, gain_cap=0.3)
+        self.assertLess(float(np.abs(cold.weights[pos]).mean()),
+                        float(np.abs(base_w[pos]).mean()))
+        for senses, motor in (
+                (frontal, {"spear_thrust": 0.2}),  # sub-threshold
+                ({"visual_target_visible": False,  # un-aimed
+                  "visual_target_azimuth": 170.0}, {"spear_thrust": 0.6})):
+            b = _make()
+            before = b.weights.copy()
+            rl.apply_plasticity(b, senses, motor, 1.0, gain_cap=0.3)
+            np.testing.assert_array_equal(b.weights, before)
+
+    def test_subfloor_abandonment(self):
+        # Both regimes abandon pools ground below a tenth of reference:
+        # dust in healthy winners is usually learned irrelevance, and
+        # re-animating it mid-tournament scrambles learned policies
+        # (vault-wide spinning incident). Dead channels stay dead until
+        # a human runs the scoped repair tool; the probe makes the
+        # collapse visible instead of hiding it.
+        rl, _make, pos, _sens = self._fake_rig()
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                dead = _make()
+                dead.weights[pos] *= 0.05
+                before = dead.weights.copy()
+                rl.pin_gains(dead, legacy=legacy)
+                np.testing.assert_array_equal(dead.weights, before)
+
     def test_legacy_runaway_only_pin(self):
         # Legacy pinning corrects runaway (>2x) but never touches
         # suppression-side learning: a 40x pool pins back, a 0.3x pool
@@ -1511,6 +1668,120 @@ class TestWiringGeneric(unittest.TestCase):
                 self.assertGreater(checked, 0)
 
 
+class TestWiringMixes(unittest.TestCase):
+    """Additive wiring mixes: normalization, filename-safe suffixes,
+    order-independent determinism, edge-union integrity, and priority
+    conflict resolution."""
+    @classmethod
+    def setUpClass(cls):
+        cls.csr = load_or_build_csr()
+        cls.pops = load_or_extract_populations()
+
+    def test_normalize_experiment(self):
+        from experimental_wiring import normalize_experiment, EXPERIMENTS
+        self.assertIsNone(normalize_experiment(None))
+        self.assertIsNone(normalize_experiment(""))
+        self.assertIsNone(normalize_experiment("none"))
+        self.assertIsNone(normalize_experiment("base"))
+        self.assertIsNone(normalize_experiment([]))
+        self.assertEqual(normalize_experiment("spear_lunge"), ("spear_lunge",))
+        self.assertEqual(normalize_experiment(["spear_lunge", "retina_wide"]),
+                         ("retina_wide", "spear_lunge"))
+        self.assertEqual(normalize_experiment("spear_lunge+retina_wide"),
+                         ("retina_wide", "spear_lunge"))
+        self.assertEqual(normalize_experiment("retina_wide,spear_lunge"),
+                         ("retina_wide", "spear_lunge"))
+        self.assertEqual(normalize_experiment(["base", "spear_lunge"]),
+                         ("spear_lunge",))
+        with self.assertRaises(ValueError):
+            normalize_experiment("not_a_real_wiring")
+        with self.assertRaises(ValueError):
+            normalize_experiment(["spear_lunge", "bogus"])
+        for name in EXPERIMENTS:
+            self.assertIn(name, normalize_experiment(name))
+
+    def test_mix_suffix_filename_safe(self):
+        from experimental_wiring import experiment_suffix
+        self.assertEqual(experiment_suffix(None), "")
+        self.assertEqual(experiment_suffix("spear_lunge"), "__exp_spear_lunge")
+        self.assertEqual(
+            experiment_suffix(["spear_lunge", "retina_wide"]),
+            "__exp_retina_wide__spear_lunge")
+        self.assertEqual(
+            experiment_suffix("spear_lunge+retina_wide"),
+            "__exp_retina_wide__spear_lunge")
+        for bad in (" ", "/", "\\", ":"):
+            self.assertNotIn(bad, experiment_suffix(
+                ["lplc2_contra_dn", "retina_wide", "spear_lunge"]))
+
+    def test_mix_order_independent(self):
+        from experimental_wiring import experiment_arrays
+        a = experiment_arrays(["spear_lunge", "retina_wide"],
+                              self.csr, self.pops)
+        b = experiment_arrays(["retina_wide", "spear_lunge"],
+                              self.csr, self.pops)
+        c = experiment_arrays("spear_lunge+retina_wide",
+                              self.csr, self.pops)
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+        for x, y in zip(a, c):
+            np.testing.assert_array_equal(x, y)
+
+    def test_mix_contains_each_wiring_edges(self):
+        from experimental_wiring import EXPERIMENTS, experiment_arrays
+        mix = ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
+        indptr, indices, _data = experiment_arrays(mix, self.csr, self.pops)
+        indptr = np.asarray(indptr)
+        indices = np.asarray(indices)
+        for name in mix:
+            with self.subTest(wiring=name):
+                pre, post, _w = EXPERIMENTS[name](self.pops)
+                step = max(len(pre) // 20, 1)
+                checked = 0
+                for s, q in zip(pre[::step], post[::step]):
+                    row = indices[indptr[int(s)]:indptr[int(s) + 1]]
+                    self.assertIn(int(q), set(row.tolist()))
+                    checked += 1
+                self.assertGreater(checked, 0)
+
+    def test_priority_override_and_conflict(self):
+        # Synthetic registry entries (restored afterwards): identical
+        # edges dedup, differing weights resolve by priority, equal
+        # priority raises a hard conflict.
+        import experimental_wiring as ew
+        saved_exp = dict(ew.EXPERIMENTS)
+        saved_prio = dict(ew.WIRING_PRIORITY)
+        try:
+            ew.EXPERIMENTS["zz_low"] = lambda pops: (
+                np.array([1, 2], dtype=np.int32),
+                np.array([3, 4], dtype=np.int32),
+                np.array([100.0, 100.0], dtype=np.float32))
+            ew.EXPERIMENTS["zz_high"] = lambda pops: (
+                np.array([1, 5], dtype=np.int32),
+                np.array([3, 6], dtype=np.int32),
+                np.array([200.0, 200.0], dtype=np.float32))
+            ew.WIRING_PRIORITY["zz_low"] = 5
+            ew.WIRING_PRIORITY["zz_high"] = 50
+            pre, post, w = ew.combine_overlays(
+                ("zz_high", "zz_low"), self.pops)
+            got = {(int(s), int(q)): float(v)
+                   for s, q, v in zip(pre, post, w)}
+            # Shared edge (1,3): higher priority wins, kept once.
+            self.assertEqual(got[(1, 3)], 200.0)
+            self.assertEqual(got[(2, 4)], 100.0)
+            self.assertEqual(got[(5, 6)], 200.0)
+            self.assertEqual(len(got), 3)
+            # Equal priority on a differing edge: hard reject.
+            ew.WIRING_PRIORITY["zz_high"] = 5
+            with self.assertRaises(ValueError):
+                ew.combine_overlays(("zz_high", "zz_low"), self.pops)
+        finally:
+            ew.EXPERIMENTS.clear()
+            ew.EXPERIMENTS.update(saved_exp)
+            ew.WIRING_PRIORITY.clear()
+            ew.WIRING_PRIORITY.update(saved_prio)
+
+
 class TestMappingMatrix(unittest.TestCase):
     """Certifies every wiring x mapping regime: each combination must
     integrate, decode a complete finite control set, and stay isolated
@@ -1585,6 +1856,35 @@ class TestMappingMatrix(unittest.TestCase):
                 enc, dec = bs._bind_codecs(rec, self.pops, {})
                 self.assertTrue(enc.legacy)
                 self.assertTrue(dec.legacy)
+                spikes = brain.integrate_50ms(enc.encode(stim))
+                self._finite_ctrl(dec.decode(spikes, sensory_hint=stim))
+
+    def test_mix_integrate_and_decode(self):
+        # Representative additive mix across regimes: union wiring must
+        # integrate and decode a complete finite control set like singles.
+        import brain_server as bs
+        from experimental_wiring import experiment_arrays, experiment_suffix
+        mix = ["retina_wide", "spear_lunge"]
+        self.assertEqual(experiment_suffix(mix),
+                         "__exp_retina_wide__spear_lunge")
+        indptr, indices, wbasis = experiment_arrays(mix, self.csr, self.pops)
+        stim = {"pheromone_conc_left": 0.6, "pheromone_conc_right": 0.3,
+                "visual_target_visible": True, "visual_target_azimuth": 10.0,
+                "visual_rival_looming": 0.4,
+                "visual_sec_presence": [1.0 if i == 10 else 0.0 for i in range(21)],
+                "visual_sec_size": [0.8 if i == 10 else 0.0 for i in range(21)],
+                "visual_sec_loom": [0.8 if i == 10 else 0.0 for i in range(21)],
+                "visual_sec_tree": [0.0] * 21}
+        for mapping in (None, "retina", ["retina", "mbon"]):
+            with self.subTest(mapping=mapping):
+                rec = {"name": "Mx",
+                       "generator_params": {"experiment": mix,
+                                            "mapping": mapping}}
+                brain = bs._bind_brain(
+                    rec, np.ascontiguousarray(np.asarray(
+                        wbasis, dtype=np.float32).copy()),
+                    self.csr, self.pops, {})
+                enc, dec = bs._bind_codecs(rec, self.pops, {})
                 spikes = brain.integrate_50ms(enc.encode(stim))
                 self._finite_ctrl(dec.decode(spikes, sensory_hint=stim))
 
@@ -1722,6 +2022,63 @@ class TestTrainerArenaContract(unittest.TestCase):
             arena_style["visual_tree_ahead_looming"],
             arena_style["visual_tree_right_looming"])
         enc.encode(arena_style)  # must not raise
+
+    def test_controls_fully_consumed(self):
+        # Every decoder control key must be consumed by the trainer's
+        # arena control application (no silently dropped channels).
+        from train_homing import KinematicFly, apply_arena_controls
+        for key in ("thrust", "yaw_torque", "pitch_torque", "roll_torque",
+                    "approach_bias", "ram_burst", "emergency_evade",
+                    "spear_thrust"):
+            self.assertIn(key, TestMappingMatrix.CTRL_KEYS)
+        ctrl = {"thrust": 0.5, "yaw_torque": 0.2, "pitch_torque": 0.1,
+                "roll_torque": 0.0, "approach_bias": 0.1,
+                "ram_burst": True, "emergency_evade": False,
+                "spear_thrust": 0.0}
+        fly = KinematicFly()
+        tgt = KinematicFly(x=10.0, z=0.0)
+        from train_homing import compute_agent_senses
+        senses, dist = compute_agent_senses(fly, tgt, prev_dist=15.0)
+        event, aimed = apply_arena_controls(fly, ctrl, senses, dist)
+        self.assertIsNone(event)
+        self.assertIsInstance(aimed, bool)
+        # Ram burst expresses as extra speed vs the same thrust calm.
+        calm = KinematicFly()
+        apply_arena_controls(
+            calm, dict(ctrl, ram_burst=False), senses, dist)
+        self.assertGreater(fly.last_speed, calm.last_speed)
+
+    def test_trainer_lunge_trigger_contact_cooldown_aim(self):
+        from train_homing import KinematicFly, apply_arena_controls
+        frontal = {"visual_target_visible": True, "visual_target_azimuth": 5.0}
+        ctrl = {"thrust": 0.4, "yaw_torque": 0.0, "pitch_torque": 0.0,
+                "roll_torque": 0.0, "approach_bias": 0.0,
+                "ram_burst": False, "emergency_evade": False,
+                "spear_thrust": 0.6}
+        # Contact range: trigger + contact on the aimed strike.
+        fly = KinematicFly()
+        event, aimed = apply_arena_controls(fly, ctrl, frontal, 1.5)
+        self.assertTrue(aimed)
+        self.assertEqual(event, "contact")
+        # Cooldown: the next command cannot retrigger a fresh strike.
+        self.assertGreater(fly.lunge_cooldown, 0.0)
+        # Rear/unseen: never aimed, never a strike.
+        for bad in ({"visual_target_visible": False,
+                     "visual_target_azimuth": 170.0},
+                    {"visual_target_visible": True,
+                     "visual_target_azimuth": 120.0}):
+            f = KinematicFly()
+            event, aimed = apply_arena_controls(f, ctrl, bad, 1.5)
+            self.assertFalse(aimed)
+        # Below-threshold command: no launch (lunge state untouched;
+        # normal thrust still steps the fly forward).
+        f = KinematicFly(x=0.0, z=0.0)
+        event, _ = apply_arena_controls(
+            f, dict(ctrl, spear_thrust=0.2), frontal, 1.5)
+        self.assertIsNone(event)
+        self.assertEqual(f.lunge_t, 0.0)
+        self.assertEqual(f.lunge_boost, 0.0)
+        self.assertEqual(f.lunge_cooldown, 0.0)
 
     def test_stale_cache_fallbacks(self):
         # Missing new pools degrade to zero channels, never crash.

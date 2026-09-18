@@ -33,6 +33,15 @@ var current_pitch_torque: float = 0.0
 var current_roll_torque: float = 0.0
 var is_ram_burst: bool = false
 var is_emergency_evade: bool = false
+# Command-hold age: the brain answers at ~5 Hz (dual-LIF step budget),
+# so each torque command would otherwise hold at FULL value across ~12
+# physics frames (~1 rad per yaw command) while flying on 200 ms-old
+# senses — overshoot, reverse, overshoot: the spin-then-spin-back wobble.
+# Holding torques decay with this time constant so each command steers a
+# bounded arc and fresh commands always win. Thrust is sustained (speed
+# continuity and the low-thrust brake depend on it).
+var cmd_age: float = 0.0
+const CMD_TAU: float = 0.15
 
 var left_wing_intact: bool = true
 var right_wing_intact: bool = true
@@ -43,6 +52,7 @@ var wing_flutter_time: float = 0.0
 var spear_thrust_cmd: float = 0.0
 var lunge_cooldown: float = 0.0
 var lunge_t: float = 0.0
+var lunge_count: int = 0
 var spear_root: Node3D = null
 const LUNGE_COOLDOWN: float = 1.2
 const LUNGE_TIME: float = 0.35
@@ -106,6 +116,7 @@ func apply_brain_controls(ctrl: Dictionary) -> void:
 	is_ram_burst = ctrl.get("ram_burst", false)
 	is_emergency_evade = ctrl.get("emergency_evade", false)
 	spear_thrust_cmd = clampf(float(ctrl.get("spear_thrust", 0.0)), 0.0, 1.0)
+	cmd_age = 0.0
 
 func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	if not is_instance_valid(rival):
@@ -316,18 +327,26 @@ func _physics_process(delta: float) -> void:
 	if right_wing_intact and is_instance_valid(right_wing_mesh):
 		right_wing_mesh.rotation.z = -flap
 
+	# Leaky command hold (see cmd_age): stale torque commands decay so a
+	# 5 Hz brain steers bounded arcs instead of winding up spins.
+	cmd_age += delta
+	var hold := exp(-cmd_age / CMD_TAU)
+	var yaw_cmd := current_yaw_torque * hold
+	var pitch_cmd := current_pitch_torque * hold
+	var roll_cmd := current_roll_torque * hold
+
 	# Flight speed and thrust
 	var speed_multiplier = 1.5 if is_ram_burst else 1.0
 	var target_speed = base_speed + (max_speed - base_speed) * current_thrust * speed_multiplier
 	var forward_vec = -global_transform.basis.z
 
 	# Yaw rotation
-	rotate_y(-current_yaw_torque * turn_rate * delta)
+	rotate_y(-yaw_cmd * turn_rate * delta)
 
 	# Pitch rotation (nose up positive). Previously nothing ever commanded
 	# pitch, so a tipped fly could never recover - it just flew wherever its
 	# nose pointed until it hit the ceiling.
-	rotate_x(current_pitch_torque * pitch_rate * delta)
+	rotate_x(pitch_cmd * pitch_rate * delta)
 
 	# Roll rotation (bank right positive). The brain commands the bank and
 	# a gentle auto-level mops up residual drift. During an emergency
@@ -338,8 +357,8 @@ func _physics_process(delta: float) -> void:
 	if is_emergency_evade:
 		_auto_level_roll(delta)
 	else:
-		rotate_z(-current_roll_torque * roll_rate * delta)
-		var lvl := 2.5 if absf(current_roll_torque) < 0.01 else 1.0
+		rotate_z(-roll_cmd * roll_rate * delta)
+		var lvl := 2.5 if absf(roll_cmd) < 0.01 else 1.0
 		_auto_level_roll(delta, lvl)
 
 	# Pitch & altitude auto-trim (stay within 2m to 12m fly combat ceiling)
@@ -363,6 +382,7 @@ func _physics_process(delta: float) -> void:
 		velocity += (-global_transform.basis.z).normalized() * LUNGE_KICK * spear_thrust_cmd
 		lunge_cooldown = LUNGE_COOLDOWN
 		lunge_t = LUNGE_TIME
+		lunge_count += 1
 	if lunge_t > 0.0:
 		lunge_t = maxf(0.0, lunge_t - delta)
 		var ext := LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
@@ -631,6 +651,8 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	spear_thrust_cmd = 0.0
 	lunge_cooldown = 0.0
 	lunge_t = 0.0
+	lunge_count = 0
+	cmd_age = 0.0
 	if is_instance_valid(spear_root):
 		spear_root.position.z = 0.0
 	front_spike_area.position = SPIKE_BASE_POS

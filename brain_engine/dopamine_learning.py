@@ -215,12 +215,14 @@ class DopamineReinforcement:
         Conservative by design: pools within 2x of reference are left
         alone, as are pools suppressed below a tenth of reference (mild
         down-regulation is legitimate learning; amplifying near-zero
-        noise 1000x would be worse than leaving it). Only clear
-        pathology is corrected. Bulk (all non-pool synapses) runs first
-        with bands but no suppression floor: the global mean masks
-        composition (hot pools plus crushed bulk cancel out), while bulk
-        collapse is always drift - nothing learns by suppressing every
-        non-pool synapse at once.
+        noise 1000x would be worse than leaving it, and dust in winners
+        is usually learned irrelevance — re-animating it scrambles
+        learned policies). Only clear pathology is corrected. Bulk
+        (all non-pool synapses) runs first with bands but
+        no suppression floor: the global mean masks composition (hot
+        pools plus crushed bulk cancel out), while bulk collapse is
+        always drift - nothing learns by suppressing every non-pool
+        synapse at once.
         legacy=True pins RUNAWAY pools only (>2x reference): pre-mapping
         brains were trained in a regime without suppression-side
         re-normalization, so anything at/under reference is left exactly
@@ -241,6 +243,17 @@ class DopamineReinforcement:
             if legacy and ratio <= 2.0:
                 return
             if ratio < 0.1:
+                # Abandoned for both regimes. A prior build lifted
+                # sub-floor pools back to the floor automatically, and
+                # live battles showed why that is wrong: dust pools in
+                # healthy winners are usually LEARNED IRRELEVANCE
+                # (channels the brain learned to fly without), and
+                # re-animating them mid-tournament scrambles learned
+                # policies. Dead channels are a human decision now:
+                # diagnose, then run the repair tool scoped to that
+                # brain. A pool that collapses mid-training stays
+                # collapsed (retraining cannot earn it back), which the
+                # probe makes visible instead of hiding it.
                 print(f"[Dopamine] pin_gains: pool {name} at {ratio:.3g}x "
                       f"reference; leaving suppressed pool alone.")
                 return
@@ -450,6 +463,24 @@ class DopamineReinforcement:
                 elif yaw < -0.05:
                     dep = 1.0 - self.lr * abs(da_signal) * 0.5
                     self._scale_outgoing(brain, self.lc11_right, dep)
+
+        # Spear-strike channel: an aimed lunge that pays off potentiates
+        # the lobula-feature efferents driving the mouth motor neurons
+        # (spear_lunge wiring: LC11/15/17/18 -> MNxm); a punished lunge
+        # depresses them. Gated on the same visible+frontal aim as the
+        # decoder, and silent by construction when the pool never fires.
+        spear = float(motor_dict.get("spear_thrust", 0.0) or 0.0)
+        if spear > 0.4:
+            spear_vis = bool(sensory_dict.get("visual_target_visible", False))
+            spear_az = abs(float(sensory_dict.get("visual_target_azimuth", 0.0) or 0.0))
+            if spear_vis and spear_az < 50.0:
+                spear_feat = self.lc11_left + self.lc11_right + self._retina_feat
+                if da_signal > 0:
+                    self._scale_outgoing(brain, spear_feat,
+                                         1.0 + self.lr * da_signal * 0.5)
+                elif da_signal < -0.2:
+                    dep = 1.0 + self.lr * da_signal * 0.5  # da<0 -> factor<1
+                    self._scale_outgoing(brain, spear_feat, dep)
 
         # Tree channel (LPLC2): side-gated avoidance. With the contra wiring a
         # lever, steering AWAY from the looming side is the correct answer -

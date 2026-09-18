@@ -93,10 +93,23 @@ def nearest_trunk_distance(fly):
 
 class KinematicFly:
     """Lightweight 3D kinematic fly agent for fast headless reinforcement training."""
+    # Spear-lunge constants mirror FlyPhysics.gd so pre-training transfers:
+    # same trigger, aim gate, cooldown, extension window, and kick scale.
+    LUNGE_TRIGGER = 0.4
+    LUNGE_COOLDOWN = 1.2
+    LUNGE_TIME = 0.35
+    LUNGE_KICK = 7.0
+    STRIKE_REACH = 2.0  # spike tip (~1.35m) + extension (0.35m) + margin
     def __init__(self, x=0.0, y=7.0, z=0.0, heading_rad=0.0, pitch_rad=0.0):
         self.pos = np.array([x, y, z], dtype=np.float32)
         self.heading = heading_rad # 0 rad = facing along +X (yaw)
         self.pitch = pitch_rad     # >0 = nose up (matches Godot rotate_x sign)
+        # Spear-lunge state (arena-like): cooldown between strikes,
+        # extension-window timer, and decaying lunge boost (m/s).
+        self.lunge_cooldown = 0.0
+        self.lunge_t = 0.0
+        self.lunge_boost = 0.0
+        self.lunge_count = 0
         self.base_speed = 3.0
         self.max_speed = 12.0
         self.turn_rate = 8.0 # matches FlyPhysics: hover-capable snap turns
@@ -149,6 +162,60 @@ class KinematicFly:
         dh = (self.heading - prev_heading + np.pi) % (2.0 * np.pi) - np.pi
         self.yaw_rate = float(np.clip(dh / dt, -8.0, 8.0))
         self.pitch_rate_applied = float(np.clip((self.pitch - prev_pitch) / dt, -3.0, 3.0))
+
+    def update_lunge(self, spear_cmd, senses, dist, dt=0.05):
+        """Arena-like spear strike. Returns (event, aimed).
+
+        event is 'triggered' (a strike launched this step), 'contact'
+        (rival within STRIKE_REACH during the extension window), or None.
+        aimed mirrors the decoder/arena gate (visible + frontal). The
+        lunge boost displaces the fly along its nose vector and decays
+        like arena drag, so lunges close distance instead of just
+        flagging intent.
+        """
+        self.lunge_cooldown = max(0.0, self.lunge_cooldown - dt)
+        cmd = float(spear_cmd or 0.0)
+        aimed = bool(senses.get("visual_target_visible", False)) \
+            and abs(float(senses.get("visual_target_azimuth", 0.0))) < 50.0
+        event = None
+        if cmd > self.LUNGE_TRIGGER and self.lunge_cooldown <= 0.0:
+            self.lunge_cooldown = self.LUNGE_COOLDOWN
+            self.lunge_t = self.LUNGE_TIME
+            self.lunge_boost = self.LUNGE_KICK * min(max(cmd, 0.0), 1.0)
+            self.lunge_count += 1
+            event = "triggered"
+        if self.lunge_t > 0.0:
+            self.lunge_t = max(0.0, self.lunge_t - dt)
+            self.pos += self.forward_vec() * (self.lunge_boost * dt)
+            self.lunge_boost *= 0.85
+            if float(dist) <= self.STRIKE_REACH:
+                event = "contact"
+        return event, aimed
+
+
+def apply_arena_controls(fly, ctrl, senses, dist, dt=0.05):
+    """Applies the full decoder control set the way the arena does.
+
+    Consumes every control key (thrust, yaw/pitch, ram burst, evade dive,
+    spear lunge) so headless training cannot silently drop a channel.
+    approach_bias is pre-folded into thrust/yaw by the decoder;
+    roll_torque has no axis in this 2D-heading trainer (JO-roll learns
+    live in the arena). Returns the lunge (event, aimed) tuple.
+    """
+    thrust_eff = float(ctrl.get("thrust", 0.2))
+    if ctrl.get("emergency_evade", False):
+        thrust_eff *= 0.5
+        pitch_eff = -1.0
+    else:
+        pitch_eff = float(ctrl.get("pitch_torque", 0.0))
+    if ctrl.get("ram_burst", False):
+        thrust_eff *= 1.5  # mirrors the arena's 1.5x ram speed
+    _ = float(ctrl.get("approach_bias", 0.0))
+    _ = float(ctrl.get("roll_torque", 0.0))
+    fly.step(thrust=thrust_eff,
+             yaw_torque=float(ctrl.get("yaw_torque", 0.0)),
+             pitch_cmd=pitch_eff, dt=dt)
+    return fly.update_lunge(ctrl.get("spear_thrust", 0.0), senses, dist, dt)
 
 
 def compute_agent_senses(agent, target, prev_dist=None):
@@ -456,8 +523,11 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         initial_dist = prev_dist
         total_da = 0.0
         success = False
+        strike = False
         crashed = False
         close_calls = 0
+        lunges = 0
+        strikes = 0
 
         t_ep_start = time.time()
 
@@ -501,22 +571,37 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                     close_calls += 1
             total_da += da
 
-            # 6. Apply Dopamine-Gated Plasticity (run's own schemes: new
+            # 6. Update physics through the arena control application
+            # (full control set: thrust/yaw/pitch, ram burst, evade dive,
+            # spear lunge with cooldown + extension window + contact).
+            lunge_event, lunge_aimed = apply_arena_controls(
+                fly, ctrl, senses, current_dist, dt=0.05)
+            # Target fly evasion: variant B trains against a twitchier target.
+            target.step(thrust=0.15, yaw_torque=np.random.uniform(-target_evasion, target_evasion), dt=0.05)
+
+            # 6b. Spear shaping: aimed committed lunges earn a little,
+            # blind or wild long-range lunges cost, and contact pays big
+            # and ends the episode as a strike kill.
+            if lunge_event == "triggered":
+                lunges += 1
+                if lunge_aimed and current_dist <= 6.0:
+                    da += 0.3
+                elif current_dist > 8.0:
+                    da -= 0.2
+                else:
+                    da -= 0.3
+            elif lunge_event == "contact":
+                lunges += 1
+                strikes += 1
+                da += 2.0
+                strike = True
+
+            # 7. Apply Dopamine-Gated Plasticity (run's own schemes: new
             # branches learn only on brains generated from those schemes).
             # Micro-gain cap: 6000 calls/session must stay micro, or high
             # learning rates compound into mid-episode runaway.
             dopamine_rl.apply_plasticity(brain, senses, ctrl, da,
                                          schemes=schemes, gain_cap=0.02)
-
-            # 7. Update physics (pitch reflex drives the nose, brain the rest).
-            # Evade reflex actuates as a dive + speed cut (mirrors the arena
-            # roll-and-dive), so the reflex can actually dodge trunks here.
-            thrust_eff = ctrl["thrust"] * (0.5 if ctrl.get("emergency_evade", False) else 1.0)
-            pitch_eff = -1.0 if ctrl.get("emergency_evade", False) else ctrl.get("pitch_torque", 0.0)
-            fly.step(thrust=thrust_eff, yaw_torque=ctrl["yaw_torque"],
-                     pitch_cmd=pitch_eff, dt=0.05)
-            # Target fly evasion: variant B trains against a twitchier target.
-            target.step(thrust=0.15, yaw_torque=np.random.uniform(-target_evasion, target_evasion), dt=0.05)
 
             # 8. Trunk collision: same tiers as the arena. Two fast slams kill.
             # Crashes cost health plus a full aversive pulse (depress the
@@ -540,8 +625,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
 
             prev_dist = current_dist
 
-            # Success threshold: closed within striking distance (3.5m)
-            if current_dist < 3.5:
+            # Success threshold: spear contact kills outright; otherwise
+            # closing within striking distance (3.5m) ends the hunt.
+            if strike or current_dist < 3.5:
                 success = True
                 break
 
@@ -553,16 +639,21 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             "final_dist": current_dist,
             "closed": distance_closed,
             "success": success,
+            "strike": strike,
             "upset": upset,
             "crashed": crashed,
             "enc": enc_type,
             "close_calls": close_calls,
+            "lunges": lunges,
+            "strikes": strikes,
             "avg_da": total_da / (step + 1)
         })
 
         tag = ("UPSET+" if upset else "") + enc_type
         if crashed:
             status_str = "CRASHED into trunk!"
+        elif strike:
+            status_str = "SUCCESS (SPEAR STRIKE!)"
         elif success:
             status_str = "SUCCESS (RAM RANGE!)"
         else:
@@ -599,6 +690,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         print(f"[Train:{label}] Upset recovery: {upset_ok}/{len(upset_eps)} knock-spawn episodes recovered to strike range.")
     crashes = sum(1 for r in results if r.get("crashed"))
     print(f"[Train:{label}] Tree crashes: {crashes}/{num_episodes} episodes ended in a trunk.")
+    lunges_tot = sum(r.get("lunges", 0) for r in results)
+    strikes_tot = sum(r.get("strikes", 0) for r in results)
+    print(f"[Train:{label}] Spear lunges: {lunges_tot} triggered, {strikes_tot} contacts.")
     close_tot = sum(r.get("close_calls", 0) for r in results)
     print(f"[Train:{label}] Close calls (<2m bark): {close_tot} steps total.")
     for et in ("SLALOM", "FOREST"):

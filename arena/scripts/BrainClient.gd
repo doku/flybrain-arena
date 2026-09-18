@@ -11,6 +11,7 @@ signal match_ready_received()
 signal match_recorded_received()
 signal tournament_closed_received()
 signal server_error_received(error: String)
+signal raster_map_received(side: String, pool: String, ids: Array, total: int)
 
 @export var server_host: String = "127.0.0.1"
 @export var server_port: int = 9999
@@ -43,19 +44,22 @@ func _process(_delta: float) -> void:
 			push_warning("[BrainClient] Dropped unparsable server packet: ",
 				json_str.left(160))
 
+var detail_level: int = 1
+
 func send_sensory_step(sens_alpha: Dictionary, sens_beta: Dictionary) -> void:
 	if not is_connected_server:
 		return
-	
+
 	var msg = {
 		"type": "step",
 		"alpha": sens_alpha,
-		"beta": sens_beta
+		"beta": sens_beta,
+		"detail": detail_level
 	}
 	var json_data = JSON.stringify(msg).to_utf8_buffer()
 	udp.put_packet(json_data)
 
-func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "") -> void:
+func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "", flight_alpha: Dictionary = {}, flight_beta: Dictionary = {}) -> void:
 	if not is_connected_server:
 		return
 
@@ -66,7 +70,9 @@ func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw
 		"arena_draw": arena_draw,
 		"battle_id": battle_id,
 		"tournament_id": tournament_id,
-		"match": match_label
+		"match": match_label,
+		"flight_alpha": flight_alpha,
+		"flight_beta": flight_beta
 	}
 	var json_data = JSON.stringify(msg).to_utf8_buffer()
 	udp.put_packet(json_data)
@@ -83,6 +89,13 @@ func request_tournament_load(alpha_path: String, beta_path: String, tournament_i
 		"lr_scale": lr_scale
 	}
 	udp.put_packet(JSON.stringify(msg).to_utf8_buffer())
+
+func request_raster_map(side: String, pool: String) -> void:
+	if not is_connected_server:
+		return
+	udp.put_packet(JSON.stringify(
+		{"type": "raster_map", "side": side, "pool": pool}).to_utf8_buffer())
+
 
 func request_match_reset(match_label: String = "") -> void:
 	if not is_connected_server:
@@ -150,5 +163,9 @@ func _handle_server_response(data: Dictionary) -> void:
 		match_recorded_received.emit()
 	elif status == "tournament_closed":
 		tournament_closed_received.emit()
+	elif status == "raster_map":
+		raster_map_received.emit(
+			str(data.get("side", "")), str(data.get("pool", "")),
+			data.get("ids", []), int(data.get("total", 0)))
 	elif status == "error":
 		server_error_received.emit(str(data.get("error", "unknown")))

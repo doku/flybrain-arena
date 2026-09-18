@@ -16,14 +16,11 @@ from connectome_loader import load_or_build_csr, load_or_extract_populations
 from lif_brain import FlyBrain
 from dopamine_learning import DopamineReinforcement
 import brain_package as vault
-from experimental_wiring import experiment_arrays
+from experimental_wiring import experiment_arrays, normalize_experiment
 
 
 def _norm_experiment(value):
-    if value is None:
-        return None
-    s = str(value).strip()
-    return None if s.lower() in ("", "none") else s
+    return normalize_experiment(value)
 
 
 def pool_mean(w, indptr, pre_ids):
@@ -36,13 +33,41 @@ def pool_mean(w, indptr, pre_ids):
     return tot_s / max(tot_n, 1)
 
 
-def main(dust_only=False, runaway_only=False):
+def _subset_ids(pops):
+    """Per-patch sensory/motor pools for dust-only restoration.
+
+    Side-combined means hide subset death (live ORNs mask dead LC11
+    inside one 'sens_left' number), so each driver pool is checked on
+    its own, plus the KC->MBON arms separately (a dead avoid arm hides
+    inside a hot combined mean)."""
+    def _all(key):
+        p = pops.get(key, {})
+        return (list(p.get("left", [])) + list(p.get("right", []))
+                + list(p.get("all", [])))
+
+    feat = []
+    for key in ("visual_lc15", "visual_lc17", "visual_lc18"):
+        feat += _all(key)
+    return [
+        ("da1", _all("pheromone_da1"), "sens"),
+        ("va1v", _all("pheromone_va1v"), "sens"),
+        ("lc10", _all("visual_lc10"), "sens"),
+        ("lc4", _all("visual_lc4"), "sens"),
+        ("lplc2", _all("visual_lplc2"), "sens"),
+        ("lc11", _all("visual_lc11"), "sens"),
+        ("lc_feat", feat, "sens"),
+        ("jo", _all("gyro_jo"), "jo"),
+    ]
+
+
+def main(dust_only=False, runaway_only=False, only=None):
     csr = load_or_build_csr()
     pops = load_or_extract_populations()
     snap = tempfile.mkdtemp(prefix="vault_snapshot_")
     for p in sorted(glob.glob(vault.VAULT_DIR + "/*.flybrain")):
         shutil.copyfile(p, os.path.join(snap, os.path.basename(p)))
     print(f"[Repair] Snapshotted vault to {snap}")
+    subsets = _subset_ids(pops)
     if dust_only:
         print("[Repair] DUST-ONLY mode: no pinning; pools under 10% of "
               "reference get native values back, everything else untouched.")
@@ -65,6 +90,11 @@ def main(dust_only=False, runaway_only=False):
     DUST_ABS = 0.02  # below this a pool holds no learnable ratios, only dust
     from sensory_motor import is_legacy_record
     for path in sorted(glob.glob(vault.VAULT_DIR + "/*.flybrain")):
+        # --brain limits scope to one identity (substring over the
+        # filename, which carries name + id): repairing the whole vault
+        # would "fix" healthy winners' learned quirks too.
+        if only and only.lower() not in os.path.basename(path).lower():
+            continue
         rec, w = vault.load_brain(path)
         if is_legacy_record(rec) and not dust_only and not runaway_only:
             print(f"[Repair] SKIP {os.path.basename(path)}: legacy "
@@ -154,18 +184,34 @@ def main(dust_only=False, runaway_only=False):
                       + pops.get("visual_lc18", {}).get("right", []))
         pool_base["sens_left"] = pool_base["sens"]
         pool_base["sens_right"] = pool_base["sens"]
+        pool_base["jo"] = rl._base_means.get("jo", 0.0)
+        pool_base["kcmbon"] = rl._base_means.get("kcmbon", 0.0)
+        pool_base["kc_app"] = pool_base["kcmbon"]
+        pool_base["kc_av"] = pool_base["kcmbon"]
+        subset_rows, subset_names = {}, []
+        for sname, sids, sref in subsets:
+            subset_rows[sname] = DopamineReinforcement._row_positions(
+                np.asarray(indptr), sids)
+            subset_names.append(sname)
+            pool_base[sname] = pool_base.get(sref, 0.0)
+        pos_app, pos_av = rl._ensure_kc_mbon(brain)
+        subset_rows["kc_app"] = pos_app
+        subset_rows["kc_av"] = pos_av
+        subset_rows["jo_sub"] = DopamineReinforcement._row_positions(
+            np.asarray(indptr), jo_ids)
+        pool_base["jo_sub"] = pool_base["jo"]
         pools = [("sens", sens_ids), ("jo", jo_ids), ("dn", None),
                  ("kcmbon", None)]
         if dust_only:
-            # Dust-only checks each side separately: one-sided dead
-            # channels (the aimless-circling pathology) hide inside
-            # combined means. 10% threshold sits in the measured gap
-            # between dead (<7%) and weak-but-alive (>30%) pools.
-            pools = [("sens_left", sens_l_ids), ("sens_right", sens_r_ids),
-                     ("dn_left", None), ("dn_right", None)]
+            # Per-subset pools (see _subset_ids): side-combined means
+            # hide subset death (live ORNs mask dead LC11; a dead avoid
+            # arm hides inside a hot combined KC->MBON mean). 10%
+            # threshold sits in the measured gap between dead (<7%) and
+            # weak-but-alive (>30%) pools.
+            pools = ([(sname, None) for sname in subset_names]
+                     + [("dn_left", None), ("dn_right", None),
+                        ("jo_sub", None), ("kc_app", None), ("kc_av", None)])
         for name, ids in pools:
-            if dust_only and name in ("jo", "kcmbon"):
-                continue
             if name == "dn":
                 pos = dn_pos
             elif name == "dn_left":
@@ -180,6 +226,8 @@ def main(dust_only=False, runaway_only=False):
                     np.asarray(indptr), sens_r_ids)
             elif name == "kcmbon":
                 pos = kc_pos
+            elif name in subset_rows:
+                pos = subset_rows[name]
             else:
                 tot = []
                 for pre in ids:
@@ -216,5 +264,10 @@ if __name__ == "__main__":
     ap.add_argument("--runaway-only", action="store_true",
                     help="pin pools over 2x reference (ratio-preserving) "
                          "for every brain, leave everything else as learned")
+    ap.add_argument("--brain", default="",
+                    help="limit scope to one identity (substring over "
+                         "vault filename, e.g. Eye3): repairing the whole "
+                         "vault would also 'fix' healthy winners' quirks")
     args = ap.parse_args()
-    main(dust_only=args.dust_only, runaway_only=args.runaway_only)
+    main(dust_only=args.dust_only, runaway_only=args.runaway_only,
+         only=args.brain or None)

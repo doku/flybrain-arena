@@ -19,6 +19,15 @@ var job_dir: String = ""
 # Live arena hook (null while the menu scene is showing).
 var arena: Node = null
 
+# Brain-view settings (menu -> arena bus): in-arena neural activation
+# overlay. Layers: "bars" (pool rates), "flow" (activation paths),
+# "raster" (per-neuron drill-down). Detail 0/1/2 gates UDP payload
+# size (counts / +context / +spike ids for raster).
+var brainview_enabled: bool = true
+var brainview_layer: String = "bars"
+var brainview_detail: int = 1
+var brainview_replay: bool = false
+
 # Tournament state (empty dict = inactive).
 var tourney: Dictionary = {}
 var sudden_death_armed: bool = false
@@ -511,12 +520,25 @@ func get_load_params() -> Dictionary:
 	}
 
 
-func on_battle_result(winner: String) -> Dictionary:
-	# winner: "alpha" | "beta" | "draw". Returns sequencing action for arena.
+func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}) -> Dictionary:
+	# winner: "alpha" | "beta" | "draw". Per-battle flight telemetry is
+	# banked on the match ("flights" list) so flight-style regressions
+	# have recorded evidence; the pool-rate stream rides along when the
+	# menu record toggle is on (gated arena-side; ~50 KB per battle).
+	# Returns sequencing action for arena.
 	var m := current_match()
 	if m.is_empty():
 		return {"action": "idle"}
 	m["battles"] = int(m.get("battles", 0)) + 1
+	if not flight_a.is_empty() or not flight_b.is_empty():
+		if not m.has("flights"):
+			m["flights"] = []
+		var entry := {
+			"battle": int(m.get("battles", 0)), "winner": winner,
+			"a": flight_a, "b": flight_b}
+		if not brain_stream.is_empty() and int((brain_stream.get("alpha", []) as Array).size()) > 0:
+			entry["stream"] = brain_stream
+		(m["flights"] as Array).append(entry)
 	if winner == "draw":
 		m["draws"] = int(m.get("draws", 0)) + 1
 		if int(m.get("draws", 0)) >= 3:

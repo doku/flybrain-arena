@@ -15,12 +15,65 @@ from scipy import sparse
 
 EXPERIMENTS = {}
 
+# Conflict priority for additive mixes (higher wins on exact-edge weight
+# clashes; ties reject loudly). Order: lplc2_contra_dn < retina_wide <
+# spear_lunge. Shared downstream pools (e.g. DNs driven by both contra and
+# wide wirings) are NOT conflicts — only identical (pre, post) edges with
+# different weights clash.
+WIRING_PRIORITY = {
+    "lplc2_contra_dn": 10,
+    "retina_wide": 20,
+    "spear_lunge": 30,
+}
+
+# One-line descriptions for the menu configurator.
+WIRING_DESCRIPTIONS = {
+    "lplc2_contra_dn": "Tree avoidance: LPLC2 loom steers AWAY (contralateral DNs).",
+    "retina_wide": "Visual pursuit assist: LC features drive same-side DNs.",
+    "spear_lunge": "Spear attack: frontal LC volleys drive mouth motor neurons.",
+}
+
 
 def _register(name):
     def deco(fn):
         EXPERIMENTS[name] = fn
+        WIRING_PRIORITY.setdefault(name, 0)
         return fn
     return deco
+
+
+def normalize_experiment(value):
+    """Canonical wiring key: None for base, else a sorted tuple of names.
+
+    Accepts None, 'base'/'none'/'', a single name, a '+'- or ','-joined
+    string, or a list/tuple of any of those. Unknown names raise (never
+    silently degrade). 'base' inside a mix is ignored (base = absence).
+    """
+    if value is None:
+        return None
+    items = value if isinstance(value, (list, tuple)) else [value]
+    names = set()
+    for item in items:
+        for part in str(item).replace(",", "+").split("+"):
+            s = part.strip()
+            if not s or s.lower() in ("none", "base"):
+                continue
+            if s not in EXPERIMENTS:
+                raise ValueError(
+                    f"Unknown experimental wiring '{s}'. "
+                    f"Available: {sorted(EXPERIMENTS)}")
+            names.add(s)
+    if not names:
+        return None
+    return tuple(sorted(names))
+
+
+def mix_label(experiment):
+    """Human/canonical label: 'base' or 'a+b' (sorted)."""
+    mix = normalize_experiment(experiment)
+    if mix is None:
+        return "base"
+    return "+".join(mix)
 
 
 @_register("lplc2_contra_dn")
@@ -145,28 +198,82 @@ def apply_overlay(csr, pre, post, w):
             np.ascontiguousarray(merged.data, dtype=np.float32))
 
 
+def combine_overlays(mix, pops):
+    """Merges the overlays of a normalized mix into one edge dict.
+
+    Returns {(pre, post): (weight, winner_name)}. Identical (pre, post,
+    weight) edges from two wirings are kept once; same (pre, post) with
+    different weights is resolved by WIRING_PRIORITY (higher wins, winner
+    logged); equal priority raises a hard conflict error. Sorted output
+    keeps the product deterministic regardless of input order.
+    """
+    edges = {}
+    post_sets = {}
+    for name in mix:
+        pre, post, w = EXPERIMENTS[name](pops)
+        post_sets[name] = set(int(q) for q in post.tolist())
+        for s, q, v in zip(pre.tolist(), post.tolist(), w.tolist()):
+            key = (int(s), int(q))
+            if key in edges:
+                old_v, old_name = edges[key]
+                if float(v) == float(old_v):
+                    continue
+                p_new = WIRING_PRIORITY.get(name, 0)
+                p_old = WIRING_PRIORITY.get(old_name, 0)
+                if p_new == p_old:
+                    raise ValueError(
+                        f"Wiring conflict: '{name}' and '{old_name}' both "
+                        f"drive edge {key} with different weights "
+                        f"({v} vs {old_v}) at equal priority. "
+                        f"Drop one of them from the mix.")
+                winner = name if p_new > p_old else old_name
+                edges[key] = (float(v) if p_new > p_old else old_v, winner)
+                print(f"[ExpWiring] conflict on edge {key}: "
+                      f"'{winner}' wins by priority "
+                      f"({name}={p_new} vs {old_name}={p_old})")
+            else:
+                edges[key] = (float(v), name)
+    # Shared-downstream warning (not a conflict): two wirings driving the
+    # same postsynaptic cells stack their drive and may saturate a readout.
+    names = list(mix)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            shared = post_sets[names[i]] & post_sets[names[j]]
+            if shared:
+                print(f"[ExpWiring] note: '{names[i]}'+'{names[j]}' share "
+                      f"{len(shared)} postsynaptic targets; combined drive "
+                      f"may saturate — retune if the readout saturates.")
+    keys = sorted(edges.keys())
+    pre = np.array([k[0] for k in keys], dtype=np.int32)
+    post = np.array([k[1] for k in keys], dtype=np.int32)
+    w = np.array([edges[k][0] for k in keys], dtype=np.float32)
+    return pre, post, w
+
+
 def experiment_arrays(experiment, csr, pops):
-    """Returns (indptr, indices, data) for an experiment, or base CSR arrays
-    when experiment is None/'none'. Unknown experiments raise.
+    """Returns (indptr, indices, data) for a wiring mix, or base CSR arrays
+    when experiment is None/'none'/'base'. Unknown names raise.
 
     This is the single funnel every FlyBrain constructor should use so the
     arity of a brain always matches its checkpoint namespace."""
-    if experiment is None or str(experiment).strip().lower() in ("", "none"):
+    mix = normalize_experiment(experiment)
+    if mix is None:
         return (np.ascontiguousarray(csr.indptr, dtype=np.int32),
                 np.ascontiguousarray(csr.indices, dtype=np.int32),
                 np.ascontiguousarray(csr.data, dtype=np.float32))
-    name = str(experiment).strip()
-    if name not in EXPERIMENTS:
-        raise ValueError(
-            f"Unknown experimental wiring '{name}'. Available: {sorted(EXPERIMENTS)}")
-    pre, post, w = EXPERIMENTS[name](pops)
-    print(f"[ExpWiring] {name}: injecting {len(pre):,} edges "
-          f"(fanout per cell, weight {w[0]:.0f})")
+    pre, post, w = combine_overlays(mix, pops)
+    print(f"[ExpWiring] {'+'.join(mix)}: injecting {len(pre):,} edges "
+          f"(combined additive overlay)")
     return apply_overlay(csr, pre, post, w)
 
 
 def experiment_suffix(experiment):
-    """Filename suffix for experiment checkpoints (empty for base runs)."""
-    if experiment is None or str(experiment).strip().lower() in ("", "none"):
+    """Filename suffix for experiment checkpoints (empty for base runs).
+
+    Filename-safe: mix names joined with '__', e.g.
+    '__exp_retina_wide__spear_lunge'. Single names keep the legacy form.
+    """
+    mix = normalize_experiment(experiment)
+    if mix is None:
         return ""
-    return f"__exp_{str(experiment).strip()}"
+    return "__exp_" + "__".join(mix)
