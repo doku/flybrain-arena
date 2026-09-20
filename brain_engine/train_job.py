@@ -62,6 +62,11 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
         record.setdefault("generator_params", {})["mapping"] = params["mapping"]
     else:
         legacy = "mapping" not in stored and resolved_mapping is None
+    # Yaw bias graduates the same way: an explicitly passed value stamps
+    # the record so training, battles, and the menu agree from then on.
+    resolved_bias = _stored("yaw_bias", None)
+    if params.get("yaw_bias", None) is not None:
+        record.setdefault("generator_params", {})["yaw_bias"] = params["yaw_bias"]
     from train_homing import CHECKPOINTS_DIR
     os.makedirs(os.path.join(CHECKPOINTS_DIR, "tmp"), exist_ok=True)
     tmp_name = os.path.join("tmp", f"train_{record['id']}.npz")
@@ -79,6 +84,7 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
         align_bonus=tuple(_stored("align_bonus", (0.5, 0.2, -0.3))),
         experiment=_stored("experiment", None),
         mapping=resolved_mapping,
+        yaw_bias=resolved_bias,
         legacy=legacy,
         init_weights=weights,
         progress_cb=progress_cb,

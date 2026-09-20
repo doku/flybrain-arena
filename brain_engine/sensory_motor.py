@@ -1,11 +1,44 @@
 import numpy as np
 
 
-KNOWN_MAPPINGS = ("base", "muscles_up", "gyro_flow", "mbon", "retina")
+KNOWN_MAPPINGS = ("base", "muscles_up", "gyro_flow", "mbon", "retina",
+                  "flow_trans")
 
 # Schemes that add encoder/decoder behavior. "base" is the absence of all
 # schemes. Mappings stack: a brain may declare any combination, e.g.
 # ["muscles_up", "gyro_flow"], and every matching section applies.
+
+
+# Yaw-bias randomization window (centers the measured ~9.0, spans the
+# observed 7-10 directional spread). Menu randomize draws uniform here.
+YAW_BIAS_LO = 6.0
+YAW_BIAS_HI = 12.0
+YAW_BIAS_DEFAULT = 9.0
+
+
+def draw_yaw_bias(rng=None):
+    """Draws a per-brain yaw-bias correction. Uniform over the measured
+    window; stamped into the record so it's reproducible, never
+    re-rolled silently."""
+    import random as _random
+    r = _random if rng is None else rng
+    return round(float(r.uniform(YAW_BIAS_LO, YAW_BIAS_HI)), 1)
+
+
+def normalize_yaw_bias(value):
+    """Canonical yaw bias: None -> default 9.0, else a float in [0, 25].
+    The ceiling covers strongly-driven mixes (full-mix Eye3 measured
+    +20.8). Garbage raises (a typo'd bias must not train as default
+    while the record claims otherwise)."""
+    if value is None:
+        return YAW_BIAS_DEFAULT
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Bad yaw_bias {value!r}: want a number in [0, 25]")
+    if not 0.0 <= v <= 25.0:
+        raise ValueError(f"Bad yaw_bias {v}: want a number in [0, 25]")
+    return v
 
 
 def is_legacy_record(rec):
@@ -41,6 +74,18 @@ def normalize_mapping(value):
             raise ValueError(f"Unknown neuro-mapping '{s}'. Known: {KNOWN_MAPPINGS}")
         schemes.add(s)
     return tuple(sorted(schemes))
+
+
+# Translational-flow cruise target (ventral flow units): the decoder
+# trims thrust to hold this. Cruise 5 m/s at 7 m altitude reads ~0.36.
+FLOW_CRUISE = 0.35
+
+
+def _side_pair(populations, key):
+    """(left, right) int32 arrays for a bilateral pool (stale-cache safe)."""
+    pool = populations.get(key, {})
+    return (np.array(pool.get("left", []), dtype=np.int32),
+            np.array(pool.get("right", []), dtype=np.int32))
 
 
 class SensoryEncoder:
@@ -84,6 +129,16 @@ class SensoryEncoder:
         lc18 = populations.get("visual_lc18", {})
         self.lc18_left = np.array(lc18.get("left", []), dtype=np.int32)
         self.lc18_right = np.array(lc18.get("right", []), dtype=np.int32)
+        # Translational optic flow (T4/T5 direction cells, flow_trans
+        # scheme only; stale-cache safe like the rest).
+        self.t4a_left, self.t4a_right = _side_pair(populations, "visual_t4a")
+        self.t4b_left, self.t4b_right = _side_pair(populations, "visual_t4b")
+        self.t4c_left, self.t4c_right = _side_pair(populations, "visual_t4c")
+        self.t4d_left, self.t4d_right = _side_pair(populations, "visual_t4d")
+        self.t5a_left, self.t5a_right = _side_pair(populations, "visual_t5a")
+        self.t5b_left, self.t5b_right = _side_pair(populations, "visual_t5b")
+        self.t5c_left, self.t5c_right = _side_pair(populations, "visual_t5c")
+        self.t5d_left, self.t5d_right = _side_pair(populations, "visual_t5d")
         # Panoramic column centers shared with the arena/trainer grids.
         self.sec_az = (-150.0, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0)
         # Reference pool sizes: stimulus spike counts scale to the LARGER
@@ -297,6 +352,42 @@ class SensoryEncoder:
                     spikes.extend(np.random.choice(
                         self.jo_right, size=min(k_r, len(self.jo_right)), replace=False))
 
+        # 3e. Translational optic flow (T4/T5) - ground-relative motion,
+        # flow_trans scheme only. Ventral (forward) flow drives the
+        # progressive pools (a), lateral slip the regressive pools (b),
+        # expansion-on-descent the downward pools (d), climbs the upward
+        # pools (c). Symmetric (both sides, no handedness) except the
+        # decoder's drift trim, which reads the signed key, not the
+        # spikes. Base scheme and legacy mode skip this section.
+        if "flow_trans" in self.schemes and not self.legacy:
+            ventral = float(np.clip(sensory_dict.get(
+                "visual_flow_ventral", 0.0), 0.0, 1.0))
+            lateral = float(np.clip(sensory_dict.get(
+                "visual_flow_lateral", 0.0), -1.0, 1.0))
+            expansion = float(np.clip(sensory_dict.get(
+                "visual_flow_expansion", 0.0), 0.0, 1.0))
+            climb = float(np.clip(sensory_dict.get(
+                "visual_flow_climb", 0.0), 0.0, 1.0))
+            flow_groups = [
+                (ventral, (self.t4a_left, self.t4a_right,
+                           self.t5a_left, self.t5a_right)),
+                (abs(lateral), (self.t4b_left, self.t4b_right,
+                                self.t5b_left, self.t5b_right)),
+                (expansion, (self.t4d_left, self.t4d_right,
+                             self.t5d_left, self.t5d_right)),
+                (climb, (self.t4c_left, self.t4c_right,
+                         self.t5c_left, self.t5c_right)),
+            ]
+            for mag, pools in flow_groups:
+                if mag > 0.05:
+                    for pool in pools:
+                        if len(pool) == 0:
+                            continue
+                        k = min(int(mag * 30), len(pool))
+                        if k > 0:
+                            spikes.extend(np.random.choice(
+                                pool, size=k, replace=False))
+
         return np.array(spikes, dtype=np.int32)
 
 
@@ -315,8 +406,9 @@ class MotorDecoder:
     mapping selects the neuro-mapping scheme ('base' default). The
     'muscles_up' scheme adds flight-muscle (MN) votes to thrust/yaw; the
     'gyro_flow' scheme adds the VS/HS roll output; the 'mbon' scheme adds
-    the mushroom-body value readout. Base output is bit-identical to the
-    pre-mapping decoder.
+    the mushroom-body value readout; 'flow_trans' adds T4/T5 cruise
+    control, drift trim, and landing flare. Base output is bit-identical
+    to the pre-mapping decoder.
     Uses the full ~1303 descending neuron pool for robustness: single-cell
     DNp09/DNp20 readouts are too sparse (2 cells) and drown in noise.
     Sign convention: yaw > 0 = turn right, yaw < 0 = turn left.
@@ -329,10 +421,17 @@ class MotorDecoder:
     spikes), so the bias-corrected reflex-led readout — whose signs
     validate correct — stays for both regimes.
     """
-    def __init__(self, populations, mapping=None, legacy=False):
+    def __init__(self, populations, mapping=None, legacy=False,
+                 yaw_bias=None):
         self.schemes = normalize_mapping(mapping)
         self.legacy = bool(legacy)
         self._dn_gain = 0.008 if self.legacy else 0.0005
+        # Per-brain intrinsic DN lateralization correction (default 9.0:
+        # measured dnR-dnL on symmetric input). A single constant
+        # over-steers brains whose true bias runs lower (constant left
+        # crawl), so records may stamp their own value (vault
+        # generator_params["yaw_bias"], menu spinbox + randomize).
+        self._dn_bias = normalize_yaw_bias(yaw_bias)
         self.dnp09_ids = set(populations["motor_thrust_dnp09"]["all"])
         self.dnp20_left = set(populations["motor_turn_dnp20"]["left"])
         self.dnp20_right = set(populations["motor_turn_dnp20"]["right"])
@@ -452,8 +551,8 @@ class MotorDecoder:
         # Intrinsic connectome bias (dnR-dnL ~+9 on symmetric input;
         # LEFT +7 / RIGHT +10 / AHEAD +10 avg over 5 trials post-continuity)
         # is subtracted so LEFT goes negative, RIGHT positive, AHEAD ~= 0.
-        DN_BIAS = 9.0
-        yaw_pop = float(np.tanh((dn_right_spikes - dn_left_spikes - DN_BIAS) / 15.0) * 0.9)
+        # Per-brain override lives in self._dn_bias (default 9.0).
+        yaw_pop = float(np.tanh((dn_right_spikes - dn_left_spikes - self._dn_bias) / 15.0) * 0.9)
         brain_yaw = float(np.clip(yaw_specific + yaw_pop, -1.0, 1.0))
         if "muscles_up" in self.schemes and not self.legacy:
             # Steering-muscle laterality: MNad-R minus MNad-L, normalized so
@@ -547,6 +646,29 @@ class MotorDecoder:
             approach_bias = float(np.clip(np.tanh((app - avv) / 8.0), -1.0, 1.0))
             thrust = float(np.clip(thrust * (1.0 + 0.3 * approach_bias), 0.0, 1.0))
             yaw_torque = float(np.clip(yaw_torque * (1.0 + 0.2 * approach_bias), -1.0, 1.0))
+
+        # 7. Translational optic flow (T4/T5): flow_trans scheme only.
+        # Cruise control holds ventral flow near target by trimming
+        # thrust; lateral drift trims yaw toward the slip (small,
+        # magnitude-only authority, never flips the sign); expansion on
+        # descent flares (thrust cut). Legacy mode never takes this
+        # branch (pre-mapping brains never drove T4/T5).
+        if "flow_trans" in self.schemes and not self.legacy \
+                and sensory_hint is not None:
+            ventral = float(np.clip(sensory_hint.get(
+                "visual_flow_ventral", 0.0), 0.0, 1.0))
+            lateral = float(np.clip(sensory_hint.get(
+                "visual_flow_lateral", 0.0), -1.0, 1.0))
+            expansion = float(np.clip(sensory_hint.get(
+                "visual_flow_expansion", 0.0), 0.0, 1.0))
+            thrust = float(np.clip(
+                thrust + np.clip((FLOW_CRUISE - ventral) * 0.5, -0.15, 0.15),
+                0.0, 1.0))
+            yaw_torque = float(np.clip(
+                yaw_torque + np.clip(lateral * 0.2, -0.15, 0.15),
+                -1.0, 1.0))
+            thrust = float(np.clip(thrust * (1.0 - 0.4 * expansion),
+                                   0.0, 1.0))
 
         return {
             "thrust": float(thrust),

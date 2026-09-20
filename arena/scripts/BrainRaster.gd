@@ -15,10 +15,13 @@ var row_ids: Array = []
 var row_index := {}
 var cols: Array = []
 
-func setup(p_pool: String, p_ids: Array, p_total: int, p_tint: Color) -> void:
+var brain := ""
+
+func setup(p_pool: String, p_ids: Array, p_total: int, p_tint: Color, p_brain: String = "") -> void:
 	pool = p_pool
 	total = p_total
 	tint = p_tint
+	brain = p_brain
 	row_ids = (p_ids as Array).slice(0, MAX_ROWS)
 	row_index.clear()
 	for i in range(row_ids.size()):
@@ -49,8 +52,8 @@ func push_step(spike_ids: Array) -> void:
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.02, 0.02, 0.05, 0.85))
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.4, 0.4, 0.5, 0.6), false, 1.0)
-	var head := "%s  %d cells%s" % [pool, total,
-		("" if total <= MAX_ROWS else " (first %d)" % MAX_ROWS)]
+	var head := "%s%s  %d cells%s" % ["" if brain == "" else brain + " ",
+		pool, total, ("" if total <= MAX_ROWS else " (first %d)" % MAX_ROWS)]
 	draw_string(ThemeDB.fallback_font, Vector2(8, 16), head,
 		HORIZONTAL_ALIGNMENT_LEFT, size.x - 16.0, 12,
 		Color(tint.r, tint.g, tint.b, 0.95))

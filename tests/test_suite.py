@@ -260,6 +260,44 @@ class TestSensoryMotor(unittest.TestCase):
         })
         self.assertFalse(ctrl["emergency_evade"])
 
+    def test_yaw_bias_override(self):
+        # Per-brain DN lateralization correction: default 9.0 pushes a
+        # symmetric volley left; bias 0.0 centers it; measured brains
+        # take their own value (Eye2 ~3, full-mix Eye3 ~15+).
+        from sensory_motor import (MotorDecoder, normalize_yaw_bias,
+                                   draw_yaw_bias, YAW_BIAS_DEFAULT,
+                                   YAW_BIAS_LO, YAW_BIAS_HI)
+        self.assertEqual(normalize_yaw_bias(None), YAW_BIAS_DEFAULT)
+        self.assertEqual(normalize_yaw_bias(3.0), 3.0)
+        for bad in ("left", [1], -1.0, 25.5):
+            with self.assertRaises(ValueError):
+                normalize_yaw_bias(bad)
+        dn = (list(self.pops["descending_all"]["left"][:20])
+              + list(self.pops["descending_all"]["right"][:20]))
+        base = MotorDecoder(self.pops).decode(dn)
+        self.assertEqual(self.decoder._dn_bias, YAW_BIAS_DEFAULT)
+        self.assertLess(base["yaw_torque"], 0.0)
+        centered = MotorDecoder(self.pops, yaw_bias=0.0).decode(dn)
+        self.assertAlmostEqual(centered["yaw_torque"], 0.0, places=5)
+        low = MotorDecoder(self.pops, yaw_bias=3.0).decode(dn)
+        self.assertGreater(low["yaw_torque"], base["yaw_torque"])
+        for _ in range(50):
+            v = draw_yaw_bias()
+            self.assertGreaterEqual(v, YAW_BIAS_LO)
+            self.assertLessEqual(v, YAW_BIAS_HI)
+
+    def test_bind_codecs_yaw_bias(self):
+        import brain_server as bs
+        rec = {"name": "Y", "generator_params": {"yaw_bias": 5.0}}
+        _enc, dec = bs._bind_codecs(rec, self.pops, {})
+        self.assertEqual(dec._dn_bias, 5.0)
+        rec2 = {"name": "Y", "generator_params": {}}
+        _enc2, dec2 = bs._bind_codecs(rec2, self.pops, {})
+        self.assertEqual(dec2._dn_bias, 9.0)
+        rec3 = {"name": "Y", "generator_params": {"yaw_bias": "port"}}
+        with self.assertRaises(ValueError):
+            bs._bind_codecs(rec3, self.pops, {})
+
     def test_brainview_stream_keys_and_detail(self):
         # Brain-view stream: legacy HUD keys intact, per-pool dict
         # present, spike ids gated on detail with truncation guard.
@@ -748,6 +786,41 @@ class TestCrossArityBattles(unittest.TestCase):
         spikes_exp = self._make(self.exp).integrate_50ms(stim)
         self.assertGreater(len(spikes_base), 0, "base brain must spike")
         self.assertGreater(len(spikes_exp), 0, "experiment brain must spike")
+
+    def test_threaded_step_matches_serial(self):
+        # Thread-per-brain must be bit-identical to the sequential path:
+        # fairness demands neither side gain anything from scheduling.
+        # Mirrors production structure exactly: encodes serially (shared
+        # global RandomState must never be touched from workers), then
+        # integrates threaded.
+        from concurrent.futures import ThreadPoolExecutor
+        import brain_server as bs
+        enc = SensoryEncoder(self.pops)
+        dec = MotorDecoder(self.pops)
+        pool_idx = bs._pool_index(self.pops)
+        sens = {"pheromone_conc_left": 0.6, "pheromone_conc_right": 0.3,
+                "visual_target_visible": True, "visual_target_azimuth": 10.0,
+                "visual_rival_looming": 0.4}
+        brains = [self._make(self.base), self._make(self.base)]
+        # One shared stimulus (identical weights + identical spikes in:
+        # identical everything out, on either path).
+        np.random.seed(1234)
+        stim = enc.encode(sens)
+        ca, sa, _, _ = bs._run_side_integrate(dec, brains[0], stim,
+                                              sens, self.pops, pool_idx, 1)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fa = ex.submit(bs._run_side_integrate, dec, brains[1],
+                           stim, sens, self.pops, pool_idx, 1)
+            cb, sb, _, _ = fa.result()
+        self.assertEqual(set(ca.keys()), set(cb.keys()))
+        for k in ca:
+            va, vb = ca[k], cb[k]
+            if isinstance(va, bool):
+                self.assertEqual(va, vb)
+            else:
+                self.assertAlmostEqual(float(va), float(vb), places=5)
+        self.assertEqual(sa["spikes"], sb["spikes"])
+        self.assertEqual(sa["pools"], sb["pools"])
 
     def test_dopamine_both_arities_alternating(self):
         rl = DopamineReinforcement(self.pops)
@@ -1344,6 +1417,46 @@ class TestLegacyCompat(unittest.TestCase):
                 rl.pin_gains(dead, legacy=legacy)
                 np.testing.assert_array_equal(dead.weights, before)
 
+    def test_depression_budget(self):
+        # Per-episode depression budget: one bad episode (120x0.98 =
+        # 0.088x unguarded) must stall at 0.5x instead of grinding into
+        # the abandonment gap; potentiation never consumes budget;
+        # budgets reset per episode and never leak across brains.
+        from dopamine_learning import DopamineReinforcement
+        rl, _make, _pos, _sens = self._fake_rig()
+        # Canonical pool list (budget tracks object identity).
+        pool = rl.da1_left
+        pos = DopamineReinforcement._row_positions(
+            _make().indptr, pool)
+        base = float(np.abs(_make().weights[pos]).mean())
+        b = _make()
+        rl.begin_episode(b)
+        for _ in range(200):
+            rl._scale_outgoing(b, pool, 0.98, cap=0.3)
+        ratio = float(np.abs(b.weights[pos]).mean()) / base
+        self.assertGreaterEqual(ratio, 0.49)
+        self.assertLess(ratio, 0.9)
+        # Potentiation still applies on top of a spent budget.
+        before = b.weights.copy()
+        rl._scale_outgoing(b, pool, 1.2, cap=0.3)
+        self.assertGreater(float(np.abs(b.weights[pos]).mean()),
+                           float(np.abs(before[pos]).mean()))
+        # Reset restores full budget; brains are independent.
+        rl.begin_episode(b)
+        b2 = _make()
+        rl.begin_episode(b2)
+        for _ in range(200):
+            rl._scale_outgoing(b2, pool, 0.98, cap=0.3)
+        r2 = float(np.abs(b2.weights[pos]).mean()) / base
+        self.assertGreaterEqual(r2, 0.49)
+        # Untracked (legacy-direct) path is unbudgeted as before
+        # (fresh list object each time defeats identity tracking).
+        c = _make()
+        for _ in range(200):
+            rl._modulate_pathway(c, list(pool), set(), 0.98)
+        rc = float(np.abs(c.weights[pos]).mean()) / base
+        self.assertLess(rc, 0.49)
+
     def test_legacy_runaway_only_pin(self):
         # Legacy pinning corrects runaway (>2x) but never touches
         # suppression-side learning: a 40x pool pins back, a 0.3x pool
@@ -1837,7 +1950,8 @@ class TestMappingMatrix(unittest.TestCase):
             indptr, indices, wbasis = experiment_arrays(
                 exp, self.csr, self.pops)
             for mapping in (None, "muscles_up", "gyro_flow", "mbon",
-                            ["muscles_up", "gyro_flow", "mbon"], "retina"):
+                            ["muscles_up", "gyro_flow", "mbon"], "retina",
+                            "flow_trans", ["retina", "flow_trans"]):
                 with self.subTest(wiring=exp or "base", mapping=mapping):
                     rec = self._rec(exp, mapping=mapping, use_mapping=True)
                     brain = bs._bind_brain(
@@ -1999,7 +2113,9 @@ class TestTrainerArenaContract(unittest.TestCase):
                   "visual_looming_rate", "altitude", "angular_yaw_rate",
                   "angular_pitch_rate", "angular_roll_rate", "tail_chase",
                   "visual_sec_presence", "visual_sec_size",
-                  "visual_sec_loom", "visual_sec_tree"}
+                  "visual_sec_loom", "visual_sec_tree",
+                  "visual_flow_ventral", "visual_flow_lateral",
+                  "visual_flow_expansion", "visual_flow_climb"}
 
     def test_trainer_covers_arena_keys(self):
         from train_homing import KinematicFly, compute_agent_senses
@@ -2387,6 +2503,109 @@ class TestRetinaWiring(unittest.TestCase):
         self.assertLess(tot, 400)
 
 
+class TestFlowTrans(unittest.TestCase):
+    """Translational optic flow: T4/T5 pool purity, direction-gated
+    encoding, cruise/drift/flare readout, dopamine + trainer support."""
+    @classmethod
+    def setUpClass(cls):
+        cls.pops = load_or_extract_populations()
+
+    def test_t4t5_pool_purity(self):
+        from connectome_loader import _retained_annotations
+        df = _retained_annotations()
+        expect = {"visual_t4a": "T4a", "visual_t4b": "T4b",
+                  "visual_t4c": "T4c", "visual_t4d": "T4d",
+                  "visual_t5a": "T5a", "visual_t5b": "T5b",
+                  "visual_t5c": "T5c", "visual_t5d": "T5d"}
+        for key, typ in expect.items():
+            with self.subTest(pool=key):
+                m = self.pops[key]
+                self.assertGreater(len(m["all"]), 1500)
+                self.assertGreater(len(m["left"]), 700)
+                self.assertGreater(len(m["right"]), 700)
+                types = set(df["type"].iloc[i] for i in m["all"])
+                self.assertEqual(types, {typ})
+
+    def test_encoder_direction_gating(self):
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        t4a = set(self.pops["visual_t4a"]["all"])
+        t5a = set(self.pops["visual_t5a"]["all"])
+        t4b = set(self.pops["visual_t4b"]["all"])
+        t4d = set(self.pops["visual_t4d"]["all"])
+        t4c = set(self.pops["visual_t4c"]["all"])
+        other = (set(self.pops["visual_lc10"]["all"])
+                 | set(self.pops["visual_lc4"]["all"]))
+        sp = set(int(s) for s in enc.encode({"visual_flow_ventral": 0.9}))
+        self.assertGreater(len(sp & (t4a | t5a)), 0)
+        self.assertEqual(len(sp & (t4b | t4d | t4c)), 0)
+        sp = set(int(s) for s in enc.encode({"visual_flow_lateral": 0.8}))
+        self.assertGreater(len(sp & t4b), 0)
+        sp = set(int(s) for s in enc.encode({"visual_flow_expansion": 0.9}))
+        self.assertGreater(len(sp & t4d), 0)
+        sp = set(int(s) for s in enc.encode({"visual_flow_climb": 0.9}))
+        self.assertGreater(len(sp & t4c), 0)
+        for s in sp:
+            self.assertNotIn(s, other)
+        # Base scheme and legacy: no T4/T5 spikes ever.
+        base = SensoryEncoder(self.pops)
+        self.assertEqual(len(base.encode({"visual_flow_ventral": 0.9,
+                                          "visual_flow_expansion": 0.9})), 0)
+        leg = SensoryEncoder(self.pops, mapping="flow_trans", legacy=True)
+        self.assertEqual(len(leg.encode({"visual_flow_ventral": 0.9})), 0)
+
+    def test_decoder_cruise_drift_flare(self):
+        from sensory_motor import MotorDecoder, FLOW_CRUISE
+        dec = MotorDecoder(self.pops, mapping="flow_trans")
+        base = MotorDecoder(self.pops)
+        hint_low = {"visual_flow_ventral": 0.0, "visual_flow_lateral": 0.0,
+                    "visual_flow_expansion": 0.0}
+        hint_high = {"visual_flow_ventral": 1.0, "visual_flow_lateral": 0.0,
+                     "visual_flow_expansion": 0.0}
+        dn = list(self.pops["descending_all"]["all"][:40])
+        t_slow = dec.decode(dn, sensory_hint=hint_low)["thrust"]
+        t_fast = dec.decode(dn, sensory_hint=hint_high)["thrust"]
+        self.assertGreater(t_slow, t_fast)
+        self.assertAlmostEqual(
+            dec.decode(dn, sensory_hint={
+                "visual_flow_ventral": FLOW_CRUISE,
+                "visual_flow_lateral": 0.0,
+                "visual_flow_expansion": 0.0})["thrust"],
+            base.decode(dn)["thrust"], places=5)
+        # Flare cuts thrust; drift trims yaw right on rightward slip.
+        f0 = dec.decode(dn, sensory_hint=hint_low)["thrust"]
+        f1 = dec.decode(dn, sensory_hint={
+            "visual_flow_ventral": 0.0, "visual_flow_lateral": 0.0,
+            "visual_flow_expansion": 1.0})["thrust"]
+        self.assertLess(f1, f0)
+        y = dec.decode(dn, sensory_hint={
+            "visual_flow_ventral": FLOW_CRUISE, "visual_flow_lateral": 0.6,
+            "visual_flow_expansion": 0.0})["yaw_torque"]
+        y0 = dec.decode(dn, sensory_hint={
+            "visual_flow_ventral": FLOW_CRUISE, "visual_flow_lateral": 0.0,
+            "visual_flow_expansion": 0.0})["yaw_torque"]
+        self.assertGreater(y, y0)
+        # Legacy: flow keys inert (same decoder, with/without hint).
+        leg = MotorDecoder(self.pops, mapping="flow_trans", legacy=True)
+        self.assertEqual(leg.decode(dn, sensory_hint=hint_high)["thrust"],
+                         leg.decode(dn)["thrust"])
+        # Base decoder ignores flow keys entirely.
+        self.assertEqual(base.decode(dn, sensory_hint=hint_high)["thrust"],
+                         base.decode(dn)["thrust"])
+
+    def test_dopamine_flow_branch_and_reward(self):
+        from dopamine_learning import DopamineReinforcement
+        rl = DopamineReinforcement(self.pops)
+        t4a = (list(self.pops["visual_t4a"]["left"])
+               + list(self.pops["visual_t4a"]["right"]))
+        r0 = rl.compute_reward(10.0, 10.1, 10.0)
+        r1 = rl.compute_reward(10.0, 10.1, 10.0, ventral=0.35,
+                               schemes=("flow_trans",))
+        self.assertGreater(r1, r0)
+        r2 = rl.compute_reward(10.0, 10.1, 10.0, ventral=0.35)
+        self.assertEqual(r2, r0)
+
+
 class TestSpearLunge(unittest.TestCase):
     """Mouth-motor spear attack: MNxm pool registration, spear_lunge
     wiring (deterministic, mouth-targeted), decoder readout with aim
@@ -2572,6 +2791,8 @@ class TestBattleTransaction(unittest.TestCase):
         class _FakeRL:
             def __init__(self):
                 self.calls = []
+            def begin_episode(self, brain):
+                self.calls.append(("begin",))
             def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
                 self.calls.append(("plastic", sig))
             def pin_gains(self, brain, legacy=False):
@@ -2590,13 +2811,16 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(rl.calls, [])
         np.testing.assert_array_equal(ba.weights, wa)
         np.testing.assert_array_equal(bb.weights, wb)
-        # A decided battle still teaches both sides and pins both.
+        # A decided battle still budgets, teaches both sides, pins both.
         rl2 = _FakeRL()
         self.srv._apply_round_learning(
             rl2, ba, bb, "alpha", {}, {}, {"yaw_torque": 0.0},
             {"yaw_torque": 0.0}, 0.5, (), (), False, False,
             arena_draw=False)
-        self.assertEqual(len(rl2.calls), 4)
+        self.assertEqual(len(rl2.calls), 6)
+        self.assertEqual([c[0] for c in rl2.calls],
+                         ["begin", "begin", "plastic", "plastic",
+                          "pin", "pin"])
 
     def test_pending_roundtrip_and_retry_idempotent(self):
         import copy

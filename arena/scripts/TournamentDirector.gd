@@ -322,10 +322,10 @@ func is_quick() -> bool:
 	return tournament_active() and bool(tourney.get("quick", false))
 
 
-func start_quick_battle(a_id: String, b_id: String) -> Dictionary:
+func start_quick_battle(a_id: String, b_id: String, random_draw: bool = false) -> Dictionary:
 	if a_id == "" or b_id == "" or a_id == b_id:
 		return {"ok": false, "error": "pick two different brains"}
-	return build_bracket([a_id, b_id], 2, 1, 0.5, 40.0, true)
+	return build_bracket([a_id, b_id], 2, 1, 0.5, 40.0, true, [], random_draw)
 
 
 func best_of_options() -> Array:
@@ -352,7 +352,7 @@ func _battle_rate(r: Dictionary) -> float:
 	return float(r.get("wins", 0)) / max(d, 1) if d > 0 else WIN_RATE_FALLBACK
 
 
-func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = []) -> Dictionary:
+func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false) -> Dictionary:
 	var all_brains: Array = list_brains() if brains_override.is_empty() else brains_override
 	var by_id := {}
 	for b in all_brains:
@@ -372,17 +372,29 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	# standard power-of-two seed order, so the top seeds take the byes,
 	# the weakest meet earliest, and round 0 holds exactly size/2 slots
 	# (real matches, BYE cards for the resting seeds, VACANT cards for
-	# empty subtrees when the roster is under half full).
-	players.sort_custom(func(a, b):
-		var sa := _strength(a)
-		var sb := _strength(b)
-		if sa[0] != sb[0]:
-			return sa[0] > sb[0]
-		if sa[1] != sb[1]:
-			return sa[1] > sb[1]
-		if sa[2] != sb[2]:
-			return sa[2] > sb[2]
-		return str(sa[3]) < str(sb[3]))
+	# empty subtrees when the roster is under half full). Random draw
+	# shuffles the entrants instead (byes fall luck-of-the-draw).
+	var seeding := "strength"
+	if random_draw:
+		seeding = "random"
+		var rng := RandomNumberGenerator.new()
+		rng.randomize()
+		for i in range(players.size() - 1, 0, -1):
+			var j := rng.randi_range(0, i)
+			var tmp = players[i]
+			players[i] = players[j]
+			players[j] = tmp
+	else:
+		players.sort_custom(func(a, b):
+			var sa := _strength(a)
+			var sb := _strength(b)
+			if sa[0] != sb[0]:
+				return sa[0] > sb[0]
+			if sa[1] != sb[1]:
+				return sa[1] > sb[1]
+			if sa[2] != sb[2]:
+				return sa[2] > sb[2]
+			return str(sa[3]) < str(sb[3]))
 	var order := _seed_order(size)
 	var leaves: Array = []
 	leaves.resize(size)
@@ -401,7 +413,7 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	tourney = {
 		"id": tid, "status": "running", "size": size, "best_of": best_of,
 		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
-		"round_time": round_time, "quick": quick,
+		"round_time": round_time, "quick": quick, "seeding": seeding,
 		"created": Time.get_datetime_string_from_system(),
 		"players": players, "byes": [],
 		"rounds": [matches], "current_round": 0, "current_match": 0,

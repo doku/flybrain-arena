@@ -17,6 +17,10 @@ const NODES := [
 	["visual_lplc2", "LPLC2", 0], ["visual_lc11", "LC11", 0],
 	["visual_lc15", "LC15", 0], ["visual_lc17", "LC17", 0],
 	["visual_lc18", "LC18", 0], ["gyro_jo", "JO", 0],
+	["visual_t4a", "T4a", 0], ["visual_t4b", "T4b", 0],
+	["visual_t4c", "T4c", 0], ["visual_t4d", "T4d", 0],
+	["visual_t5a", "T5a", 0], ["visual_t5b", "T5b", 0],
+	["visual_t5c", "T5c", 0], ["visual_t5d", "T5d", 0],
 	["mbon_app", "MBON+", 1], ["mbon_av", "MBON-", 1],
 	["dn_left", "dnL", 2], ["dn_right", "dnR", 2],
 	["motor_thrust_dnp09", "DNp09", 2], ["motor_turn_dnp20", "DNp20", 2],
@@ -42,6 +46,14 @@ const EDGES := [
 	["visual_lc11", "motor_mouth", "spear"], ["visual_lc15", "motor_mouth", "spear"],
 	["visual_lc17", "motor_mouth", "spear"], ["visual_lc18", "motor_mouth", "spear"],
 	["gyro_jo", "flow_vs", "gyro"], ["gyro_jo", "flow_hs", "gyro"],
+	["visual_t4a", "dn_left", "flowt"], ["visual_t4a", "dn_right", "flowt"],
+	["visual_t4b", "dn_left", "flowt"], ["visual_t4b", "dn_right", "flowt"],
+	["visual_t4c", "dn_left", "flowt"], ["visual_t4c", "dn_right", "flowt"],
+	["visual_t4d", "dn_left", "flowt"], ["visual_t4d", "dn_right", "flowt"],
+	["visual_t5a", "dn_left", "flowt"], ["visual_t5a", "dn_right", "flowt"],
+	["visual_t5b", "dn_left", "flowt"], ["visual_t5b", "dn_right", "flowt"],
+	["visual_t5c", "dn_left", "flowt"], ["visual_t5c", "dn_right", "flowt"],
+	["visual_t5d", "dn_left", "flowt"], ["visual_t5d", "dn_right", "flowt"],
 	["mbon_app", "dn_left", "value"], ["mbon_app", "dn_right", "value"],
 	["mbon_av", "dn_left", "value"], ["mbon_av", "dn_right", "value"],
 	["dn_left", "motor_steer", "base"], ["dn_right", "motor_steer", "base"],
@@ -49,7 +61,7 @@ const EDGES := [
 ]
 const KIND_WIRING := {"contra": "lplc2_contra_dn", "wide": "retina_wide",
 	"spear": "spear_lunge"}
-const KIND_SCHEME := {"gyro": "gyro_flow"}
+const KIND_SCHEME := {"gyro": "gyro_flow", "flowt": "flow_trans"}
 
 var tint := Color.WHITE
 var emas := {}
@@ -58,6 +70,7 @@ var wiring: Array = []
 var mapping: Array = []
 var selected := ""
 var node_xy := {}
+var title := ""
 
 func refresh(p_emas: Dictionary, p_caps: Dictionary, p_wiring: Array,
 		p_mapping: Array) -> void:
@@ -115,6 +128,10 @@ func _notification(what: int) -> void:
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.02, 0.02, 0.05, 0.78))
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.4, 0.4, 0.5, 0.6), false, 1.0)
+	if title != "":
+		draw_string(ThemeDB.fallback_font, Vector2(8, 16), title,
+			HORIZONTAL_ALIGNMENT_LEFT, size.x - 16.0, 12,
+			Color(0.85, 0.85, 0.9, 0.9))
 	for e in EDGES:
 		if not _edge_on(str(e[2])):
 			continue

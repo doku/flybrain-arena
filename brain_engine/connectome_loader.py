@@ -99,6 +99,20 @@ def load_or_extract_populations(force_regen=False):
     visual_lc15 = get_indices(types.str.match(r"^LC15$", na=False))
     visual_lc17 = get_indices(types.str.match(r"^LC17$", na=False))
     visual_lc18 = get_indices(types.str.match(r"^LC18$", na=False))
+    # Translational optic flow: T4/T5 direction-selective cells, exact
+    # matches (T4_unclear/T5a_unclear excluded — a handful of ambiguous
+    # rows). a/b = progressive/regressive (front-to-back/back-to-front),
+    # c/d = upward/downward (lobula-plate layer convention; ambiguous
+    # subtypes are excluded, never guessed). Clean bilateral via
+    # somaSide (6795R/6790L, no suffix fallback needed).
+    visual_t4a = get_indices(types.str.match(r"^T4a$", na=False))
+    visual_t4b = get_indices(types.str.match(r"^T4b$", na=False))
+    visual_t4c = get_indices(types.str.match(r"^T4c$", na=False))
+    visual_t4d = get_indices(types.str.match(r"^T4d$", na=False))
+    visual_t5a = get_indices(types.str.match(r"^T5a$", na=False))
+    visual_t5b = get_indices(types.str.match(r"^T5b$", na=False))
+    visual_t5c = get_indices(types.str.match(r"^T5c$", na=False))
+    visual_t5d = get_indices(types.str.match(r"^T5d$", na=False))
 
     # --- Neuro-mapping pools (Stage 1: muscles_up + gyro_flow) ---
     # Flight-muscle motor readout: DLMn/DVMn wing power (thrust), MNad
@@ -160,6 +174,16 @@ def load_or_extract_populations(force_regen=False):
         "visual_lc15": visual_lc15,
         "visual_lc17": visual_lc17,
         "visual_lc18": visual_lc18,
+        # Translational optic flow (flow_trans scheme): T4/T5 direction
+        # cells, progressive/regressive/up/down x T4/T5.
+        "visual_t4a": visual_t4a,
+        "visual_t4b": visual_t4b,
+        "visual_t4c": visual_t4c,
+        "visual_t4d": visual_t4d,
+        "visual_t5a": visual_t5a,
+        "visual_t5b": visual_t5b,
+        "visual_t5c": visual_t5c,
+        "visual_t5d": visual_t5d,
         # Neuro-mapping readout/injection pools (muscles_up + gyro_flow)
         "motor_flight_thrust": motor_flight_thrust,
         "motor_steer": motor_steer,
@@ -200,7 +224,13 @@ def load_or_extract_populations(force_regen=False):
           f"JO: {len(pops['gyro_jo']['all'])}, "
           f"VS/HS: {len(pops['flow_vs']['all'])}/{len(pops['flow_hs']['all'])}, "
           f"MBON app/av: {len(pops['mbon_app']['all'])}/{len(pops['mbon_av']['all'])}, "
-          f"MN-mouth: {len(pops['motor_mouth']['all'])}")
+          f"MN-mouth: {len(pops['motor_mouth']['all'])}, "
+          f"T4a/b/c/d: {len(pops['visual_t4a']['all'])}/"
+          f"{len(pops['visual_t4b']['all'])}/"
+          f"{len(pops['visual_t4c']['all'])}/{len(pops['visual_t4d']['all'])}, "
+          f"T5a/b/c/d: {len(pops['visual_t5a']['all'])}/"
+          f"{len(pops['visual_t5b']['all'])}/"
+          f"{len(pops['visual_t5c']['all'])}/{len(pops['visual_t5d']['all'])}")
 
     with open(POPULATIONS_CACHE_FILE, "w") as f:
         json.dump(pops, f, indent=2)

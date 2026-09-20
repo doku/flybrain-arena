@@ -16,6 +16,8 @@ var bv_enable: CheckButton
 var bv_layer: OptionButton
 var bv_detail: OptionButton
 var bv_replay: CheckButton
+var gen_yaw_bias: SpinBox
+var gen_yaw_random: CheckButton
 var gen_name: LineEdit
 var gen_variant: OptionButton
 var gen_seed: SpinBox
@@ -35,6 +37,7 @@ var job_label: Label
 
 var tourney_size: OptionButton
 var tourney_bestof: OptionButton
+var tourney_random: CheckButton
 var tourney_lr: SpinBox
 var tourney_round_time: SpinBox
 var player_list: ItemList
@@ -242,11 +245,13 @@ func _build_vault_column() -> VBoxContainer:
 	return c
 
 
-func _spin(label_text: String, parent: VBoxContainer, minv: float, maxv: float, step: float, value: float) -> SpinBox:
+func _spin(label_text: String, parent: VBoxContainer, minv: float, maxv: float, step: float, value: float, tip: String = "") -> SpinBox:
 	var row := HBoxContainer.new()
 	var l := Label.new()
 	l.text = label_text
 	l.custom_minimum_size = Vector2(150, 0)
+	if tip != "":
+		l.tooltip_text = tip
 	row.add_child(l)
 	var s := SpinBox.new()
 	s.min_value = minv
@@ -254,6 +259,8 @@ func _spin(label_text: String, parent: VBoxContainer, minv: float, maxv: float, 
 	s.step = step
 	s.value = value
 	s.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	if tip != "":
+		s.tooltip_text = tip
 	row.add_child(s)
 	parent.add_child(row)
 	return s
@@ -327,6 +334,7 @@ const MAPPING_OPTIONS := [
 	["gyro_flow", "Antennal gyro input (JO) + VS/HS roll output."],
 	["mbon", "Mushroom-body learned-will readout (approach/avoid value)."],
 	["retina", "Panoramic 21-sector eye (pairs with retina_wide wiring)."],
+	["flow_trans", "Translational flow: T4/T5 cruise control, drift trim, landing flare."],
 ]
 
 
@@ -385,8 +393,15 @@ func _build_config_dialog() -> void:
 	vb.add_child(th)
 	gen_seed = _spin("Seed", vb, 0, 9999, 1, 11)
 	gen_lr = _spin("Learning rate", vb, 0.001, 0.05, 0.001, 0.008)
-	gen_gain = _spin("Dist gain", vb, 0.0, 1.0, 0.01, 0.15)
+	gen_gain = _spin("Dist gain [*0.1-0.2]", vb, 0.0, 1.0, 0.01, 0.15,
+		"Recommended 0.1-0.2 (especially full wiring mixes). 0.5 amplifies dopamine swings and collapses pools faster.")
 	gen_evasion = _spin("Evasion bias", vb, 0.0, 1.0, 0.05, 0.2)
+	gen_yaw_bias = _spin("Yaw bias [*9.0]", vb, 0.0, 25.0, 0.1, 9.0,
+		"Intrinsic DN lateralization correction (measured ~9). Lower if the fly crawls left, raise if it crawls right.")
+	gen_yaw_random = CheckButton.new()
+	gen_yaw_random.text = "randomize yaw bias (6-12)"
+	gen_yaw_random.tooltip_text = "Draws the bias uniform 6-12 at generate time for handedness variation; stamped into the record."
+	vb.add_child(gen_yaw_random)
 	var closerow := HBoxContainer.new()
 	closerow.alignment = BoxContainer.ALIGNMENT_CENTER
 	vb.add_child(closerow)
@@ -459,8 +474,14 @@ func _build_tourney_column() -> VBoxContainer:
 		tourney_bestof.add_item("Best of %d" % b)
 	tourney_bestof.selected = 3
 	c.add_child(tourney_bestof)
-	tourney_lr = _spin("Tourney learn x", c, 0.0, 1.0, 0.1, 0.5)
+	tourney_lr = _spin("Tourney learn x [*0.5]", c, 0.0, 1.0, 0.1, 0.5,
+		"Default 0.5. Long formats 0.2-0.3 (selection over adaptation), short exhibition or sharpening a favorite 0.7-1.0, 0.0 = frozen bracket.")
 	tourney_round_time = _spin("Battle time (s)", c, 10.0, 120.0, 5.0, 40.0)
+	tourney_random = CheckButton.new()
+	tourney_random.text = "Random draw"
+	tourney_random.tooltip_text = "Shuffle entrants instead of strength seeding (byes fall luck-of-the-draw)."
+	tourney_random.button_pressed = true
+	c.add_child(tourney_random)
 	var pl := Label.new()
 	pl.text = "Participants (Ctrl+click multi-select):"
 	pl.add_theme_font_size_override("font_size", 13)
@@ -549,7 +570,7 @@ func _on_brain_selected(idx: int) -> void:
 		mv_text = "+".join(mv) if mv is Array else str(mv)
 	detail_label.text = ("{name}  [{id}]\nBattles {b} (W{l} L{lo} D{d}) | " + \
 		"Matches {m} (W{mw} L{ml}) | Titles {t}\nEpisodes {e} in {s} sessions | " + \
-		"variant {v} seed {sd} lr {lr} gain {g} ev {ev} exp {x} map {mp}\nlineage: {lin}").format({
+		"variant {v} seed {sd} lr {lr} gain {g} ev {ev} exp {x} map {mp} yb {yb}\nlineage: {lin}").format({
 		"name": str(selected_brain.get("name", "?")), "id": str(selected_brain.get("id", "?")),
 		"b": int(r.get("battles", 0)), "l": int(r.get("wins", 0)),
 		"lo": int(r.get("losses", 0)), "d": int(r.get("draws", 0)),
@@ -559,6 +580,7 @@ func _on_brain_selected(idx: int) -> void:
 		"v": str(p.get("variant", "?")), "sd": str(p.get("seed", "?")),
 		"lr": str(p.get("learning_rate", "?")), "g": str(p.get("dist_gain", "?")),
 		"ev": str(p.get("evasion", "?")), "x": _mix_text(p.get("experiment", "base")),
+		"yb": str(p.get("yaw_bias", 9.0)),
 		"mp": mv_text,
 		"lin": str(selected_brain.get("lineage", {}).get("source", "?"))})
 	_prefill_train_widgets(p)
@@ -578,6 +600,7 @@ func _gen_params() -> Dictionary:
 		"align_bonus": [0.5, 0.2, -0.3],
 		"experiment": gen_wiring.duplicate() if not gen_wiring.is_empty() else null,
 		"mapping": schemes if not schemes.is_empty() else null,
+		"yaw_bias": snappedf(randf_range(6.0, 12.0), 0.1) if gen_yaw_random.button_pressed else float(gen_yaw_bias.value),
 	}
 
 
@@ -627,7 +650,7 @@ func _retrain_params() -> Dictionary:
 	var stored: Dictionary = selected_brain.get("generator_params", {})
 	var out := {}
 	for k in ["variant", "seed", "learning_rate", "dist_gain", "evasion",
-			"align_bonus", "experiment", "mapping"]:
+			"align_bonus", "experiment", "mapping", "yaw_bias"]:
 		if stored.has(k):
 			out[k] = stored[k]
 	return out
@@ -647,6 +670,8 @@ func _prefill_train_widgets(p: Dictionary) -> void:
 	gen_lr.value = float(p.get("learning_rate", gen_lr.value))
 	gen_gain.value = float(p.get("dist_gain", gen_gain.value))
 	gen_evasion.value = float(p.get("evasion", gen_evasion.value))
+	gen_yaw_bias.value = float(p.get("yaw_bias", 9.0))
+	gen_yaw_random.button_pressed = false
 	var exp = p.get("experiment", null)
 	var raw: Array = []
 	if exp is Array:
@@ -781,11 +806,12 @@ func _on_start_tournament() -> void:
 	if ids.size() < 2:
 		bracket_status.text = "Pick at least 2 brains (Ctrl+click)."
 		return
-	var res: Dictionary = TournamentDirector.build_bracket(ids, size, bestof, tourney_lr.value, tourney_round_time.value)
+	var res: Dictionary = TournamentDirector.build_bracket(ids, size, bestof, tourney_lr.value, tourney_round_time.value, false, [], tourney_random.button_pressed)
 	if not res.get("ok", false):
 		bracket_status.text = "Cannot start: %s" % res.get("error", "?")
 		return
-	bracket_status.text = "Tournament %s ready." % str(res.get("tournament_id", ""))
+	bracket_status.text = "Tournament %s ready (%s)." % [str(res.get("tournament_id", "")),
+		"random draw" if tourney_random.button_pressed else "strength seeded"]
 	_render_bracket()
 	await get_tree().create_timer(0.5).timeout
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
@@ -798,7 +824,7 @@ func _on_quick_battle() -> void:
 	if ids.size() != 2:
 		bracket_status.text = "Quick battle needs exactly 2 selected brains (Ctrl+click)."
 		return
-	var res: Dictionary = TournamentDirector.start_quick_battle(str(ids[0]), str(ids[1]))
+	var res: Dictionary = TournamentDirector.start_quick_battle(str(ids[0]), str(ids[1]), tourney_random.button_pressed)
 	if not res.get("ok", false):
 		bracket_status.text = "Cannot start: %s" % res.get("error", "?")
 		return

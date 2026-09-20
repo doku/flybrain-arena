@@ -15,6 +15,19 @@ var is_round_active: bool = true
 var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 
+# Shared control cadence (fairness invariant): BOTH flies' commands
+# arrive in one packet, so both always share the same reply interval
+# and the same torque-hold tau. Per-side taus would hand one fly
+# crisper handling and are forbidden by construction (single shared
+# variable, set on both flies every reply).
+var ctrl_label: Label
+var bv_reply_ema: float = 0.2
+var bv_shared_tau: float = 0.15
+var bv_last_reply: float = -1.0
+var bv_cad_n: int = 0
+var bv_cad_dt_sum: float = 0.0
+var bv_cad_tau_sum: float = 0.0
+
 # Brain-view L0 pool-rate bars (key, short label, bar-full count).
 # Updated on every motor reply (~5 Hz) with EMA smoothing; always-on
 # capable (toggled by menu setting, B key, BRAIN button).
@@ -24,6 +37,10 @@ const BV_POOLS := [
 	["visual_lplc2", "LPLC2", 60.0], ["visual_lc11", "LC11", 40.0],
 	["visual_lc15", "LC15", 40.0], ["visual_lc17", "LC17", 40.0],
 	["visual_lc18", "LC18", 40.0], ["gyro_jo", "JO", 60.0],
+	["visual_t4a", "T4a", 40.0], ["visual_t4b", "T4b", 40.0],
+	["visual_t4c", "T4c", 40.0], ["visual_t4d", "T4d", 40.0],
+	["visual_t5a", "T5a", 40.0], ["visual_t5b", "T5b", 40.0],
+	["visual_t5c", "T5c", 40.0], ["visual_t5d", "T5d", 40.0],
 	["mbon_app", "MBONap", 30.0], ["mbon_av", "MBONav", 30.0],
 	["dn_left", "dnL", 120.0], ["dn_right", "dnR", 120.0],
 	["motor_thrust_dnp09", "DNp09", 4.0], ["motor_turn_dnp20", "DNp20", 4.0],
@@ -34,6 +51,8 @@ const BV_POOLS := [
 ]
 var bv_panel_alpha: VBoxContainer
 var bv_panel_beta: VBoxContainer
+var bv_head_alpha: Label
+var bv_head_beta: Label
 var bv_rows_alpha := {}
 var bv_rows_beta := {}
 var bv_ema_alpha := {}
@@ -78,6 +97,14 @@ const BV_NETS := [
 	["visual_lc11", "motor_mouth", "spear"], ["visual_lc15", "motor_mouth", "spear"],
 	["visual_lc17", "motor_mouth", "spear"], ["visual_lc18", "motor_mouth", "spear"],
 	["gyro_jo", "flow_vs", "gyro"], ["gyro_jo", "flow_hs", "gyro"],
+	["visual_t4a", "dn_left", "flowt"], ["visual_t4a", "dn_right", "flowt"],
+	["visual_t4b", "dn_left", "flowt"], ["visual_t4b", "dn_right", "flowt"],
+	["visual_t4c", "dn_left", "flowt"], ["visual_t4c", "dn_right", "flowt"],
+	["visual_t4d", "dn_left", "flowt"], ["visual_t4d", "dn_right", "flowt"],
+	["visual_t5a", "dn_left", "flowt"], ["visual_t5a", "dn_right", "flowt"],
+	["visual_t5b", "dn_left", "flowt"], ["visual_t5b", "dn_right", "flowt"],
+	["visual_t5c", "dn_left", "flowt"], ["visual_t5c", "dn_right", "flowt"],
+	["visual_t5d", "dn_left", "flowt"], ["visual_t5d", "dn_right", "flowt"],
 	["mbon_app", "dn_left", "value"], ["mbon_app", "dn_right", "value"],
 	["mbon_av", "dn_left", "value"], ["mbon_av", "dn_right", "value"],
 	["dn_left", "motor_steer", "base"], ["dn_right", "motor_steer", "base"],
@@ -85,7 +112,7 @@ const BV_NETS := [
 ]
 const BV_NET_WIRING := {"contra": "lplc2_contra_dn", "wide": "retina_wide",
 	"spear": "spear_lunge"}
-const BV_NET_SCHEME := {"gyro": "gyro_flow"}
+const BV_NET_SCHEME := {"gyro": "gyro_flow", "flowt": "flow_trans"}
 const BV_NET_COLORS := {
 	"pheromone_da1": Color(0.4, 1.0, 0.4), "pheromone_va1v": Color(0.5, 0.9, 0.3),
 	"visual_lc10": Color(1.0, 0.9, 0.3), "visual_lc4": Color(1.0, 0.5, 0.2),
@@ -228,6 +255,16 @@ func refresh_slot_names() -> void:
 	wins_alpha = 0
 	wins_beta = 0
 	_update_win_label()
+	# Brain-view headers follow the fighters: named brains in
+	# tournament/quick battles, ALPHA/BETA in free battle.
+	if is_instance_valid(bv_head_alpha):
+		bv_head_alpha.text = _slot_name("alpha") + " BRAIN"
+	if is_instance_valid(bv_head_beta):
+		bv_head_beta.text = _slot_name("beta") + " BRAIN"
+	if is_instance_valid(bv_flow_alpha):
+		bv_flow_alpha.set("title", _slot_name("alpha") + " FLOW")
+	if is_instance_valid(bv_flow_beta):
+		bv_flow_beta.set("title", _slot_name("beta") + " FLOW")
 	# New fighters: raster selections reference the old brains' pools.
 	bv_sel_alpha = ""
 	bv_sel_beta = ""
@@ -295,6 +332,7 @@ func _ready() -> void:
 	_build_health_hud()
 	_build_hit_flash()
 	_build_winner_overlay()
+	_layout_match_hud()
 	_build_brainview()
 	_generate_forest()
 	_setup_dynamic_tree_opacity()
@@ -815,12 +853,17 @@ func _add_tree_part(parent: Node3D, pname: String, mesh: Mesh, pos: Vector3, mat
 
 
 func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Material, cmat: Material, full: bool) -> void:
-	# Every section provably overlaps the one below: the upper trunk pivots
-	# about its own base (fixed inside the lower trunk), and each canopy
-	# blob center sits well within (main + side radii - margin) of its
-	# parent blob. Mesh names feed the dynamic-fade system.
+	# Butt joints, no overlaps: each section starts exactly where the one
+	# below ends (flare 0-1.8, trunk 1.8-9.8, trunk-top 9.8-17.8, canopy
+	# stacked tangent on top). Radii already match at every rim
+	# (0.85 / 0.55), so the seams read as growth rings, not intersections.
+	# The upper trunk still tilts, pivoting about its base point seated
+	# on the lower trunk's top rim (<=4 deg, rim shift negligible).
+	# Canopy side blobs stay merged foliage masses by design - only the
+	# wood-to-wood and wood-to-canopy joints abut. Mesh names feed the
+	# dynamic-fade system.
 	_add_tree_part(parent, "Roots", _tree_mesh("flare"), Vector3(0, 0.9, 0), tmat)
-	_add_tree_part(parent, "Trunk", _tree_mesh("trunk_low"), Vector3(0, 4.6, 0), tmat)
+	_add_tree_part(parent, "Trunk", _tree_mesh("trunk_low"), Vector3(0, 5.8, 0), tmat)
 	var tilt_ang := decor.randf_range(0.0, 0.07)
 	var tilt_az := decor.randf_range(0.0, TAU)
 	var tilt_dir := Vector3(cos(tilt_az), 0.0, sin(tilt_az))
@@ -828,12 +871,13 @@ func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Mat
 	if axis.length() < 0.01:
 		axis = Vector3.RIGHT
 	var top_basis := Basis(axis.normalized(), tilt_ang)
-	var top_base := Vector3(0, 7.4, 0)
+	var top_base := Vector3(0, 9.8, 0)
 	var top_part := _add_tree_part(parent, "TrunkTop", _tree_mesh("trunk_top"), top_base, tmat)
 	top_part.position = top_base + top_basis * Vector3(0, 4.0, 0)
 	top_part.basis = top_basis
 	var top_pos: Vector3 = top_base + top_basis * Vector3(0, 8.0, 0)
-	var canopy_main := top_pos + Vector3(0, 1.2, 0)
+	# Main canopy blob (scaled half-height 1.98) tangent on the trunk top.
+	var canopy_main := top_pos + Vector3(0, 1.98, 0)
 	_add_tree_part(parent, "Canopy", _tree_mesh("blob"), canopy_main, cmat,
 		Vector3(1.15, 0.90, 1.15))
 	var a2 := decor.randf_range(0.0, TAU)
@@ -842,8 +886,9 @@ func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Mat
 		canopy_main + side_dir * 1.8 + Vector3(0, -1.0, 0), cmat,
 		Vector3(0.72, 0.58, 0.72))
 	if full:
+		# Crown blob (scaled half-height 1.35) tangent on the main mass.
 		_add_tree_part(parent, "Canopy3", _tree_mesh("blob_small"),
-			canopy_main + tilt_dir * 0.2 + Vector3(0, 2.4, 0), cmat,
+			canopy_main + tilt_dir * 0.2 + Vector3(0, 3.33, 0), cmat,
 			Vector3(1.0, 0.90, 1.0))
 
 
@@ -1007,6 +1052,8 @@ func _check_seq_watchdog() -> void:
 		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
 
 func _reset_round() -> void:
+	# New round waits for the landing ceremony (bounded inside).
+	await _await_landing()
 	current_round_time = round_time_limit
 	if tournament_active:
 		var director := _director()
@@ -1017,6 +1064,10 @@ func _reset_round() -> void:
 	stats_beta  = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 	flight_alpha = {}
 	flight_beta = {}
+	bv_cad_n = 0
+	bv_cad_dt_sum = 0.0
+	bv_cad_tau_sum = 0.0
+	bv_last_reply = -1.0
 	bv_stream_alpha.clear()
 	bv_stream_beta.clear()
 	_exit_replay()
@@ -1124,10 +1175,10 @@ func _build_health_hud() -> void:
 
 	alpha_health_bar = _make_health_bar(Color(1.0, 0.45, 0.15))
 	beta_health_bar = _make_health_bar(Color(0.15, 0.6, 1.0))
-	alpha_wing_l = _make_wing_label("LW")
-	alpha_wing_r = _make_wing_label("RW")
-	beta_wing_l = _make_wing_label("LW")
-	beta_wing_r = _make_wing_label("RW")
+	alpha_wing_l = _make_wing_label("Left Wing")
+	alpha_wing_r = _make_wing_label("Right Wing")
+	beta_wing_l = _make_wing_label("Left Wing")
+	beta_wing_r = _make_wing_label("Right Wing")
 
 	vbox.add_child(_make_fly_row("ALPHA", Color(1.0, 0.55, 0.3), alpha_health_bar, alpha_wing_l, alpha_wing_r))
 	alpha_row_name = (vbox.get_child(vbox.get_child_count() - 1) as HBoxContainer).get_child(0) as Label
@@ -1177,8 +1228,9 @@ func _make_wing_label(text: String) -> Label:
 	var l := Label.new()
 	l.text = text
 	l.add_theme_font_size_override("font_size", 14)
-	l.custom_minimum_size = Vector2(40, 0)
+	l.custom_minimum_size = Vector2(96, 0)
 	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.clip_text = true
 	return l
 
 func _update_health_hud() -> void:
@@ -1197,6 +1249,56 @@ func _update_wing_label(label: Label, intact: bool) -> void:
 	label.modulate = Color(0.45, 1.0, 0.45) if intact else Color(1.0, 0.25, 0.25)
 
 
+func _layout_match_hud() -> void:
+	# Generation readout is a retired free-battle-evolution leftover:
+	# hide it outright (updates stay guarded no-ops).
+	if is_instance_valid(gen_label):
+		gen_label.visible = false
+	# Round time + wins move to a centered top strip, clear of the
+	# side brain-view panels (reparented scene labels, same nodes).
+	var hud: CanvasLayer = $HUD
+	var strip := HBoxContainer.new()
+	strip.name = "MatchStrip"
+	strip.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	strip.offset_left = -320.0
+	strip.offset_right = 320.0
+	strip.offset_top = 64.0
+	strip.offset_bottom = 96.0
+	strip.alignment = BoxContainer.ALIGNMENT_CENTER
+	strip.add_theme_constant_override("separation", 40)
+	hud.add_child(strip)
+	for lbl in [timer_label, win_label]:
+		if is_instance_valid(lbl):
+			(lbl as Label).horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			var parent := (lbl as Node).get_parent()
+			if parent != null:
+				parent.remove_child(lbl)
+			strip.add_child(lbl)
+	# Control-cadence readout: shared reply rate + torque-hold tau.
+	# Both flies always share these (fairness invariant).
+	ctrl_label = Label.new()
+	ctrl_label.name = "CtrlLabel"
+	ctrl_label.add_theme_font_size_override("font_size", 14)
+	ctrl_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	strip.add_child(ctrl_label)
+	_update_ctrl_label()
+	# Status line ("AERIAL JOUST IN PROGRESS", etc.) to bottom-left,
+	# out of the fight and the top strips.
+	if is_instance_valid(status_label):
+		var corner := VBoxContainer.new()
+		corner.name = "StatusCorner"
+		corner.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+		corner.offset_left = 12.0
+		corner.offset_right = 420.0
+		corner.offset_top = -60.0
+		corner.offset_bottom = -12.0
+		hud.add_child(corner)
+		var old_parent := (status_label as Node).get_parent()
+		if old_parent != null:
+			old_parent.remove_child(status_label)
+		corner.add_child(status_label)
+
+
 func _build_brainview() -> void:
 	# L0 pool-rate bars: one slim panel per fly, screen edges, always-on
 	# capable. 23 rows x 2 panels of tiny bars is trivial draw load; the
@@ -1210,6 +1312,8 @@ func _build_brainview() -> void:
 		Color(1.0, 0.55, 0.3))
 	bv_flow_beta = _make_bv_flow(hud, "FlowBeta", Control.PRESET_BOTTOM_RIGHT,
 		Color(0.4, 0.75, 1.0))
+	bv_flow_alpha.set("title", "ALPHA FLOW")
+	bv_flow_beta.set("title", "BETA FLOW")
 	_build_brain_clouds()
 	_build_replay_panel(hud)
 	_apply_brainview_settings()
@@ -1432,7 +1536,8 @@ func _on_raster_map(side: String, pool: String, ids: Array, total: int) -> void:
 	if not is_instance_valid(raster):
 		return
 	raster.setup(pool, ids, total,
-		Color(1.0, 0.55, 0.3) if side == "alpha" else Color(0.4, 0.75, 1.0))
+		Color(1.0, 0.55, 0.3) if side == "alpha" else Color(0.4, 0.75, 1.0),
+		_slot_name(side))
 	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 
 
@@ -1488,6 +1593,10 @@ func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPrese
 	head.add_theme_font_size_override("font_size", 12)
 	head.add_theme_color_override("font_color", tint)
 	panel.add_child(head)
+	if pname == "BrainAlpha":
+		bv_head_alpha = head
+	else:
+		bv_head_beta = head
 	for spec in BV_POOLS:
 		bv_caps[str(spec[0])] = float(spec[2])
 	for spec in BV_POOLS:
@@ -1533,6 +1642,12 @@ func _apply_brainview_settings() -> void:
 		bv_panel_alpha.visible = enabled
 	if is_instance_valid(bv_panel_beta):
 		bv_panel_beta.visible = enabled
+	# Per-fly spike readout lines (orange/blue "brain n=...") belong to
+	# the brain-view family: they follow the same show toggle.
+	if is_instance_valid(brain_alpha_label):
+		brain_alpha_label.visible = enabled
+	if is_instance_valid(brain_beta_label):
+		brain_beta_label.visible = enabled
 	_apply_bv_layer(layer)
 
 
@@ -1578,6 +1693,10 @@ func _on_brain_button() -> void:
 			bv_panel_alpha.visible = true
 		if is_instance_valid(bv_panel_beta):
 			bv_panel_beta.visible = true
+		if is_instance_valid(brain_alpha_label):
+			brain_alpha_label.visible = true
+		if is_instance_valid(brain_beta_label):
+			brain_beta_label.visible = true
 		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 	else:
 		_cycle_bv_layer()
@@ -1592,6 +1711,10 @@ func _toggle_brainview() -> void:
 		bv_panel_alpha.visible = show_now
 	if is_instance_valid(bv_panel_beta):
 		bv_panel_beta.visible = show_now
+	if is_instance_valid(brain_alpha_label):
+		brain_alpha_label.visible = show_now
+	if is_instance_valid(brain_beta_label):
+		brain_beta_label.visible = show_now
 	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 
 
@@ -1946,6 +2069,8 @@ func _report_battle(draw: bool) -> void:
 func _handle_draw() -> void:
 	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
 	is_round_active = false
+	# Both walk away: land upright for the rematch.
+	_begin_landing("")
 	if tournament_active:
 		# Server records the draw (no dopamine) and replies tournament_battle
 		# "draw"; sequencing continues in _on_tournament_battle.
@@ -2055,10 +2180,33 @@ func _process(delta: float) -> void:
 
 # ────────────────────────────────────────────────────────────────────
 
+func _update_ctrl_label() -> void:
+	if not is_instance_valid(ctrl_label):
+		return
+	var hz := 0.0
+	if bv_reply_ema > 0.001:
+		hz = 1.0 / bv_reply_ema
+	ctrl_label.text = "CTRL %.1fHz t%.2f" % [hz, bv_shared_tau]
+
+
 func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int, stats: Dictionary = {}) -> void:
+	# Shared cadence tracking: reply interval EMA -> shared hold tau
+	# (0.75x, clamped 0.10-0.40), set identically on both flies.
+	var now := Time.get_ticks_msec() / 1000.0
+	if bv_last_reply > 0.0:
+		var dt := maxf(now - bv_last_reply, 0.001)
+		bv_reply_ema = lerpf(bv_reply_ema, dt, 0.2)
+		bv_shared_tau = clampf(0.75 * bv_reply_ema, 0.10, 0.40)
+		bv_cad_n += 1
+		bv_cad_dt_sum += dt
+		bv_cad_tau_sum += bv_shared_tau
+	bv_last_reply = now
+	if is_instance_valid(fly_alpha):
+		fly_alpha.hold_tau = bv_shared_tau
+	if is_instance_valid(fly_beta):
+		fly_beta.hold_tau = bv_shared_tau
+	_update_ctrl_label()
 	current_generation = gen
-	if is_instance_valid(gen_label):
-		gen_label.text = "GENERATION: %04d" % gen
 	fly_alpha.apply_brain_controls(ctrl_alpha)
 	fly_beta.apply_brain_controls(ctrl_beta)
 	_accum_flight(flight_alpha, fly_alpha, ctrl_alpha)
@@ -2067,14 +2215,14 @@ func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int,
 	# Brain activation readout: spikes + descending-neuron balance per fly.
 	var st_a = stats.get("alpha", {})
 	var st_b = stats.get("beta", {})
-	if is_instance_valid(brain_alpha_label):
+	if is_instance_valid(brain_alpha_label) and brain_alpha_label.visible:
 		brain_alpha_label.text = "%s brain n=%d DN L/R %d/%d LPLC2 %d MN %d VS %d thrust %.2f yaw %+.2f pitch %+.2f roll %+.2f" % [
 			(_slot_name("alpha") + "      ").substr(0, 6),
 			int(st_a.get("spikes", 0)), int(st_a.get("dn_left", 0)), int(st_a.get("dn_right", 0)),
 			int(st_a.get("lplc2", 0)), int(st_a.get("mn_thrust", 0)), int(st_a.get("vs_flow", 0)),
 			float(ctrl_alpha.get("thrust", 0.2)), float(ctrl_alpha.get("yaw_torque", 0.0)),
 			float(ctrl_alpha.get("pitch_torque", 0.0)), float(ctrl_alpha.get("roll_torque", 0.0))]
-	if is_instance_valid(brain_beta_label):
+	if is_instance_valid(brain_beta_label) and brain_beta_label.visible:
 		brain_beta_label.text = "%s brain n=%d DN L/R %d/%d LPLC2 %d MN %d VS %d thrust %.2f yaw %+.2f pitch %+.2f roll %+.2f" % [
 			(_slot_name("beta") + "      ").substr(0, 6),
 			int(st_b.get("spikes", 0)), int(st_b.get("dn_left", 0)), int(st_b.get("dn_right", 0)),
@@ -2127,18 +2275,21 @@ func _flight_summary(acc: Dictionary, fly: CharacterBody3D) -> Dictionary:
 		"ram_frac": snappedf(float(acc["ram_steps"]) / n, 0.001),
 		"spear_max": snappedf(float(acc["spear_max"]), 0.01),
 		"lunges": lunges,
+		"ctrl_hz": snappedf(float(bv_cad_n) / maxf(bv_cad_dt_sum, 0.001), 0.01),
+		"tau": snappedf(bv_cad_tau_sum / maxf(bv_cad_n, 1), 0.001),
 	}
 
 
 func _print_flight_line(slot: String, f: Dictionary) -> void:
 	if f.is_empty() or int(f.get("samples", 0)) == 0:
 		return
-	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples)" % [
+	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples) ctrl %.1fHz t%.3f" % [
 		slot, float(f.get("alt_mean", 0.0)), float(f.get("alt_min", 0.0)),
 		float(f.get("alt_max", 0.0)), float(f.get("thrust_mean", 0.0)),
 		float(f.get("pitch_mean", 0.0)), float(f.get("yaw_abs_mean", 0.0)),
 		100.0 * float(f.get("evade_frac", 0.0)), 100.0 * float(f.get("ram_frac", 0.0)),
-		float(f.get("spear_max", 0.0)), int(f.get("lunges", 0)), int(f.get("samples", 0))])
+		float(f.get("spear_max", 0.0)), int(f.get("lunges", 0)), int(f.get("samples", 0)),
+		float(f.get("ctrl_hz", 0.0)), float(f.get("tau", 0.0))])
 
 
 func _on_strike_landed(attacker_id: String, target_part: String) -> void:
@@ -2181,7 +2332,35 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 		if is_instance_valid(status_label):
 			status_label.text = _ko_text("alpha")
 
+	# Landing ceremony instead of a frozen frame: loser drops
+	# belly-up, winner lowers onto its feet (runs behind the banner).
+	_begin_landing("beta" if victim_id == "alpha" else "alpha")
 	_end_round()
+
+
+func _begin_landing(winner_slot: String) -> void:
+	# winner_slot "alpha"/"beta", or "" for a draw (both land upright).
+	for side in ["alpha", "beta"]:
+		var fly: CharacterBody3D = fly_alpha if side == "alpha" else fly_beta
+		if is_instance_valid(fly):
+			fly.begin_landing(winner_slot == "" or side == winner_slot)
+
+
+func _await_landing() -> void:
+	# Holds the round reset until both flies are down (bounded: a fly
+	# stuck on a tree still resets after 8 s).
+	var waited := 0.0
+	while waited < 8.0:
+		var a_down := true
+		if is_instance_valid(fly_alpha):
+			a_down = bool(fly_alpha.landing_done())
+		var b_down := true
+		if is_instance_valid(fly_beta):
+			b_down = bool(fly_beta.landing_done())
+		if a_down and b_down:
+			return
+		await get_tree().create_timer(0.25).timeout
+		waited += 0.25
 
 # Knockout banner: free battle keeps the classic "FLY ALPHA" phrasing;
 # tournament battles use the assigned brain name.
@@ -2229,6 +2408,7 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	if battle_winner == "draw":
 		if is_instance_valid(status_label):
 			status_label.text = "%s DRAW - REPLAYING" % tourney_match_label
+		_begin_landing("")
 		_show_callout("DRAW", Color(0.78, 0.78, 0.82),
 			"%s STALEMATE - REPLAY" % tourney_match_label, "REMATCH", false)
 		await get_tree().create_timer(5.0).timeout

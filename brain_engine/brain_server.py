@@ -1,14 +1,17 @@
+import atexit
 import os
 import sys
 import json
 import time
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import numpy as np
 
 from connectome_loader import load_or_build_csr, load_or_extract_populations
 from lif_brain import FlyBrain
-from sensory_motor import SensoryEncoder, MotorDecoder, normalize_mapping, is_legacy_record
+from sensory_motor import (SensoryEncoder, MotorDecoder, normalize_mapping,
+                             normalize_yaw_bias, is_legacy_record)
 from evolution_engine import EvolutionManager
 from dopamine_learning import DopamineReinforcement
 from experimental_wiring import (experiment_arrays, experiment_suffix,
@@ -32,6 +35,8 @@ def _pool_index(pops):
     for key in ("pheromone_da1", "pheromone_va1v", "visual_lc10",
                 "visual_lc4", "visual_lplc2", "visual_lc11", "visual_lc15",
                 "visual_lc17", "visual_lc18", "gyro_jo",
+                "visual_t4a", "visual_t4b", "visual_t4c", "visual_t4d",
+                "visual_t5a", "visual_t5b", "visual_t5c", "visual_t5d",
                 "motor_thrust_dnp09", "motor_turn_dnp20",
                 "motor_giant_fiber", "motor_ram_dnpe017", "motor_mouth",
                 "motor_flight_thrust", "motor_steer", "flow_vs", "flow_hs",
@@ -46,6 +51,18 @@ def _pool_index(pops):
 
 
 RASTER_CAP = 128
+
+
+def _run_side_integrate(dec, brain, stim, sens, pops, pool_idx, detail):
+    """Integrate->decode->stats for one fighter. Pure function of its
+    inputs (distinct brain object, read-only decoder): safe on worker
+    threads. Encoding stays on the main thread deliberately: the
+    Poisson sampler uses the shared global RandomState, which must
+    never be touched from two threads at once."""
+    spikes = brain.integrate_50ms(stim)
+    ctrl = dec.decode(spikes, sensory_hint=sens)
+    stats = _spike_stats(spikes, pops, pool_idx, detail)
+    return ctrl, stats, sens, spikes
 
 
 def _raster_ids(pool_idx, pool, cap=RASTER_CAP):
@@ -211,12 +228,19 @@ def _bind_codecs(rec, pops, codec_cache):
         raise ValueError(
             f"brain '{rec.get('name')}' declares unknown neuro-mapping "
             f"'{(rec.get('generator_params', {}) or {}).get('mapping', None)}'")
+    try:
+        yb = normalize_yaw_bias((rec.get("generator_params", {}) or {}).get("yaw_bias", None))
+    except ValueError:
+        raise ValueError(
+            f"brain '{rec.get('name')}' declares bad yaw_bias "
+            f"'{(rec.get('generator_params', {}) or {}).get('yaw_bias', None)}'")
     legacy = is_legacy_record(rec)
-    key = (m, legacy)
+    key = (m, legacy, yb)
     if key not in codec_cache:
         codec_cache[key] = (SensoryEncoder(pops, mapping=m, legacy=legacy),
-                            MotorDecoder(pops, mapping=m, legacy=legacy))
-        print(f"[Server] Cached {m} sensorimotor codecs (legacy={legacy})")
+                            MotorDecoder(pops, mapping=m, legacy=legacy,
+                                         yaw_bias=yb))
+        print(f"[Server] Cached {m} sensorimotor codecs (legacy={legacy}, yaw_bias={yb})")
     return codec_cache[key]
 
 
@@ -337,6 +361,11 @@ def _apply_round_learning(dopamine_rl, brain_alpha, brain_beta, winner,
     draw counters advance."""
     if arena_draw:
         return
+    # Per-battle depression budgets (single pulses are too small to bind
+    # at 0.7x vs a 0.5 budget, but the books stay balanced if caps ever
+    # grow — and mixed-arity bouts must never share one budget).
+    dopamine_rl.begin_episode(brain_alpha)
+    dopamine_rl.begin_episode(brain_beta)
     if winner == "alpha":
         dopamine_rl.apply_plasticity(brain_alpha, sens_a, ctrl_a, pulse, schemes_a)
         dopamine_rl.apply_plasticity(brain_beta, sens_b, ctrl_b, -0.8 * pulse, schemes_b)
@@ -436,7 +465,20 @@ def run_brain_server(host="127.0.0.1", port=9999):
     # Per-mapping sensorimotor codecs (base pair above serves free battle,
     # which stays on the current stack; tournament fighters bind their own
     # at tournament_load via _bind_codecs, legacy ones included).
-    codec_cache = {((), False): (encoder, decoder)}
+    codec_cache = {((), False, 9.0): (encoder, decoder)}
+    # Thread-per-brain step workers (njit releases the GIL; per-side
+    # work is a pure function of its inputs). FO_SERIAL=1 forces the
+    # sequential path. One pool, two workers, owned by the loop.
+    # atexit shutdown: worker threads are non-daemon and would wedge
+    # interpreter exit (Ctrl+C hang) without it.
+    if (os.environ.get("FO_SERIAL", "") == "1"):
+        step_executor = None
+        print("[Server] Step workers: serial (FO_SERIAL=1).")
+    else:
+        step_executor = ThreadPoolExecutor(max_workers=2,
+                                           thread_name_prefix="side")
+        atexit.register(step_executor.shutdown, False)
+        print("[Server] Step workers: 2 threads (one per fighter).")
     # Reference wiring for pool-aware gain pinning (wbase of the boot
     # experiment; overlay edge counts shift pool means negligibly).
     dopamine_rl = DopamineReinforcement(
@@ -554,26 +596,39 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 enc_b = tourney_b["enc"] if tournament_mode and tourney_b["rec"] is not None else encoder
                 dec_b = tourney_b["dec"] if tournament_mode and tourney_b["rec"] is not None else decoder
 
-                # Encode sensory states into Poisson spikes
-                stim_a = enc_a.encode(sens_a)
-                stim_b = enc_b.encode(sens_b)
-
-                # Integrate 50 ms in biological LIF connectomes
-                spikes_a = brain_alpha.integrate_50ms(stim_a)
-                spikes_b = brain_beta.integrate_50ms(stim_b)
-
-                # Decode descending motor spikes into flight controls
-                # (brain readout blended with sensory reflex for reliable sign).
-                ctrl_a = dec_a.decode(spikes_a, sensory_hint=sens_a)
-                ctrl_b = dec_b.decode(spikes_b, sensory_hint=sens_b)
-                last_sens_a, last_sens_b = sens_a, sens_b
-                last_ctrl_a, last_ctrl_b = ctrl_a, ctrl_b
-
                 try:
                     detail = int(msg.get("detail", 0))
                 except (TypeError, ValueError):
                     detail = 0
                 detail = max(0, min(detail, 2))
+
+                # Dual-brain step. Encoding runs serially on the main
+                # thread (Poisson sampler owns the shared global
+                # RandomState); integrate->decode->stats runs threaded
+                # across the two fighters (njit releases the GIL;
+                # distinct brain objects, read-only decoders — thread
+                # assignment cannot affect outputs). FO_SERIAL=1 forces
+                # the legacy sequential path for debugging/comparison.
+                stim_a = enc_a.encode(sens_a)
+                stim_b = enc_b.encode(sens_b)
+                if step_executor is None:
+                    ctrl_a, stats_a, _, _ = _run_side_integrate(
+                        dec_a, brain_alpha, stim_a, sens_a, pops,
+                        pool_idx, detail)
+                    ctrl_b, stats_b, _, _ = _run_side_integrate(
+                        dec_b, brain_beta, stim_b, sens_b, pops,
+                        pool_idx, detail)
+                else:
+                    fut_a = step_executor.submit(
+                        _run_side_integrate, dec_a, brain_alpha,
+                        stim_a, sens_a, pops, pool_idx, detail)
+                    fut_b = step_executor.submit(
+                        _run_side_integrate, dec_b, brain_beta,
+                        stim_b, sens_b, pops, pool_idx, detail)
+                    ctrl_a, stats_a, _, _ = fut_a.result()
+                    ctrl_b, stats_b, _, _ = fut_b.result()
+                last_sens_a, last_sens_b = sens_a, sens_b
+                last_ctrl_a, last_ctrl_b = ctrl_a, ctrl_b
                 # Wiring/mapping labels are bound once per fighter (see
                 # tournament_load / boot); the hot loop only reads them.
                 if tournament_mode:
@@ -590,10 +645,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     "beta": ctrl_b,
                     "generation": evo_mgr.generation,
                     "stats": {
-                        "alpha": _spike_stats(spikes_a, pops, pool_idx,
-                                              detail),
-                        "beta": _spike_stats(spikes_b, pops, pool_idx,
-                                             detail),
+                        "alpha": stats_a,
+                        "beta": stats_b,
                         "wiring": {"alpha": wire_a, "beta": wire_b},
                         "mapping": {"alpha": map_a, "beta": map_b},
                     },

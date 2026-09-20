@@ -58,6 +58,19 @@ class DopamineReinforcement:
         jo = populations.get("gyro_jo", {})
         self.jo_left = list(jo.get("left", []))
         self.jo_right = list(jo.get("right", []))
+        # Translational-flow pools (T4/T5, flow_trans scheme). Direction
+        # groups combine T4+T5 of one tuning (a progressive, b
+        # regressive, c up, d down), both sides; stale-cache safe.
+        self.t4 = {}
+        for _dk, _tk in (("a", ("visual_t4a", "visual_t5a")),
+                         ("b", ("visual_t4b", "visual_t5b")),
+                         ("c", ("visual_t4c", "visual_t5c")),
+                         ("d", ("visual_t4d", "visual_t5d"))):
+            _cells = []
+            for _pk in _tk:
+                _pp = populations.get(_pk, {})
+                _cells += list(_pp.get("left", [])) + list(_pp.get("right", []))
+            self.t4[_dk] = _cells
         # Mushroom-body value pools (mbon scheme): Kenyon cells + NT-sign
         # valence MBONs (ACh approach / Glu+GABA avoid). Stale-cache safe.
         self.kc_ids = np.array(populations.get("mushroom_body_kc", []), dtype=np.int32)
@@ -91,12 +104,62 @@ class DopamineReinforcement:
             + self.va1v_right + self.lc10_left + self.lc10_right
             + self.lc4_left + self.lc4_right + self.lplc2_left
             + self.lplc2_right + self.lc11_left + self.lc11_right
-            + self._retina_feat)
+            + self._retina_feat + self.t4["a"] + self.t4["b"]
+            + self.t4["c"] + self.t4["d"])
         self._jo_pref = frozenset(self.jo_left + self.jo_right)
         # Depression floor: refuse to scale a pool that is already at or
         # below this fraction of its reference mean. Potentiation (factor
         # > 1) is never blocked.
         self._floor_frac = 0.12
+        # Per-episode depression budget: even above the floor, one bad
+        # episode (120 micro-steps at 0.98x = 0.088x) or one big battle
+        # pulse can strand a pool in the abandonment gap faster than any
+        # guard reacts. Between begin_episode() calls a pool may lose at
+        # most this fraction of its magnitude (uniform row scaling means
+        # the cumulative product tracks the mean ratio exactly).
+        # Potentiation never consumes budget. Trainer calls
+        # begin_episode() per episode; server per battle.
+        self._ep_budget = 0.5
+        self._cum = {}
+        # Canonical pool lists (object identity -> budget name). Combo
+        # lists built per call (e.g. spear_feat) register themselves in
+        # apply_plasticity before scaling.
+        self._pool_of = {}
+        for _name, _lst in (("da1", self.da1_left), ("da1", self.da1_right),
+                            ("va1v", self.va1v_left), ("va1v", self.va1v_right),
+                            ("lc10", self.lc10_left), ("lc10", self.lc10_right),
+                            ("lplc2", self.lplc2_left), ("lplc2", self.lplc2_right),
+                            ("lc11", self.lc11_left), ("lc11", self.lc11_right),
+                            ("jo", self.jo_left), ("jo", self.jo_right),
+                            ("t4a", self.t4["a"]), ("t4b", self.t4["b"]),
+                            ("t4c", self.t4["c"]), ("t4d", self.t4["d"])):
+            self._pool_of[id(_lst)] = _name
+
+    def begin_episode(self, brain):
+        """Resets per-pool depression budgets for one brain. Call at each
+        episode (trainer) or battle (server) start."""
+        bid = id(brain)
+        for k in [k for k in self._cum if k[0] == bid]:
+            del self._cum[k]
+
+    def _within_budget(self, brain, pools, factor):
+        """True if applying factor keeps every named pool within its
+        per-episode depression budget (also records it). Potentiation
+        and untracked pools always pass."""
+        if factor >= 1.0:
+            return True
+        if isinstance(pools, str):
+            pools = (pools,)
+        if not pools:
+            return True
+        bid = id(brain)
+        keys = [(bid, p) for p in pools]
+        for key in keys:
+            if self._cum.get(key, 1.0) * factor < 1.0 - self._ep_budget:
+                return False
+        for key in keys:
+            self._cum[key] = self._cum.get(key, 1.0) * factor
+        return True
 
     @staticmethod
     def _row_positions(indptr, pre_list):
@@ -308,13 +371,17 @@ class DopamineReinforcement:
                 [pos_app, pos_av]).astype(np.int32),
                 self._base_means.get("kcmbon", 0.0))
 
-    def compute_reward(self, current_dist, prev_dist, azimuth_deg, dt=0.05, tail_chase=0.0):
+    def compute_reward(self, current_dist, prev_dist, azimuth_deg, dt=0.05, tail_chase=0.0,
+                       ventral=0.0, schemes=()):
         """
         Computes the net dopamine neuromodulatory signal:
           - Closing distance (prev_dist > current_dist) -> PAM reward (positive DA)
           - Drifting away (prev_dist < current_dist) -> PPL1 aversive (negative DA)
           - Target heading alignment -> gaze bonus
           - Tail chase (behind victim, facing its tail) -> small position bonus
+          - Steady cruise (flow_trans brains only): ventral flow near the
+            cruise target earns a small bonus, so speed regulation itself
+            is worth something, not just closing.
         The tail bonus is deliberately small (+0.4 max): positioning is shaping
         for the kill, never worth more than the kill itself.
         """
@@ -334,8 +401,15 @@ class DopamineReinforcement:
         else:
             r_align = bad
 
+        # 3. Cruise steadiness (flow_trans only): ventral flow near target.
+        from sensory_motor import FLOW_CRUISE
+        r_flow = 0.0
+        if "flow_trans" in tuple(schemes or ()):
+            v = float(np.clip(ventral, 0.0, 1.0))
+            r_flow = 0.2 * (1.0 - min(abs(v - FLOW_CRUISE) / FLOW_CRUISE, 1.0))
+
         # Net dopamine concentration (PAM > 0 vs PPL1 < 0)
-        da_signal = np.clip(r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0)), -2.0, 2.0)
+        da_signal = np.clip(r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0)) + r_flow, -2.0, 2.0)
         return float(da_signal)
 
     def apply_plasticity(self, brain, sensory_dict, motor_dict, da_signal, schemes=(),
@@ -475,12 +549,20 @@ class DopamineReinforcement:
             spear_az = abs(float(sensory_dict.get("visual_target_azimuth", 0.0) or 0.0))
             if spear_vis and spear_az < 50.0:
                 spear_feat = self.lc11_left + self.lc11_right + self._retina_feat
-                if da_signal > 0:
-                    self._scale_outgoing(brain, spear_feat,
-                                         1.0 + self.lr * da_signal * 0.5)
-                elif da_signal < -0.2:
-                    dep = 1.0 + self.lr * da_signal * 0.5  # da<0 -> factor<1
-                    self._scale_outgoing(brain, spear_feat, dep)
+                # Register the combo list so the depression budget sees
+                # both member pools (these rows also feed pursuit thrust
+                # on retina_wide brains — halve magnitudes so strikes
+                # can't tax pursuit into the ground).
+                self._pool_of[id(spear_feat)] = ("lc11", "lcfeat")
+                try:
+                    if da_signal > 0:
+                        self._scale_outgoing(brain, spear_feat,
+                                             1.0 + self.lr * da_signal * 0.25)
+                    elif da_signal < -0.2:
+                        dep = 1.0 + self.lr * da_signal * 0.25  # da<0 -> factor<1
+                        self._scale_outgoing(brain, spear_feat, dep)
+                finally:
+                    del self._pool_of[id(spear_feat)]
 
         # Tree channel (LPLC2): side-gated avoidance. With the contra wiring a
         # lever, steering AWAY from the looming side is the correct answer -
@@ -521,6 +603,29 @@ class DopamineReinforcement:
                 dep = 1.0 - self.lr * max(abs(da_signal), 0.3) * 0.5
                 self._scale_outgoing(brain, pool, dep)
 
+        # Translational-flow channel (flow_trans brains only): the
+        # direction pools actually driven this tick learn under signed
+        # DA — potentiation when paying off, depression when punished.
+        # Threshold-gated on stimulus presence (no drive = no scaling),
+        # mirroring the JO torque-authority guard.
+        if "flow_trans" in schemes:
+            _flow_drives = []
+            if float(sensory_dict.get("visual_flow_ventral", 0.0)) > 0.2:
+                _flow_drives.append("a")
+            if abs(float(sensory_dict.get("visual_flow_lateral", 0.0))) > 0.2:
+                _flow_drives.append("b")
+            if float(sensory_dict.get("visual_flow_expansion", 0.0)) > 0.2:
+                _flow_drives.append("d")
+            if float(sensory_dict.get("visual_flow_climb", 0.0)) > 0.2:
+                _flow_drives.append("c")
+            for _dk in _flow_drives:
+                if da_signal > 0:
+                    self._scale_outgoing(brain, self.t4[_dk],
+                                         1.0 + self.lr * da_signal * 0.5)
+                elif da_signal < -0.2:
+                    dep = 1.0 + self.lr * da_signal * 0.5  # da<0 -> factor<1
+                    self._scale_outgoing(brain, self.t4[_dk], dep)
+
         # Mushroom-body value pathway (mbon brains only): reward writes
         # approach, punishment writes avoidance. Potentiate KC->MBON_app
         # under DA>0 (and KC->MBON_av under DA<0), depress the opposite
@@ -556,6 +661,9 @@ class DopamineReinforcement:
         cap = self._gain_cap if cap is None else cap
         factor = float(np.clip(factor, 1.0 - cap, 1.0 + cap))
         if factor == 1.0 or not pre_list:
+            return
+        if not self._within_budget(
+                brain, self._pool_of.get(id(pre_list)), factor):
             return
         if factor < 1.0:
             ref = self._outgoing_ref(pre_list)
@@ -639,6 +747,12 @@ class DopamineReinforcement:
         factor_av = float(np.clip(factor_av, 1.0 - cap, 1.0 + cap))
         if factor_app == 1.0 and factor_av == 1.0:
             return
+        if not self._within_budget(brain, "kc_app", factor_app):
+            factor_app = 1.0
+        if not self._within_budget(brain, "kc_av", factor_av):
+            factor_av = 1.0
+        if factor_app == 1.0 and factor_av == 1.0:
+            return
         pos_app, pos_av = self._ensure_kc_mbon(brain)
         ref = (self._base_means or {}).get("kcmbon", 0.0)
         if len(pos_app) > 0 and factor_app != 1.0:
@@ -664,6 +778,8 @@ class DopamineReinforcement:
         cap = self._gain_cap if cap is None else cap
         factor = float(np.clip(factor, 1.0 - cap, 1.0 + cap))
         if factor == 1.0:
+            return
+        if not self._within_budget(brain, "dn_" + side, factor):
             return
         self._ensure_motor_masks(brain)
         mask = self._mask_left if side == "left" else self._mask_right

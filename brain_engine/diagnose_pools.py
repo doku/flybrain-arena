@@ -140,8 +140,82 @@ def census(path, steps=30):
               f"({counts[k] / max(len(pools[k]), 1) / steps:.2f}/cell/step)")
 
 
+def subset_ratios(weights, indptr, pops, wbasis):
+    """Subset-native ratios for every driver pool (the collapse census)."""
+    from dopamine_learning import DopamineReinforcement
+    out = {}
+
+    def _all(key):
+        p = pops.get(key, {})
+        return sorted(set(list(p.get("left", [])) + list(p.get("right", []))
+                          + list(p.get("all", []))))
+
+    feat = []
+    for key in ("visual_lc15", "visual_lc17", "visual_lc18"):
+        feat += _all(key)
+    lc11 = pops.get("visual_lc11", {})
+    groups = {
+        "da1": _all("pheromone_da1"),
+        "va1v": _all("pheromone_va1v"),
+        "lc10": _all("visual_lc10"),
+        "lc4": _all("visual_lc4"),
+        "lplc2": _all("visual_lplc2"),
+        "lc11": sorted(set(list(lc11.get("left", [])) + list(lc11.get("right", [])))),
+        "lcfeat": sorted(set(feat)),
+    }
+    for name, ids in groups.items():
+        pos = DopamineReinforcement._row_positions(np.asarray(indptr), ids)
+        if len(pos) == 0:
+            continue
+        cur = float(np.abs(weights[pos]).mean())
+        nat = float(np.abs(wbasis[pos]).mean())
+        out[name] = cur / nat if nat > 0 else 1.0
+    return out
+
+
+def sweep():
+    """Vault-wide collapse census: every brain, every driver pool,
+    flags dust (<0.10) and weak (<0.20). Read-only."""
+    import glob
+    from experimental_wiring import normalize_experiment, experiment_arrays
+    csr = load_or_build_csr()
+    pops = load_or_extract_populations()
+    for path in sorted(glob.glob(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "brains", "*.flybrain"))):
+        try:
+            rec, w = vault.load_brain(path)
+        except Exception as e:
+            print(f"{os.path.basename(path):32s} UNREADABLE: {e}")
+            continue
+        gp = rec.get("generator_params", {}) or {}
+        exp = normalize_experiment(gp.get("experiment"))
+        try:
+            indptr, indices, wbasis = experiment_arrays(exp, csr, pops)
+        except Exception as e:
+            print(f"{os.path.basename(path):32s} WIRING ERROR: {e}")
+            continue
+        if len(w) != len(indices):
+            print(f"{os.path.basename(path):32s} arity mismatch")
+            continue
+        w = np.ascontiguousarray(np.asarray(w, dtype=np.float32))
+        wbasis = np.ascontiguousarray(np.asarray(wbasis, dtype=np.float32))
+        ratios = subset_ratios(w, indptr, pops, wbasis)
+        dust = sorted(k for k, v in ratios.items() if v < 0.10)
+        weak = sorted(k for k, v in ratios.items() if 0.10 <= v < 0.20)
+        detail = " ".join(f"{k}={ratios[k]:.2f}" for k in sorted(ratios))
+        if dust:
+            print(f"{rec.get('name', '?'):12s} DUST {dust} | {detail}")
+        elif weak:
+            print(f"{rec.get('name', '?'):12s} weak {weak} | {detail}")
+        else:
+            print(f"{rec.get('name', '?'):12s} ok")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[2] == "--census":
         census(sys.argv[1])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--sweep":
+        sweep()
     else:
         main()

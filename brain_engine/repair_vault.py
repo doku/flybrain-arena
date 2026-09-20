@@ -193,13 +193,23 @@ def main(dust_only=False, runaway_only=False, only=None):
             subset_rows[sname] = DopamineReinforcement._row_positions(
                 np.asarray(indptr), sids)
             subset_names.append(sname)
-            pool_base[sname] = pool_base.get(sref, 0.0)
+            # Subset-NATIVE reference (mean over these rows of the
+            # native mix weights): the pooled sens mean misleads on
+            # small-native pools (ORN rows at 0.67 read as 12% of the
+            # pooled 5.37 yet are only 14% of their own native mean —
+            # both weak, but the yardstick must be honest).
+            spos = subset_rows[sname]
+            pool_base[sname] = float(np.abs(wbase[spos]).mean()) \
+                if len(spos) else 0.0
         pos_app, pos_av = rl._ensure_kc_mbon(brain)
         subset_rows["kc_app"] = pos_app
         subset_rows["kc_av"] = pos_av
         subset_rows["jo_sub"] = DopamineReinforcement._row_positions(
             np.asarray(indptr), jo_ids)
-        pool_base["jo_sub"] = pool_base["jo"]
+        for _kn, _kp in (("kc_app", pos_app), ("kc_av", pos_av),
+                         ("jo_sub", subset_rows["jo_sub"])):
+            pool_base[_kn] = float(np.abs(wbase[_kp]).mean()) \
+                if len(_kp) else 0.0
         pools = [("sens", sens_ids), ("jo", jo_ids), ("dn", None),
                  ("kcmbon", None)]
         if dust_only:

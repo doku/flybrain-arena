@@ -82,11 +82,39 @@ def fly_scenario(rec, weights, csr, pops, scenario, episodes, steps):
     }
 
 
+def measure_bias(rec, weights, csr, pops, steps=60):
+    """Intrinsic DN lateralization on symmetric input: equal L/R odor,
+    dead-ahead target, no loom. Reports mean (dnR-dnL) spikes and the
+    yaw sign the current decoder puts out — the number a per-brain
+    yaw_bias should cancel."""
+    import brain_server as bs
+    struct_cache = {}
+    brain = bs._bind_brain(rec, np.ascontiguousarray(
+        np.asarray(weights, dtype=np.float32)), csr, pops, struct_cache)
+    enc, dec = bs._bind_codecs(rec, pops, {})
+    dn_l = set(pops["descending_all"]["left"])
+    dn_r = set(pops["descending_all"]["right"])
+    stim = {"pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5,
+            "visual_target_visible": True, "visual_target_azimuth": 0.0,
+            "visual_rival_looming": 0.0}
+    diffs, yaws = [], []
+    brain.reset_state()
+    for _ in range(steps):
+        spikes = brain.integrate_50ms(enc.encode(stim))
+        sp = set(int(x) for x in spikes)
+        diffs.append(len(sp & dn_r) - len(sp & dn_l))
+        yaws.append(dec.decode(spikes, sensory_hint=stim)["yaw_torque"])
+    return float(np.mean(diffs)), float(np.mean(yaws))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("brains", nargs=2, help="Two vault brain names to compare")
     ap.add_argument("--episodes", type=int, default=4)
     ap.add_argument("--steps", type=int, default=60)
+    ap.add_argument("--bias", action="store_true",
+                    help="Bias-measurement mode: intrinsic dnR-dnL on "
+                    "symmetric input instead of flight scenarios.")
     ap.add_argument("--fresh", action="store_true",
                     help="Compare FRESH (untrained) brains with each brain's "
                     "own wiring+mapping instead of vault weights: separates "
@@ -114,6 +142,22 @@ def main():
         print(f"[{rec['name']}] wiring={gp.get('experiment', 'base')} "
               f"mapping={gp.get('mapping', 'base')} "
               f"episodes={rec.get('training', {}).get('episodes', '?')}")
+
+    if args.bias:
+        print(f"\n=== INTRINSIC BIAS (symmetric input, {args.steps} steps) ===")
+        print(f"{'brain':12s} {'dnR-dnL':>8s} {'yaw':>8s} "
+              f"{'suggest_yb':>10s}")
+        for (rec, w), name in zip(recs, args.brains):
+            diff, yaw = measure_bias(rec, w, csr, pops, args.steps)
+            gp = rec.get("generator_params", {}) or {}
+            print(f"{name:12s} {diff:8.2f} {yaw:+8.3f} "
+                  f"{max(0.0, min(25.0, round(diff, 1))):10.1f} "
+                  f"(stored yb={gp.get('yaw_bias', 9.0)})")
+        print("suggest_yb = measured dnR-dnL clamped to [0, 25]: the "
+              "correction that zeroes this brain's symmetric response, "
+              "valid only while per-tick diffs stay inside the readout's "
+              "linear range (saturated brains ignore corrections).")
+        return
 
     results = {}
     for (rec, w), name in zip(recs, args.brains):

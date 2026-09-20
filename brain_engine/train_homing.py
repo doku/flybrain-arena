@@ -349,6 +349,18 @@ def compute_agent_senses(agent, target, prev_dist=None):
             sec_tree[7 + ci] = wood
             sec_tree[14 + ci] = wood
 
+    # Translational optic flow (mirrors FlyPhysics cell-for-cell):
+    # ventral = horizontal speed over altitude (/2 so cruise reads
+    # ~FLOW_CRUISE), expansion/climb from vertical speed over altitude.
+    # Lateral is always 0.0 here: the kinematic fly moves along its nose
+    # (no sideslip axis), so drift-cancel learns live in the arena.
+    _hspeed = float(np.linalg.norm(agent.forward_vec()[[0, 2]])
+                    * agent.last_speed)
+    _alt = max(float(agent.pos[1]), 1.0)
+    _vy = float(agent.forward_vec()[1] * agent.last_speed)
+    flow_ventral = float(np.clip(_hspeed / _alt / 2.0, 0.0, 1.0))
+    flow_expansion = float(np.clip(max(0.0, -_vy) / _alt / 2.0, 0.0, 1.0))
+    flow_climb = float(np.clip(max(0.0, _vy) / _alt / 2.0, 0.0, 1.0))
     return {
         "pheromone_conc_left": c_left,
         "pheromone_conc_right": c_right,
@@ -364,6 +376,10 @@ def compute_agent_senses(agent, target, prev_dist=None):
                                    tree_right),
         "altitude": float(agent.pos[1]),
         "tail_chase": tail_chase,
+        "visual_flow_ventral": flow_ventral,
+        "visual_flow_lateral": 0.0,
+        "visual_flow_expansion": flow_expansion,
+        "visual_flow_climb": flow_climb,
         "visual_sec_presence": sec_presence,
         "visual_sec_size": sec_size,
         "visual_sec_loom": sec_loom,
@@ -395,7 +411,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                  save_name=None, seed=None, target_evasion=0.2,
                  learning_rate=0.008, dist_gain=0.15, align_bonus=(0.5, 0.2, -0.3),
                  experiment=None, init_weights=None, progress_cb=None,
-                 return_brain=False, mapping=None, legacy=False):
+                 return_brain=False, mapping=None, yaw_bias=None, legacy=False):
     global TREES
     cfg = VARIANTS.get(variant, {})
     label = cfg.get("label", variant)
@@ -440,7 +456,8 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     # Legacy brains (pre-mapping records) train in their original regime:
     # fused loom channel, legacy decoder operating point, no gain pinning.
     encoder = SensoryEncoder(pops, mapping=mapping, legacy=legacy)
-    decoder = MotorDecoder(pops, mapping=mapping, legacy=legacy)
+    decoder = MotorDecoder(pops, mapping=mapping, legacy=legacy,
+                           yaw_bias=yaw_bias)
     schemes = () if legacy else mapping
     dopamine_rl = DopamineReinforcement(pops, learning_rate=learning_rate,
                                         dist_gain=dist_gain, align_bonus=align_bonus,
@@ -518,6 +535,11 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         TREES = base_trees + extra
 
         brain.reset_state()
+        # Per-episode depression budget: a pool may lose at most half
+        # its magnitude per episode, so one bad episode can never grind
+        # a channel into the abandonment gap (the recurring vault-wide
+        # collapse). Potentiation is never budgeted.
+        dopamine_rl.begin_episode(brain)
 
         _, prev_dist = compute_agent_senses(fly, target)
         initial_dist = prev_dist
@@ -551,7 +573,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 prev_dist=prev_dist,
                 azimuth_deg=senses["visual_target_azimuth"],
                 dt=0.05,
-                tail_chase=senses.get("tail_chase", 0.0)
+                tail_chase=senses.get("tail_chase", 0.0),
+                ventral=senses.get("visual_flow_ventral", 0.0),
+                schemes=schemes
             )
             # Recovery shaping: penalize knocked attitudes and ceiling/floor
             # excursions so the brain learns pursuit policies that stay
@@ -587,9 +611,12 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 if lunge_aimed and current_dist <= 6.0:
                     da += 0.3
                 elif current_dist > 8.0:
-                    da -= 0.2
+                    # Softened: punished lunges share rows with pursuit
+                    # thrust (retina_wide), so wild-lunge taxes stay
+                    # small — the miss itself is the lesson.
+                    da -= 0.1
                 else:
-                    da -= 0.3
+                    da -= 0.15
             elif lunge_event == "contact":
                 lunges += 1
                 strikes += 1

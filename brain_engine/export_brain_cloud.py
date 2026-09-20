@@ -26,6 +26,8 @@ OUT = os.path.join(PROJECT_ROOT, "arena", "models", "brain_cloud.json")
 POOL_ORDER = ["pheromone_da1", "pheromone_va1v", "visual_lc10",
               "visual_lc4", "visual_lplc2", "visual_lc11", "visual_lc15",
               "visual_lc17", "visual_lc18", "gyro_jo",
+              "visual_t4a", "visual_t4b", "visual_t4c", "visual_t4d",
+              "visual_t5a", "visual_t5b", "visual_t5c", "visual_t5d",
               "motor_thrust_dnp09", "motor_turn_dnp20", "motor_giant_fiber",
               "motor_ram_dnpe017", "motor_mouth", "motor_flight_thrust",
               "motor_steer", "flow_vs", "flow_hs", "mbon_app", "mbon_av",

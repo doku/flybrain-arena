@@ -32,6 +32,20 @@ Godot 4 arena (ArenaGlade.tscn)  <--UDP 127.0.0.1:9999-->  Python neuro-server
 - **Tick:** 50 ms brain ticks at 20 Hz. A dual-brain step costs ~140–210 ms on
   reference hardware, so the server **collapses queued steps to newest**
   (control messages are never dropped); effective control rate ≈ 5 Hz.
+- **Fairness contract (identical conditions, both brains):** the two
+  fighters integrate on twin worker threads (thread-per-brain;
+  `FO_SERIAL=1` forces sequential) — equal compute, bit-identical
+  outputs either way (encoding stays serial: the Poisson sampler owns
+  the shared global RandomState and never runs on workers; worker
+  threads are non-daemon, shut down via atexit so Ctrl+C exits cleanly)
+  — and both commands arrive in one packet, so both
+  flies share one reply cadence and one torque-hold tau: `shared_tau =
+  clamp(0.75 × interval, 0.10, 0.40)`, set identically every reply
+  (per-side taus are forbidden: they'd hand one fly crisper handling).
+  The top-center strip shows live `CTRL Hz τ`, and every battle banks
+  `ctrl_hz`/`tau` means in its `flights` entry as a conditions ledger.
+  The headless trainer (fixed-dt, seeded) remains the
+  cadence-independent reference.
 - **Server launch:** `launch_battle.py` refuses to start if UDP 9999 is held
   (stale server would steal replies), drains server stdout to `server_log.txt`
   (unbuffered `-u`), and shuts the server down with Godot.
@@ -77,6 +91,8 @@ side-unknown and never driven. Cross-checked against FlyWire/MANC publications
 | `visual_lc15` | 126 | 61 / 65 | LC15 (retina) | Loom-feature readout |
 | `visual_lc17` | 353 | 178 / 175 | LC17 (retina) | Loom-feature readout |
 | `visual_lc18` | 208 | 104 / 104 | LC18 (retina) | Loom-feature readout |
+| `visual_t4a/b/c/d` | 1684/1690/1778/1709 | ~840 / ~850 each | T4 progressive/regressive/up/down (flow_trans) | Translational flow, signed by subtype |
+| `visual_t5a/b/c/d` | 1664/1715/1720/1620 | ~830 / ~855 each | T5 progressive/regressive/up/down (flow_trans) | Translational flow, signed by subtype |
 | `gyro_jo` | 672 | 348 / 324 | JO (Johnston's organ; sides from instance suffix) | Antennal gyroscope, gyro_flow only |
 
 ### 4.2 Motor readout pools
@@ -157,6 +173,22 @@ retina.
 - **retina**: +21-sector panoramic eye (LC11 tracking + LC15/17/18 loom
   features + 7-ray wood); pairs with `retina_wide` wiring. Rear sectors track
   only — evade/parry paths untouched, rear-aspect kills preserved.
+- **flow_trans**: +translational optic flow (T4/T5 direction cells).
+  Arena and trainer derive ventral flow (groundspeed ÷ altitude, cruise
+  reads ~0.35), lateral slip (signed), expansion/climb on descent/ascent
+  — trainer lateral is always 0 (no sideslip axis; drift learns live).
+  Decoder: cruise-control thrust trim toward target flow, small drift yaw
+  trim, landing flare (thrust cut on expansion). Dopamine: cruise
+  steadiness bonus + direction-pool credit, scheme-gated.
+- **yaw_bias**: per-brain DN lateralization correction (default 9.0,
+  measured range 6–12, ceiling 25 for hot mixes). Menu spinbox +
+  randomize draw; stamped in generator params, retrain-graduatable.
+  Diagnose with `probe_flight_style.py --bias` before tuning blind.
+  Limit: fixed subtraction can't center a saturated readout — full-mix
+  brains pin the DN population term near +0.9 on every stimulus (their
+  steering vote is nearly constant; they fly on reflex plus a rightward
+  offset). Centering those needs activity-relative readout
+  normalization, not a bigger constant.
 - Explicit `mapping` in train params graduates a legacy brain (record stamped).
 - Free battle (no vault identities) always runs the current stack.
 
@@ -206,10 +238,23 @@ form). Vault files keep native arity end-to-end; mixed brackets supported
   preserved). Current brains: full bands. Legacy brains: runaway-only (>2×).
   Numerical-dust pools are left for the repair tool.
 - **Vault repair** (`repair_vault.py`, snapshots + `.bak` always):
-  `--dust-only` (restore <10%-of-reference pools to native, per driver
-  subset — DA1/VA1v/LC10/LC4/LPLC2/LC11/loom-features/JO/DN-sides/MBON
-  arms — plus `--brain <name>` to scope one identity), `--runaway-only`
-  (pin >2× pools for every brain), full mode (legacy skipped).
+  `--dust-only` (restore <10%-of-**subset-native**-reference pools to
+  native, per driver subset — DA1/VA1v/LC10/LC4/LPLC2/LC11/loom/JO/DN/
+  MBON-arms — plus `--brain <name>` to scope one identity),
+  `--runaway-only` (pin >2× pools for every brain), full mode (legacy skipped).
+- **Depression budget (permanent collapse guard):** between
+  `begin_episode()` calls (each trainer episode, each battle) a pool may
+  lose at most half its magnitude — tracked as an exact cumulative
+  product per brain, since uniform row scaling moves the mean exactly.
+  Potentiation never consumes budget; untracked legacy paths stay
+  unbudgeted. One bad episode can no longer strand a channel in the
+  abandonment gap.
+- **Collapse post-mortem pattern:** dead odor rows (DA1/VA1v ~0.15×) with
+  live LC10 still leave KCs/DN silent — ignition needs convergent drive,
+  so 0.1–0.2× sensory pools are marginal even above the dust line; probe
+  before trusting them. High `dist_gain` (0.5) amplifies dopamine swings
+  and collapses pools faster; prefer 0.1–0.2 for full-mix training.
+  Vault-wide census: `diagnose_pools.py --sweep`.
 - **Abandonment-gap lesson (measured):** one bad episode (120 micro-steps
   at 0.98×) or one big battle pulse (0.7×) can grind a pool below the
   pin-abandon line (0.1×) while the depression floor (0.12×) refuses
@@ -236,9 +281,12 @@ deltas. The trainer mirrors the arena's spear strike (same trigger, aim
 gate, 1.2 s cooldown, 0.35 s extension window, kick scale, contact reach):
 aimed committed lunges earn shaping reward, blind/wild lunges cost, and
 contact ends the episode as a strike kill; dopamine credits the
-lobula-feature→mouth efferents on paid-off lunges. Known shaping
-simplifications: kinematic (no momentum), scripted target, 6 s episodes vs
-40 s rounds, no roll axis (JO-roll learns live).
+lobula-feature→mouth efferents on paid-off lunges. Translational flow
+channels are computed kinematically (ventral/expansion exact; lateral is
+always 0 — no sideslip axis, drift-cancel learns live) with a cruise
+steadiness reward for flow_trans runs. Known shaping simplifications:
+kinematic (no momentum), scripted target, 6 s episodes vs 40 s rounds,
+no roll axis (JO-roll learns live).
 
 ## 10. Arena (`arena/`)
 
@@ -256,7 +304,9 @@ simplifications: kinematic (no momentum), scripted target, 6 s episodes vs
 - **Combat:** rear-aspect thorax puncture kills (frontal hits parry into spike
   clashes), wing impales tear (60 + 15 wound; torn wing forfeits), spike-clash
   wounds both + knockback with cooldown dedup, tree slams (>11 tear + 50 dmg;
-  >6.5 clip + 15), health/bleed-out KOs.
+  >6.5 clip + 15), health/bleed-out KOs. End-of-round landing ceremony:
+  loser drops belly-up, winner lowers onto its feet (draws: both upright);
+  the next round waits for touchdown (8 s cap).
 - **Flight telemetry:** every control step accumulates altitude profile,
   thrust/pitch/yaw means, evade/ram exposure, spear demand, and lunge
   count per fly. The summary rides with the battle report (printed to

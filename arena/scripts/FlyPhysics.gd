@@ -33,19 +33,30 @@ var current_pitch_torque: float = 0.0
 var current_roll_torque: float = 0.0
 var is_ram_burst: bool = false
 var is_emergency_evade: bool = false
-# Command-hold age: the brain answers at ~5 Hz (dual-LIF step budget),
-# so each torque command would otherwise hold at FULL value across ~12
-# physics frames (~1 rad per yaw command) while flying on 200 ms-old
-# senses — overshoot, reverse, overshoot: the spin-then-spin-back wobble.
-# Holding torques decay with this time constant so each command steers a
-# bounded arc and fresh commands always win. Thrust is sustained (speed
-# continuity and the low-thrust brake depend on it).
+# Command-hold age: the brain answers every few hundred ms (dual-LIF
+# step budget), so each torque command would otherwise hold at FULL
+# value across many physics frames (~1 rad per yaw command) while flying
+# on stale senses — overshoot, reverse, overshoot: the spin-then-spin-back
+# wobble. Holding torques decay so each command steers a bounded arc and
+# fresh commands always win. Thrust is sustained (speed continuity and
+# the low-thrust brake depend on it). hold_tau tracks the measured reply
+# cadence (shared across both flies for fairness — see ArenaManager);
+# 0.15 s is the full-speed default.
 var cmd_age: float = 0.0
-const CMD_TAU: float = 0.15
+var hold_tau: float = 0.15
 
 var left_wing_intact: bool = true
 var right_wing_intact: bool = true
 var wing_flutter_time: float = 0.0
+
+# End-of-round landing ceremony: 0 = fighting (normal), 1 = loser drops
+# upside-down, 2 = winner lowers upright. Brain input ignored while
+# landing; is_disabled is left untouched so the loser stays immune to
+# further hits. reset_fly clears it.
+var landing_mode: int = 0
+const LAND_POS_Y: float = 0.62
+const LOSER_SINK_RATE: float = 3.0
+const WINNER_SINK_RATE: float = 1.4
 
 # Spear lunge attack (mouth-motor driven): a short forward impulse plus
 # a visible spear extension. Gated by cooldown so strikes stay discrete.
@@ -127,10 +138,14 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 			"visual_target_elevation": 0.0,
 			"visual_target_visible": false,
 			"visual_looming_rate": 0.0,
-			"angular_yaw_rate": 0.0,
-			"angular_pitch_rate": 0.0,
-			"angular_roll_rate": 0.0,
-			"tail_chase": 0.0,
+		"angular_yaw_rate": 0.0,
+		"angular_pitch_rate": 0.0,
+		"angular_roll_rate": 0.0,
+		"tail_chase": 0.0,
+		"visual_flow_ventral": 0.0,
+		"visual_flow_lateral": 0.0,
+		"visual_flow_expansion": 0.0,
+		"visual_flow_climb": 0.0,
 			"visual_sec_presence": [],
 			"visual_sec_size": [],
 			"visual_sec_loom": [],
@@ -284,11 +299,38 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 		"angular_pitch_rate": pitch_rate_now,
 		"angular_roll_rate": roll_rate_now,
 		"tail_chase": tail_chase,
+		"visual_flow_ventral": _flow_ventral(),
+		"visual_flow_lateral": _flow_lateral(),
+		"visual_flow_expansion": _flow_expansion(),
+		"visual_flow_climb": _flow_climb(),
 		"visual_sec_presence": sec_presence,
 		"visual_sec_size": sec_size,
 		"visual_sec_loom": sec_loom,
 		"visual_sec_tree": sec_tree
 	}
+
+func _flow_ventral() -> float:
+	# Translational optic flow: horizontal groundspeed over altitude,
+	# scaled so cruise (~5 m/s at ~7 m) reads ~0.35 (FLOW_CRUISE).
+	var hspeed := Vector2(velocity.x, velocity.z).length()
+	return clampf(hspeed / maxf(global_position.y, 1.0) / 2.0, 0.0, 1.0)
+
+
+func _flow_lateral() -> float:
+	# Sideways body velocity (signed: + = drifting right).
+	var side := velocity.dot(global_transform.basis.x)
+	return clampf(side / 6.0, -1.0, 1.0)
+
+
+func _flow_expansion() -> float:
+	# Ground expansion on descent (~ time-to-contact inverted).
+	return clampf(maxf(0.0, -velocity.y) / maxf(global_position.y, 1.0) / 2.0, 0.0, 1.0)
+
+
+func _flow_climb() -> float:
+	# Upward visual flow while climbing (mirror of expansion).
+	return clampf(maxf(0.0, velocity.y) / maxf(global_position.y, 1.0) / 2.0, 0.0, 1.0)
+
 
 func _ray_loom(ray_dir: Vector3) -> float:
 	# Nose-ray trunk proximity, 0..1 over the 14m detection range. Rival is
@@ -306,8 +348,47 @@ func _ray_loom(ray_dir: Vector3) -> float:
 	var d = global_position.distance_to(hit["position"])
 	return clampf((OBSTACLE_RAY_LENGTH - d) / OBSTACLE_RAY_LENGTH, 0.0, 1.0)
 
+func begin_landing(upright: bool) -> void:
+	# End-of-round ceremony: loser (upright=false) drops upside-down,
+	# winner lowers onto its feet. Stops neuro motion; takes
+	# precedence over the disabled death spiral (checked first below).
+	landing_mode = 2 if upright else 1
+	velocity = Vector3.ZERO
+
+
+func landing_done() -> bool:
+	return landing_mode > 0 and global_position.y <= LAND_POS_Y + 0.05
+
+
+func _landing_step(delta: float) -> void:
+	# Graceful descent: sink straight down while slerping to the
+	# ceremony attitude (winner: wings-level nose-forward; loser:
+	# same heading, belly-up). No bounce, no spiral.
+	var rate := WINNER_SINK_RATE if landing_mode == 2 else LOSER_SINK_RATE
+	global_position.y = maxf(global_position.y - rate * delta, LAND_POS_Y)
+	var fwd := -global_transform.basis.z
+	if fwd.length() < 0.01:
+		fwd = Vector3.FORWARD
+	fwd = fwd.normalized()
+	var up := Vector3.UP if landing_mode == 2 else Vector3.DOWN
+	var z_axis := -fwd
+	var x_axis := up.cross(z_axis)
+	if x_axis.length() < 0.05:
+		x_axis = Vector3.RIGHT
+	else:
+		x_axis = x_axis.normalized()
+	var y_axis := z_axis.cross(x_axis).normalized()
+	var target := Basis(x_axis, y_axis, z_axis).orthonormalized()
+	var turn := 1.5 if landing_mode == 2 else 2.5
+	global_transform.basis = global_transform.basis.orthonormalized().slerp(
+		target, clampf(turn * delta, 0.0, 1.0))
+
+
 func _physics_process(delta: float) -> void:
 	clash_cooldown = maxf(0.0, clash_cooldown - delta)
+	if landing_mode > 0:
+		_landing_step(delta)
+		return
 	if is_disabled:
 		# Death spiral: disabled knockout falling into grass
 		velocity.y -= 18.0 * delta # Gravity
@@ -328,9 +409,9 @@ func _physics_process(delta: float) -> void:
 		right_wing_mesh.rotation.z = -flap
 
 	# Leaky command hold (see cmd_age): stale torque commands decay so a
-	# 5 Hz brain steers bounded arcs instead of winding up spins.
+	# slow brain steers bounded arcs instead of winding up spins.
 	cmd_age += delta
-	var hold := exp(-cmd_age / CMD_TAU)
+	var hold := exp(-cmd_age / hold_tau)
 	var yaw_cmd := current_yaw_torque * hold
 	var pitch_cmd := current_pitch_torque * hold
 	var roll_cmd := current_roll_torque * hold
@@ -638,6 +719,7 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	velocity = Vector3.ZERO
 	health = 100.0
 	is_disabled = false
+	landing_mode = 0
 	left_wing_intact = true
 	right_wing_intact = true
 	# Reset sensorimotor state so the new round starts head-on with no
