@@ -37,13 +37,37 @@ scenarios = [
         'pheromone_conc_left': 0.0, 'pheromone_conc_right': 0.0,
         'visual_target_visible': False, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0
     }),
+    ('Floor baseline (far trace, symmetric)', {
+        'pheromone_conc_left': 0.06, 'pheromone_conc_right': 0.06,
+        'visual_target_visible': False, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 0.0, 'scent_cast': 0.0, 'scent_surge': 0.0
+    }),
+    ('Glued on (saturated symmetric)', {
+        'pheromone_conc_left': 0.95, 'pheromone_conc_right': 0.95,
+        'visual_target_visible': True, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 0.0, 'scent_cast': 0.0, 'scent_surge': 0.0
+    }),
+    ('Lost 10s, cast right (search)', {
+        'pheromone_conc_left': 0.05, 'pheromone_conc_right': 0.05,
+        'visual_target_visible': False, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 10.0, 'scent_cast': 1.0, 'scent_surge': 0.0
+    }),
+    ('Closing surge (rising scent)', {
+        'pheromone_conc_left': 0.6, 'pheromone_conc_right': 0.6,
+        'visual_target_visible': True, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 0.0, 'scent_cast': 0.0, 'scent_surge': 1.0
+    }),
 ]
 
 for name, senses in scenarios:
     brain.reset_state()
+    encoder.reset_odor()
     stim = encoder.encode(senses)
     spikes = brain.integrate_50ms(stim)
-    ctrl = decoder.decode(spikes)
+    # Scenarios carrying scent dynamics get the full hint path (reflex
+    # contrast, lost-search, surge); legacy ones stay brain-only.
+    hint = senses if any(k.startswith("scent_") for k in senses) else None
+    ctrl = decoder.decode(spikes, sensory_hint=hint)
     spk_list = list(spikes)
     dnp09_spk = sum(1 for s in spk_list if s in dn09_set)
     dnp20_l_spk = sum(1 for s in spk_list if s in dn20_l_set)

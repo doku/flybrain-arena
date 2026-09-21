@@ -121,6 +121,11 @@ class KinematicFly:
         # trains later via live arena dopamine, not pre-training.
         self.yaw_rate = 0.0
         self.pitch_rate_applied = 0.0
+        # Scent dynamics (mirrors FlyPhysics cell-for-cell): smoothed
+        # total for surge, lost-timer for search, free-running cast.
+        self.scent_prev_smooth = -1.0
+        self.scent_lost_time = 0.0
+        self.scent_cast_phase = 0.0
 
     def forward_vec(self):
         cp = float(np.cos(self.pitch))
@@ -263,6 +268,16 @@ def compute_agent_senses(agent, target, prev_dist=None):
     c_left = float(np.clip(c_base * factor_l, 0.0, 1.0))
     c_right = float(np.clip(c_base * factor_r, 0.0, 1.0))
 
+    # Scent dynamics, part 1 (mirrors FlyPhysics 2b): surge on rising
+    # total. Trainer steps are 50 ms like brain ticks.
+    _sdt = 0.05
+    _total = c_left + c_right
+    if agent.scent_prev_smooth < 0.0:
+        agent.scent_prev_smooth = _total
+    _smooth = agent.scent_prev_smooth + (_total - agent.scent_prev_smooth) * min(1.0, _sdt * 2.0)
+    scent_surge = float(np.clip((_smooth - agent.scent_prev_smooth) / _sdt * 3.0, 0.0, 1.0))
+    agent.scent_prev_smooth = _smooth
+
     # Visual azimuth (horizontal) and nose-relative elevation (for pitch)
     dot_fwd = np.clip(float(np.dot(forward_h, to_h_dir)), -1.0, 1.0)
     dot_right = np.clip(float(np.dot(right_h, to_h_dir)), -1.0, 1.0)
@@ -280,6 +295,15 @@ def compute_agent_senses(agent, target, prev_dist=None):
     to_self_h = to_self_h / (float(np.linalg.norm(to_self_h)) + 1e-4)
     behind_victim = float(np.dot(victim_fwd_h, to_self_h)) < -0.15
     tail_chase = 1.0 if (behind_victim and visible and abs(azimuth_deg) < 35.0) else 0.0
+
+    # Scent dynamics, part 2: floor-relative lost timer (usable scent
+    # or eyes reset it) + free-running cast bias for search steering.
+    if _total > 0.12 or visible:
+        agent.scent_lost_time = 0.0
+    else:
+        agent.scent_lost_time += _sdt
+    agent.scent_cast_phase += _sdt * 0.8
+    scent_cast = float(np.sin(agent.scent_cast_phase))
 
     # Obstacle cone: three nose rays (-35/0/+35 relative to heading). Mirrors
     # the arena's FlyPhysics._ray_loom fan: the trainer must hand the encoder
@@ -364,6 +388,9 @@ def compute_agent_senses(agent, target, prev_dist=None):
     return {
         "pheromone_conc_left": c_left,
         "pheromone_conc_right": c_right,
+        "scent_lost": agent.scent_lost_time,
+        "scent_cast": scent_cast,
+        "scent_surge": scent_surge,
         "visual_target_azimuth": azimuth_deg,
         "visual_target_elevation": apparent_elev_deg,
         "visual_target_visible": visible,
@@ -476,6 +503,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     results = []
 
     for ep in range(1, num_episodes + 1):
+        # Fresh nose per episode: habituation must not carry a saturated
+        # gain into a new spawn.
+        encoder.reset_odor()
         # Spawn Fly Alpha and Target Fly at starting positions (~28m apart)
         # Randomize target position slightly to prevent overfitting
         target_x = 12.0 + np.random.uniform(-4.0, 4.0)
@@ -541,8 +571,10 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         # collapse). Potentiation is never budgeted.
         dopamine_rl.begin_episode(brain)
 
-        _, prev_dist = compute_agent_senses(fly, target)
+        _s0, prev_dist = compute_agent_senses(fly, target)
         initial_dist = prev_dist
+        prev_scent = float(_s0.get("pheromone_conc_left", 0.0)
+                           + _s0.get("pheromone_conc_right", 0.0))
         total_da = 0.0
         success = False
         strike = False
@@ -567,7 +599,10 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             # 4. Decode descending motor controls (brain + reflex assist)
             ctrl = decoder.decode(spikes, sensory_hint=senses)
 
-            # 5. Compute Dopamine reward (closing distance + gaze alignment + tail chase)
+            # 5. Compute Dopamine reward (closing distance + gaze alignment
+            # + tail chase + scent gradient ascent)
+            scent_now = float(senses.get("pheromone_conc_left", 0.0)
+                              + senses.get("pheromone_conc_right", 0.0))
             da = dopamine_rl.compute_reward(
                 current_dist=current_dist,
                 prev_dist=prev_dist,
@@ -575,8 +610,11 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 dt=0.05,
                 tail_chase=senses.get("tail_chase", 0.0),
                 ventral=senses.get("visual_flow_ventral", 0.0),
-                schemes=schemes
+                schemes=schemes,
+                scent_now=scent_now,
+                scent_prev=prev_scent
             )
+            prev_scent = scent_now
             # Recovery shaping: penalize knocked attitudes and ceiling/floor
             # excursions so the brain learns pursuit policies that stay
             # flyable (level, in-band) instead of, e.g., firewalling thrust

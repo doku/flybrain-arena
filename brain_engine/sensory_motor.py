@@ -147,6 +147,14 @@ class SensoryEncoder:
         # side-unknown); without this, one antenna would drive half as hard.
         self.da1_ref = max(len(self.da1_left), len(self.da1_right), 1)
         self.va1v_ref = max(len(self.va1v_left), len(self.va1v_right), 1)
+        # ORN habituation state: sustained odor adapts the encoder gain
+        # down so glued-on smells don't saturate the ORNs. Totals below
+        # HAB_KNEE (the far-field floor zone) never habituate, so the
+        # trace that guarantees re-acquisition survives; recovery is slow
+        # (tens of seconds of battle time). Fresh encoders start at 1.0,
+        # so single-shot tests and first encounters are unaffected; call
+        # reset_odor() at episode/battle boundaries for a fresh nose.
+        self.odor_gain = 1.0
         self.lplc2_ref = max(len(self.lplc2_left), len(self.lplc2_right), 1)
         # Antennal gyroscope (JO), gyro_flow scheme only. Stale caches
         # predate these pools: .get keeps old vault tooling importable.
@@ -155,17 +163,33 @@ class SensoryEncoder:
         self.jo_right = np.array(jo.get("right", []), dtype=np.int32)
         self.jo_ref = max(len(self.jo_left), len(self.jo_right), 1)
 
+    # Habituation tuning (per 50 ms encode tick): attack ~3 s,
+    # recover ~20 s. Floor at 0.3 keeps a saturated nose 30% awake.
+    HAB_KNEE = 0.3
+    HAB_FLOOR = 0.3
+    HAB_ATTACK = 1.0 / 60.0
+    HAB_RECOVER = 1.0 / 400.0
+
     @staticmethod
     def _sample(pool, k):
         if k <= 0 or len(pool) == 0:
             return []
         return np.random.choice(pool, size=k, replace=k > len(pool))
 
+    def reset_odor(self):
+        """Fresh-nose reset for episode/battle boundaries."""
+        self.odor_gain = 1.0
+
     def encode(self, sensory_dict, dt=0.5, duration_ms=50.0):
         """
         sensory_dict contains:
           - pheromone_conc_left: float [0.0 .. 1.0] (Rival fly scent on left antenna)
           - pheromone_conc_right: float [0.0 .. 1.0] (Rival fly scent on right antenna)
+          - scent_lost: float seconds since usable scent (floor-relative;
+            drives search steering when > 3 with nothing visible)
+          - scent_cast: float [-1.0 .. 1.0] slow cast bias for search sweeps
+          - scent_surge: float [0.0 .. 1.0] rising-total-conc surge (chemo-
+            taxis thrust). All three default to found/calm when absent.
           - visual_target_azimuth: float [-180 .. +180] deg (0 = directly ahead, - = left, + = right)
           - visual_target_elevation: float [-90 .. +90] deg
           - visual_target_visible: bool
@@ -189,15 +213,25 @@ class SensoryEncoder:
         c_left = np.clip(sensory_dict.get("pheromone_conc_left", 0.0), 0.0, 1.0)
         c_right = np.clip(sensory_dict.get("pheromone_conc_right", 0.0), 0.0, 1.0)
 
+        # ORN habituation: adapt the drive gain to sustained odor above
+        # the floor knee; recover slowly in clean air. The floor zone
+        # never adapts (gain target 1.0 there).
+        total_odor = float(c_left + c_right)
+        excess = max(0.0, total_odor - self.HAB_KNEE)
+        target = max(self.HAB_FLOOR, 1.0 / (1.0 + 2.0 * excess))
+        rate = self.HAB_ATTACK if target < self.odor_gain else self.HAB_RECOVER
+        self.odor_gain += (target - self.odor_gain) * rate
+        g = self.odor_gain
+
         # Left antenna ORNs
         if c_left > 0.01 and len(self.da1_left) > 0:
-            spikes.extend(self._sample(self.da1_left, int(c_left * self.da1_ref)))
-            spikes.extend(self._sample(self.va1v_left, int(c_left * self.va1v_ref)))
+            spikes.extend(self._sample(self.da1_left, int(c_left * self.da1_ref * g)))
+            spikes.extend(self._sample(self.va1v_left, int(c_left * self.va1v_ref * g)))
 
         # Right antenna ORNs
         if c_right > 0.01 and len(self.da1_right) > 0:
-            spikes.extend(self._sample(self.da1_right, int(c_right * self.da1_ref)))
-            spikes.extend(self._sample(self.va1v_right, int(c_right * self.va1v_ref)))
+            spikes.extend(self._sample(self.da1_right, int(c_right * self.da1_ref * g)))
+            spikes.extend(self._sample(self.va1v_right, int(c_right * self.va1v_ref * g)))
 
         # 2. Visual Small Target Tracking (LC10)
         # Fires when target fly is within forward visual hemisphere
@@ -502,9 +536,12 @@ class MotorDecoder:
             if sensory_hint is None:
                 return base
             # No brain spikes: fall back to pure reflex so the fly still homess.
+            # Surge applies here too: a homing fly spends extra thrust closing.
+            fb_surge = float(np.clip(sensory_hint.get("scent_surge", 0.0), 0.0, 1.0))
             return {
-                "thrust": 0.2,
-                "yaw_torque": float(self.reflex_yaw(sensory_hint)),
+                "thrust": float(np.clip(0.2 + fb_surge * 0.25, 0.0, 1.0)),
+                "yaw_torque": float(self._lost_search_yaw(
+                    sensory_hint, self.reflex_yaw(sensory_hint))),
                 "pitch_torque": float(self.reflex_pitch(sensory_hint)),
                 "roll_torque": 0.0,
                 "approach_bias": 0.0,
@@ -539,6 +576,11 @@ class MotorDecoder:
             loom_spikes = sum(counts.get(s, 0) for s in self.lc_loom_ids)
             thrust += np.clip(loom_spikes * 0.004, 0.0, 0.15)
         thrust = float(np.clip(thrust, 0.0, 1.0))
+        if sensory_hint is not None:
+            # Chemotaxis surge: rising total scent means closing - spend
+            # up to +0.25 extra thrust on it. Absent key reads 0.
+            surge = float(np.clip(sensory_hint.get("scent_surge", 0.0), 0.0, 1.0))
+            thrust = float(np.clip(thrust + surge * 0.25, 0.0, 1.0))
 
         # 2. Steering / Yaw Torque: normalized DN population vector + DNp20.
         # Normalized (tanh) so small lateral diffs still steer and total
@@ -575,6 +617,7 @@ class MotorDecoder:
             # only partly removes); brain sets thrust/bursts/variation.
             reflex = self.reflex_yaw(sensory_hint)
             yaw_torque = float(np.clip(0.3 * brain_yaw + 0.7 * reflex, -1.0, 1.0))
+            yaw_torque = self._lost_search_yaw(sensory_hint, yaw_torque)
         else:
             yaw_torque = brain_yaw
 
@@ -682,12 +725,32 @@ class MotorDecoder:
         }
 
     @staticmethod
+    def _lost_search_yaw(sensory_hint, yaw_torque):
+        """Floor-relative lost-scent search: usable scent gone 3+ s with
+        nothing visible -> blend toward the slow cast sweep instead of
+        coasting straight. Keys default to found, so legacy/partial
+        dicts behave exactly as before."""
+        if sensory_hint is None:
+            return yaw_torque
+        if float(sensory_hint.get("scent_lost", 0.0)) <= 3.0:
+            return yaw_torque
+        if bool(sensory_hint.get("visual_target_visible", False)):
+            return yaw_torque
+        cast = float(np.clip(sensory_hint.get("scent_cast", 0.0), -1.0, 1.0))
+        return float(np.clip(0.5 * yaw_torque + 0.5 * cast * 0.8, -1.0, 1.0))
+
+    @staticmethod
     def reflex_yaw(sensory_dict):
-        """Pure sensory tropotaxis prior: >0 right, <0 left."""
+        """Pure sensory tropotaxis prior: >0 right, <0 left. Lateral
+        CONTRAST (R-L)/(R+L): bearing reads the same faint or strong,
+        so far-faint traces steer decisively and glued-on saturation
+        no longer flattens the turn. Sign and silence preserved: equal
+        inputs (incl. double-zero floor) still read exactly 0."""
         c_l = float(np.clip(sensory_dict.get("pheromone_conc_left", 0.0), 0.0, 1.0))
         c_r = float(np.clip(sensory_dict.get("pheromone_conc_right", 0.0), 0.0, 1.0))
         az = float(sensory_dict.get("visual_target_azimuth", 0.0))
-        return float(np.clip((c_r - c_l) * 1.5 + az / 90.0 * 0.8, -1.0, 1.0))
+        contrast = (c_r - c_l) / (c_r + c_l + 1e-6)
+        return float(np.clip(contrast * 1.5 + az / 90.0 * 0.8, -1.0, 1.0))
 
     @staticmethod
     def reflex_evade(sensory_dict):

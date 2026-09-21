@@ -130,7 +130,12 @@ fallbacks to the excitatory default).
 
 - **Pheromone:** bilateral concentrations × head-shadow antenna factors;
   strength follows nose direction (directional smelling: full nose-on, faint
-  trace behind).
+  trace behind). The gradient floor never dies (lost flies must re-acquire);
+  ORN drive habituates above the floor knee (gain → 0.3 sustained, ~20 s
+  recovery, fresh nose per episode/battle). Yaw reflex reads lateral
+  CONTRAST (R−L)/(R+L), so faint traces steer as decisively as strong ones.
+  Scent dynamics keys (`scent_lost`/`scent_cast`/`scent_surge`) drive search
+  steering (lost 3+ s + blind → cast sweeps) and closing surge (+0.25 thrust).
 - **LC10 tracking:** gated on target-visible; side by azimuth sign (dead-ahead
   splits both sides); intensity falls off toward the periphery.
 - **LC4:** rival-loom scalar drives both sides (non-spatial); legacy brains use
@@ -148,7 +153,9 @@ fallbacks to the excitatory default).
   DNp09 kick + MN votes (muscles_up) + LC11/loom urgency (retina).
 - **Yaw:** normalized DN population vector (intrinsic +9 R-bias subtracted)
   + DNp20 + MN laterality (muscles_up) + LC11 fixation (retina), blended
-  30/70 with the olfactory/visual reflex (reflex leads the sign).
+  30/70 with the olfactory/visual reflex (reflex leads the sign; reflex
+  yaw is lateral-contrast normalized, and blends toward cast sweeps when
+  scent is lost 3+ s with nothing visible).
 - **Pitch:** reflex-driven (elevation tracking + altitude hold).
 - **Roll:** VS/HS balance, gyro_flow only.
 - **Bursts:** ram (DNpe017 ≥ 2), emergency evade (giant fiber gated on visible

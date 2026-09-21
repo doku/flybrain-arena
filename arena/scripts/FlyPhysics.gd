@@ -78,6 +78,15 @@ var rival: FlyPhysics = null
 
 # Scent and visual tracking
 var prev_rival_dist: float = 50.0
+# Scent dynamics (rival-detection channel): smoothed total for surge,
+# lost-timer for search behavior, free-running cast phase. The gradient
+# floor never dies (lost flies must re-acquire), so "lost" is defined
+# floor-relative: total at/below LOST_THRESH with nothing visible.
+const LOST_THRESH: float = 0.12
+const LOST_CAST_RATE: float = 0.8
+var scent_prev_smooth: float = -1.0
+var scent_lost_time: float = 0.0
+var scent_cast_phase: float = 0.0
 
 # Antennal-gyro tracking: previous attitude for per-tick angular rates.
 # Synced on reset; re-syncs automatically on the first sensory read.
@@ -134,6 +143,9 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 		return {
 			"pheromone_conc_left": 0.0,
 			"pheromone_conc_right": 0.0,
+			"scent_lost": 0.0,
+			"scent_cast": 0.0,
+			"scent_surge": 0.0,
 			"visual_target_azimuth": 0.0,
 			"visual_target_elevation": 0.0,
 			"visual_target_visible": false,
@@ -240,6 +252,23 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	var behind_rival = rival_local.z > 0.15
 	var tail_chase = 1.0 if (behind_rival and is_visible and absf(azimuth_deg) < 35.0) else 0.0
 
+	# 2b. Scent dynamics: surge (rising total = closing), lost timer and
+	# cast bias for search. Smoothed total (0.5 s tau) so per-frame noise
+	# never fires the surge; sentinel snaps on first read (no spawn kick).
+	var scent_total = c_left + c_right
+	var dt := maxf(frame_delta, 0.001)
+	if scent_prev_smooth < 0.0:
+		scent_prev_smooth = scent_total
+	var scent_smooth = scent_prev_smooth + (scent_total - scent_prev_smooth) * minf(1.0, dt * 2.0)
+	var scent_surge = clampf((scent_smooth - scent_prev_smooth) / dt * 3.0, 0.0, 1.0)
+	scent_prev_smooth = scent_smooth
+	if scent_total > LOST_THRESH or is_visible:
+		scent_lost_time = 0.0
+	else:
+		scent_lost_time += dt
+	scent_cast_phase += dt * LOST_CAST_RATE
+	var scent_cast = sin(scent_cast_phase)
+
 	# 5. Panoramic sector grid (retina scheme): 7 azimuth columns over the
 	# full circle x 3 elevation bands = 21 cells. Rival occupies exactly
 	# one cell (presence + angular size + loom); tree rays fan all 7
@@ -285,6 +314,9 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	return {
 		"pheromone_conc_left": c_left,
 		"pheromone_conc_right": c_right,
+		"scent_lost": scent_lost_time,
+		"scent_cast": scent_cast,
+		"scent_surge": scent_surge,
 		"visual_target_azimuth": azimuth_deg,
 		"visual_target_elevation": elevation_deg,
 		"visual_target_visible": is_visible,
@@ -742,6 +774,9 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	clash_cooldown = 0.0
 	basis_init = false
 	prev_rival_dist = spawn_pos.distance_to(rival.global_position) if is_instance_valid(rival) else 28.0
+	scent_prev_smooth = -1.0
+	scent_lost_time = 0.0
+	scent_cast_phase = 0.0
 	if is_instance_valid(left_wing_mesh):
 		left_wing_mesh.visible = true
 	if is_instance_valid(right_wing_mesh):

@@ -847,6 +847,10 @@ def run_brain_server(host="127.0.0.1", port=9999):
                       f"({tourney_note()} match={msg.get('match', '')})", flush=True)
                 brain_alpha.reset_state()
                 brain_beta.reset_state()
+                # Fresh noses: encoder habituation must not carry a
+                # saturated gain across battles.
+                for _enc, _dec in codec_cache.values():
+                    _enc.reset_odor()
                 if "match" in msg:
                     tourney_tag["match"] = str(msg["match"])
                 sock.sendto(json.dumps({"status": "match_ready"}).encode("utf-8"), client_addr)

@@ -372,7 +372,7 @@ class DopamineReinforcement:
                 self._base_means.get("kcmbon", 0.0))
 
     def compute_reward(self, current_dist, prev_dist, azimuth_deg, dt=0.05, tail_chase=0.0,
-                       ventral=0.0, schemes=()):
+                       ventral=0.0, schemes=(), scent_now=0.0, scent_prev=0.0):
         """
         Computes the net dopamine neuromodulatory signal:
           - Closing distance (prev_dist > current_dist) -> PAM reward (positive DA)
@@ -382,6 +382,11 @@ class DopamineReinforcement:
           - Steady cruise (flow_trans brains only): ventral flow near the
             cruise target earns a small bonus, so speed regulation itself
             is worth something, not just closing.
+          - Scent gradient ascent (optional scent_now/scent_prev totals):
+            rising total concentration pays up to +0.5, falling costs the
+            same - smelling the approach is worth something even when the
+            eyes haven't found the rival yet. Defaults 0.0 keep legacy
+            callers (and the server battle loop) exactly unchanged.
         The tail bonus is deliberately small (+0.4 max): positioning is shaping
         for the kill, never worth more than the kill itself.
         """
@@ -390,6 +395,10 @@ class DopamineReinforcement:
 
         # 1. Distance shaping reward: rewards positive closing velocity
         r_dist = np.clip(closing_speed * self.dist_gain, -2.0, 2.0)
+
+        # 1b. Scent gradient ascent: rising total odor concentration.
+        scent_rate = (float(scent_now) - float(scent_prev)) / max(dt, 1e-6)
+        r_scent = 0.5 * float(np.clip(scent_rate * 2.0, -1.0, 1.0))
 
         # 2. Heading alignment reward: bonus if facing toward opponent
         abs_azimuth = abs(azimuth_deg)
@@ -409,7 +418,7 @@ class DopamineReinforcement:
             r_flow = 0.2 * (1.0 - min(abs(v - FLOW_CRUISE) / FLOW_CRUISE, 1.0))
 
         # Net dopamine concentration (PAM > 0 vs PPL1 < 0)
-        da_signal = np.clip(r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0)) + r_flow, -2.0, 2.0)
+        da_signal = np.clip(r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0)) + r_flow + r_scent, -2.0, 2.0)
         return float(da_signal)
 
     def apply_plasticity(self, brain, sensory_dict, motor_dict, da_signal, schemes=(),
@@ -675,6 +684,18 @@ class DopamineReinforcement:
             if end > start:
                 brain.weights[start:end] = np.clip(
                     brain.weights[start:end] * factor, -3000.0, 3000.0)
+
+    def scent_acuity(self, brain):
+        """Olfactory acuity lineage metric: mean |w| over DA1+VA1v
+        outgoing synapses (both sides). Rises when pursuit training
+        potentiates the nose, falls when wrong-way turns depress it.
+        Read-only measurement for breeding records and selection design;
+        fitness integration needs arena->server stats plumbing (follow-up).
+        Returns 0.0 when the brain has no ORN efferents yet."""
+        return float(np.mean([
+            self._pool_cur(brain, self.da1_left + self.da1_right),
+            self._pool_cur(brain, self.va1v_left + self.va1v_right),
+        ]))
 
     @staticmethod
     def _pool_cur(brain, pre_list):

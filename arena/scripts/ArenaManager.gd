@@ -1150,7 +1150,7 @@ func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, fea
 	# Feature readout: the exact pre-brain values about to be sent north.
 	if is_instance_valid(feat):
 		var vis = "Y" if sens.get("visual_target_visible", false) else "-"
-		feat.text = "AZ %+.0f EL %+.0f RIV %.2f TR %.2f (L%.2f R%.2f) VIS %s PH L%.2f R%.2f TAIL %.0f" % [
+		feat.text = "AZ %+.0f EL %+.0f RIV %.2f TR %.2f (L%.2f R%.2f) VIS %s PH L%.2f R%.2f LOST %.0fs SURGE %.2f TAIL %.0f" % [
 			float(sens.get("visual_target_azimuth", 0.0)),
 			float(sens.get("visual_target_elevation", 0.0)),
 			float(sens.get("visual_rival_looming", 0.0)),
@@ -1160,6 +1160,8 @@ func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, fea
 			vis,
 			float(sens.get("pheromone_conc_left", 0.0)),
 			float(sens.get("pheromone_conc_right", 0.0)),
+			float(sens.get("scent_lost", 0.0)),
+			float(sens.get("scent_surge", 0.0)),
 			float(sens.get("tail_chase", 0.0))]
 
 func _build_health_hud() -> void:

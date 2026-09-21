@@ -127,6 +127,117 @@ class TestSensoryMotor(unittest.TestCase):
         for s in spikes_right:
             self.assertIn(s, da1_right_set)
 
+    def test_reflex_yaw_contrast(self):
+        # Lateral contrast (R-L)/(R+L): bearing reads the same faint or
+        # strong; equal inputs (incl. double-zero) stay exactly silent.
+        ry = MotorDecoder.reflex_yaw
+        self.assertEqual(ry({"pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}), 0.0)
+        self.assertEqual(ry({"pheromone_conc_left": 0.0, "pheromone_conc_right": 0.0}), 0.0)
+        faint = ry({"pheromone_conc_left": 0.2, "pheromone_conc_right": 0.05})
+        glued = ry({"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.85})
+        self.assertLess(faint, 0.0)
+        self.assertLess(glued, 0.0)
+        # Faint-but-lateral steers harder than strong-but-balanced.
+        self.assertLess(faint, glued)
+        self.assertGreater(
+            ry({"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.2}), 0.0)
+
+    def test_lost_search_and_surge(self):
+        # Lost 3+ s with nothing visible: yaw blends toward the cast
+        # sweep instead of coasting; eyes or fresh scent disables it.
+        dec = MotorDecoder(self.pops)
+        lost = {"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.05,
+                "visual_target_visible": False, "scent_lost": 10.0,
+                "scent_cast": 1.0, "scent_surge": 0.0}
+        self.assertGreater(dec.decode([], sensory_hint=lost)["yaw_torque"], 0.0)
+        lost["scent_cast"] = -1.0
+        self.assertLess(dec.decode([], sensory_hint=lost)["yaw_torque"], 0.0)
+        found = dict(lost, scent_lost=0.0, scent_cast=1.0)
+        self.assertAlmostEqual(
+            dec.decode([], sensory_hint=found)["yaw_torque"],
+            dec.reflex_yaw(found), places=6)
+        seen = dict(lost, visual_target_visible=True)
+        self.assertAlmostEqual(
+            dec.decode([], sensory_hint=seen)["yaw_torque"],
+            dec.reflex_yaw(seen), places=6)
+        # Surge: rising scent spends extra thrust (capped at 1.0).
+        calm = {"pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5,
+                "visual_target_visible": True, "scent_surge": 0.0}
+        rising = dict(calm, scent_surge=1.0)
+        t0 = dec.decode([], sensory_hint=calm)["thrust"]
+        t1 = dec.decode([], sensory_hint=rising)["thrust"]
+        self.assertGreater(t1, t0)
+        self.assertLessEqual(t1, 1.0)
+
+    def test_scent_reward_and_acuity(self):
+        # Rising total conc pays, falling costs; acuity reads ORN
+        # efferent strength and rises with correct-turn potentiation.
+        rl = DopamineReinforcement(self.pops)
+        up = rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.6, scent_prev=0.4)
+        flat = rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.4, scent_prev=0.4)
+        down = rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.4, scent_prev=0.6)
+        self.assertGreater(up, flat)
+        self.assertLess(down, flat)
+        # Legacy callers (no scent kwargs) unchanged.
+        self.assertEqual(
+            rl.compute_reward(20.0, 20.0, 0.0),
+            rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.0, scent_prev=0.0))
+        # Minimal fake brain: 3 outgoing 0.5-weight edges per ORN.
+        # Targets sit past every pool id so motor/KC masks (matched on
+        # postsynaptic targets) stay empty and only ORN efferents move.
+        import types
+        orn = set(self.pops["pheromone_da1"]["left"]
+                  + self.pops["pheromone_da1"]["right"]
+                  + self.pops["pheromone_va1v"]["left"]
+                  + self.pops["pheromone_va1v"]["right"])
+        top = max(orn) + 2
+        indptr = np.zeros(top + 1, dtype=np.int64)
+        tot = 0
+        for i in range(top):
+            indptr[i] = tot
+            if i in orn:
+                tot += 3
+        indptr[top] = tot
+        brain = types.SimpleNamespace(
+            indptr=indptr,
+            indices=(900000 + np.arange(tot)).astype(np.int32),
+            weights=np.full(tot, 0.5, dtype=np.float32))
+        a0 = rl.scent_acuity(brain)
+        self.assertAlmostEqual(a0, 0.5, places=5)
+        sens = {"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.1,
+                "visual_target_azimuth": -40.0}
+        motor = {"yaw_torque": -0.5, "thrust": 0.3, "pitch_torque": 0.0}
+        rl.apply_plasticity(brain, sens, motor, 1.0)
+        self.assertGreater(rl.scent_acuity(brain), a0)
+
+    def test_odor_habituation(self):
+        # Sustained strong odor adapts the drive down (bounded by the
+        # floor); clean air recovers slowly; the floor zone never adapts.
+        enc = SensoryEncoder(self.pops)
+        strong = {"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.9}
+        np.random.seed(7)
+        n1 = len(enc.encode(strong))
+        self.assertGreater(n1, 0)
+        for _ in range(200):
+            enc.encode(strong)
+        self.assertLess(enc.odor_gain, 1.0)
+        self.assertGreaterEqual(enc.odor_gain, 0.3)
+        np.random.seed(7)
+        n2 = len(enc.encode(strong))
+        self.assertLess(n2, n1 * 0.7)
+        # Floor zone never habituates (re-acquisition trace survives).
+        enc2 = SensoryEncoder(self.pops)
+        for _ in range(50):
+            enc2.encode({"pheromone_conc_left": 0.1, "pheromone_conc_right": 0.1})
+        self.assertEqual(enc2.odor_gain, 1.0)
+        # Slow recovery in clean air, then fresh-nose reset.
+        g_low = enc.odor_gain
+        for _ in range(400):
+            enc.encode({})
+        self.assertGreater(enc.odor_gain, g_low)
+        enc.reset_odor()
+        self.assertEqual(enc.odor_gain, 1.0)
+
     def test_sensory_encoder_visual_tracking(self):
         spikes_vis_left = self.encoder.encode({
             "visual_target_visible": True,
@@ -2106,6 +2217,7 @@ class TestTrainerArenaContract(unittest.TestCase):
 
     # Mirror of FlyPhysics.gd get_sensory_data (update together).
     ARENA_KEYS = {"pheromone_conc_left", "pheromone_conc_right",
+                  "scent_lost", "scent_cast", "scent_surge",
                   "visual_target_azimuth", "visual_target_elevation",
                   "visual_target_visible", "visual_rival_looming",
                   "visual_tree_left_looming", "visual_tree_ahead_looming",
