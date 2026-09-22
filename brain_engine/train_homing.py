@@ -470,7 +470,6 @@ SCHOOL_STAGES = [
 SCHOOL_DIFFICULTY = {
     "camp_dist": [20.0, 35.0],
     "camp_ring": [0, 8],
-    "camp_heading": [0.4, 1.2],
     "mover_speed": [4.0, 9.0],
     "mover_waypoints": [2, 5],
     "mover_wobble": [0.05, 0.25],
@@ -478,7 +477,6 @@ SCHOOL_DIFFICULTY = {
     "gap": [3.5, 2.2],
     "upset": [0.3, 0.7],
     "heading_jitter": [0.4, 1.2],
-    "spawn_dist": [26.0, 30.0],
 }
 SCHOOL_TAKEDOWN_PAY = 4.5
 SCHOOL_TAIL_RATE = 1.0
@@ -935,6 +933,12 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             elif school_ctx is not None \
                     and school_ctx["behavior"] == "camp":
                 target.step(thrust=0.0, yaw_torque=0.0, dt=0.05)
+            elif school_ctx is not None:
+                # School duel: legacy random walk on the school stream so
+                # school episodes never consume global draws.
+                target.step(thrust=0.15, yaw_torque=float(
+                    school_rngs["target"].uniform(
+                        -target_evasion, target_evasion)), dt=0.05)
             else:
                 # Target fly evasion: variant B trains against a twitchier target.
                 target.step(thrust=0.15, yaw_torque=np.random.uniform(-target_evasion, target_evasion), dt=0.05)
