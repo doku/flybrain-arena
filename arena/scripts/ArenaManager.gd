@@ -2686,8 +2686,26 @@ func _evo_active() -> bool:
 const EVO_EPISODES := 50
 # Two-step evo breeding: half the episodes pre-train, half Advanced
 # Flight School (default school curriculum; school code selects stages).
+# NOTE: this JSON must NEVER ride argv (--params2): Godot strips embedded
+# double-quotes when joining argv on Windows, corrupting it exactly like
+# the old empty --name bug. _evo_params2_file writes it to disk and the
+# spawns pass --params2-file instead (same pattern as generate_brain_async).
 const EVO_SCHOOL_PARAMS := '{"curriculum": {}}'
 const EVO_NOISE := 0.05
+
+
+func _evo_params2_file(result_file: String) -> String:
+	# Writes the school params JSON next to the result file; returns the
+	# path for --params2-file, or "" when unwritable (caller then omits
+	# stage 2 and the breed degrades to single-stage instead of aborting).
+	var path := result_file.get_base_dir().path_join(
+		result_file.get_file().get_basename() + "_params2.json")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return ""
+	f.store_string(EVO_SCHOOL_PARAMS)
+	f.close()
+	return path
 var evo_waiting := false
 var evo_wait_result := {}
 var evo_breed_pid := 0
@@ -2848,10 +2866,13 @@ func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
 	var display := brain_name if brain_name != "" else ("wild G%d" % target_gen)
 	var args := ["breed", "--strategy", strategy,
 		"--episodes", str(EVO_EPISODES / 2), "--seed", str(seed),
-		"--episodes2", str(EVO_EPISODES / 2), "--params2", EVO_SCHOOL_PARAMS,
+		"--episodes2", str(EVO_EPISODES / 2),
 		"--noise", str(EVO_NOISE), "--progress", progress_path,
 		"--gen", str(target_gen),
 		"--log-file", log_path]
+	var p2 := _evo_params2_file(result_file)
+	if p2 != "":
+		args += ["--params2-file", p2]
 	if brain_name != "":
 		args += ["--name", brain_name]
 	if parent_id != "":
@@ -3065,10 +3086,13 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	var args := ["breed", "--strategy",
 		"clone" if kind == "clone" else "random",
 		"--episodes", str(EVO_EPISODES / 2), "--seed", str(int(spec.get("seed", 0))),
-		"--episodes2", str(EVO_EPISODES / 2), "--params2", EVO_SCHOOL_PARAMS,
+		"--episodes2", str(EVO_EPISODES / 2),
 		"--noise", str(EVO_NOISE), "--progress", str(spec.get("progress", "")),
 		"--gen", str(int(spec.get("gen", 1))),
 		"--log-file", log_path]
+	var p2 := _evo_params2_file(rf)
+	if p2 != "":
+		args += ["--params2-file", p2]
 	# Never emit an empty argv element: Godot drops it on Windows, so
 	# `--name ""` arrives as a bare `--name` and argparse aborts the
 	# worker (this killed every wild breed). Empty = wild auto-christen.
