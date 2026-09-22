@@ -19,6 +19,9 @@
 /brains/
 *.flybrain
 *.npz
+# Nested runtime caches (e.g. brain_engine/checkpoints/ from CWD-relative
+# default dirs in tests and tools) - same rule, any depth.
+brain_engine/checkpoints/
 
 # Runtime state: tournament brackets, training jobs, logs
 /tournaments/
