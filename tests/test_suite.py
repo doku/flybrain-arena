@@ -2006,6 +2006,118 @@ class TestWiringMixes(unittest.TestCase):
             ew.WIRING_PRIORITY.update(saved_prio)
 
 
+class TestWiringGenome(unittest.TestCase):
+    """Genome layer: frozen legacy byte-identity, deterministic random
+    generation under role constraints, validation rejects, stable ids.
+    Pops-only (no CSR) so it runs without the connectome cache."""
+    @classmethod
+    def setUpClass(cls):
+        cls.pops = load_or_extract_populations()
+
+    def test_frozen_byte_identity(self):
+        # Frozen genomes must reproduce the historical overlays exactly
+        # (pre-refactor hashes in tests/fixtures/frozen_genome_hashes.json).
+        import hashlib
+        import json
+        import os
+        import experimental_wiring as ew
+        fix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "fixtures", "frozen_genome_hashes.json")
+        with open(fix_path) as f:
+            fix = json.load(f)
+        for name in ("lplc2_contra_dn", "retina_wide", "spear_lunge"):
+            with self.subTest(wiring=name):
+                pre, post, w = ew.EXPERIMENTS[name](self.pops)
+                self.assertEqual(len(pre), fix[name]["n_edges"])
+                h = hashlib.sha256()
+                h.update(pre.tobytes())
+                h.update(post.tobytes())
+                h.update(w.tobytes())
+                self.assertEqual(h.hexdigest(), fix[name]["sha256"])
+                # Frozen rules compile to the same bytes directly.
+                cpre, cpost, cw = ew.compile_genome(
+                    ew.FROZEN_GENOMES[name], self.pops)
+                np.testing.assert_array_equal(pre, cpre)
+                np.testing.assert_array_equal(post, cpost)
+                np.testing.assert_array_equal(w, cw)
+
+    def test_generate_deterministic(self):
+        import numpy as np
+        import experimental_wiring as ew
+        a = ew.generate_genome(np.random.default_rng(11), self.pops, 4)
+        b = ew.generate_genome(np.random.default_rng(11), self.pops, 4)
+        self.assertEqual(a, b)
+        c = ew.generate_genome(np.random.default_rng(12), self.pops, 4)
+        self.assertNotEqual(a, c)
+        self.assertEqual(len(a["rules"]), 4)
+
+    def test_generate_roles(self):
+        import numpy as np
+        import experimental_wiring as ew
+        reg = ew.build_pool_registry(self.pops)
+        for seed in range(200):
+            g = ew.generate_genome(
+                np.random.default_rng(seed), self.pops, 3)
+            self.assertEqual(len(g["rules"]), 3)
+            for r in g["rules"]:
+                self.assertEqual(reg[r["source"]]["role"], "sensory")
+                self.assertIn(reg[r["target"]]["role"], ("motor", "central"))
+                self.assertIn(r["source_side"], ("left", "right"))
+                self.assertIn(r["target_side"], ("left", "right"))
+                self.assertIn(r["sign"], (1.0, -1.0))
+                self.assertTrue(0.0 < r["weight"] <= 2000.0)
+                self.assertTrue(1 <= r["fanout"] <= 64)
+
+    def test_validator_rejects(self):
+        import experimental_wiring as ew
+        good = dict(ew.FROZEN_GENOMES["lplc2_contra_dn"]["rules"][0])
+        ew.validate_rule(good)  # frozen rules are valid
+        bad_variants = []
+        for k in ("source", "sign", "stream_seed"):
+            v = dict(good)
+            del v[k]
+            bad_variants.append(v)
+        for kw in ({"source_side": "up"}, {"target_side": "down"},
+                   {"sign": 0.0}, {"sign": 2.0},
+                   {"weight": 0.0}, {"weight": -5.0}, {"weight": 99999.0},
+                   {"fanout": 0}, {"fanout": -2}, {"fanout": True},
+                   {"fanout": 999}, {"topography": "retinotopic"},
+                   {"stream": ""}, {"stream_seed": -1}):
+            vv = dict(good)
+            vv.update(kw)
+            bad_variants.append(vv)
+        for bad in bad_variants:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ew.validate_rule(bad)
+        with self.assertRaises(ValueError):
+            ew.validate_genome({"name": "x", "rules": []})
+        with self.assertRaises(ValueError):
+            ew.validate_genome({"name": "x",
+                                "rules": [good, dict(good)]})
+        # Unknown pools pass shape validation but fail with pops given.
+        v = dict(good, source="no_such_pool_xyz")
+        ew.validate_rule(v)
+        with self.assertRaises(ValueError):
+            ew.validate_genome({"name": "x", "rules": [v]}, self.pops)
+        ew.validate_genome({"name": "x", "rules": [good]}, self.pops)
+        with self.assertRaises(ValueError):
+            ew.generate_genome(np.random.default_rng(3), self.pops, 0)
+
+    def test_genome_id_stable(self):
+        import numpy as np
+        import experimental_wiring as ew
+        a = ew.generate_genome(np.random.default_rng(21), self.pops, 3)
+        b = ew.generate_genome(np.random.default_rng(21), self.pops, 3)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertEqual(ew.genome_label(a), "g" + ew.genome_id(a))
+        renamed = dict(a, name="whatever")
+        self.assertEqual(ew.genome_id(renamed), ew.genome_id(a))
+        c = ew.generate_genome(np.random.default_rng(22), self.pops, 3)
+        self.assertNotEqual(ew.genome_id(a), ew.genome_id(c))
+        self.assertRegex(ew.genome_label(a), r"^g[0-9a-f]{10}$")
+
+
 class TestMappingMatrix(unittest.TestCase):
     """Certifies every wiring x mapping regime: each combination must
     integrate, decode a complete finite control set, and stay isolated

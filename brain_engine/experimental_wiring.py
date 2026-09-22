@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import numpy as np
 from scipy import sparse
@@ -92,24 +94,11 @@ def lplc2_contra_dn(pops, fanout=16, weight=260.0):
     Edges are excitatory (+weight). fanout is how many contralateral DNs each
     LPLC2 cell innervates; weight is tuned by phase-0 probe vs the DN readout
     sensitivity (dnR-dnL ~ 9 bias, tanh /15).
+
+    Frozen genome: compiles FROZEN_GENOMES["lplc2_contra_dn"] (byte-identical
+    to the historical implementation).
     """
-    lp_l = np.asarray(pops["visual_lplc2"]["left"], dtype=np.int64)
-    lp_r = np.asarray(pops["visual_lplc2"]["right"], dtype=np.int64)
-    dn_r = np.asarray(pops["descending_all"]["right"], dtype=np.int64)
-    dn_l = np.asarray(pops["descending_all"]["left"], dtype=np.int64)
-    rng = np.random.default_rng(0)  # deterministic wiring across runs
-    pre, post, w = [], [], []
-    for src, tgt in ((lp_l, dn_r), (lp_r, dn_l)):
-        for s in src:
-            picks = rng.choice(tgt, size=min(fanout, len(tgt)), replace=False)
-            pre.append(np.full(len(picks), s))
-            post.append(picks)
-            w.append(np.full(len(picks), float(weight)))
-    if not pre:
-        return None
-    return (np.concatenate(pre).astype(np.int32),
-            np.concatenate(post).astype(np.int32),
-            np.concatenate(w).astype(np.float32))
+    return _frozen("lplc2_contra_dn", pops, fanout, weight)
 
 
 @_register("retina_wide")
@@ -125,27 +114,11 @@ def retina_wide(pops, fanout=6, weight=200.0):
     pursuit toward (contrast the contra tree-avoidance wiring), and the
     overlay is small enough that the standard DN readout and dopamine
     keep working on top.
+
+    Frozen genome: compiles FROZEN_GENOMES["retina_wide"] (byte-identical
+    to the historical implementation).
     """
-    pre, post, w = [], [], []
-    rng = np.random.default_rng(7)  # deterministic wiring across runs
-    dn_l = np.asarray(pops["descending_all"]["left"], dtype=np.int64)
-    dn_r = np.asarray(pops["descending_all"]["right"], dtype=np.int64)
-    for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
-        pool = pops.get(key, {})
-        for src, tgt in ((np.asarray(pool.get("left", []), dtype=np.int64), dn_l),
-                         (np.asarray(pool.get("right", []), dtype=np.int64), dn_r)):
-            if len(src) == 0 or len(tgt) == 0:
-                continue
-            for s in src:
-                picks = rng.choice(tgt, size=min(fanout, len(tgt)), replace=False)
-                pre.append(np.full(len(picks), s))
-                post.append(picks)
-                w.append(np.full(len(picks), float(weight)))
-    if not pre:
-        return None
-    return (np.concatenate(pre).astype(np.int32),
-            np.concatenate(post).astype(np.int32),
-            np.concatenate(w).astype(np.float32))
+    return _frozen("retina_wide", pops, fanout, weight)
 
 
 @_register("spear_lunge")
@@ -158,29 +131,11 @@ def spear_lunge(pops, fanout=3, weight=200.0):
     LC15/17/18 loom) onto all six MNxm cells, giving the decoder a
     genuine mouth-motor signal to fire the spear thrust from. Aimed in
     the decoder (visible + frontal gate), so rear tracking never lunges.
+
+    Frozen genome: compiles FROZEN_GENOMES["spear_lunge"] (byte-identical
+    to the historical implementation).
     """
-    pre, post, w = [], [], []
-    rng = np.random.default_rng(21)  # deterministic wiring across runs
-    mx = np.asarray(pops.get("motor_mouth", {}).get("all", []), dtype=np.int64)
-    if len(mx) == 0:
-        return None
-    drivers = []
-    for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
-        pool = pops.get(key, {})
-        drivers += list(pool.get("left", [])) + list(pool.get("right", []))
-    drivers = np.asarray(drivers, dtype=np.int64)
-    if len(drivers) == 0:
-        return None
-    for s in drivers:
-        picks = rng.choice(mx, size=min(fanout, len(mx)), replace=False)
-        pre.append(np.full(len(picks), s))
-        post.append(picks)
-        w.append(np.full(len(picks), float(weight)))
-    if not pre:
-        return None
-    return (np.concatenate(pre).astype(np.int32),
-            np.concatenate(post).astype(np.int32),
-            np.concatenate(w).astype(np.float32))
+    return _frozen("spear_lunge", pops, fanout, weight)
 
 
 def apply_overlay(csr, pre, post, w):
@@ -277,3 +232,313 @@ def experiment_suffix(experiment):
     if mix is None:
         return ""
     return "__exp_" + "__".join(mix)
+
+
+# ── Genome layer: parameterized projection rules ─────────────────────
+# A wiring genome is a small list of projection RULES instead of a toggle
+# over hand-written overlays. Each rule names source/target pools (+side),
+# polarity, weight, fanout, topography, and the rng stream it draws from.
+# The compiler below materializes rules to the same (pre, post, w) edge
+# arrays the legacy overlay functions return, so combine_overlays,
+# apply_overlay, arity handling, and the vault all work unchanged. The
+# three legacy wirings are frozen genomes (byte-identical output, proven
+# by tests/fixtures/frozen_genome_hashes.json); new neuron groups become
+# explorable by adding rows to the pool registry, not overlay code.
+
+ROLE_BY_PREFIX = (
+    ("visual_", "sensory"),
+    ("pheromone_", "sensory"),
+    ("gyro_", "sensory"),
+    ("flow_", "sensory"),
+    ("motor_", "motor"),
+    ("descending_", "motor"),
+    ("dopamine_", "modulatory"),
+    ("mbon_", "central"),
+    ("mushroom_body_", "central"),
+)
+
+GENOME_SIDES = ("left", "right", "all")
+GENOME_TOPOGRAPHIES = ("random",)
+MAX_RULE_WEIGHT = 2000.0
+MAX_RULE_FANOUT = 64
+
+# Generator marriages: which target roles a sensory source may innervate.
+# motor = readout drive, central = association readout. modulatory pools
+# are never wiring targets (dopamine arrives via plasticity, not edges).
+GENOME_TARGET_ROLES = ("motor", "central")
+
+
+def pool_role(name):
+    """Role of a connectome pool for wiring constraints (prefix table)."""
+    for prefix, role in ROLE_BY_PREFIX:
+        if str(name).startswith(prefix):
+            return role
+    return "central"
+
+
+def build_pool_registry(pops):
+    """{pool: {role, sides: {side: size}}} for pools with any members."""
+    reg = {}
+    for key, pool in pops.items():
+        if not isinstance(pool, dict):
+            continue
+        sides = {}
+        for side in ("left", "right", "all"):
+            try:
+                n = len(pool.get(side, []))
+            except TypeError:
+                n = 0
+            if n:
+                sides[side] = n
+        if sides:
+            reg[str(key)] = {"role": pool_role(key), "sides": sides}
+    return reg
+
+
+_RULE_KEYS = ("source", "source_side", "target", "target_side", "sign",
+              "weight", "fanout", "topography", "stream", "stream_seed")
+
+
+def validate_rule(rule):
+    """Canonicalize one projection rule (raises ValueError on anything
+    malformed). Returns a normalized copy; never mutates the input."""
+    if not isinstance(rule, dict):
+        raise ValueError(f"rule must be a dict, got {type(rule).__name__}")
+    missing = [k for k in _RULE_KEYS if k not in rule]
+    if missing:
+        raise ValueError(f"rule missing keys {missing}: {rule}")
+    src, tgt = str(rule["source"]), str(rule["target"])
+    if not src or not tgt:
+        raise ValueError(f"rule needs non-empty source/target: {rule}")
+    ss, ts = str(rule["source_side"]), str(rule["target_side"])
+    if ss not in GENOME_SIDES or ts not in GENOME_SIDES:
+        raise ValueError(f"rule sides must be in {GENOME_SIDES}: {rule}")
+    try:
+        sign = float(rule["sign"])
+    except (TypeError, ValueError):
+        raise ValueError(f"rule sign must be numeric (+1/-1): {rule}")
+    if sign not in (1.0, -1.0):
+        raise ValueError(f"rule sign must be +1 or -1: {rule}")
+    try:
+        weight = float(rule["weight"])
+    except (TypeError, ValueError):
+        raise ValueError(f"rule weight must be numeric: {rule}")
+    if not 0.0 < weight <= MAX_RULE_WEIGHT:
+        raise ValueError(
+            f"rule weight must be in (0, {MAX_RULE_WEIGHT}]: {rule}")
+    fanout = rule["fanout"]
+    if isinstance(fanout, bool) or not isinstance(fanout, int):
+        raise ValueError(f"rule fanout must be an int: {rule}")
+    if not 1 <= fanout <= MAX_RULE_FANOUT:
+        raise ValueError(
+            f"rule fanout must be in [1, {MAX_RULE_FANOUT}]: {rule}")
+    topo = str(rule["topography"])
+    if topo not in GENOME_TOPOGRAPHIES:
+        raise ValueError(
+            f"rule topography must be in {GENOME_TOPOGRAPHIES}: {rule}")
+    stream = str(rule["stream"])
+    if not stream:
+        raise ValueError(f"rule stream must be a non-empty name: {rule}")
+    seed = rule["stream_seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f"rule stream_seed must be an int: {rule}")
+    if not 0 <= seed < 2 ** 32:
+        raise ValueError(f"rule stream_seed must be in [0, 2**32): {rule}")
+    return {"source": src, "source_side": ss, "target": tgt,
+            "target_side": ts, "sign": sign, "weight": weight,
+            "fanout": fanout, "topography": topo, "stream": stream,
+            "stream_seed": seed}
+
+
+def validate_genome(genome, pops=None):
+    """Canonicalize a genome envelope {"name": str|None, "rules": [...]};
+    duplicate (source, side, target, side) pairs are rejected (the
+    compiler keeps first-wins, so dupes are almost always a mistake).
+    With pops given, unknown pool names are also rejected (typo guard);
+    without pops only rule shapes are checked, so stale caches with
+    missing pools still compile (the compiler skips them like the
+    legacy retina overlay always did)."""
+    if not isinstance(genome, dict) or not isinstance(
+            genome.get("rules"), list) or not genome["rules"]:
+        raise ValueError("genome needs a non-empty 'rules' list")
+    name = genome.get("name", None)
+    if name is not None and not isinstance(name, str):
+        raise ValueError("genome name must be a string or None")
+    rules = [validate_rule(r) for r in genome["rules"]]
+    seen = set()
+    for r in rules:
+        pair = (r["source"], r["source_side"], r["target"], r["target_side"])
+        if pair in seen:
+            raise ValueError(f"duplicate rule pair {pair} in genome")
+        seen.add(pair)
+    if pops is not None:
+        registry = build_pool_registry(pops)
+        for r in rules:
+            for pool_key in ("source", "target"):
+                if r[pool_key] not in registry:
+                    raise ValueError(
+                        f"unknown {pool_key} pool '{r[pool_key]}' "
+                        f"(registry has {sorted(registry)})")
+    return {"name": name, "rules": rules}
+
+
+def compile_rules(rules, pops):
+    """Materialize validated rule dicts to (pre, post, w) edge arrays.
+
+    Rules sharing a (stream, stream_seed) draw from one rng in rule
+    order (this is how the frozen legacy genomes reproduce their exact
+    historical edge sets). Exact-duplicate edges keep the first
+    occurrence. Returns None when nothing innervates (same contract as
+    the legacy overlay functions). Missing/empty pools are skipped.
+    """
+    streams = {}
+    order = []
+    for r in rules:
+        key = (r["stream"], r["stream_seed"])
+        if key not in streams:
+            streams[key] = []
+            order.append(key)
+        streams[key].append(r)
+    pre, post, w = [], [], []
+    seen = set()
+    for key in order:
+        rng = np.random.default_rng(key[1])
+        for r in streams[key]:
+            src = np.asarray(pops.get(r["source"], {}).get(
+                r["source_side"], []), dtype=np.int64)
+            tgt = np.asarray(pops.get(r["target"], {}).get(
+                r["target_side"], []), dtype=np.int64)
+            if len(src) == 0 or len(tgt) == 0:
+                continue
+            for s in src:
+                picks = rng.choice(
+                    tgt, size=min(r["fanout"], len(tgt)), replace=False)
+                for q in picks.tolist():
+                    edge = (int(s), int(q))
+                    if edge in seen:
+                        continue
+                    seen.add(edge)
+                    pre.append(edge[0])
+                    post.append(edge[1])
+                    w.append(float(r["sign"]) * float(r["weight"]))
+    if not pre:
+        return None
+    return (np.array(pre, dtype=np.int32),
+            np.array(post, dtype=np.int32),
+            np.array(w, dtype=np.float32))
+
+
+def compile_genome(genome, pops):
+    """Validate + compile a genome envelope to edge arrays (None if empty)."""
+    return compile_rules(validate_genome(genome)["rules"], pops)
+
+
+def genome_id(genome):
+    """Stable id for a genome: sha1 of canonical rules, 10 hex chars.
+    Renames don't change it (name excluded); rule ORDER does (streams
+    draw in rule order, so reordered rules are a different genome)."""
+    rules = validate_genome(genome)["rules"]
+    canon = json.dumps(rules, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:10]
+
+
+def genome_label(genome):
+    """Filename-safe arity-namespace label for genome checkpoints."""
+    return "g" + genome_id(genome)
+
+
+def generate_genome(rng, pops, n_rules=3, name=None):
+    """Sample a random wiring genome. rng is np.random.Generator (use
+    np.random.default_rng(seed) for reproducibility); sources are
+    sensory-role pools, targets motor/central; signs mostly excitatory;
+    each rule gets its own draw stream. Raises on tiny registries that
+    can't supply n_rules distinct pairs."""
+    if n_rules < 1:
+        raise ValueError("generate_genome needs n_rules >= 1")
+    registry = build_pool_registry(pops)
+    sources = sorted(p for p, m in registry.items() if m["role"] == "sensory")
+    targets = sorted(p for p, m in registry.items()
+                     if m["role"] in GENOME_TARGET_ROLES)
+    if not sources or not targets:
+        raise ValueError(
+            "genome generation needs sensory sources and motor/central targets")
+    rules = []
+    seen_pairs = set()
+    tries = 0
+    while len(rules) < n_rules and tries < 50 * n_rules:
+        tries += 1
+        src = str(rng.choice(sources))
+        tgt = str(rng.choice(targets))
+        ss = str(rng.choice(["left", "right"]))
+        ts = str(rng.choice(["left", "right"]))
+        if (src, ss, tgt, ts) in seen_pairs:
+            continue
+        seen_pairs.add((src, ss, tgt, ts))
+        sign = 1.0 if float(rng.random()) < 0.8 else -1.0
+        rules.append({
+            "source": src, "source_side": ss, "target": tgt,
+            "target_side": ts, "sign": sign,
+            "weight": round(float(rng.uniform(50.0, 400.0)), 1),
+            "fanout": int(rng.integers(2, 17)),
+            "topography": "random",
+            "stream": "g%d" % len(rules),
+            "stream_seed": int(rng.integers(0, 2 ** 31)),
+        })
+    if len(rules) < n_rules:
+        raise ValueError(
+            f"registry too small for {n_rules} distinct rule pairs")
+    return validate_genome({"name": name, "rules": rules}, pops)
+
+
+# Frozen legacy genomes: the three historical overlays re-expressed as
+# rules. Stream seeds reproduce each overlay's original rng stream, so
+# compiled output is byte-identical to the pre-genome functions (gated
+# by tests/fixtures/frozen_genome_hashes.json). Rule order mirrors the
+# original loops exactly - do not reorder.
+FROZEN_GENOMES = {
+    "lplc2_contra_dn": {"name": "lplc2_contra_dn", "rules": [
+        {"source": "visual_lplc2", "source_side": "left",
+         "target": "descending_all", "target_side": "right",
+         "sign": 1.0, "weight": 260.0, "fanout": 16,
+         "topography": "random", "stream": "lplc2_contra_dn",
+         "stream_seed": 0},
+        {"source": "visual_lplc2", "source_side": "right",
+         "target": "descending_all", "target_side": "left",
+         "sign": 1.0, "weight": 260.0, "fanout": 16,
+         "topography": "random", "stream": "lplc2_contra_dn",
+         "stream_seed": 0},
+    ]},
+    "retina_wide": {"name": "retina_wide", "rules": [
+        {"source": pool, "source_side": side,
+         "target": "descending_all", "target_side": side,
+         "sign": 1.0, "weight": 200.0, "fanout": 6,
+         "topography": "random", "stream": "retina_wide",
+         "stream_seed": 7}
+        for pool in ("visual_lc11", "visual_lc15", "visual_lc17",
+                     "visual_lc18")
+        for side in ("left", "right")
+    ]},
+    "spear_lunge": {"name": "spear_lunge", "rules": [
+        {"source": pool, "source_side": side,
+         "target": "motor_mouth", "target_side": "all",
+         "sign": 1.0, "weight": 200.0, "fanout": 3,
+         "topography": "random", "stream": "spear_lunge",
+         "stream_seed": 21}
+        for pool in ("visual_lc11", "visual_lc15", "visual_lc17",
+                     "visual_lc18")
+        for side in ("left", "right")
+    ]},
+}
+
+
+def _frozen(name, pops, fanout=None, weight=None):
+    """Compile a frozen genome, optionally overriding fanout/weight."""
+    rules = []
+    for r in FROZEN_GENOMES[name]["rules"]:
+        rr = dict(r)
+        if fanout is not None:
+            rr["fanout"] = fanout
+        if weight is not None:
+            rr["weight"] = weight
+        rules.append(rr)
+    return compile_rules(rules, pops)
