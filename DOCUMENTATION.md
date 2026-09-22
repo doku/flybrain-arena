@@ -11,7 +11,11 @@ after every battle, tournaments, and a managed vault of evolving brains.
   neuro-server, then the Godot 4 arena at the vault menu.
 - **Free battle:** classic evolution — generational clone/mutate duels, no vault identities.
 - **Tournament:** pick ≥2 brains, single elimination, best-of-N per match. Quick
-  battle = best-of-1 exhibition between 2 brains.
+  battle = best-of-1 exhibition between 2 brains. Optional losers bracket
+  (default on): round-0 losers play their own bracket (needs 2/4/8, else
+  skipped with a log line) — its final loser is last place, backed by two
+  losses against fellow losers instead of one random loss. Evo mode always
+  runs it and archives that fly.
 - **Generate / Train:** menu creates brains (variant, seed, additive wiring
   mix, mapping) and trains them headlessly (menu shows progress; failures
   report in the job label). Wiring/mapping/hyperparams live in the
@@ -407,15 +411,44 @@ contract (key equality, full control-key consumption, trainer lunge
 trigger/contact/cooldown/aim, dopamine spear credit, stale-cache fallbacks,
 legacy+scheme inertness, gyro scale), retina vision + wiring, brain-view
 stream (pool keys, detail gating, truncation guard, raster id slices,
-soma-cloud asset schema), subfloor abandonment, Godot headless scene
-runs, flight-style probe (`brain_engine/probe_flight_style.py`: two vault
+soma-cloud asset schema), subfloor abandonment, evo loop (biggest-loser
+query incl. tie-breaks, archive/restore round-trip, breeder param
+validity), Godot headless scene runs, flight-style probe
+(`brain_engine/probe_flight_style.py`: two vault
 brains, real or fresh weights, against climb/level/dive targets —
 separates wiring effects from learned effects), learning verification
 (`brain_engine/verify_learning.py`: curve, zero-DA control, crash
 conditioning), pool diagnostics (`brain_engine/diagnose_pools.py`:
 weight ratios, spike census).
 
-## 14. Data & git policy
+## 14. Evolution mode (eternal tournament loop)
+
+`START EVOLUTION` runs tournaments back-to-back forever (until EVO STOP
+or quit): each generation archives the single biggest loser (earliest
+exit + fewest battle wins, random tie-break) to `brains/archive/` —
+invisible to the roster, listed in the menu hall of shame with per-brain
+Restore — then breeds 1 winner-clone (weight copy + noise, **fresh
+seed**, full 50-episode training, lineage stamped) + 1 random (random
+wiring mix/mapping/yaw-bias/rates, 50 eps) and rebuilds at constant
+roster size (extras trimmed worst-first, logged distinctly). State rides
+in the tournament JSON (`evo.active/generation/episodes`), so the loop
+survives quit/resume; failures disable evo loudly instead of looping
+broken. Elimination skips brains missing from the vault (resumed old
+brackets, mid-event deletes) and falls through to the next-worst
+present fighter. Breeding shows a centered phase panel (title, status,
+progress, spinner); each attempt writes a per-job log file, dead
+workers fail fast with their last episode, and one automatic retry
+covers transient worker deaths before the generation aborts. STOP and breed timeouts free the shared vault-async slot at
+once (quitting mid-breed orphans the job: it finishes into the vault
+as a harmless stray). Pace is honest: ~15–25 min per generation,
+unattended. Budget: `evo_breeder.py` (`breed_clone`/`breed_random`,
+`biggest_loser`), `vault_cli.py breed/archive/restore/archive-list`.
+Deep-tested: loser query incl. byes/vacants/draws/quick/tie-breaks,
+archive/restore round-trips/ambiguity/double-restore, live 1-episode
+clone+random breeds (lineage, fresh seeds, divergent weights, vault
+restored afterwards).
+
+## 15. Data & git policy
 
 `.gitignore` versions code + config only (`arena/`, `brain_engine/`,
 `tests/`, launchers, regenerated `populations_mapped.json`). Never committed:

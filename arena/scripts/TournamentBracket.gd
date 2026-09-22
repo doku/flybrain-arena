@@ -5,12 +5,20 @@ extends Control
 ## players grayed out, live match gold-bordered, champion node at the end.
 ## Used by the vault menu and the arena overlay. Pure layout + _draw lines.
 
-const CARD_W := 210.0
-const CARD_H := 92.0
-const GAP_X := 52.0
-const ROW_GAP := 16.0
+# Layout metrics (vars, not consts): render_bracket picks the normal or
+# compact set by bracket size, so small brackets stay readable while big
+# ones fit without scrolling. Always edit via _apply_metrics().
+var CARD_W := 210.0
+var CARD_H := 92.0
+var GAP_X := 52.0
+var ROW_GAP := 16.0
 const TOP_PAD := 32.0
 const SIDE_PAD := 12.0
+# Font sizes paired with the metrics above.
+var FS_COL_HEAD := 15
+var FS_CARD_HEAD := 12
+var FS_ROW := 15
+var FS_BIG_NAME := 19
 
 const COL_LINE := Color(0.62, 0.62, 0.68, 0.85)
 const COL_LIVE := Color(1.0, 0.82, 0.3, 1.0)
@@ -18,8 +26,12 @@ const COL_WIN := Color(0.5, 1.0, 0.55)
 const COL_LOSE := Color(0.42, 0.42, 0.46)
 const COL_TBD := Color(0.55, 0.55, 0.6)
 const COL_CHAMP := Color(1.0, 0.85, 0.35)
+const COL_LOSER := Color(1.0, 0.35, 0.3)
+const COL_LOSER_DIM := Color(0.75, 0.3, 0.28, 0.85)
 
 var segments: Array = []
+# View-relative losers start for _round_name (0 in losers-focus mode).
+var _lf_view := -1
 
 
 func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1) -> void:
@@ -37,16 +49,53 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 		size = custom_minimum_size
 		queue_redraw()
 		return
+	# Focus mode: while live losers rounds are playing (and the
+	# tournament is still running), the losers bracket REPLACES the main
+	# one - 2-3 narrow columns instead of 6+, so it fits on screen.
+	# At review time (complete) the full bracket comes back.
+	var losers_from := int(tourney.get("losers_start_round", -1))
+	var focus := losers_from > 0 and cur_round >= losers_from \
+		and str(tourney.get("status", "")) == "running"
+	var shown: Array = rounds.duplicate()
+	if focus:
+		shown = shown.slice(losers_from)
+		cur_round = cur_round - losers_from
+		losers_from = 0
+	_lf_view = losers_from
+	# TBA templates (display-only, never written back): synthesize future
+	# main rounds from tournament size, and future losers rounds by
+	# halving, so the whole bracket is visible before matches resolve.
+	if focus:
+		while (shown[shown.size() - 1] as Array).size() > 1:
+			var _prev2: Array = shown[shown.size() - 1]
+			shown.append(_tbd_round(maxi(1, int(ceil(float(_prev2.size()) / 2.0)))))
+	else:
+		var size_n := maxi(2, int(tourney.get("size", 4)))
+		var main_expected := 0
+		var _s := size_n
+		while _s > 1:
+			main_expected += 1
+			_s = int(_s / 2)
+		var main_have: int = losers_from if losers_from >= 0 else rounds.size()
+		while shown.size() < main_expected:
+			var _prev: Array = shown[shown.size() - 1]
+			shown.append(_tbd_round(maxi(1, int(ceil(float(_prev.size()) / 2.0)))))
+		if losers_from >= 0:
+			while (shown[shown.size() - 1] as Array).size() > 1:
+				var _prev3: Array = shown[shown.size() - 1]
+				shown.append(_tbd_round(maxi(1, int(ceil(float(_prev3.size()) / 2.0)))))
+	rounds = shown
 	var n_rounds: int = rounds.size()
-	var cols: int = n_rounds + 1  # + champion column
+	var cols: int = n_rounds + 1  # + champion/last-place column
+	_apply_metrics(cols, (rounds[0] as Array).size())
 	# Column x positions.
 	var xs: Array = []
 	for i in range(cols):
 		xs.append(SIDE_PAD + i * (CARD_W + GAP_X))
-	# Round header labels.
+	# Round header labels. Focus mode's final column is LAST PLACE.
 	for i in range(n_rounds):
 		add_child(_make_header(str(xs[i]), _round_name(i, n_rounds, tourney)))
-	add_child(_make_header(str(xs[n_rounds]), "CHAMPION"))
+	add_child(_make_header(str(xs[n_rounds]), "LAST PLACE" if focus else "CHAMPION"))
 	# Card tops per round for feeder-centering.
 	var tops: Array = []
 	for r in range(n_rounds):
@@ -64,19 +113,23 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 				var y1: float = float(prev[f1]) if f1 < prev.size() else y0 + CARD_H + ROW_GAP
 				rtops.append((y0 + y1) * 0.5)
 		tops.append(rtops)
-	# Cards.
+	# Cards. In losers rounds the loser advances (green = advances in
+	# every column; the winner is out and greyed like any eliminated).
 	for r in range(n_rounds):
 		var rms2: Array = rounds[r]
+		var loser_adv: bool = losers_from >= 0 and r >= losers_from
 		for mi in range(rms2.size()):
 			var m: Dictionary = rms2[mi]
 			var live: bool = (r == cur_round and mi == cur_match)
-			var card := _make_match_card(m, r, mi, live)
+			var card := _make_match_card(m, r, mi, live, loser_adv)
 			card.position = Vector2(float(xs[r]), float(tops[r][mi]))
 			add_child(card)
-	# Connectors from feeders into each later-round match.
+	# Connectors from feeders into each later-round match. Edges
+	# landing in losers rounds draw muted red (distinct consolation).
 	for r in range(1, n_rounds):
 		var rms3: Array = rounds[r]
 		var prev2: Array = tops[r - 1]
+		var loser_edge := losers_from >= 0 and r >= losers_from
 		for mi in range(rms3.size()):
 			var live2: bool = (r == cur_round and mi == cur_match)
 			var mx: float = float(xs[r])
@@ -87,18 +140,47 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 					continue
 				var fcy: float = float(prev2[f]) + CARD_H * 0.5
 				var fx: float = float(xs[r - 1]) + CARD_W
-				segments.append({"a": Vector2(fx, fcy), "b": Vector2(mid_x, fcy), "live": live2})
-				segments.append({"a": Vector2(mid_x, fcy), "b": Vector2(mid_x, mcy), "live": live2})
-				segments.append({"a": Vector2(mid_x, mcy), "b": Vector2(mx, mcy), "live": live2})
-	# Champion node centered on the final.
-	var champ_name := _champion_name(tourney)
-	var final_tops: Array = tops[n_rounds - 1]
-	var final_mid: float = float(final_tops[final_tops.size() - 1]) + CARD_H * 0.5
-	var champ := _make_champ_card(champ_name, tourney)
-	champ.position = Vector2(float(xs[n_rounds]), final_mid - CARD_H * 0.5)
-	add_child(champ)
-	var fx0: float = float(xs[n_rounds - 1]) + CARD_W
-	segments.append({"a": Vector2(fx0, final_mid), "b": Vector2(float(xs[n_rounds]), final_mid), "live": false})
+				segments.append({"a": Vector2(fx, fcy), "b": Vector2(mid_x, fcy), "live": live2, "loser": loser_edge})
+				segments.append({"a": Vector2(mid_x, fcy), "b": Vector2(mid_x, mcy), "live": live2, "loser": loser_edge})
+				segments.append({"a": Vector2(mid_x, mcy), "b": Vector2(mx, mcy), "live": live2, "loser": loser_edge})
+	# Champion node centered on the main final; with consolation, a
+	# LAST PLACE node hangs off the losers final in red. Focus mode
+	# skips the champion (main bracket hidden) and the final column
+	# carries LAST PLACE alone.
+	if focus:
+		var f_tops: Array = tops[n_rounds - 1]
+		var f_mid: float = float(f_tops[f_tops.size() - 1]) + CARD_H * 0.5
+		var flast := _make_last_place_card(_last_place_name(tourney), tourney)
+		flast.position = Vector2(float(xs[n_rounds]), f_mid - CARD_H * 0.5)
+		add_child(flast)
+		var fx0: float = float(xs[n_rounds - 1]) + CARD_W
+		segments.append({"a": Vector2(fx0, f_mid), "b": Vector2(float(xs[n_rounds]), f_mid), "live": false, "loser": true})
+	else:
+		var champ_name := _champion_name(tourney)
+		var champ_mid: float
+		if losers_from > 0:
+			var main_final: Array = tops[losers_from - 1]
+			champ_mid = float(main_final[main_final.size() - 1]) + CARD_H * 0.5
+		else:
+			var final_tops: Array = tops[n_rounds - 1]
+			champ_mid = float(final_tops[final_tops.size() - 1]) + CARD_H * 0.5
+		var champ := _make_champ_card(champ_name, tourney)
+		champ.position = Vector2(float(xs[n_rounds]), champ_mid - CARD_H * 0.5)
+		add_child(champ)
+		var cfx0: float
+		if losers_from > 0:
+			cfx0 = float(xs[losers_from - 1]) + CARD_W
+		else:
+			cfx0 = float(xs[n_rounds - 1]) + CARD_W
+		segments.append({"a": Vector2(cfx0, champ_mid), "b": Vector2(float(xs[n_rounds]), champ_mid), "live": false})
+		if losers_from > 0:
+			var l_tops: Array = tops[n_rounds - 1]
+			var l_mid: float = float(l_tops[l_tops.size() - 1]) + CARD_H * 0.5
+			var last := _make_last_place_card(_last_place_name(tourney), tourney)
+			last.position = Vector2(float(xs[n_rounds]), l_mid - CARD_H * 0.5)
+			add_child(last)
+			var lx0: float = float(xs[n_rounds - 1]) + CARD_W
+			segments.append({"a": Vector2(lx0, l_mid), "b": Vector2(float(xs[n_rounds]), l_mid), "live": false, "loser": true})
 	# Size for scroll containers.
 	var n0: Array = rounds[0]
 	var height: float = TOP_PAD + n0.size() * (CARD_H + ROW_GAP) + SIDE_PAD
@@ -110,10 +192,17 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 func _draw() -> void:
 	for s in segments:
 		var col: Color = COL_LIVE if bool(s.get("live", false)) else COL_LINE
+		if bool(s.get("loser", false)) and not bool(s.get("live", false)):
+			col = COL_LOSER_DIM
 		draw_line(s["a"], s["b"], col, 2.0)
 
 
 func _round_name(r: int, n_rounds: int, tourney: Dictionary) -> String:
+	var losers_from := _lf_view
+	if losers_from >= 0 and r >= losers_from:
+		if r == n_rounds - 1:
+			return "LOSERS FINAL"
+		return "LOSERS R%d" % (r - losers_from + 1)
 	if bool(tourney.get("quick", false)):
 		return "FINAL" if n_rounds == 1 else ("ROUND %d" % (r + 1))
 	if r == n_rounds - 1 and n_rounds > 1:
@@ -121,6 +210,41 @@ func _round_name(r: int, n_rounds: int, tourney: Dictionary) -> String:
 	if r == n_rounds - 2 and n_rounds > 2:
 		return "SEMIFINAL"
 	return "ROUND %d" % (r + 1)
+
+
+func _last_place_name(tourney: Dictionary) -> String:
+	var lid := str(tourney.get("last_place_id", ""))
+	if lid == "":
+		return "TBD"
+	for p in tourney.get("players", []):
+		if str(p.get("id", "")) == lid:
+			return str(p.get("name", "?"))
+	return "?"
+
+
+func _make_last_place_card(last_name: String, tourney: Dictionary) -> PanelContainer:
+	var decided: bool = str(tourney.get("last_place_id", "")) != ""
+	var card := _card_panel(COL_LOSER if decided else Color(0.3, 0.3, 0.36), 2 if decided else 1)
+	var vb := VBoxContainer.new()
+	vb.alignment = BoxContainer.ALIGNMENT_CENTER
+	vb.add_theme_constant_override("separation", 4)
+	card.add_child(vb)
+	var head := Label.new()
+	head.text = "LAST PLACE"
+	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	head.add_theme_font_size_override("font_size", FS_CARD_HEAD)
+	head.add_theme_color_override("font_color", COL_LOSER if decided else Color(0.6, 0.6, 0.65))
+	vb.add_child(head)
+	var nm := Label.new()
+	nm.text = last_name
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	nm.clip_text = true
+	nm.add_theme_font_size_override("font_size", FS_BIG_NAME)
+	nm.add_theme_color_override("font_color", COL_LOSER if decided else COL_TBD)
+	vb.add_child(nm)
+	card.custom_minimum_size = Vector2(CARD_W, CARD_H)
+	card.size = card.custom_minimum_size
+	return card
 
 
 func _champion_name(tourney: Dictionary) -> String:
@@ -136,7 +260,7 @@ func _champion_name(tourney: Dictionary) -> String:
 func _make_header(x: String, text: String) -> Label:
 	var l := Label.new()
 	l.text = text
-	l.add_theme_font_size_override("font_size", 15)
+	l.add_theme_font_size_override("font_size", FS_COL_HEAD)
 	l.add_theme_color_override("font_color", Color(0.75, 0.75, 0.8))
 	l.position = Vector2(float(x), 6.0)
 	l.custom_minimum_size = Vector2(CARD_W, 22.0)
@@ -160,7 +284,43 @@ func _card_panel(border: Color, border_w: int) -> PanelContainer:
 	return pc
 
 
-func _make_match_card(m: Dictionary, r: int, mi: int, live: bool) -> PanelContainer:
+func _apply_metrics(cols: int, rows0: int) -> void:
+	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond
+	# (size-8 fresh = 4 cols fits at 690px). CARD_H must clear the card
+	# content (~78px: margins + header + two 24px rows) or text spills
+	# into the neighbor card.
+	if cols > 3 or rows0 > 3:
+		CARD_W = 120.0
+		CARD_H = 84.0
+		GAP_X = 22.0
+		ROW_GAP = 8.0
+		FS_COL_HEAD = 12
+		FS_CARD_HEAD = 10
+		FS_ROW = 12
+		FS_BIG_NAME = 14
+	else:
+		CARD_W = 210.0
+		CARD_H = 92.0
+		GAP_X = 52.0
+		ROW_GAP = 16.0
+		FS_COL_HEAD = 15
+		FS_CARD_HEAD = 12
+		FS_ROW = 15
+		FS_BIG_NAME = 19
+
+
+func _tbd_round(count: int) -> Array:
+	# Placeholder future round: TBD cards (never vacant, so rows read
+	# "TBD" and headers stay plain). Display-only; see render_bracket.
+	var out: Array = []
+	for i in range(count):
+		out.append({"a_id": "", "b_id": "", "a_name": "TBD", "b_name": "TBD",
+			"bye": false, "vacant": false, "wins_a": 0, "wins_b": 0,
+			"draws": 0, "winner_id": "", "battles": 0, "tbd": true})
+	return out
+
+
+func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: bool = false) -> PanelContainer:
 	var decided: bool = str(m.get("winner_id", "")) != ""
 	var bye: bool = bool(m.get("bye", false))
 	var vacant: bool = bool(m.get("vacant", false))
@@ -183,18 +343,20 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool) -> PanelContai
 		htxt += "  •  BYE"
 	elif vacant:
 		htxt += "  •  VACANT"
+	elif loser_adv:
+		htxt += "  •  LOSER ADV"
 	head.text = htxt
-	head.add_theme_font_size_override("font_size", 12)
+	head.add_theme_font_size_override("font_size", FS_CARD_HEAD)
 	head.add_theme_color_override("font_color", COL_LIVE if live else Color(0.6, 0.6, 0.65))
 	vb.add_child(head)
 	var wa: int = int(m.get("wins_a", 0))
 	var wb: int = int(m.get("wins_b", 0))
-	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided))
-	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided))
+	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided, loser_adv))
+	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided, loser_adv))
 	return card
 
 
-func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: bool, decided: bool) -> HBoxContainer:
+func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	var nm := Label.new()
@@ -203,7 +365,7 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 	nm.clip_text = true
 	nm.custom_minimum_size = Vector2(CARD_W - 60.0, 24.0)
 	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	nm.add_theme_font_size_override("font_size", 15)
+	nm.add_theme_font_size_override("font_size", FS_ROW)
 	var col := Color(0.92, 0.92, 0.94)
 	if vacant:
 		col = Color(0.28, 0.28, 0.32)
@@ -211,12 +373,15 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 		col = COL_TBD
 	elif decided:
 		var won: bool = str(m.get("winner_id", "")) == str(m.get("a_id" if slot == "a" else "b_id", ""))
-		col = COL_WIN if won else COL_LOSE
+		if loser_adv:
+			col = COL_LOSE if won else COL_WIN
+		else:
+			col = COL_WIN if won else COL_LOSE
 	nm.add_theme_color_override("font_color", col)
 	row.add_child(nm)
 	var sc := Label.new()
 	sc.text = str(score)
-	sc.add_theme_font_size_override("font_size", 15)
+	sc.add_theme_font_size_override("font_size", FS_ROW)
 	sc.add_theme_color_override("font_color", col)
 	row.add_child(sc)
 	return row
@@ -232,14 +397,14 @@ func _make_champ_card(champ_name: String, tourney: Dictionary) -> PanelContainer
 	var head := Label.new()
 	head.text = "CHAMPION"
 	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	head.add_theme_font_size_override("font_size", 12)
+	head.add_theme_font_size_override("font_size", FS_CARD_HEAD)
 	head.add_theme_color_override("font_color", COL_CHAMP if decided else Color(0.6, 0.6, 0.65))
 	vb.add_child(head)
 	var nm := Label.new()
 	nm.text = champ_name
 	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	nm.clip_text = true
-	nm.add_theme_font_size_override("font_size", 19)
+	nm.add_theme_font_size_override("font_size", FS_BIG_NAME)
 	nm.add_theme_color_override("font_color", COL_CHAMP if decided else COL_TBD)
 	vb.add_child(nm)
 	return card

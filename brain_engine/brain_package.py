@@ -237,6 +237,99 @@ def log_training_session(record, episodes, params, notes=""):
     return record
 
 
+ARCHIVE_DIR = os.path.join(VAULT_DIR, "archive")
+ARCHIVE_LOG = os.path.join(ARCHIVE_DIR, "log.json")
+
+
+def _read_archive_log():
+    try:
+        with open(ARCHIVE_LOG) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _write_archive_log(entries):
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=ARCHIVE_DIR)
+    os.close(fd)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(entries, f, indent=2)
+        os.replace(tmp, ARCHIVE_LOG)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def archive_brain(path_or_id, reason=""):
+    """Retires a brain to brains/archive/ (the vault scanner globs
+    non-recursively, so archived files drop out of the roster with no
+    code changes). Appends to the archive log; refreshes the index.
+    Returns the log entry."""
+    rec, _w = load_brain(path_or_id)  # validates the package first
+    src = _resolve(path_or_id)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    dst = os.path.join(ARCHIVE_DIR, os.path.basename(src))
+    shutil.move(src, dst)
+    bak = src + ".bak"
+    if os.path.isfile(bak):
+        shutil.move(bak, dst + ".bak")
+    entry = {"id": rec.get("id", ""), "name": rec.get("name", "?"),
+             "filename": os.path.basename(dst),
+             "archived_utc": _utcnow(), "reason": reason,
+             "record": rec.get("record", {}),
+             "generator_params": rec.get("generator_params", {})}
+    log = _read_archive_log()
+    log.append(entry)
+    _write_archive_log(log)
+    refresh_index()
+    return entry
+
+
+def restore_brain(name_or_id):
+    """Brings an archived brain back to the vault (re-indexed on next
+    scan). Returns the record."""
+    key = str(name_or_id)
+    cands = []
+    if os.path.isdir(ARCHIVE_DIR):
+        for fname in sorted(os.listdir(ARCHIVE_DIR)):
+            if not fname.endswith(PACKAGE_EXT):
+                continue
+            if key.lower() in fname.lower():
+                cands.append(fname)
+    if not cands:
+        raise FileNotFoundError(f"No archived brain matches '{key}'")
+    if len(cands) > 1:
+        raise ValueError(f"Ambiguous archive match '{key}': {cands}")
+    src = os.path.join(ARCHIVE_DIR, cands[0])
+    dst = os.path.join(VAULT_DIR, cands[0])
+    if os.path.exists(dst):
+        raise FileExistsError(f"Vault already holds {cands[0]}")
+    shutil.move(src, dst)
+    bak = src + ".bak"
+    if os.path.isfile(bak):
+        shutil.move(bak, dst + ".bak")
+    rec, _w = load_brain(dst)
+    refresh_index()
+    return rec
+
+
+def list_archive():
+    """Archive log entries, newest last, each with a `present` flag."""
+    out = []
+    for e in _read_archive_log():
+        e = dict(e)
+        e["present"] = os.path.isfile(
+            os.path.join(ARCHIVE_DIR, str(e.get("filename", ""))))
+        out.append(e)
+    return out
+
+
 def win_rate(record):
     r = record["record"]
     decided = r["wins"] + r["losses"]

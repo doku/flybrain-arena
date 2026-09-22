@@ -173,6 +173,97 @@ def cmd_import(a):
     return out({"ok": True, "brain": rec})
 
 
+def cmd_archive(a):
+    try:
+        entry = vault.archive_brain(a.id, reason=getattr(a, "reason", ""))
+    except Exception as e:
+        return err(str(e))
+    return out({"ok": True, "archived": entry})
+
+
+def cmd_restore(a):
+    try:
+        rec = vault.restore_brain(a.id)
+    except Exception as e:
+        return err(str(e))
+    return out({"ok": True, "brain": rec})
+
+
+def cmd_archive_list(_a):
+    try:
+        entries = vault.list_archive()
+    except Exception as e:
+        return err(str(e))
+    return out({"ok": True, "archived": entries})
+
+
+class _TeeLog:
+    # Duplicates prints to a log file (spawned workers have no console,
+    # so silent deaths would otherwise leave zero evidence).
+    def __init__(self, path):
+        self.path = path
+        self.term = sys.stdout
+        self.fh = open(path, "w") if path else None
+
+    def write(self, text):
+        self.term.write(text)
+        if self.fh is not None:
+            try:
+                self.fh.write(text)
+            except OSError:
+                pass
+
+    def flush(self):
+        self.term.flush()
+        if self.fh is not None:
+            try:
+                self.fh.flush()
+            except OSError:
+                pass
+
+    def close(self):
+        if self.fh is not None:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+            self.fh = None
+
+
+def cmd_breed(a):
+    import evo_breeder
+    import traceback
+    log = _TeeLog(getattr(a, "log_file", "") or "")
+    old_stdout = sys.stdout
+    sys.stdout = log
+    try:
+        print(f"[breed] strategy={a.strategy} name={a.name} "
+              f"episodes={a.episodes} seed={a.seed}", flush=True)
+        prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
+            if getattr(a, "progress", "") else None
+        if a.strategy == "clone":
+            rec, _w, summary = evo_breeder.breed_clone(
+                a.parent, a.name, int(a.seed), int(a.episodes),
+                noise=float(getattr(a, "noise", 0.05) or 0.05),
+                progress_cb=prog)
+        elif a.strategy == "random":
+            rec, _w, summary = evo_breeder.breed_random(
+                a.name, int(a.seed), int(a.episodes), progress_cb=prog,
+                generation=int(getattr(a, "gen", 1) or 1))
+        else:
+            return err(f"unknown strategy '{a.strategy}' (clone|random)")
+        print(f"[breed] done: {rec.get('name')} ({rec.get('id')}) "
+              f"summary={summary}", flush=True)
+    except Exception as e:
+        print(f"[breed] FAILED: {e}\n{traceback.format_exc()}", flush=True)
+        return out({"ok": False, "error": str(e)}, a.result_file)
+    finally:
+        sys.stdout = old_stdout
+        log.close()
+    return out({"ok": True, "brain": rec, "summary": summary},
+               a.result_file)
+
+
 def main():
     p = argparse.ArgumentParser(description="Fly-brain vault CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -193,10 +284,27 @@ def main():
     q = sub.add_parser("import"); q.add_argument("--npz", required=True)
     q.add_argument("--name", required=True); q.add_argument("--params", default="")
     q.add_argument("--params-file", default="")
+    q = sub.add_parser("archive"); q.add_argument("--id", required=True)
+    q.add_argument("--reason", default="")
+    q = sub.add_parser("restore"); q.add_argument("--id", required=True)
+    q = sub.add_parser("archive-list")
+    q = sub.add_parser("breed"); q.add_argument("--strategy", required=True)
+    # --name is optional-value: empty string (wild auto-christen) must
+    # survive even when the launcher drops empty argv elements
+    # (Godot OS.create_process on Windows), leaving a bare `--name`
+    # followed by the next option. nargs="?" maps that to "" too.
+    q.add_argument("--name", nargs="?", default="", const="");
+    q.add_argument("--episodes", type=int, required=True)
+    q.add_argument("--parent", default=""); q.add_argument("--seed", type=int, required=True)
+    q.add_argument("--noise", type=float, default=0.05)
+    q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
+    q.add_argument("--log-file", default=""); q.add_argument("--gen", type=int, default=1)
     a = p.parse_args()
     fn = {"list": cmd_list, "info": cmd_info, "generate": cmd_generate,
           "train": cmd_train, "delete": cmd_delete, "rename": cmd_rename,
-          "export": cmd_export, "import": cmd_import}[a.cmd]
+          "export": cmd_export, "import": cmd_import, "archive": cmd_archive,
+          "restore": cmd_restore, "archive-list": cmd_archive_list,
+          "breed": cmd_breed}[a.cmd]
     return fn(a)
 
 

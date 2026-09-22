@@ -189,6 +189,19 @@ func list_brains() -> Array:
 	return []
 
 
+func archive_list() -> Array:
+	# Hall of shame: archived biggest losers, newest last.
+	var res := _run_cli(["archive-list"])
+	if res.get("ok", false):
+		return res.get("archived", [])
+	push_warning("[Director] archive list failed: %s" % res.get("error", "?"))
+	return []
+
+
+func restore_archived(arch_id: String) -> Dictionary:
+	return _run_cli(["restore", "--id", arch_id])
+
+
 func generate_brain_async(brain_name: String, params: Dictionary) -> Dictionary:
 	var params_file := job_dir.path_join("gen_params_%d.json" % Time.get_ticks_msec())
 	var f := FileAccess.open(params_file, FileAccess.WRITE)
@@ -332,6 +345,99 @@ func best_of_options() -> Array:
 	return [1, 3, 5, 7, 9, 11]
 
 
+# ── Evolution mode: eternal tournament loop ──────────────────────
+# Each generation archives the biggest loser and breeds 1 winner-clone
+# + 1 random, holding roster size constant. State rides in
+# tourney["evo"] (persisted by save_state), so quit/resume just works.
+
+func evo_ranking() -> Array:
+	# Player ids worst-first: earliest exit round, then fewest battle
+	# wins. Mirrors evo_breeder.biggest_loser (Python, unit-tested);
+	# keep the two in sync when touching this rule.
+	var last_round := {}
+	var bwins := {}
+	for ri in range(tourney.get("rounds", []).size()):
+		var rnd: Array = tourney["rounds"][ri]
+		for m in rnd:
+			if not (m is Dictionary):
+				continue
+			for side in ["a", "b"]:
+				var pid := str(m.get("a_id" if side == "a" else "b_id", ""))
+				if pid == "":
+					continue
+				last_round[pid] = ri
+				var wkey := "wins_a" if side == "a" else "wins_b"
+				bwins[pid] = int(bwins.get(pid, 0)) + int(m.get(wkey, 0))
+	var ids := last_round.keys()
+	ids.sort_custom(func(p, q):
+		if last_round[p] != last_round[q]:
+			return last_round[p] < last_round[q]
+		if int(bwins.get(p, 0)) != int(bwins.get(q, 0)):
+			return int(bwins.get(p, 0)) < int(bwins.get(q, 0))
+		return str(p) < str(q))
+	return ids
+
+
+func evo_vault_ids() -> Array:
+	# Ids physically present in the vault right now. Tournament rounds
+	# can reference brains deleted/archived mid-event (resumed old
+	# brackets, manual deletes); elimination must skip the missing
+	# instead of aborting the generation on a ghost.
+	var ids: Array = []
+	for b in list_brains():
+		ids.append(str((b as Dictionary).get("id", "")))
+	return ids
+
+
+func evo_biggest_loser() -> Dictionary:
+	return evo_bottom_two().get("last", {"id": "", "via": "none"})
+
+
+func evo_bottom_two() -> Dictionary:
+	# Bottom two THROUGH COMBAT: the losers-final loser is last place,
+	# the losers-final winner is second-last — both decided by a full
+	# best-of match, never by battle win/loss tallies. Falls back to
+	# earliest-exit ranking only when no consolation ran.
+	var present := evo_vault_ids()
+	var champ := str(tourney.get("champion_id", ""))
+	var last := str(tourney.get("last_place_id", ""))
+	if last != "" and last != champ and last in present:
+		var second := ""
+		var losers_from := int(tourney.get("losers_start_round", -1))
+		if losers_from >= 0:
+			var rounds: Array = tourney.get("rounds", [])
+			var fin: Dictionary = (rounds[rounds.size() - 1] as Array)[0]
+			var w := str(fin.get("winner_id", ""))
+			if w != "" and w != last and w in present:
+				second = w
+		if second != "":
+			return {"last": {"id": last, "via": "consolation"},
+				"second": {"id": second, "via": "consolation"}}
+	var ranked: Array = []
+	for pid in evo_ranking():
+		if str(pid) != champ and str(pid) in present:
+			ranked.append(str(pid))
+	# A valid consolation last-place survives even when its partner is
+	# missing: second falls back to ranking, never the reverse.
+	if last != "" and last != champ and last in present:
+		var rest: Array = []
+		for pid in ranked:
+			if str(pid) != last:
+				rest.append(str(pid))
+		return {"last": {"id": last, "via": "consolation"},
+			"second": {"id": str(rest[0]) if rest.size() > 0 else "",
+				"via": "ranking" if rest.size() > 0 else "none"}}
+	return {"last": {"id": str(ranked[0]) if ranked.size() > 0 else "",
+			"via": "ranking" if ranked.size() > 0 else "none"},
+		"second": {"id": str(ranked[1]) if ranked.size() > 1 else "",
+			"via": "ranking" if ranked.size() > 1 else "none"}}
+
+
+func evo_archive(brain_id: String, reason: String) -> Dictionary:
+	# Blocking: local file move, milliseconds.
+	return _run_cli(["archive", "--id", brain_id, "--reason", reason])
+
+
 func size_options() -> Array:
 	return [4, 8, 16]
 
@@ -352,7 +458,7 @@ func _battle_rate(r: Dictionary) -> float:
 	return float(r.get("wins", 0)) / max(d, 1) if d > 0 else WIN_RATE_FALLBACK
 
 
-func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false) -> Dictionary:
+func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false, consolation: bool = false) -> Dictionary:
 	var all_brains: Array = list_brains() if brains_override.is_empty() else brains_override
 	var by_id := {}
 	for b in all_brains:
@@ -414,6 +520,9 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 		"id": tid, "status": "running", "size": size, "best_of": best_of,
 		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
 		"round_time": round_time, "quick": quick, "seeding": seeding,
+		"random_draw": random_draw,
+		"consolation": consolation and not quick,
+		"losers_start_round": -1, "last_place_id": "",
 		"created": Time.get_datetime_string_from_system(),
 		"players": players, "byes": [],
 		"rounds": [matches], "current_round": 0, "current_match": 0,
@@ -434,6 +543,22 @@ func _new_match(a, b) -> Dictionary:
 		"wins_a": 0, "wins_b": 0, "draws": 0,
 		"winner_id": "", "battles": 0,
 	}
+
+
+func _match_loser(mm: Dictionary) -> String:
+	# Loser of a decided match for loser-advance consolation rounds.
+	# Bye walkovers have no loser (a walkover is not loss evidence);
+	# undecided or vacant matches yield "" like missing winners do.
+	var w := str(mm.get("winner_id", ""))
+	if w == "" or bool(mm.get("bye", false)) or bool(mm.get("vacant", false)):
+		return ""
+	var a := str(mm.get("a_id", ""))
+	var b := str(mm.get("b_id", ""))
+	if w == a and b != "":
+		return b
+	if w == b and a != "":
+		return a
+	return ""
 
 
 func _seed_order(size: int) -> Array:
@@ -594,15 +719,44 @@ func advance_after_match() -> Dictionary:
 		if int(tourney["current_match"]) < r.size():
 			save_state()
 			return {"action": "next_match"}
-	# Round complete: build next from winners (empty slots = vacant subtrees).
+	# Round complete: build next from winners - or from losers inside
+	# the consolation bracket (loser advances, converging down to last
+	# place + second-last for the archives). Empty slots = vacant subtrees.
+	var _losers_from := int(tourney.get("losers_start_round", -1))
+	var _loser_mode := _losers_from >= 0 and int(tourney["current_round"]) >= _losers_from
 	var winners: Array = []
 	for mm in r:
-		winners.append(str(mm.get("winner_id", "")))
+		if _loser_mode:
+			winners.append(_match_loser(mm))
+		else:
+			winners.append(str(mm.get("winner_id", "")))
 	if winners.size() == 1:
+		var losers_from := int(tourney.get("losers_start_round", -1))
+		if losers_from < 0:
+			# Main final decided: crown the champion, then maybe run
+			# the losers bracket to find last place (loser advances;
+			# the losers-final loser is last).
+			tourney["champion_id"] = winners[0]
+			if bool(tourney.get("consolation", false)):
+				if _build_losers_bracket():
+					save_state()
+					return {"action": "next_match",
+						"consolation_started": true}
+				print("[Director] Consolation skipped: need exactly 2/4/8 "
+					+ "real round-0 losers.")
+		else:
+			# Losers final decided: its loser is last place (a loss in
+			# every consolation round it fought). The main champion set
+			# earlier stands; the final winner is second-last.
+			var fin: Dictionary = r[0]
+			var w := str(fin.get("winner_id", ""))
+			tourney["last_place_id"] = str(fin.get(
+				"b_id" if w == str(fin.get("a_id", "")) else "a_id", ""))
 		tourney["status"] = "complete"
-		tourney["champion_id"] = winners[0]
 		save_state()
-		return {"action": "tournament_end", "champion_id": winners[0]}
+		return {"action": "tournament_end",
+			"champion_id": str(tourney.get("champion_id", "")),
+			"last_place_id": str(tourney.get("last_place_id", ""))}
 	var names := {}
 	for p in tourney.get("players", []):
 		names[str(p.get("id", ""))] = str(p.get("name", "?"))
@@ -635,6 +789,50 @@ func advance_after_match() -> Dictionary:
 	return {"action": "next_match"}
 
 
+func _build_losers_bracket() -> bool:
+	# Collects real round-0 losers (played matches only: no byes, no
+	# vacant cards, decided winner) and appends their mini-bracket as
+	# new rounds. Only exact powers 2/4/8 (else the evidence distorts).
+	# Returns true when a losers bracket starts.
+	var names := {}
+	for p in tourney.get("players", []):
+		names[str(p.get("id", ""))] = str(p.get("name", "?"))
+	var losers: Array = []
+	var r0: Array = tourney["rounds"][0]
+	for m in r0:
+		if not (m is Dictionary):
+			continue
+		if bool(m.get("bye", false)) or bool(m.get("vacant", false)):
+			continue
+		var a := str(m.get("a_id", ""))
+		var b := str(m.get("b_id", ""))
+		var w := str(m.get("winner_id", ""))
+		if a == "" or b == "" or w == "":
+			continue
+		losers.append(b if w == a else a)
+	if not (losers.size() == 2 or losers.size() == 4 or losers.size() == 8):
+		return false
+	var first: Array = []
+	for k in range(0, losers.size(), 2):
+		first.append(_new_match(
+			{"id": losers[k], "name": str(names.get(losers[k], "?"))},
+			{"id": losers[k + 1], "name": str(names.get(losers[k + 1], "?"))}))
+	var rounds: Array = tourney["rounds"]
+	tourney["losers_start_round"] = rounds.size()
+	rounds.append(first)
+	tourney["current_round"] = rounds.size() - 1
+	tourney["current_match"] = 0
+	return true
+
+
+func last_place_name() -> String:
+	var lid := str(tourney.get("last_place_id", ""))
+	for p in tourney.get("players", []):
+		if str(p.get("id", "")) == lid:
+			return str(p.get("name", "?"))
+	return "?"
+
+
 func champion_name() -> String:
 	var cid := str(tourney.get("champion_id", ""))
 	for p in tourney.get("players", []):
@@ -657,9 +855,13 @@ func bracket_text() -> String:
 		str(tourney.get("id", "")), int(tourney.get("best_of", 7)),
 		int(tourney.get("wins_needed", 4))])
 	var rounds: Array = tourney.get("rounds", [])
+	var _lf := int(tourney.get("losers_start_round", -1))
 	for ri in range(rounds.size()):
 		var label := "Final" if ri == rounds.size() - 1 and rounds.size() > 1 else ("Round %d" % (ri + 1))
+		if _lf >= 0 and ri >= _lf:
+			label = "Losers final" if ri == rounds.size() - 1 else ("Losers R%d" % (ri - _lf + 1))
 		lines.append("== %s ==" % label)
+		var _la := _lf >= 0 and ri >= _lf
 		for mi in range(rounds[ri].size()):
 			var mm: Dictionary = rounds[ri][mi]
 			var marker := ""
@@ -670,13 +872,19 @@ func bracket_text() -> String:
 			else:
 				var w := ""
 				if str(mm.get("winner_id", "")) != "":
-					var wn := str(mm.get("a_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("b_name", "?"))
-					w = "  => %s" % wn
+					if _la:
+						var ln := str(mm.get("b_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("a_name", "?"))
+						w = "  => %s (loser advances)" % ln
+					else:
+						var wn := str(mm.get("a_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("b_name", "?"))
+						w = "  => %s" % wn
 				lines.append("  %s %d - %d %s%s%s" % [str(mm.get("a_name", "?")),
 					int(mm.get("wins_a", 0)), int(mm.get("wins_b", 0)),
 					str(mm.get("b_name", "?")), w, marker])
 	if str(tourney.get("status", "")) == "complete":
 		lines.append("CHAMPION: %s" % champion_name())
+		if str(tourney.get("last_place_id", "")) != "":
+			lines.append("LAST PLACE: %s" % last_place_name())
 	return "\n".join(lines)
 
 

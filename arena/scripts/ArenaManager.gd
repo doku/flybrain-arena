@@ -125,7 +125,7 @@ const BV_NET_COLORS := {
 # Replay (L4): per-battle pool-rate stream. One count array per motor
 # reply (~5 Hz), capped; banked into the tournament JSON `flights`
 # entry when the menu record toggle is on, plus an in-memory copy for
-# the post-battle scrubber. ~50 KB per 40 s battle — toggle-gated.
+# the post-battle scrubber. ~50 KB per 40 s battle ??toggle-gated.
 const BV_STREAM_MAX := 600
 var bv_stream_alpha: Array = []
 var bv_stream_beta: Array = []
@@ -182,6 +182,7 @@ var tourney_match_label: String = ""
 var tourney_awaiting_load: bool = false
 var bracket_overlay: Control
 var arena_bracket: BracketView
+var bracket_scroll: ScrollContainer
 var bracket_title: Label
 var bracket_button: Button
 
@@ -316,6 +317,9 @@ func _ready() -> void:
 	brain_client.merged.connect(_on_merged)
 	brain_client.restarted.connect(_on_restarted)
 	brain_client.tournament_battle_received.connect(_on_tournament_battle)
+	var _edir := _director()
+	if _edir != null:
+		_edir.async_done.connect(_on_evo_async)
 	brain_client.raster_map_received.connect(_on_raster_map)
 	brain_client.brains_loaded.connect(_on_brains_loaded)
 	brain_client.match_ready_received.connect(_on_match_ready)
@@ -334,6 +338,8 @@ func _ready() -> void:
 	_build_winner_overlay()
 	_layout_match_hud()
 	_build_brainview()
+	_build_evo_panel()
+	_build_evo_status()
 	_generate_forest()
 	_setup_dynamic_tree_opacity()
 	# Tournament battles are sequenced by the director (brains load first);
@@ -357,6 +363,11 @@ func _enter_tournament_mode() -> void:
 	director.arena = self
 	_build_bracket_overlay()
 	_build_menu_bar(true)
+	# Pipeline kick-off: queue a wild breed for the next generation
+	# immediately, so it trains in the background while gen 1 plays.
+	if _evo_active():
+		var evo: Dictionary = director.tourney.get("evo", {})
+		_evo_queue_wild(int(evo.get("generation", 1)) + 1)
 	_request_current_battle_load()
 
 
@@ -391,6 +402,9 @@ func _build_menu_bar(tournament: bool) -> void:
 		var replay_bt := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
 		replay_bt.pressed.connect(_toggle_replay)
 		bar.add_child(replay_bt)
+		var evo_stop_b := _menu_bar_button("EVO STOP", "Stop the evolution loop (keeps current bracket).")
+		evo_stop_b.pressed.connect(_on_evo_stop)
+		bar.add_child(evo_stop_b)
 	else:
 		if is_instance_valid(merge_button):
 			merge_button.visible = false
@@ -465,7 +479,9 @@ func _build_bracket_overlay() -> void:
 	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bracket_overlay.add_child(center)
 	var panel := PanelContainer.new()
-	panel.custom_minimum_size = Vector2(880, 600)
+	# Near-fullscreen at the 1280x720 canvas (40px side / 35px vertical
+	# margins) so the bracket gets maximum room before scrolling.
+	panel.custom_minimum_size = Vector2(1200, 650)
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = Color(0.06, 0.06, 0.09, 0.98)
 	sb.border_color = Color(0.4, 0.4, 0.46)
@@ -489,6 +505,7 @@ func _build_bracket_overlay() -> void:
 	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
 	vb.add_child(scroll)
+	bracket_scroll = scroll
 	arena_bracket = BracketView.new()
 	arena_bracket.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	arena_bracket.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -509,11 +526,50 @@ func _show_arena_bracket(title_text: String) -> void:
 	arena_bracket.render_bracket(director.tourney,
 		int(director.tourney.get("current_round", 0)),
 		int(director.tourney.get("current_match", 0)))
+	# The renderer picks compact metrics for big brackets so most fit
+	# outright; whatever still overflows keeps native scrolling here.
+	if is_instance_valid(bracket_scroll):
+		bracket_scroll.scroll_horizontal = 0
+		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
 
 func _hide_arena_bracket() -> void:
 	if bracket_overlay != null:
 		bracket_overlay.visible = false
+
+
+func _save_bracket_record(with_png: bool) -> void:
+	# Permanent record of the finished bracket: bracket text always, plus
+	# a viewport PNG once the overlay has settled (2 frames). TXT/PNG land
+	# next to the tournament save as bracket_<id>.txt/.png. Skipped for
+	# quick battles (single exhibition, no bracket).
+	var director := _director()
+	if director == null or director.is_quick():
+		return
+	if (director.tourney.get("rounds", []) as Array).is_empty():
+		return
+	var base: String = director.tournament_dir.path_join("bracket_%s" % str(director.tourney.get("id", "draft")))
+	var f := FileAccess.open(base + ".txt", FileAccess.WRITE)
+	if f != null:
+		f.store_string(director.bracket_text())
+		f.close()
+		print("[Arena] Bracket record saved: ", base + ".txt")
+	if not with_png:
+		return
+	var showed := false
+	if not (is_instance_valid(bracket_overlay) and bracket_overlay.visible):
+		_show_arena_bracket("CHAMPION: %s - FINAL RECORD" % director.champion_name())
+		showed = true
+	await get_tree().process_frame
+	await get_tree().process_frame
+	if is_instance_valid(bracket_overlay) and bracket_overlay.visible:
+		var img := get_viewport().get_texture().get_image()
+		if img.save_png(base + ".png") == OK:
+			print("[Arena] Bracket screenshot saved: ", base + ".png")
+		else:
+			push_warning("[Arena] Bracket screenshot failed: " + base + ".png")
+	if showed:
+		_hide_arena_bracket()
 
 func _on_bracket_toggle() -> void:
 	if bracket_overlay != null and bracket_overlay.visible:
@@ -1284,20 +1340,23 @@ func _layout_match_hud() -> void:
 	ctrl_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	strip.add_child(ctrl_label)
 	_update_ctrl_label()
-	# Status line ("AERIAL JOUST IN PROGRESS", etc.) to bottom-left,
-	# out of the fight and the top strips.
+	# Status line ("AERIAL JOUST IN PROGRESS", etc.) centered right
+	# above the buttons - stacked over the EVO line (menu bar -46/-10,
+	# EVO line -74/-50, this box -104/-78), out of the fight view.
 	if is_instance_valid(status_label):
 		var corner := VBoxContainer.new()
 		corner.name = "StatusCorner"
-		corner.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
-		corner.offset_left = 12.0
-		corner.offset_right = 420.0
-		corner.offset_top = -60.0
-		corner.offset_bottom = -12.0
+		corner.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+		corner.offset_left = -400.0
+		corner.offset_right = 400.0
+		corner.offset_top = -104.0
+		corner.offset_bottom = -78.0
+		corner.alignment = BoxContainer.ALIGNMENT_CENTER
 		hud.add_child(corner)
 		var old_parent := (status_label as Node).get_parent()
 		if old_parent != null:
 			old_parent.remove_child(status_label)
+		(status_label as Label).horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		corner.add_child(status_label)
 
 
@@ -1644,18 +1703,19 @@ func _apply_brainview_settings() -> void:
 		bv_panel_alpha.visible = enabled
 	if is_instance_valid(bv_panel_beta):
 		bv_panel_beta.visible = enabled
-	# Per-fly spike readout lines (orange/blue "brain n=...") belong to
-	# the brain-view family: they follow the same show toggle.
+	# Per-fly spike readout lines ("brain n=... thrust/yaw/...") stay
+	# hidden permanently: bars + diagram + 3D carry the same data and
+	# the labels just eat layout room.
 	if is_instance_valid(brain_alpha_label):
-		brain_alpha_label.visible = enabled
+		brain_alpha_label.visible = false
 	if is_instance_valid(brain_beta_label):
-		brain_beta_label.visible = enabled
+		brain_beta_label.visible = false
 	_apply_bv_layer(layer)
 
 
 func _apply_bv_layer(layer: String) -> void:
 	# Bars always ride along when enabled. Flow shows on "flow", or on
-	# "raster" until a pool is selected — then the raster takes its
+	# "raster" until a pool is selected ??then the raster takes its
 	# rect (click again to deselect and return to the diagram).
 	_apply_bv_side_layer("alpha", layer)
 	_apply_bv_side_layer("beta", layer)
@@ -1695,10 +1755,7 @@ func _on_brain_button() -> void:
 			bv_panel_alpha.visible = true
 		if is_instance_valid(bv_panel_beta):
 			bv_panel_beta.visible = true
-		if is_instance_valid(brain_alpha_label):
-			brain_alpha_label.visible = true
-		if is_instance_valid(brain_beta_label):
-			brain_beta_label.visible = true
+		# Spike readout lines stay hidden (see _apply_brainview_settings).
 		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 	else:
 		_cycle_bv_layer()
@@ -1713,10 +1770,7 @@ func _toggle_brainview() -> void:
 		bv_panel_alpha.visible = show_now
 	if is_instance_valid(bv_panel_beta):
 		bv_panel_beta.visible = show_now
-	if is_instance_valid(brain_alpha_label):
-		brain_alpha_label.visible = show_now
-	if is_instance_valid(brain_beta_label):
-		brain_beta_label.visible = show_now
+	# Spike readout lines stay hidden (see _apply_brainview_settings).
 	_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 
 
@@ -2084,7 +2138,7 @@ func _handle_draw() -> void:
 		"TIME UP - NOBODY BLED - REMATCH",
 		"REMATCH")
 
-# ── Dynamic tree fade ───────────────────────────────────────────────
+# ?�?� Dynamic tree fade ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 # Every combat-area tree gets its own StandardMaterial3D (so alpha can
 # be set per-tree). Each frame the camera->fly ray is tested against
 # each tree's XZ position; occluding trees go translucent instantly,
@@ -2128,7 +2182,71 @@ func _setup_dynamic_tree_opacity() -> void:
 			"canopy_mats": canopy_mats,
 		})
 
+func _evo_watcher_tick(delta: float) -> void:
+	# Background pipeline pump, throttled: adopts finished breeds,
+	# launches queued specs when the shared slot is free, refreshes
+	# the bottom-left status line. No-ops unless evo is active.
+	if not _evo_active():
+		if is_instance_valid(evo_status_line):
+			evo_status_line.visible = false
+		return
+	_evo_adopt_finished()
+	var director := _director()
+	if director != null and not evo_waiting and director.pending_async.is_empty():
+		for spec in _evo_pending():
+			if not bool((spec as Dictionary).get("launched", false)):
+				_evo_spawn_spec(spec)
+				break
+	evo_status_tick += delta
+	if evo_status_tick < EVO_STATUS_EVERY:
+		return
+	evo_status_tick = 0.0
+	_update_evo_status_line()
+
+
+func _update_evo_status_line() -> void:
+	if not is_instance_valid(evo_status_line):
+		return
+	var director := _director()
+	if director == null:
+		evo_status_line.visible = false
+		return
+	var evo: Dictionary = director.tourney.get("evo", {})
+	var gen := int(evo.get("generation", 1))
+	var parts: Array = []
+	for spec in _evo_pending():
+		var s := spec as Dictionary
+		var label := str(s.get("name", ""))
+		if label == "":
+			label = "wild G%d" % int(s.get("gen", gen + 1))
+		if bool(s.get("launched", false)):
+			var prog := _evo_poll_file(str(s.get("progress", "")))
+			if prog.is_empty():
+				parts.append("%s warming up" % label)
+			else:
+				parts.append("%s ep %d/%d" % [label,
+					int(prog.get("episode", 0)), EVO_EPISODES])
+		else:
+			parts.append("%s queued" % label)
+	for kind in (evo.get("done", {}) as Dictionary).keys():
+		parts.append("%s done" % _evo_done_name(str(kind)))
+	if parts.is_empty():
+		evo_status_line.visible = false
+		return
+	evo_status_line.text = "EVO G%d • %s" % [gen, " • ".join(parts)]
+	evo_status_line.visible = true
+
+
 func _process(delta: float) -> void:
+	_evo_watcher_tick(delta)
+	# Evo spinner animation while the phase panel is up.
+	if is_instance_valid(evo_panel) and evo_panel.visible:
+		evo_spin_tick += delta
+		if evo_spin_tick >= 0.1:
+			evo_spin_tick = 0.0
+			evo_spin_frame = (evo_spin_frame + 1) % EVO_SPINNER.size()
+			if is_instance_valid(evo_spinner):
+				evo_spinner.text = EVO_SPINNER[evo_spin_frame]
 	# Soma-cloud slow spin for depth while visible.
 	if is_instance_valid(bv_cloud_alpha) and bv_cloud_alpha.visible:
 		bv_cloud_alpha.rotate_y(0.25 * delta)
@@ -2180,7 +2298,7 @@ func _process(delta: float) -> void:
 		for cm in entry["canopy_mats"]:
 			(cm as StandardMaterial3D).albedo_color.a = lerpf((cm as StandardMaterial3D).albedo_color.a, target, k)
 
-# ────────────────────────────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 
 func _update_ctrl_label() -> void:
 	if not is_instance_valid(ctrl_label):
@@ -2372,8 +2490,31 @@ func _ko_text(winner_slot: String) -> String:
 		return "KNOCKOUT! %s WINS!" % n
 	return "KNOCKOUT! FLY %s WINS!" % n
 
+func _check_speed_violations() -> void:
+	# ILLEGAL-speed marking: a fly that lived pinned at the hard speed
+	# cap was flying impossibly (the G2-wild zoom exploit), not
+	# skillfully. The physics cap already neutralized it mid-battle;
+	# this marks the record on console + status. Dynamic .get() because
+	# the flies are statically CharacterBody3D (FlyPhysics members).
+	for side in ["alpha", "beta"]:
+		var fly: CharacterBody3D = fly_alpha if side == "alpha" else fly_beta
+		if not is_instance_valid(fly):
+			continue
+		if not bool(fly.get("speed_exploit")):
+			continue
+		var frac := 0.0
+		if float(fly.get("fly_time")) > 0.0:
+			frac = float(fly.get("capped_time")) / float(fly.get("fly_time"))
+		var msg := "ILLEGAL SPEED: %s capped %.0f%% of battle (peak %.1f m/s)" % [
+			_slot_name(side), frac * 100.0, float(fly.get("peak_speed"))]
+		print("[Arena] ", msg)
+		if is_instance_valid(status_label):
+			status_label.text = msg
+
+
 func _end_round() -> void:
 	is_round_active = false
+	_check_speed_violations()
 	print("[Arena] Round concluded! Sending battle stats to evolution engine...")
 	if tournament_active:
 		_report_battle(false)
@@ -2481,6 +2622,15 @@ func _handle_advance_result(res: Dictionary) -> void:
 		_tourney_close_ack = false
 		brain_client.request_tournament_end(champ_slot)
 		var champ_name: String = director.champion_name()
+		# Evolution mode: skip the review-wait and breed the next
+		# generation instead (champion display happens inside).
+		if _evo_active():
+			_run_evo_generation()
+			return
+		var last_line := ""
+		var last_id := str(res.get("last_place_id", ""))
+		if last_id != "":
+			last_line = " - LAST PLACE %s" % director.last_place_name()
 		# The final bracket stays open for review: no auto-hide, no auto
 		# quit. The user leaves via QUIT TO MENU in the bottom bar when
 		# done (the bracket CLOSE button only hides the overlay; BRACKET
@@ -2488,8 +2638,9 @@ func _handle_advance_result(res: Dictionary) -> void:
 		_hide_loading()
 		winner_overlay.visible = false
 		_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET" % champ_name)
+		_save_bracket_record(true)
 		if is_instance_valid(status_label):
-			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s - review, then QUIT TO MENU" % champ_name
+			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s - review, then QUIT TO MENU" % [champ_name, last_line]
 		# Wait for the server's title write in the background (no leaving
 		# until it lands, so the menu never shows a stale pre-title vault).
 		# Bounded so a dead server can never hang the game here.
@@ -2502,9 +2653,787 @@ func _handle_advance_result(res: Dictionary) -> void:
 			if is_instance_valid(status_label):
 				status_label.text += " (title may lag - see server_log.txt)"
 		elif is_instance_valid(status_label):
-			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s (title banked) - review, then QUIT TO MENU" % champ_name
+			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s (title banked) - review, then QUIT TO MENU" % [champ_name, last_line]
 	else:
+		if bool(res.get("consolation_started", false)):
+			_show_arena_bracket("LOSERS BRACKET - LOSER ADVANCES TO LAST PLACE")
+			if is_instance_valid(status_label):
+				status_label.text = "Main champion crowned - loser advances, converging to last place."
+			# Pipeline: queue clone breed from champion while consolation runs.
+			# The wild head-start has trained since tourney start; announce
+			# the generation now that its champion half is known, and
+			# refresh immediately instead of waiting for the 5s tick.
+			if _evo_active():
+				var evo: Dictionary = director.tourney.get("evo", {})
+				var gen := int(evo.get("generation", 1))
+				var champ_name: String = director.champion_name()
+				_evo_queue_clone(gen + 1, str(director.tourney.get("champion_id", "")),
+					champ_name)
+				_update_evo_status_line()
+				if is_instance_valid(status_label):
+					status_label.text = "EVO GEN %d begun - training G%d-%s-kin + wild in background..." % [gen + 1, gen + 1, champ_name]
+			await get_tree().create_timer(3.0).timeout
+			_hide_arena_bracket()
 		_request_current_battle_load()
+
+func _evo_active() -> bool:
+	var director := _director()
+	if director == null:
+		return false
+	return bool(director.tourney.get("evo", {}).get("active", false))
+
+
+const EVO_EPISODES := 50
+const EVO_NOISE := 0.05
+var evo_waiting := false
+var evo_wait_result := {}
+var evo_breed_pid := 0
+# Display name of the brain banked by the last _evo_await_result success
+# (wild brains are christened Python-side; the id alone can't show it).
+var evo_last_bred_name := ""
+# Last _evo_spawn_spec failure text, so tournament-end aborts can say
+# WHY a breed never started (e.g. slot held by a stuck worker) instead
+# of just "check brains/jobs log".
+var evo_last_spawn_error := ""
+# Pipelined breeding: specs live in tourney["evo"]["pending"], completions
+# in ["done"], so quit/resume and the tournament-end handoff share one
+# source of truth. A spec: {kind, name, parent, seed, gen, progress,
+# result, pid, launched}. Wild display names come from Python
+# (evo_breeder.wild_name, deterministic from seed); the arena passes
+# name "" + --gen and reads the christened name back from the result.
+var evo_status_line: Label
+var evo_status_tick := 0.0
+const EVO_STATUS_EVERY := 5.0
+
+
+func _build_evo_status() -> void:
+	# Small dim line centered right above the bottom menu bar. Updated
+	# at most every EVO_STATUS_EVERY seconds - never fights per-battle
+	# status_label writers for the same pixels.
+	var hud: CanvasLayer = $HUD
+	evo_status_line = Label.new()
+	evo_status_line.name = "EvoStatusLine"
+	evo_status_line.add_theme_font_size_override("font_size", 13)
+	evo_status_line.add_theme_color_override("font_color", Color(0.65, 0.65, 0.7, 0.9))
+	evo_status_line.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	evo_status_line.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	evo_status_line.offset_left = -400.0
+	evo_status_line.offset_right = 400.0
+	evo_status_line.offset_top = -74.0
+	evo_status_line.offset_bottom = -50.0
+	evo_status_line.visible = false
+	hud.add_child(evo_status_line)
+# Centered evolution phase overlay: big title + status + progress bar
+# + spinner, so long breed/train waits read as a loading phase.
+var evo_panel: ColorRect
+var evo_title: Label
+var evo_status: Label
+var evo_bar: ProgressBar
+var evo_spinner: Label
+var evo_spin_tick := 0.0
+var evo_spin_frame := 0
+const EVO_SPINNER := ["|", "/", "-", "\\", "|", "/", "-", "\\"]
+
+
+func _build_evo_panel() -> void:
+	var hud: CanvasLayer = $HUD
+	evo_panel = ColorRect.new()
+	evo_panel.name = "EvoPanel"
+	evo_panel.color = Color(0.02, 0.02, 0.05, 0.72)
+	evo_panel.set_anchors_preset(Control.PRESET_FULL_RECT)
+	evo_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	evo_panel.visible = false
+	hud.add_child(evo_panel)
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	evo_panel.add_child(center)
+	var vb := VBoxContainer.new()
+	vb.alignment = BoxContainer.ALIGNMENT_CENTER
+	vb.add_theme_constant_override("separation", 12)
+	center.add_child(vb)
+	evo_spinner = Label.new()
+	evo_spinner.add_theme_font_size_override("font_size", 56)
+	evo_spinner.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(evo_spinner)
+	evo_title = Label.new()
+	evo_title.add_theme_font_size_override("font_size", 30)
+	evo_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(evo_title)
+	evo_status = Label.new()
+	evo_status.add_theme_font_size_override("font_size", 18)
+	evo_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	evo_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	evo_status.custom_minimum_size = Vector2(560, 0)
+	vb.add_child(evo_status)
+	evo_bar = ProgressBar.new()
+	evo_bar.min_value = 0.0
+	evo_bar.max_value = 100.0
+	evo_bar.custom_minimum_size = Vector2(420, 22)
+	evo_bar.show_percentage = true
+	vb.add_child(evo_bar)
+
+
+func _show_evo_phase(title: String, status: String) -> void:
+	if is_instance_valid(evo_title):
+		evo_title.text = title
+	_update_evo_phase(status, -1.0)
+	if is_instance_valid(evo_panel):
+		evo_panel.visible = true
+
+
+func _update_evo_phase(status: String, pct: float) -> void:
+	if is_instance_valid(evo_status):
+		evo_status.text = status
+	if is_instance_valid(evo_bar) and pct >= 0.0:
+		evo_bar.value = clampf(pct, 0.0, 100.0)
+
+
+func _hide_evo_phase() -> void:
+	if is_instance_valid(evo_panel):
+		evo_panel.visible = false
+
+
+func _on_evo_async(op: String, result: Dictionary) -> void:
+	# Catches breed completions for the evolution loop (only while a
+	# breed is awaited; training jobs use their own signalling).
+	if evo_waiting and op == "evo_breed":
+		evo_wait_result = result
+
+
+func _evo_poll_file(path: String) -> Dictionary:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return {}
+	var text := f.get_as_text().strip_edges()
+	f.close()
+	if text.begins_with("{") and text.ends_with("}"):
+		var parsed = JSON.parse_string(text)
+		if parsed is Dictionary:
+			return parsed
+	return {}
+
+
+func _evo_breed(strategy: String, brain_name: String, parent_id: String,
+		seed: int, progress_path: String, result_file: String,
+		target_gen: int = 1) -> String:
+	# LEGACY - no live callers (tournament-end handoff uses the queued
+	# pipeline + _evo_await_queued instead). Kept as a retry-wrapper
+	# reference. Returns the
+	# new brain id, or "" on failure/abort. One automatic retry covers
+	# transient worker deaths (the 86%-then-silence failure); only a
+	# second failure aborts the generation loudly. Empty wild names are
+	# christened Python-side from seed+gen (--gen), so pass it through.
+	for attempt in [1, 2]:
+		var got := await _evo_breed_attempt(strategy, brain_name, parent_id,
+			seed, progress_path, result_file, attempt, target_gen)
+		if got != "" or not _evo_active():
+			return got
+		_show_evo_phase("BREEDING " + brain_name,
+			"Attempt 1 died - retrying once...")
+	return ""
+
+
+func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
+		seed: int, progress_path: String, result_file: String, attempt: int,
+		target_gen: int = 1) -> String:
+	var director := _director()
+	if director == null:
+		return ""
+	var log_path := result_file.get_base_dir().path_join(
+		result_file.get_file().get_basename() + ".log")
+	var display := brain_name if brain_name != "" else ("wild G%d" % target_gen)
+	var args := ["breed", "--strategy", strategy,
+		"--episodes", str(EVO_EPISODES), "--seed", str(seed),
+		"--noise", str(EVO_NOISE), "--progress", progress_path,
+		"--gen", str(target_gen),
+		"--log-file", log_path]
+	if brain_name != "":
+		args += ["--name", brain_name]
+	if parent_id != "":
+		args += ["--parent", parent_id]
+	_show_evo_phase("BREEDING " + display,
+		"Spawning worker (attempt %d)... ep 0/%d" % [attempt, EVO_EPISODES])
+	var res: Dictionary = director.run_cli_async(
+		"evo_breed", args, result_file)
+	if not bool(res.get("ok", false)):
+		_show_evo_phase("BREEDING " + display,
+			"Breed failed to start: %s" % str(res.get("error", "?")))
+		return ""
+	# Lost in the _evo_await_result extraction: the await loop's liveness
+	# gate and kill path both key off evo_breed_pid. Without this the
+	# worker is unkillable and silent deaths hang to the full timeout.
+	evo_breed_pid = int(res.get("pid", 0))
+	return await _evo_await_result(display, progress_path, result_file, seed)
+
+
+func _evo_await_result(display: String, progress_path: String,
+		result_file: String, expect_seed: int = -1) -> String:
+	# Poll loop shared by fresh spawns and adopted pipelined specs:
+	# waits for the verdict, with liveness gate + timeout + cleanup.
+	# evo_breed_pid must hold the worker pid (spawn sets it; adopters
+	# copy it from the spec first). expect_seed >= 0 rejects stale
+	# verdicts from previous runs at the same deterministic path.
+	# Returns the bred brain id or "".
+	evo_waiting = true
+	evo_wait_result = {}
+	var waited := 0.0
+	while evo_waiting and waited < 1200.0:
+		await get_tree().create_timer(2.0).timeout
+		waited += 2.0
+		if not _evo_active():
+			_evo_kill_job()
+			evo_waiting = false
+			_hide_evo_phase()
+			return ""
+		# Liveness gate: a worker that died silently (no result file,
+		# no exception verdict) must fail fast with its last episode,
+		# not hang to the 20-minute timeout.
+		if evo_breed_pid > 0 and not OS.is_process_running(evo_breed_pid):
+			var last := _evo_poll_file(progress_path)
+			_show_evo_phase("BREEDING " + display,
+				"Worker died at ep %d/%d - failing fast." % [
+				int(last.get("episode", 0)), EVO_EPISODES])
+			evo_waiting = false
+			break
+		var prog := _evo_poll_file(progress_path)
+		if not prog.is_empty():
+			var pct := 100.0 * float(prog.get("episode", 0)) / maxf(float(prog.get("total", EVO_EPISODES)), 1.0)
+			_show_evo_phase("BREEDING " + display,
+				"Training ep %d/%d ..." % [int(prog.get("episode", 0)), EVO_EPISODES])
+			_update_evo_phase("Training ep %d/%d ..." % [int(prog.get("episode", 0)), EVO_EPISODES], pct)
+		# Verdicts are accepted from our own result file only. The shared
+		# async signal can carry another pipelined job's verdict while we
+		# wait, so a signal value with no corroborating file of our own is
+		# discarded instead of misattributed to this breed.
+		var fres := _evo_read_result(result_file)
+		if not fres.is_empty():
+			if expect_seed >= 0 and bool(fres.get("ok", false)) \
+					and _evo_verdict_seed(fres) != expect_seed:
+				print("[Arena] EVO stale verdict ignored while awaiting %s." % display)
+				DirAccess.remove_absolute(result_file)
+			else:
+				evo_wait_result = fres
+				evo_waiting = false
+		elif not evo_wait_result.is_empty():
+			evo_wait_result = {}
+	# Grace check: a verdict that landed on the very tick the budget
+	# expired must not turn a success into a timeout abort (this exact
+	# miss orphaned a healthy clone verdict on disk in gen 1).
+	if evo_wait_result.is_empty():
+		var late := _evo_read_result(result_file)
+		if not late.is_empty() and (expect_seed < 0 \
+				or not bool(late.get("ok", false)) \
+				or _evo_verdict_seed(late) == expect_seed):
+			evo_wait_result = late
+	if evo_wait_result.is_empty():
+		# Timed out with no verdict: free the shared async slot now
+		# instead of leaving _poll_async's 30-minute timeout to hold
+		# every other vault op hostage. Waiting flag clears too, or
+		# every later gate misreads this dead wait as live.
+		_evo_kill_job()
+		evo_waiting = false
+		_hide_evo_phase()
+		var tdir := _director()
+		if tdir != null:
+			tdir.pending_async = {}
+		return ""
+	var out: Dictionary = (evo_wait_result as Dictionary).duplicate()
+	evo_wait_result = {}
+	evo_breed_pid = 0
+	if not bool(out.get("ok", false)):
+		return ""
+	var bred_brain := out.get("brain", {}) as Dictionary
+	var bred := str(bred_brain.get("id", ""))
+	evo_last_bred_name = str(bred_brain.get("name", ""))
+	# Job litter cleanup: per-generation progress/result files served
+	# their purpose once the id is banked (failures + logs stay).
+	if bred != "":
+		DirAccess.remove_absolute(progress_path)
+		DirAccess.remove_absolute(result_file)
+	return bred
+
+
+func _evo_kill_job() -> void:
+	if evo_breed_pid > 0:
+		OS.kill(evo_breed_pid)
+	evo_breed_pid = 0
+
+
+func _evo_spec_paths(kind: String, target_gen: int) -> Array:
+	var director := _director()
+	var jd: String = director.job_dir if director != null else "."
+	var base := "evo_g%d_%s" % [target_gen, kind]
+	return [jd.path_join(base + ".json"), jd.path_join(base + "_result.json")]
+
+
+func _evo_pending() -> Array:
+	var director := _director()
+	if director == null:
+		return []
+	return director.tourney.get("evo", {}).get("pending", [])
+
+
+func _evo_done() -> Dictionary:
+	var director := _director()
+	if director == null:
+		return {}
+	return director.tourney.get("evo", {}).get("done", {})
+
+
+func _evo_done_id(kind: String) -> String:
+	# done values are {id, name} dicts; pre-name-change saves banked
+	# bare id strings, which quit/resume can still load - tolerate both.
+	var entry = _evo_done().get(kind, "")
+	if entry is Dictionary:
+		return str((entry as Dictionary).get("id", ""))
+	return str(entry)
+
+
+func _evo_done_name(kind: String) -> String:
+	# Display name for a banked offspring, falling back to the kind
+	# when the entry predates name banking or the verdict had none.
+	var entry = _evo_done().get(kind, "")
+	if entry is Dictionary:
+		var nm := str((entry as Dictionary).get("name", ""))
+		if nm != "":
+			return nm
+	return kind
+
+
+func _evo_save_queue(pending: Array, done: Dictionary) -> void:
+	var director := _director()
+	if director == null:
+		return
+	var evo: Dictionary = director.tourney.get("evo", {})
+	evo["pending"] = pending
+	evo["done"] = done
+	director.save_state()
+
+
+func _evo_has_kind(kind: String) -> bool:
+	# True once a kind is queued OR completed (prevents double-spawns
+	# across hooks, watcher ticks, and the tournament-end fallback).
+	for spec in _evo_pending():
+		if str((spec as Dictionary).get("kind", "")) == kind:
+			return true
+	return _evo_done().has(kind)
+
+
+func _evo_queue_spec(kind: String, brain_name: String, parent_id: String,
+		seed: int, target_gen: int) -> void:
+	var pending := _evo_pending()
+	for spec in pending:
+		if str((spec as Dictionary).get("kind", "")) == kind:
+			return
+	var paths := _evo_spec_paths(kind, target_gen)
+	pending.append({"kind": kind, "name": brain_name, "parent": parent_id,
+		"seed": seed, "gen": target_gen, "progress": paths[0],
+		"result": paths[1], "pid": 0, "launched": false})
+	_evo_save_queue(pending, _evo_done())
+
+
+func _evo_queue_wild(target_gen: int) -> void:
+	# Random needs nothing but a generation: name "" lets Python
+	# christen it deterministically (wild_name from seed).
+	if _evo_has_kind("wild"):
+		return
+	_evo_queue_spec("wild", "", "", randi(), target_gen)
+
+
+func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String) -> void:
+	if champ_id == "" or _evo_has_kind("clone"):
+		return
+	_evo_queue_spec("clone", "G%d-%s-kin" % [target_gen, champ_name],
+		champ_id, randi(), target_gen)
+
+
+func _evo_spawn_spec(spec: Dictionary) -> bool:
+	# Fire-and-forget spawn for one queued spec. Completion is adopted
+	# by the watcher or the tournament-end handoff - never awaited here.
+	var director := _director()
+	if director == null:
+		return false
+	var kind := str(spec.get("kind", ""))
+	var rf := str(spec.get("result", ""))
+	var log_path := rf.get_base_dir().path_join(
+		rf.get_file().get_basename() + ".log")
+	var args := ["breed", "--strategy",
+		"clone" if kind == "clone" else "random",
+		"--episodes", str(EVO_EPISODES), "--seed", str(int(spec.get("seed", 0))),
+		"--noise", str(EVO_NOISE), "--progress", str(spec.get("progress", "")),
+		"--gen", str(int(spec.get("gen", 1))),
+		"--log-file", log_path]
+	# Never emit an empty argv element: Godot drops it on Windows, so
+	# `--name ""` arrives as a bare `--name` and argparse aborts the
+	# worker (this killed every wild breed). Empty = wild auto-christen.
+	var sname := str(spec.get("name", ""))
+	if sname != "":
+		args += ["--name", sname]
+	if str(spec.get("parent", "")) != "":
+		args += ["--parent", str(spec.get("parent", ""))]
+	DirAccess.remove_absolute(str(spec.get("progress", "")))
+	var res: Dictionary = director.run_cli_async(
+		"evo_breed", args, str(spec.get("result", "")))
+	if not bool(res.get("ok", false)):
+		evo_last_spawn_error = str(res.get("error", "?"))
+		print("[Arena] EVO spawn failed for ", kind, ": ", evo_last_spawn_error)
+		return false
+	evo_last_spawn_error = ""
+	spec["pid"] = int(res.get("pid", 0))
+	spec["launched"] = true
+	_evo_save_queue(_evo_pending(), _evo_done())
+	return true
+
+
+func _evo_read_result(path: String) -> Dictionary:
+	# Complete-verdict read with the brace guard (partial writes retry
+	# next tick). Returns {} when nothing conclusive is on disk.
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return {}
+	var text := f.get_as_text().strip_edges()
+	f.close()
+	if not (text.begins_with("{") and text.ends_with("}")):
+		return {}
+	var parsed = JSON.parse_string(text)
+	return parsed if parsed is Dictionary else {}
+
+
+func _evo_verdict_seed(verdict: Dictionary) -> int:
+	# Seed stamped in the bred brain's generator_params, or -1 when the
+	# verdict carries none. Breed paths are deterministic per
+	# gen+kind, so a seed mismatch means STALE (previous run's verdict
+	# at the same path) - never adopt it.
+	var brain := verdict.get("brain", {}) as Dictionary
+	var gp := brain.get("generator_params", {}) as Dictionary
+	if not gp.has("seed"):
+		return -1
+	return int(gp.get("seed", -1))
+
+
+func _evo_adopt_finished() -> Dictionary:
+	# Sweeps queued specs for completed result files: banks {kind: id},
+	# drops failed specs (re-bred at tournament end), cleans litter.
+	# Returns ids adopted this sweep.
+	var got := {}
+	var pending := _evo_pending()
+	var done := _evo_done()
+	var director := _director()
+	var keep: Array = []
+	for spec in pending:
+		var sd := spec as Dictionary
+		var rf := str(sd.get("result", ""))
+		var verdict := _evo_read_result(rf)
+		if verdict.is_empty():
+			# Liveness gate (background path had none): a worker that
+			# died before writing a verdict must not hold the shared
+			# slot hostage - that wedged generation-end spawns with
+			# "another operation is already running" forever.
+			if bool(sd.get("launched", false)):
+				var pid := int(sd.get("pid", 0))
+				if pid > 0 and not OS.is_process_running(pid):
+					var last := _evo_poll_file(str(sd.get("progress", "")))
+					var log_path := rf.get_base_dir().path_join(
+						rf.get_file().get_basename() + ".log")
+					print("[Arena] EVO background worker died at ep %d/%d (%s) - dropping; see %s" % [
+						int(last.get("episode", 0)), EVO_EPISODES,
+						str(sd.get("kind", "?")), log_path])
+					if director != null and str(director.pending_async.get("result_file", "")) == rf:
+						director.pending_async = {}
+					continue
+			keep.append(spec)
+			continue
+		if bool(verdict.get("ok", false)):
+			var vbrain := verdict.get("brain", {}) as Dictionary
+			var bid := str(vbrain.get("id", ""))
+			if bid != "":
+				# Stale-verdict guard: same path as a previous run's
+				# breed (paths are deterministic per gen+kind). Adopting
+				# it would bank the wrong brain; delete and keep waiting
+				# for our own worker instead.
+				if _evo_verdict_seed(verdict) != int(sd.get("seed", -1)):
+					print("[Arena] EVO stale verdict for %s (seed %d, want %d) - deleting." % [
+						str(sd.get("kind", "?")), _evo_verdict_seed(verdict),
+						int(sd.get("seed", -1))])
+					DirAccess.remove_absolute(rf)
+					keep.append(spec)
+					continue
+				var bname := str(vbrain.get("name", ""))
+				done[str((spec as Dictionary).get("kind", ""))] = {"id": bid, "name": bname}
+				got[str((spec as Dictionary).get("kind", ""))] = bid
+				DirAccess.remove_absolute(str((spec as Dictionary).get("progress", "")))
+				DirAccess.remove_absolute(rf)
+			else:
+				keep.append(spec)
+		else:
+			print("[Arena] EVO breed failed in background: ",
+				str(verdict.get("error", "?")))
+			# Dropped: the tournament-end fallback re-breeds it fresh.
+	_evo_save_queue(keep, done)
+	return got
+
+
+func _run_evo_generation() -> void:
+	# Tournament-end handoff for the evolution loop. Adopts any breeds
+	# that finished in the background (wild from tourney start, clone
+	# from consolation start), awaits stragglers via the shared slot,
+	# then rebuilds the bracket at constant roster size. STOP (menu
+	# bar) or quit aborts between polls; failures disable evo loudly.
+	var director := _director()
+	if director == null:
+		return
+	# Record the finished bracket first: archiving below mutates the
+	# tourney, and the rebuild replaces it entirely.
+	await _save_bracket_record(true)
+	var evo: Dictionary = director.tourney.get("evo", {})
+	var gen := int(evo.get("generation", 1))
+	var champ_id := str(director.tourney.get("champion_id", ""))
+	var champ_name: String = director.champion_name()
+	_show_callout("EVO GEN %d CHAMPION: %s" % [gen, champ_name],
+		Color(1.0, 0.85, 0.3), "BREEDING NEXT GENERATION", "", false)
+	_show_evo_phase("EVO GENERATION %d" % [gen + 1],
+		"Champion %s - ranking bottom two..." % champ_name)
+	if is_instance_valid(status_label):
+		status_label.text = "EVO gen %d champion %s - ranking bottom two..." % [gen, champ_name]
+	# --- Archive bottom two ---
+	var bottom: Dictionary = director.evo_bottom_two()
+	var last_id := str((bottom.get("last", {}) as Dictionary).get("id", ""))
+	var second_id := str((bottom.get("second", {}) as Dictionary).get("id", ""))
+	var via := str((bottom.get("last", {}) as Dictionary).get("via", "ranking"))
+	if via == "ranking" and is_instance_valid(status_label):
+		status_label.text = "EVO gen %d: no consolation ran - bottom two by ranking fallback." % gen
+	if last_id == "":
+		_evo_abort("no loser found - bracket empty?")
+		return
+	for pair in [[last_id, "biggest loser"], [second_id, "second-last"]]:
+		if str(pair[0]) == "":
+			continue
+		var ares: Dictionary = director.evo_archive(
+			str(pair[0]), "evo gen %d %s (%s)" % [gen, str(pair[1]), via])
+		if not bool(ares.get("ok", false)):
+			_evo_abort("archive failed: %s" % str(ares.get("error", "?")))
+			return
+		print("[Arena] EVO gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
+	# --- Adopt background breeds + await stragglers ---
+	var target_gen := gen + 1
+	_evo_adopt_finished()
+	var id1 := _evo_done_id("clone")
+	var id2 := _evo_done_id("wild")
+	# Queue missing specs (watcher will launch them when the slot is free)
+	if id1 == "" and not _evo_has_kind("clone"):
+		_evo_queue_clone(target_gen, champ_id, champ_name)
+	if id2 == "" and not _evo_has_kind("wild"):
+		_evo_queue_wild(target_gen)
+	# Tournament is over: show whatever is left in training before
+	# blocking on stragglers (names for the done, ep counts for the
+	# live, queued for the rest).
+	_show_evo_phase("EVO GENERATION %d" % target_gen,
+		_evo_offspring_summary(target_gen))
+	if is_instance_valid(status_label):
+		status_label.text = "EVO gen %d over - breeding gen %d..." % [gen, target_gen]
+	# Await any still-pending specs one by one via the shared slot.
+	# done is re-read between awaits: the watcher may bank the wild
+	# breed while the clone await is in flight.
+	if id1 == "" and _evo_has_kind("clone"):
+		id1 = await _evo_await_queued("clone")
+		if id1 == "":
+			# Last-chance rescue: a verdict adopted by a concurrent
+			# sweep between the await's last tick and this line.
+			_evo_adopt_finished()
+			id1 = _evo_done_id("clone")
+		if id1 == "" and _evo_active():
+			_evo_abort("clone breeding failed - %s" % _evo_spawn_why())
+			return
+	if id2 == "":
+		id2 = _evo_done_id("wild")
+	if id2 == "" and _evo_has_kind("wild"):
+		id2 = await _evo_await_queued("wild")
+		if id2 == "":
+			_evo_adopt_finished()
+			id2 = _evo_done_id("wild")
+		if id2 == "" and _evo_active():
+			_evo_abort("random breeding failed - %s" % _evo_spawn_why())
+			return
+	# --- Rebuild bracket at constant roster size ---
+	var size := int(director.tourney.get("size", 8))
+	var gone := [last_id, second_id]
+	var present: Array = director.evo_vault_ids()
+	var roster: Array = []
+	for p in director.tourney.get("players", []):
+		var pid := str((p as Dictionary).get("id", ""))
+		if pid != "" and not (pid in gone) and pid in present:
+			roster.append(pid)
+	roster.append(id1)
+	roster.append(id2)
+	while roster.size() > size:
+		var extra := ""
+		for pid in director.evo_ranking():
+			if str(pid) in roster and str(pid) != champ_id:
+				extra = str(pid)
+				break
+		if extra == "":
+			break
+		var trim: Dictionary = director.evo_archive(extra, "evo roster trim gen %d" % (gen + 1))
+		roster.erase(extra)
+		if not bool(trim.get("ok", false)):
+			print("[Arena] EVO trim skipped missing %s, continuing." % extra)
+	var res: Dictionary = director.build_bracket(
+		roster, size, int(director.tourney.get("best_of", 7)),
+		float(director.tourney.get("lr_scale", 0.5)),
+		float(director.tourney.get("round_time", 40.0)),
+		false, [], bool(director.tourney.get("random_draw", false)), true)
+	if not bool(res.get("ok", false)):
+		_evo_abort("next bracket failed: %s" % str(res.get("error", "?")))
+		return
+	director.tourney["evo"] = {"active": true, "generation": gen + 1,
+		"episodes": EVO_EPISODES}
+	director.save_state()
+	# Pipeline: kick off the next generation's wild breed immediately
+	_evo_queue_wild(gen + 2)
+	_show_evo_phase("EVO GENERATION %d" % [gen + 1],
+		"Roster ready (%d fighters) - loading first battle..." % roster.size())
+	if is_instance_valid(status_label):
+		status_label.text = "EVO gen %d ready (%d fighters)." % [gen + 1, roster.size()]
+	await get_tree().create_timer(2.0).timeout
+	_hide_evo_phase()
+	_request_current_battle_load()
+
+
+func _evo_offspring_summary(target_gen: int) -> String:
+	# One line per offspring for the tournament-end phase panel: done
+	# brains by christened name, live ones with ep progress, the rest
+	# as queued. Shows "whatever is left in training" at a glance.
+	var lines: Array = []
+	for kind in ["clone", "wild"]:
+		if _evo_done().has(kind):
+			lines.append("%s - done" % _evo_done_name(kind))
+			continue
+		var found := false
+		for spec in _evo_pending():
+			var s := spec as Dictionary
+			if str(s.get("kind", "")) != kind:
+				continue
+			found = true
+			var label := str(s.get("name", ""))
+			if label == "":
+				label = "wild G%d" % int(s.get("gen", target_gen))
+			if bool(s.get("launched", false)):
+				var prog := _evo_poll_file(str(s.get("progress", "")))
+				if prog.is_empty():
+					lines.append("%s - warming up" % label)
+				else:
+					lines.append("%s - training ep %d/%d" % [label,
+						int(prog.get("episode", 0)), EVO_EPISODES])
+			else:
+				lines.append("%s - queued" % label)
+		if not found:
+			lines.append("%s - queued" % kind)
+	return "\n".join(lines)
+
+
+func _evo_spawn_why() -> String:
+	# Human-readable cause for the last spawn failure, defaulting to
+	# the log pointer when the breed died mid-flight instead.
+	if evo_last_spawn_error != "":
+		return evo_last_spawn_error
+	return "check brains/jobs log"
+
+
+func _evo_await_queued(kind: String) -> String:
+	# Waits for a queued spec of the given kind to finish. The spec is
+	# DETACHED from the pending list first, so the watcher can neither
+	# adopt its result file out from under the await nor double-launch
+	# it; the bred id is banked into done here instead. Returns id or "".
+	if _evo_done().has(kind):
+		return _evo_done_id(kind)
+	var pending := _evo_pending()
+	for i in range(pending.size()):
+		var s := pending[i] as Dictionary
+		if str(s.get("kind", "")) != kind:
+			continue
+		pending.remove_at(i)
+		_evo_save_queue(pending, _evo_done())
+		var sname0 := str(s.get("name", ""))
+		var display0 := sname0 if sname0 != "" else ("wild G%d" % int(s.get("gen", 1)))
+		if not bool(s.get("launched", false)):
+			# The shared slot may still be held by the sibling breed
+			# (e.g. wild head-start unfinished at tournament end).
+			# Spawning into a busy slot fails instantly ("another
+			# operation is already running"), so wait for it instead,
+			# sweeping adoptions meanwhile. STOP aborts the wait.
+			var tdir := _director()
+			var swait := 0.0
+			while tdir != null and not tdir.pending_async.is_empty() and swait < 1200.0:
+				if not _evo_active():
+					return ""
+				_show_evo_phase("BREEDING " + display0,
+					"Waiting for the training slot (%s in progress)..." % str(tdir.pending_async.get("op", "?")))
+				await get_tree().create_timer(2.0).timeout
+				swait += 2.0
+				_evo_adopt_finished()
+				tdir = _director()
+			if tdir == null:
+				return ""
+			if not tdir.pending_async.is_empty():
+				_show_evo_phase("BREEDING " + display0,
+					"Training slot never freed - check brains/jobs log")
+				return ""
+			if not _evo_spawn_spec(s):
+				_show_evo_phase("BREEDING " + display0,
+					"Breed failed to start: %s" % evo_last_spawn_error)
+				return ""
+		# Fresh spawns and watcher-launched jobs alike: the await loop's
+		# liveness gate and kill path key off evo_breed_pid.
+		evo_breed_pid = int(s.get("pid", 0))
+		var sname := str(s.get("name", ""))
+		var display := sname if sname != "" else ("wild G%d" % int(s.get("gen", 1)))
+		var bred := await _evo_await_result(display,
+			str(s.get("progress", "")), str(s.get("result", "")),
+			int(s.get("seed", -1)))
+		if bred != "":
+			var done := _evo_done()
+			done[kind] = {"id": bred, "name": evo_last_bred_name}
+			_evo_save_queue(_evo_pending(), done)
+		return bred
+	return ""
+
+
+func _evo_abort(reason: String) -> void:
+	var director := _director()
+	if director != null:
+		director.tourney["evo"] = {"active": false}
+		director.save_state()
+	_hide_evo_phase()
+	if is_instance_valid(status_label):
+		status_label.text = "EVOLUTION STOPPED: %s" % reason
+	print("[Arena] EVOLUTION STOPPED: %s" % reason)
+
+
+func _on_evo_stop() -> void:
+	if not _evo_active() and not evo_waiting:
+		if is_instance_valid(status_label):
+			status_label.text = "Evolution loop is not running."
+		return
+	_evo_kill_job()
+	evo_waiting = false
+	# Kill watcher-launched pipelined workers too: they hold no global
+	# pid, so _evo_kill_job can't reach them. Otherwise they keep
+	# burning GPU and land stray verdicts after the loop is gone.
+	for spec in _evo_pending():
+		var pid := int((spec as Dictionary).get("pid", 0))
+		if pid > 0 and OS.is_process_running(pid):
+			OS.kill(pid)
+	# Free the shared async slot: the killed breed job will never write
+	# its result file, and _poll_async only times that out after 30 min
+	# (blocking every other vault op meanwhile).
+	var director := _director()
+	if director != null:
+		director.pending_async = {}
+	# Clear pipeline queue so the watcher stops trying to spawn/adopt.
+	_evo_save_queue([], {})
+	_evo_abort("stopped by user")
+
 
 func _slot_of(brain_id: String) -> String:
 	var director := _director()

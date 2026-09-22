@@ -2810,6 +2810,199 @@ class TestSpearLunge(unittest.TestCase):
                 self.assertGreater(tot, 4)
 
 
+class TestEvoLoop(unittest.TestCase):
+    """Eternal evolution loop: biggest-loser query, archive/restore
+    round-trip, breeder parameter validation (no training runs here)."""
+    def _bracket(self, matches):
+        return {"rounds": [matches]}
+
+    def test_biggest_loser_earliest_exit(self):
+        import evo_breeder as evo
+        import random
+        t = self._bracket([
+            {"a_id": " champ ", "b_id": "mid", "wins_a": 4, "wins_b": 1},
+            {"a_id": "early1", "b_id": "early2", "wins_a": 0, "wins_b": 4},
+        ])
+        t["rounds"].append([
+            {"a_id": " champ ", "b_id": "early2", "wins_a": 4, "wins_b": 2},
+        ])
+        # early1 exited round 0 with 0 wins -> biggest loser.
+        pick, info = evo.biggest_loser(t, random.Random(0))
+        self.assertEqual(pick, "early1")
+        self.assertEqual(info["last_round"], 0)
+        self.assertEqual(info["battle_wins"], 0)
+
+    def test_biggest_loser_tiebreak_seeded(self):
+        import evo_breeder as evo
+        import random
+        t = self._bracket([
+            {"a_id": "x", "b_id": "y", "wins_a": 2, "wins_b": 2},
+        ])
+        picks = {evo.biggest_loser(t, random.Random(s))[0]
+                 for s in range(10)}
+        # Seeded tie-breaks vary across seeds but stay in the tied set.
+        self.assertTrue(picks <= {"x", "y"})
+        self.assertGreater(len(picks), 1)
+
+    def test_biggest_loser_empty_raises(self):
+        import evo_breeder as evo
+        with self.assertRaises(ValueError):
+            evo.biggest_loser({"rounds": []})
+        with self.assertRaises(ValueError):
+            evo.biggest_loser({})
+
+    def test_wild_name_deterministic(self):
+        import random
+        import evo_breeder as evo
+        a = evo.wild_name(random.Random(42), 3)
+        b = evo.wild_name(random.Random(42), 3)
+        self.assertEqual(a, b)
+        self.assertTrue(a.endswith(" G3"))
+        parts = a.split(" ")
+        self.assertEqual(len(parts), 3)
+        self.assertIn(parts[0], evo.WILD_ADJECTIVES)
+        self.assertIn(parts[1], evo.WILD_CALLSIGNS)
+        self.assertEqual(parts[2], "G3")
+        names = {evo.wild_name(random.Random(s), 3) for s in range(60)}
+        self.assertGreater(len(names), 50)
+
+    def test_unique_wild_name_collision(self):
+        import random
+        import evo_breeder as evo
+        base = evo.wild_name(random.Random(7), 2)
+        # No collision: plain deterministic name.
+        self.assertEqual(
+            evo.unique_wild_name(random.Random(7), 2, set()), base)
+        # Collision: deterministic Mk suffix, repeatable.
+        u1 = evo.unique_wild_name(random.Random(7), 2, {base})
+        self.assertTrue(u1.startswith(base + " Mk"))
+        self.assertEqual(
+            u1, evo.unique_wild_name(random.Random(7), 2, {base}))
+        u2 = evo.unique_wild_name(random.Random(7), 2, {base, u1})
+        self.assertNotEqual(u2, u1)
+        self.assertTrue(u2.startswith(base + " Mk"))
+
+
+
+    def test_biggest_loser_byes_draws_quick(self):
+        import evo_breeder as evo
+        import random
+        # Bye walkovers and vacant cards must not crown phantom losers;
+        # draws still count as played rounds.
+        t = {"rounds": [[
+            {"a_id": "bye_guy", "b_id": "", "wins_a": 0, "wins_b": 0,
+             "bye": True, "winner_id": "bye_guy"},
+            {"a_id": "", "b_id": "", "vacant": True},
+            {"a_id": "f1", "b_id": "f2", "wins_a": 3, "wins_b": 4,
+             "draws": 1},
+        ], [
+            {"a_id": "bye_guy", "b_id": "f2", "wins_a": 0, "wins_b": 4},
+        ]]}
+        pick, info = evo.biggest_loser(t, random.Random(1))
+        self.assertEqual(pick, "f1")
+        self.assertEqual(info["last_round"], 0)
+        # Quick battle: loser is simply the one with fewer wins.
+        q = {"rounds": [[
+            {"a_id": "qa", "b_id": "qb", "wins_a": 1, "wins_b": 0}]]}
+        pick, _info = evo.biggest_loser(q, random.Random(0))
+        self.assertEqual(pick, "qb")
+        # Missing keys default to zero, never crash.
+        r = {"rounds": [[{"a_id": "m1", "b_id": "m2"}]]}
+        pick, info = evo.biggest_loser(r, random.Random(0))
+        self.assertIn(pick, ("m1", "m2"))
+        self.assertEqual(info["battle_wins"], 0)
+
+    def test_archive_edge_cases(self):
+        import tempfile
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_evo_edge_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            with self.assertRaises(FileNotFoundError):
+                vault.archive_brain("ghost")
+            r1 = vault.new_record("EdgeA", {})
+            vault.save_brain(r1, np.zeros(16, dtype=np.float32),
+                             backup=False)
+            # IDs derive from wall-clock ms: space them out so the two
+            # same-named brains don't share a filename.
+            time.sleep(0.02)
+            r2 = vault.new_record("EdgeA", {})
+            vault.save_brain(r2, np.zeros(16, dtype=np.float32),
+                             backup=False)
+            vault.archive_brain(r1["id"], reason="edge test")
+            vault.archive_brain(r2["id"], reason="edge test")
+            # Ambiguous substring match must fail loud, not restore wrong.
+            with self.assertRaises(ValueError):
+                vault.restore_brain("EdgeA")
+            vault.restore_brain(r1["id"])
+            # Restoring twice: second hits the gone-file path.
+            with self.assertRaises(FileNotFoundError):
+                vault.restore_brain(r1["id"])
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_archive_restore_roundtrip(self):
+        import tempfile
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_evo_test_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("EvoTest", {})
+            vault.save_brain(
+                rec, np.zeros(32, dtype=np.float32), backup=False)
+            entry = vault.archive_brain(rec["id"], reason="test loser")
+            self.assertEqual(entry["id"], rec["id"])
+            self.assertFalse(os.path.isfile(
+                os.path.join(tmp, rec["filename"])))
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["present"]], [rec["id"]])
+            back = vault.restore_brain(rec["id"])
+            self.assertEqual(back["id"], rec["id"])
+            self.assertTrue(os.path.isfile(
+                os.path.join(tmp, rec["filename"])))
+            with self.assertRaises(FileNotFoundError):
+                vault.restore_brain("nope-not-here")
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_breed_random_params_valid(self):
+        # Random param construction without training: valid wiring,
+        # mapping, yaw_bias ranges (mirrors breed_random's draws).
+        import random as _random
+        from experimental_wiring import normalize_experiment
+        from sensory_motor import (normalize_mapping, normalize_yaw_bias,
+                                   draw_yaw_bias, YAW_BIAS_LO, YAW_BIAS_HI)
+        exps = ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
+        maps = ["muscles_up", "gyro_flow", "mbon", "retina", "flow_trans"]
+        for seed in range(20):
+            rr = _random.Random(seed)
+            mix = sorted(x for x in exps if rr.random() < 0.4)
+            stack = sorted(x for x in maps if rr.random() < 0.5)
+            normalize_experiment(mix or None)
+            normalize_mapping(stack or None)
+            v = draw_yaw_bias(rr)
+            normalize_yaw_bias(v)
+            self.assertGreaterEqual(v, YAW_BIAS_LO)
+            self.assertLessEqual(v, YAW_BIAS_HI)
+
+
 class TestGodotArenaHeadless(unittest.TestCase):
     """Verifies that Godot 4 compiles all GDScripts and runs each scene without errors."""
     def _run_headless(self, scene=""):
