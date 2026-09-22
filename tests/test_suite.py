@@ -2197,6 +2197,36 @@ class TestWiringGenome(unittest.TestCase):
             ew.remap_for_genome("retina_wide", None, child, old_w,
                                 np.random.default_rng(3), self.pops)
 
+    def test_genome_from_seed_and_attach(self):
+        import experimental_wiring as ew
+        a = ew.genome_from_seed(77, 3)
+        b = ew.genome_from_seed(77, 3)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a["rules"]), 3)
+        ew.validate_genome(a, self.pops)
+        params = {}
+        ew.attach_genome(params, a)
+        self.assertEqual(params["genome"], a)
+        self.assertEqual(params["genome_id"], ew.genome_label(a))
+
+    def test_derive_mapping_cli(self):
+        import io
+        import json
+        import types
+        from contextlib import redirect_stdout
+        import vault_cli
+        ns = types.SimpleNamespace(genome="", genome_seed=42,
+                                   genome_rules=3, result_file="")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = vault_cli.cmd_derive_mapping(ns)
+        self.assertEqual(code, 0)
+        payload = json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertTrue(payload.get("ok", False))
+        self.assertEqual(payload["genome_id"], "0e5f52b8c9")
+        self.assertEqual(payload["mapping"], ["muscles_up"])
+        self.assertEqual(payload["n_rules"], 3)
+
     def test_genome_id_stable(self):
         import numpy as np
         import experimental_wiring as ew

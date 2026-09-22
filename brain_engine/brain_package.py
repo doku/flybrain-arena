@@ -37,6 +37,7 @@ DEFAULT_GENERATOR_PARAMS = {
     "evasion": 0.2,
     "experiment": None,
     "genome": None,
+    "genome_id": None,
     "mapping": None,
     "yaw_bias": None,
 }

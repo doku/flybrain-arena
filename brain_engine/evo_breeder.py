@@ -142,7 +142,7 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     train_job (multi-stage summary when staged)."""
     from train_job import train_brain
     from experimental_wiring import (mutate_genome, remap_for_genome,
-                                     derive_mapping)
+                                     derive_mapping, attach_genome)
     from connectome_loader import load_or_extract_populations
     rec, weights = vault.load_brain(parent_id)
     gp = dict(rec.get("generator_params", {}) or {})
@@ -168,10 +168,11 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
         "align_bonus": list(gp.get("align_bonus", [0.5, 0.2, -0.3])),
         "evasion": gp.get("evasion", 0.2),
         "experiment": gp.get("experiment"),
-        "genome": genome,
         "mapping": child_mapping,
         "yaw_bias": gp.get("yaw_bias"),
     }
+    if genome is not None:
+        attach_genome(params, genome)
     child = vault.new_record(name, params)
     child["lineage"] = {"parent_ids": [rec.get("id", "")],
                         "source": f"clone:{rec.get('id', '')}"}
@@ -202,7 +203,8 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
     import random as _random
     import numpy as _np
     from sensory_motor import draw_yaw_bias
-    from experimental_wiring import generate_genome, derive_mapping
+    from experimental_wiring import (generate_genome, derive_mapping,
+                                     attach_genome)
     from connectome_loader import load_or_extract_populations
     r = _random.Random(int(seed))
     if not (name or "").strip():
@@ -224,10 +226,10 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
         "align_bonus": [0.5, 0.2, -0.3],
         "evasion": round(r.uniform(0.0, 0.6), 2),
         "experiment": None,
-        "genome": genome,
         "mapping": stack if stack else None,
         "yaw_bias": draw_yaw_bias(r),
     }
+    attach_genome(params, genome)
     from train_job import fresh_weights
     record = vault.new_record(name, params)
     weights = fresh_weights(params.get("experiment"), params.get("genome"))

@@ -59,13 +59,44 @@ def cmd_info(a):
     return out({"ok": True, "brain": rec})
 
 
+def cmd_derive_mapping(a):
+    """Resolves a genome to its mapping without touching the CSR:
+    --genome '{envelope}' or --genome-seed N [--genome-rules M].
+    Returns {mapping, genome_id, genome_label, n_rules} for menu display
+    and record stamping (menus never hash genomes themselves)."""
+    import experimental_wiring as ew
+    try:
+        genome = None
+        if getattr(a, "genome", ""):
+            import json as _json
+            genome = _json.loads(a.genome)
+        else:
+            genome = ew.genome_from_seed(
+                int(getattr(a, "genome_seed", 0) or 0),
+                int(getattr(a, "genome_rules", 3) or 3))
+        mapping = list(ew.derive_mapping(genome))
+        return out({"ok": True, "mapping": mapping,
+                    "genome_id": ew.genome_id(genome),
+                    "genome_label": ew.genome_label(genome),
+                    "n_rules": len(ew.validate_genome(genome)["rules"])},
+                   a.result_file)
+    except Exception as e:
+        return err(str(e))
+
+
 def cmd_generate(a):
     params = _parse_params(a)
     if isinstance(params, dict) and params.get("__error"):
         return err(params["__error"])
     from train_job import fresh_weights
     try:
-        weights = fresh_weights(params.get("experiment"))
+        import experimental_wiring as ew
+        genome = params.get("genome", None)
+        if genome is None and params.get("genome_seed", None) is not None:
+            genome = ew.genome_from_seed(params.get("genome_seed"),
+                                         params.get("genome_rules", 3))
+            ew.attach_genome(params, genome)
+        weights = fresh_weights(params.get("experiment"), genome)
         rec = vault.new_record(a.name, params)
         vault.save_brain(rec, weights)
     except Exception as e:
@@ -328,6 +359,11 @@ def main():
     q.add_argument("--reason", default="")
     q = sub.add_parser("restore"); q.add_argument("--id", required=True)
     q = sub.add_parser("archive-list")
+    q = sub.add_parser("derive-mapping")
+    q.add_argument("--genome", default="")
+    q.add_argument("--genome-seed", type=int, default=0)
+    q.add_argument("--genome-rules", type=int, default=3)
+    q.add_argument("--result-file", default="")
     q = sub.add_parser("breed"); q.add_argument("--strategy", required=True)
     # --name is optional-value: empty string (wild auto-christen) must
     # survive even when the launcher drops empty argv elements
@@ -343,10 +379,11 @@ def main():
     q.add_argument("--log-file", default=""); q.add_argument("--gen", type=int, default=1)
     a = p.parse_args()
     fn = {"list": cmd_list, "info": cmd_info, "generate": cmd_generate,
-          "train": cmd_train, "delete": cmd_delete, "rename": cmd_rename,
-          "export": cmd_export, "import": cmd_import, "archive": cmd_archive,
-          "restore": cmd_restore, "archive-list": cmd_archive_list,
-          "breed": cmd_breed}[a.cmd]
+           "train": cmd_train, "delete": cmd_delete, "rename": cmd_rename,
+           "export": cmd_export, "import": cmd_import, "archive": cmd_archive,
+           "restore": cmd_restore, "archive-list": cmd_archive_list,
+           "derive-mapping": cmd_derive_mapping,
+           "breed": cmd_breed}[a.cmd]
     return fn(a)
 
 

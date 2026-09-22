@@ -447,6 +447,26 @@ def genome_label(genome):
     return "g" + genome_id(genome)
 
 
+def genome_from_seed(seed, n_rules=3):
+    """Deterministic genome envelope from a menu-friendly seed (loads
+    the cached pool registry; no CSR needed). The same seed always
+    builds the same envelope, so generate/train/breed entry points
+    reproduce it independently without passing rules around."""
+    import numpy as _np
+    from connectome_loader import load_or_extract_populations
+    pops = load_or_extract_populations()
+    return generate_genome(_np.random.default_rng(int(seed)), pops,
+                           max(1, int(n_rules)))
+
+
+def attach_genome(params, genome):
+    """Stamps a genome envelope + its stable id onto a params dict
+    (vault whitelist carries both into the record)."""
+    params["genome"] = genome
+    params["genome_id"] = genome_label(genome)
+    return params
+
+
 def generate_genome(rng, pops, n_rules=3, name=None):
     """Sample a random wiring genome. rng is np.random.Generator (use
     np.random.default_rng(seed) for reproducibility); sources are

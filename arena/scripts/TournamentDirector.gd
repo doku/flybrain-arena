@@ -221,6 +221,15 @@ func generate_brain_async(brain_name: String, params: Dictionary) -> Dictionary:
 		"--params-file", params_file], result_file)
 
 
+func derive_mapping(genome_seed: int, genome_rules: int) -> Dictionary:
+	# Resolves a wiring genome seed to its mapping without touching the
+	# CSR (pure rule-table lookup, ~100 ms): returns {ok, mapping,
+	# genome_id, genome_label, n_rules}. Menus call this to display a
+	# genome before generating; records always carry concrete stacks.
+	return _run_cli(["derive-mapping", "--genome-seed", str(genome_seed),
+		"--genome-rules", str(genome_rules)])
+
+
 func delete_brain(brain_id: String) -> Dictionary:
 	var res := _run_cli(["delete", "--id", brain_id])
 	if res.get("ok", false):

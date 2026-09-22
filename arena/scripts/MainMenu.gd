@@ -20,6 +20,11 @@ var bv_detail: OptionButton
 var bv_replay: CheckButton
 var gen_yaw_bias: SpinBox
 var gen_yaw_random: CheckButton
+var gen_genome_check: CheckButton
+var gen_genome_seed: SpinBox
+var gen_genome_rules: SpinBox
+var gen_derive_check: CheckButton
+var gen_derived: Dictionary = {}
 var gen_name: LineEdit
 var gen_variant: OptionButton
 var gen_seed: SpinBox
@@ -414,6 +419,27 @@ func _build_config_dialog() -> void:
 		d.add_theme_font_size_override("font_size", 12)
 		d.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		vb.add_child(d)
+	var gh := Label.new()
+	gh.text = "WIRING GENOME (random rules - overrides mixes above)"
+	gh.add_theme_font_size_override("font_size", 15)
+	vb.add_child(gh)
+	gen_genome_check = CheckButton.new()
+	gen_genome_check.text = "random genome"
+	gen_genome_check.tooltip_text = "Sample a grammar-constrained wiring genome (sensory to motor/central pools). Overrides the mixes above; mapping derives from its efferents unless unchecked below."
+	gen_genome_check.toggled.connect(_sync_config_from_dialog)
+	vb.add_child(gen_genome_check)
+	gen_genome_seed = _spin("Genome seed", vb, 0.0, 99999.0, 1.0, 42.0,
+		"Same seed always builds the same genome (reproducible bloodlines).")
+	gen_genome_seed.value_changed.connect(_on_genome_spin)
+	gen_genome_rules = _spin("Genome rules", vb, 1.0, 8.0, 1.0, 3.0,
+		"Projection rules sampled (1-8). More rules = wilder wiring.")
+	gen_genome_rules.value_changed.connect(_on_genome_spin)
+	gen_derive_check = CheckButton.new()
+	gen_derive_check.text = "derive mapping from wiring"
+	gen_derive_check.tooltip_text = "Resolve the mapping from the genome's efferents (retina/flow/muscles/mbon light up when driven). Untick to hand-pick below."
+	gen_derive_check.button_pressed = true
+	gen_derive_check.toggled.connect(_sync_config_from_dialog)
+	vb.add_child(gen_derive_check)
 	var mh := Label.new()
 	mh.text = "NEURO MAPPING (stackable, empty = base)"
 	mh.add_theme_font_size_override("font_size", 15)
@@ -469,11 +495,29 @@ func _sync_dialog_from_state() -> void:
 	_update_config_summary()
 
 
+func _on_genome_spin(_v: float) -> void:
+	_sync_config_from_dialog()
+
+
+func _resolve_genome() -> void:
+	# Resolves the genome seed/rules to mapping+id via the vault CLI
+	# (pure rule-table lookup, no CSR - fast enough to run on clicks).
+	gen_derived = {}
+	if not is_instance_valid(gen_genome_check) or not gen_genome_check.button_pressed:
+		return
+	if not TournamentDirector.python_ready:
+		gen_derived = {"ok": false, "error": "no python"}
+		return
+	gen_derived = TournamentDirector.derive_mapping(
+		int(gen_genome_seed.value), int(gen_genome_rules.value))
+
+
 func _sync_config_from_dialog(_on: bool = true) -> void:
 	gen_wiring.clear()
 	for cb in gen_wire_checks:
 		if (cb as CheckButton).button_pressed:
 			gen_wiring.append((cb as CheckButton).text)
+	_resolve_genome()
 	_update_config_summary()
 
 
@@ -482,6 +526,23 @@ func _update_config_summary() -> void:
 	for cb in gen_map_checks:
 		if (cb as CheckButton).button_pressed:
 			schemes.append((cb as CheckButton).text)
+	var genome_on := is_instance_valid(gen_genome_check) and gen_genome_check.button_pressed
+	if genome_on:
+		var wtext := "genome"
+		if bool(gen_derived.get("ok", false)):
+			wtext = "Genome %s (%d rules)" % [str(gen_derived.get("genome_label", "?")),
+				int(gen_derived.get("n_rules", 0))]
+		elif not gen_derived.is_empty():
+			wtext = "Genome (unresolved: %s)" % str(gen_derived.get("error", "?"))
+		var mtext := "derived"
+		if bool(gen_derived.get("ok", false)):
+			var dm: Array = gen_derived.get("mapping", [])
+			mtext = "derived (%s)" % ("base" if dm.is_empty() else ", ".join(dm))
+		if not (is_instance_valid(gen_derive_check) and gen_derive_check.button_pressed):
+			mtext = "base" if schemes.is_empty() else ", ".join(schemes)
+		if is_instance_valid(gen_config_summary):
+			gen_config_summary.text = "Wiring: %s\nMap: %s" % [wtext, mtext]
+		return
 	var wtext := "base" if gen_wiring.is_empty() else " + ".join(gen_wiring)
 	var mtext := "base" if schemes.is_empty() else ", ".join(schemes)
 	if is_instance_valid(gen_config_summary):
@@ -646,9 +707,11 @@ func _on_brain_selected(idx: int) -> void:
 	if p.has("mapping"):
 		var mv = p.get("mapping", "base")
 		mv_text = "+".join(mv) if mv is Array else str(mv)
+	var gid := str(p.get("genome_id", ""))
+	var gtext := "genome " + gid if gid != "" else _mix_text(p.get("experiment", "base"))
 	detail_label.text = ("{name}  [{id}]\nBattles {b} (W{l} L{lo} D{d}) | " + \
 		"Matches {m} (W{mw} L{ml}) | Titles {t}\nEpisodes {e} in {s} sessions | " + \
-		"variant {v} seed {sd} lr {lr} gain {g} ev {ev} exp {x} map {mp} yb {yb}\nlineage: {lin}").format({
+		"variant {v} seed {sd} lr {lr} gain {g} ev {ev} wiring {x} map {mp} yb {yb}\nlineage: {lin}").format({
 		"name": str(selected_brain.get("name", "?")), "id": str(selected_brain.get("id", "?")),
 		"b": int(r.get("battles", 0)), "l": int(r.get("wins", 0)),
 		"lo": int(r.get("losses", 0)), "d": int(r.get("draws", 0)),
@@ -657,7 +720,7 @@ func _on_brain_selected(idx: int) -> void:
 		"e": int(t.get("episodes", 0)), "s": (t.get("sessions", []) as Array).size(),
 		"v": str(p.get("variant", "?")), "sd": str(p.get("seed", "?")),
 		"lr": str(p.get("learning_rate", "?")), "g": str(p.get("dist_gain", "?")),
-		"ev": str(p.get("evasion", "?")), "x": _mix_text(p.get("experiment", "base")),
+		"ev": str(p.get("evasion", "?")), "x": gtext,
 		"yb": str(p.get("yaw_bias", 9.0)),
 		"mp": mv_text,
 		"lin": str(selected_brain.get("lineage", {}).get("source", "?"))})
@@ -669,17 +732,31 @@ func _gen_params() -> Dictionary:
 	for cb in gen_map_checks:
 		if (cb as CheckButton).button_pressed:
 			schemes.append((cb as CheckButton).text)
-	return {
+	var genome_on := is_instance_valid(gen_genome_check) and gen_genome_check.button_pressed
+	var mapping: Array = []
+	if genome_on and is_instance_valid(gen_derive_check) and gen_derive_check.button_pressed \
+			and bool(gen_derived.get("ok", false)):
+		for m in gen_derived.get("mapping", []):
+			mapping.append(str(m))
+	else:
+		mapping = schemes
+	var out := {
 		"variant": gen_variant.get_item_text(gen_variant.selected),
 		"seed": int(gen_seed.value),
 		"learning_rate": gen_lr.value,
 		"dist_gain": gen_gain.value,
 		"evasion": gen_evasion.value,
 		"align_bonus": [0.5, 0.2, -0.3],
-		"experiment": gen_wiring.duplicate() if not gen_wiring.is_empty() else null,
-		"mapping": schemes if not schemes.is_empty() else null,
+		"experiment": gen_wiring.duplicate() if not gen_wiring.is_empty() and not genome_on else null,
+		"mapping": mapping if not mapping.is_empty() else null,
 		"yaw_bias": snappedf(randf_range(6.0, 12.0), 0.1) if gen_yaw_random.button_pressed else float(gen_yaw_bias.value),
 	}
+	if genome_on:
+		# Seeds rebuild the identical envelope Python-side at generate
+		# and train time; the record stamps envelope + id on arrival.
+		out["genome_seed"] = int(gen_genome_seed.value)
+		out["genome_rules"] = int(gen_genome_rules.value)
+	return out
 
 
 func _on_generate() -> void:
@@ -728,7 +805,8 @@ func _retrain_params() -> Dictionary:
 	var stored: Dictionary = selected_brain.get("generator_params", {})
 	var out := {}
 	for k in ["variant", "seed", "learning_rate", "dist_gain", "evasion",
-			"align_bonus", "experiment", "mapping", "yaw_bias"]:
+			"align_bonus", "experiment", "genome", "genome_id",
+			"mapping", "yaw_bias"]:
 		if stored.has(k):
 			out[k] = stored[k]
 	return out
