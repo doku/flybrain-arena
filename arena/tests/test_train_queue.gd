@@ -41,6 +41,18 @@ func test_enqueue_cancel_clear() -> void:
 	_check(d.train_queue.is_empty(), "clear idempotent")
 
 
+func test_purge_queued() -> void:
+	var d = _new_director()
+	d.enqueue_training("id1", "Alpha", 50, {})
+	d.enqueue_training("id2", "Beta", 25, {})
+	d.enqueue_training("id1", "Alpha", 10, {})
+	_check(d.purge_queued("id1") == 2, "purge drops both entries")
+	_check(d.train_queue.size() == 1, "unrelated entry survives")
+	_check(str(d.train_queue[0].get("id", "")) == "id2", "survivor is Beta")
+	_check(d.purge_queued("ghost") == 0, "purge no-op on absent id")
+	_check(d.train_queue.size() == 1, "no-op changes nothing")
+
+
 func test_pump_refuses_safely() -> void:
 	var d = _new_director()
 	d.enqueue_training("idx", "Xray", 50, {})
@@ -62,6 +74,7 @@ func _initialize() -> void:
 		quit(failures)
 		return
 	test_enqueue_cancel_clear()
+	test_purge_queued()
 	test_pump_refuses_safely()
 	if failures == 0:
 		print("ALL TRAIN QUEUE TESTS PASSED")

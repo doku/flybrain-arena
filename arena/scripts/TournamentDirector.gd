@@ -234,6 +234,10 @@ func delete_brain(brain_id: String) -> Dictionary:
 	var res := _run_cli(["delete", "--id", brain_id])
 	if res.get("ok", false):
 		vault_changed.emit()
+		# A queued entry for a deleted brain would burn at launch
+		# (worker fails instantly, fail-path pump eats the next) and
+		# look exactly like vanishing queue items. Purge up front.
+		purge_queued(brain_id)
 	return res
 
 
@@ -304,6 +308,9 @@ func poll_job() -> Dictionary:
 				res = parsed
 	job_progress.emit(int(res.get("episode", 0)), int(res.get("total", 0)))
 	if float(res.get("pct", 0.0)) >= 100.0:
+		print("[Director] Job done: %s (%d/%d)" % [
+			str(active_job.get("brain_id", "?")),
+			int(res.get("episode", 0)), int(res.get("total", 0))])
 		active_job = {}
 		vault_changed.emit()
 		_pump_train_queue()
@@ -315,6 +322,8 @@ func poll_job() -> Dictionary:
 	var pid := int(active_job.get("pid", 0))
 	if pid > 0 and not OS.is_process_running(pid):
 		var err_text := _read_job_result_error(str(active_job.get("result_file", "")))
+		print("[Director] Job failed: %s - %s" % [
+			str(active_job.get("brain_id", "?")), err_text])
 		active_job = {}
 		job_failed.emit(err_text)
 		_pump_train_queue()
@@ -327,6 +336,8 @@ func enqueue_training(brain_id: String, brain_name: String, episodes: int,
 	# caller decides start-now vs queue (see _pump_train_queue).
 	train_queue.append({"id": brain_id, "name": brain_name,
 		"episodes": maxi(1, episodes), "params": params})
+	print("[Director] Queued %s x%d (#%d, depth %d)" % [brain_name,
+		maxi(1, episodes), train_queue.size(), train_queue.size()])
 	train_queue_changed.emit()
 	return train_queue.size()
 
@@ -334,9 +345,28 @@ func enqueue_training(brain_id: String, brain_name: String, episodes: int,
 func cancel_queued(index: int) -> bool:
 	if index < 0 or index >= train_queue.size():
 		return false
+	print("[Director] Queue cancel: %s (had %d waiting)" % [
+		str((train_queue[index] as Dictionary).get("name", "?")),
+		train_queue.size()])
 	train_queue.remove_at(index)
 	train_queue_changed.emit()
 	return true
+
+
+func purge_queued(brain_id: String) -> int:
+	# Drops every queued entry for a deleted brain. Returns the count
+	# removed (0 = nothing to do, no signal).
+	var kept: Array = []
+	for spec in train_queue:
+		if str((spec as Dictionary).get("id", "")) != brain_id:
+			kept.append(spec)
+	var dropped := train_queue.size() - kept.size()
+	if dropped > 0:
+		print("[Director] Queue purge: dropped %d entr%s for deleted %s" % [
+			dropped, "y" if dropped == 1 else "ies", brain_id])
+		train_queue = kept
+		train_queue_changed.emit()
+	return dropped
 
 
 func clear_train_queue() -> void:
@@ -363,6 +393,8 @@ func _pump_train_queue() -> bool:
 		print("[Director] Queued training deferred for %s: %s" % [
 			str(head.get("name", "?")), str(res.get("error", "?"))])
 		return false
+	print("[Director] Auto-starting queued %s (%d left waiting)" % [
+		str(head.get("name", "?")), train_queue.size() - 1])
 	train_queue.pop_front()
 	train_queue_changed.emit()
 	return true
