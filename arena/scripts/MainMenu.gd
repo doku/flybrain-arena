@@ -786,15 +786,9 @@ func _on_async_done(op: String, result: Dictionary) -> void:
 			return
 		refresh_vault()
 		var brain: Dictionary = result.get("brain", {})
-		var brain_name := str(brain.get("name", "?"))
-		var tres: Dictionary = TournamentDirector.start_training(
-			str(brain.get("id", "")), int(gen_episodes.value), _gen_params())
-		if tres.get("ok", false):
-			job_label.text = "Training %s x%d ..." % [brain_name, int(gen_episodes.value)]
-			job_bar.value = 0.0
-			log_label.text = "Generated '%s' - training in background." % brain_name
-		else:
-			log_label.text = "Generated '%s' but train did not start: %s" % [brain_name, tres.get("error", "?")]
+		_start_or_queue(str(brain.get("id", "")),
+			str(brain.get("name", "?")), int(gen_episodes.value),
+			_gen_params(), "Generated '%s'")
 
 
 func _retrain_params() -> Dictionary:
@@ -865,28 +859,34 @@ func _prefill_train_widgets(p: Dictionary) -> void:
 		(cb as CheckButton).button_pressed = active.has((cb as CheckButton).text)
 
 
+func _start_or_queue(bid: String, bname: String, eps: int,
+		params: Dictionary, done_fmt: String) -> void:
+	# Single choke point for starting training: runs now when the worker
+	# slot is free and nothing waits, otherwise joins the FIFO queue
+	# (the pump starts it automatically). done_fmt formats the log line
+	# with the brain name, e.g. "Generated '%s'".
+	if TournamentDirector.active_job.is_empty() \
+			and TournamentDirector.train_queue.is_empty():
+		var res: Dictionary = TournamentDirector.start_training(bid, eps, params)
+		if res.get("ok", false):
+			job_bar.value = 0.0
+			job_label.text = "Training %s ..." % bname
+			log_label.text = (done_fmt % bname) + " - training in background."
+		else:
+			job_label.text = "Train failed: %s" % res.get("error", "?")
+		return
+	var pos: int = TournamentDirector.enqueue_training(bid, bname, eps, params)
+	TournamentDirector.pump_train_queue()
+	log_label.text = (done_fmt % bname) + " - queued #%d." % pos
+
+
 func _on_train() -> void:
 	if selected_brain.is_empty():
 		log_label.text = "Select a brain first."
 		return
-	var bid := str(selected_brain.get("id", ""))
-	var bname := str(selected_brain.get("name", "?"))
-	var eps := int(gen_episodes.value)
-	# Start now when the worker slot is free, otherwise queue behind
-	# what's running (the pump starts us automatically).
-	if TournamentDirector.active_job.is_empty() \
-			and TournamentDirector.train_queue.is_empty():
-		var res: Dictionary = TournamentDirector.start_training(bid, eps, _retrain_params())
-		if res.get("ok", false):
-			job_bar.value = 0.0
-			job_label.text = "Training %s ..." % bname
-		else:
-			job_label.text = "Train failed: %s" % res.get("error", "?")
-		return
-	var pos: int = TournamentDirector.enqueue_training(
-		bid, bname, eps, _retrain_params())
-	TournamentDirector.pump_train_queue()
-	log_label.text = "Queued %s x%d (#%d in queue)." % [bname, eps, pos]
+	_start_or_queue(str(selected_brain.get("id", "")),
+		str(selected_brain.get("name", "?")), int(gen_episodes.value),
+		_retrain_params(), "Training '%s'")
 
 
 func _on_queue_remove() -> void:
