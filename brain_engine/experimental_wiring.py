@@ -554,17 +554,20 @@ def mutate_genome(rng, genome, pops, max_changes=1):
             r["weight"] = round(float(r["weight"]) * float(
                 rng.uniform(0.7, 1.4)), 1)
         elif op == "jitter_fanout":
+            delta = int(rng.integers(-2, 3))
+            if delta == 0:
+                continue
             r["fanout"] = int(np.clip(
-                int(r["fanout"]) + int(rng.integers(-2, 3)),
-                1, MAX_RULE_FANOUT))
+                int(r["fanout"]) + delta, 1, MAX_RULE_FANOUT))
         elif op == "rewire_target":
             pair = None
+            current = (str(r["target"]), str(r["target_side"]))
             for _ in range(10):
                 cand = (str(rng.choice(targets)),
                         str(rng.choice(["left", "right"])))
                 taken = {(x["target"], x["target_side"]) for j, x in
                          enumerate(rules) if j != idx}
-                if cand not in taken:
+                if cand not in taken and cand != current:
                     pair = cand
                     break
             if pair is None:
