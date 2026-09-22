@@ -2587,6 +2587,84 @@ class TestFlightSchool(unittest.TestCase):
                            + senses["pheromone_conc_right"], 0.0)
 
 
+class TestT4Recurrence(unittest.TestCase):
+    """T4/T5 cannot self-sustain: saturated drive evokes exactly the
+    forced set (each cell fires once, no refire), and silence follows
+    stimulus removal immediately - on fresh AND 20x-potentiated
+    efferents. Guards the no-seizure verdict: if T4 counts ever reach
+    thousands per tick again, one of these fails first."""
+    POOLS = ["visual_t4a", "visual_t4b", "visual_t4c", "visual_t4d",
+             "visual_t5a", "visual_t5b", "visual_t5c", "visual_t5d"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.csr = load_or_build_csr()
+        cls.pops = load_or_extract_populations()
+        cls.t4ids = set()
+        for k in cls.POOLS:
+            cls.t4ids.update(cls.pops[k]["all"])
+
+    def _brain(self, potentiate=1.0):
+        from lif_brain import FlyBrain
+        w = np.ascontiguousarray(
+            np.asarray(self.csr.data, dtype=np.float32).copy())
+        if potentiate != 1.0:
+            indptr = np.asarray(self.csr.indptr)
+            for pre in self.t4ids:
+                s, e = int(indptr[pre]), int(indptr[pre + 1])
+                if e > s:
+                    w[s:e] *= potentiate
+        return FlyBrain(self.csr.indptr, self.csr.indices, w)
+
+    def _hot_stim(self):
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        return enc.encode({"visual_flow_ventral": 1.0,
+                           "visual_flow_lateral": 1.0,
+                           "visual_flow_expansion": 1.0,
+                           "visual_flow_climb": 1.0})
+
+    def _t4hits(self, spikes):
+        from collections import Counter
+        c = Counter(int(s) for s in spikes)
+        hits = sum(v for k, v in c.items() if k in self.t4ids)
+        uniq = sum(1 for k in c if k in self.t4ids)
+        return hits, uniq
+
+    def test_no_refire_fresh(self):
+        brain = self._brain()
+        last = None
+        for _ in range(5):
+            last = brain.integrate_50ms(self._hot_stim())
+        hits, uniq = self._t4hits(last)
+        # Forced set only (<= 480 stimulus ids), each exactly once.
+        self.assertLessEqual(uniq, 480)
+        self.assertEqual(hits, uniq)
+
+    def test_no_persistence(self):
+        brain = self._brain()
+        for _ in range(5):
+            brain.integrate_50ms(self._hot_stim())
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        for _ in range(3):
+            s = brain.integrate_50ms(enc.encode({}))
+            hits, _u = self._t4hits(s)
+            self.assertEqual(hits, 0)
+            self.assertEqual(len(s), 0)
+
+    def test_no_refire_potentiated(self):
+        brain = self._brain(potentiate=20.0)
+        last = None
+        for _ in range(5):
+            last = brain.integrate_50ms(self._hot_stim())
+        hits, uniq = self._t4hits(last)
+        self.assertEqual(hits, uniq)
+        s = brain.integrate_50ms(
+            SensoryEncoder(self.pops, mapping="flow_trans").encode({}))
+        self.assertEqual(len(s), 0)
+
+
 class TestMappingMatrix(unittest.TestCase):
     """Certifies every wiring x mapping regime: each combination must
     integrate, decode a complete finite control set, and stay isolated
