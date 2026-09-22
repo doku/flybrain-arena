@@ -11,6 +11,8 @@ var selected_brain: Dictionary = {}
 var brain_list: ItemList
 var detail_label: Label
 var log_label: Label
+var archive_list_view: ItemList
+var archive_entries: Array = []
 
 var bv_enable: CheckButton
 var bv_layer: OptionButton
@@ -38,6 +40,7 @@ var job_label: Label
 var tourney_size: OptionButton
 var tourney_bestof: OptionButton
 var tourney_random: CheckButton
+var tourney_consolation: CheckButton
 var tourney_lr: SpinBox
 var tourney_round_time: SpinBox
 var player_list: ItemList
@@ -237,6 +240,22 @@ func _build_vault_column() -> VBoxContainer:
 	imp.text = "Import .npz"
 	imp.pressed.connect(_on_import_dialog)
 	row.add_child(imp)
+	var arch_head := Label.new()
+	arch_head.text = "HALL OF SHAME (archived losers)"
+	arch_head.add_theme_font_size_override("font_size", 13)
+	c.add_child(arch_head)
+	archive_list_view = ItemList.new()
+	archive_list_view.custom_minimum_size = Vector2(280, 90)
+	archive_list_view.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+	c.add_child(archive_list_view)
+	var arch_row := HBoxContainer.new()
+	arch_row.add_theme_constant_override("separation", 6)
+	c.add_child(arch_row)
+	var restore_b := Button.new()
+	restore_b.text = "Bring back"
+	restore_b.tooltip_text = "Restore the selected archived brain to the vault roster."
+	restore_b.pressed.connect(_on_archive_restore)
+	arch_row.add_child(restore_b)
 	detail_label = Label.new()
 	detail_label.add_theme_font_size_override("font_size", 13)
 	detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -482,6 +501,11 @@ func _build_tourney_column() -> VBoxContainer:
 	tourney_random.tooltip_text = "Shuffle entrants instead of strength seeding (byes fall luck-of-the-draw)."
 	tourney_random.button_pressed = true
 	c.add_child(tourney_random)
+	tourney_consolation = CheckButton.new()
+	tourney_consolation.text = "Losers bracket (find last place)"
+	tourney_consolation.tooltip_text = "After the final, round-0 losers play their own bracket (needs 2/4/8); its final loser is last place."
+	tourney_consolation.button_pressed = true
+	c.add_child(tourney_consolation)
 	var pl := Label.new()
 	pl.text = "Participants (Ctrl+click multi-select):"
 	pl.add_theme_font_size_override("font_size", 13)
@@ -508,6 +532,11 @@ func _build_tourney_column() -> VBoxContainer:
 	quick_button.tooltip_text = "One exhibition battle between exactly 2 selected brains."
 	quick_button.pressed.connect(_on_quick_battle)
 	srow.add_child(quick_button)
+	var evo_button := Button.new()
+	evo_button.text = "START EVOLUTION"
+	evo_button.tooltip_text = "Eternal loop: tournament, archive biggest loser, breed 1 winner-clone + 1 random (50 eps), next generation. STOP in the arena."
+	evo_button.pressed.connect(_on_start_evolution)
+	srow.add_child(evo_button)
 	bracket_status = Label.new()
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -552,7 +581,32 @@ func refresh_vault() -> void:
 	if not brains.is_empty() and selected_brain.is_empty():
 		brain_list.select(0)
 		_on_brain_selected(0)
+	_refresh_archive()
 	_update_bracket_preview()
+
+
+func _refresh_archive() -> void:
+	archive_entries = TournamentDirector.archive_list()
+	if is_instance_valid(archive_list_view):
+		archive_list_view.clear()
+		for e in archive_entries:
+			archive_list_view.add_item("%s  [%s]%s" % [
+				str(e.get("name", "?")), str(e.get("id", "?")),
+				"" if bool(e.get("present", true)) else " (missing)"])
+
+
+func _on_archive_restore() -> void:
+	var sel := archive_list_view.get_selected_items()
+	if sel.is_empty() or int(sel[0]) < 0 or int(sel[0]) >= archive_entries.size():
+		log_label.text = "Select an archived brain first."
+		return
+	var entry: Dictionary = archive_entries[int(sel[0])]
+	var res: Dictionary = TournamentDirector.restore_archived(str(entry.get("id", "")))
+	if not bool(res.get("ok", false)):
+		log_label.text = "Restore failed: %s" % str(res.get("error", "?"))
+		return
+	log_label.text = "Brought back '%s'." % str(entry.get("name", "?"))
+	refresh_vault()
 
 
 func _on_brain_selected(idx: int) -> void:
@@ -806,12 +860,35 @@ func _on_start_tournament() -> void:
 	if ids.size() < 2:
 		bracket_status.text = "Pick at least 2 brains (Ctrl+click)."
 		return
-	var res: Dictionary = TournamentDirector.build_bracket(ids, size, bestof, tourney_lr.value, tourney_round_time.value, false, [], tourney_random.button_pressed)
+	var res: Dictionary = TournamentDirector.build_bracket(ids, size, bestof, tourney_lr.value, tourney_round_time.value, false, [], tourney_random.button_pressed, tourney_consolation.button_pressed)
 	if not res.get("ok", false):
-		bracket_status.text = "Cannot start: %s" % res.get("error", "?")
+		bracket_status.text = "Cannot start: %s" % str(res.get("error", "?"))
 		return
-	bracket_status.text = "Tournament %s ready (%s)." % [str(res.get("tournament_id", "")),
-		"random draw" if tourney_random.button_pressed else "strength seeded"]
+	bracket_status.text = "Tournament %s ready (%s%s)." % [str(res.get("tournament_id", "")),
+		"random draw" if tourney_random.button_pressed else "strength seeded",
+		" + losers" if tourney_consolation.button_pressed else ""]
+
+
+func _on_start_evolution() -> void:
+	# Eternal evolution loop: same setup as a tournament, then the arena
+	# chains generations automatically (archive loser, breed clone +
+	# random, next bracket) until EVO STOP. Offspring train 50 eps.
+	var size := int(TournamentDirector.size_options()[tourney_size.selected])
+	var bestof := int(TournamentDirector.best_of_options()[tourney_bestof.selected])
+	var ids := _selected_player_ids()
+	if ids.size() < 2:
+		bracket_status.text = "Pick at least 2 brains (Ctrl+click)."
+		return
+	# Evo always runs the losers bracket: bottom-two elimination must
+	# come through combat, never the ranking fallback.
+	var res: Dictionary = TournamentDirector.build_bracket(ids, size, bestof, tourney_lr.value, tourney_round_time.value, false, [], tourney_random.button_pressed, true)
+	if not res.get("ok", false):
+		bracket_status.text = "Cannot start: %s" % str(res.get("error", "?"))
+		return
+	TournamentDirector.tourney["evo"] = {"active": true, "generation": 1,
+		"episodes": 50}
+	TournamentDirector.save_state()
+	bracket_status.text = "EVOLUTION gen 1 ready (%s)." % str(res.get("tournament_id", ""))
 	_render_bracket()
 	await get_tree().create_timer(0.5).timeout
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")

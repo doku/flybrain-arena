@@ -11,12 +11,29 @@ signal landed_strike(target_part: String)
 
 # Flight aerodynamics constants (fruit-fly agile: hover-capable, snap turns).
 # Tuned for watchable jousts: cruise ~5 m/s, full thrust 12 m/s.
+# Thrust gain is calibrated so cruise equilibrium EQUALS target speed:
+# per-tick add = target*gain*dt vs drag multiply drag_coeff^(60dt);
+# v* = target*gain/(60*(1-drag_coeff)) = target*1.8/1.8 = target.
+# (The old gain 5.0 converged to 2.78x target: full thrust flew 33 m/s
+# and ram 46 m/s while max_speed claimed 12 - the G2-wild zoom bug.)
 @export var base_speed: float = 3.0
 @export var max_speed: float = 12.0
 @export var turn_rate: float = 8.0
 @export var pitch_rate: float = 2.5
 @export var roll_rate: float = 3.0
 @export var drag_coeff: float = 0.97
+const THRUST_GAIN: float = 1.8
+# Hard speed cap. Legit peak is a full-speed lunge (12 + 7 = 19), so
+# 1.6x = 19.2 clears every legal transient (ram 18, lunge 19, clash
+# bounce <= 18) and only true runaways ever touch it. Time pinned at
+# the cap marks the fly ILLEGAL (speed_exploit) - the zoom signature.
+const SPEED_CAP_MULT: float = 1.6
+const EXPLOIT_MIN_TIME: float = 3.0
+const EXPLOIT_FRAC: float = 0.3
+var capped_time: float = 0.0
+var fly_time: float = 0.0
+var peak_speed: float = 0.0
+var speed_exploit: bool = false
 
 # Hard altitude limits: a tipped/crippled fly can otherwise convert its huge
 # forward speed into an endless vertical climb the soft trim can't catch.
@@ -363,7 +380,16 @@ func landing_done() -> bool:
 func _landing_step(delta: float) -> void:
 	# Graceful descent: sink straight down while slerping to the
 	# ceremony attitude (winner: wings-level nose-forward; loser:
-	# same heading, belly-up). No bounce, no spiral.
+	# same heading, belly-up). No bounce, no spiral. The winner keeps
+	# beating its intact wings like it's still alive (faster victory
+	# flutter); the loser's wings stay frozen.
+	if landing_mode == 2:
+		wing_flutter_time += delta * 90.0
+		var flap := sin(wing_flutter_time) * 0.5
+		if left_wing_intact and is_instance_valid(left_wing_mesh):
+			left_wing_mesh.rotation.z = flap
+		if right_wing_intact and is_instance_valid(right_wing_mesh):
+			right_wing_mesh.rotation.z = -flap
 	var rate := WINNER_SINK_RATE if landing_mode == 2 else LOSER_SINK_RATE
 	global_position.y = maxf(global_position.y - rate * delta, LAND_POS_Y)
 	var fwd := -global_transform.basis.z
@@ -480,10 +506,22 @@ func _physics_process(delta: float) -> void:
 	# the fly can stop in place and spin around (snapshot pre-move speed
 	# for impacts).
 	var pre_move_speed = velocity.length()
-	velocity += forward_vec * target_speed * delta * 5.0
+	velocity += forward_vec * target_speed * delta * THRUST_GAIN
 	velocity *= pow(drag_coeff, delta * 60.0)
 	if current_thrust < 0.25:
 		velocity *= pow(0.85, delta * 60.0)
+	# Hard speed cap: lunge/clash/ram transients may spike, but nothing
+	# sustains above max_speed*SPEED_CAP_MULT. Time spent pinned at the
+	# cap marks the fly ILLEGAL (speed_exploit) - the zoom signature.
+	var spd := velocity.length()
+	peak_speed = maxf(peak_speed, spd)
+	var cap := max_speed * SPEED_CAP_MULT
+	if spd > cap:
+		velocity *= cap / spd
+		capped_time += delta
+	fly_time += delta
+	speed_exploit = capped_time > EXPLOIT_MIN_TIME and fly_time > 0.0 \
+		and capped_time / fly_time > EXPLOIT_FRAC
 
 	move_and_slide()
 	_enforce_altitude_limits()
@@ -653,7 +691,10 @@ func _resolve_spike_clash(victim: FlyPhysics) -> void:
 	axis = axis.normalized()
 	gives_away.global_position += axis * 0.6
 	braces.global_position -= axis * 0.6
-	gives_away.velocity = -gives_away.velocity * 1.6 + Vector3.UP * 2.5
+	# Elastic deflection (1.0x): separates the pair and reverses the
+	# giver without CREATING energy. The old 1.6x multiplier injected
+	# speed every clash - chained head-ons ran away to zoom velocities.
+	gives_away.velocity = -gives_away.velocity * 1.0 + Vector3.UP * 2.5
 	braces.velocity = braces.velocity * 0.4 + Vector3.UP * 1.5
 	clash_cooldown = CLASH_COOLDOWN
 	victim.clash_cooldown = CLASH_COOLDOWN
@@ -740,6 +781,10 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	front_spike_area.position = SPIKE_BASE_POS
 	obstacle_hit_cooldown = 0.0
 	clash_cooldown = 0.0
+	capped_time = 0.0
+	fly_time = 0.0
+	peak_speed = 0.0
+	speed_exploit = false
 	basis_init = false
 	prev_rival_dist = spawn_pos.distance_to(rival.global_position) if is_instance_valid(rival) else 28.0
 	if is_instance_valid(left_wing_mesh):
