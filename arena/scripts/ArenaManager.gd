@@ -2684,6 +2684,13 @@ func _evo_active() -> bool:
 
 
 const EVO_EPISODES := 50
+# Await/slot-wait ceiling: two-stage breeds (25+25 eps) run ~40+ min on
+# this hardware (single-stage wild already took 22 min). The old fixed
+# 20-min timeout aborted generations mid-training while the worker was
+# still legitimately burning CPU - the log showed only the banner
+# (buffered) and the verdict never landed. Episodes-proportional: 50
+# eps x 80 s + loader headroom = 66 min.
+const EVO_AWAIT_TIMEOUT := EVO_EPISODES * 80.0
 # Two-step evo breeding: half the episodes pre-train, half Advanced
 # Flight School (default school curriculum; school code selects stages).
 # NOTE: this JSON must NEVER ride argv (--params2): Godot strips embedded
@@ -2903,7 +2910,7 @@ func _evo_await_result(display: String, progress_path: String,
 	evo_waiting = true
 	evo_wait_result = {}
 	var waited := 0.0
-	while evo_waiting and waited < 1200.0:
+	while evo_waiting and waited < EVO_AWAIT_TIMEOUT:
 		await get_tree().create_timer(2.0).timeout
 		waited += 2.0
 		if not _evo_active():
@@ -2952,7 +2959,9 @@ func _evo_await_result(display: String, progress_path: String,
 				or _evo_verdict_seed(late) == expect_seed):
 			evo_wait_result = late
 	if evo_wait_result.is_empty():
-		# Timed out with no verdict: free the shared async slot now
+		# Timed out with no verdict: the worker may STILL be training
+		# legitimately (buffered log hides progress) - kill it here so
+		# it stops burning CPU, free the shared async slot now
 		# instead of leaving _poll_async's 30-minute timeout to hold
 		# every other vault op hostage. Waiting flag clears too, or
 		# every later gate misreads this dead wait as live.
@@ -3396,7 +3405,7 @@ func _evo_await_queued(kind: String) -> String:
 			# sweeping adoptions meanwhile. STOP aborts the wait.
 			var tdir := _director()
 			var swait := 0.0
-			while tdir != null and not tdir.pending_async.is_empty() and swait < 1200.0:
+			while tdir != null and not tdir.pending_async.is_empty() and swait < EVO_AWAIT_TIMEOUT:
 				if not _evo_active():
 					return ""
 				_show_evo_phase("BREEDING " + display0,

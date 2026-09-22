@@ -273,7 +273,12 @@ class _TeeLog:
         self.term.write(text)
         if self.fh is not None:
             try:
+                # Flush per write: without this, Python block-buffers the
+                # redirected stdout, so a still-running worker's log shows
+                # only the explicitly-flushed banner - a legit 40-min
+                # training run looked like an instant silent death.
                 self.fh.write(text)
+                self.fh.flush()
             except OSError:
                 pass
 
