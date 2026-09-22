@@ -343,6 +343,8 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 		htxt += "  •  BYE"
 	elif vacant:
 		htxt += "  •  VACANT"
+	elif bool(m.get("skipped", false)):
+		htxt += "  •  SKIP"
 	elif loser_adv:
 		htxt += "  •  LOSER ADV"
 	head.text = htxt

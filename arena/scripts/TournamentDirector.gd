@@ -642,6 +642,35 @@ func _new_match(a, b) -> Dictionary:
 	}
 
 
+func _battle_wins(pid: String) -> int:
+	# Total battle wins across every round (main + consolation): the
+	# deterministic tiebreak for skipped losers finals.
+	var n := 0
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			var d := mm as Dictionary
+			if str(d.get("a_id", "")) == pid:
+				n += int(d.get("wins_a", 0))
+			if str(d.get("b_id", "")) == pid:
+				n += int(d.get("wins_b", 0))
+	return n
+
+
+func _resolve_skipped_final(fin: Dictionary) -> void:
+	# Last-two archiving without fighting: fewer total battle wins is
+	# last place (ties go to b, so a_id takes last). Marks the card
+	# skipped for honest display; evo_bottom_two reads it like a played
+	# final (loser = last, winner = second-last).
+	var a := str(fin.get("a_id", ""))
+	var b := str(fin.get("b_id", ""))
+	var w := b
+	if _battle_wins(a) > _battle_wins(b):
+		w = a
+	fin["winner_id"] = w
+	fin["skipped"] = true
+	tourney["last_place_id"] = b if w == a else a
+
+
 func _match_loser(mm: Dictionary) -> String:
 	# Loser of a decided match for loser-advance consolation rounds.
 	# Bye walkovers have no loser (a walkover is not loss evidence);
@@ -836,6 +865,16 @@ func advance_after_match() -> Dictionary:
 			tourney["champion_id"] = winners[0]
 			if bool(tourney.get("consolation", false)):
 				if _build_losers_bracket():
+					var lr: Array = tourney["rounds"][int(tourney.get("losers_start_round", -1))]
+					if lr.size() == 1:
+						# Single-match consolation IS the final: both are
+						# last-two, archive them without fighting it.
+						_resolve_skipped_final(lr[0])
+						tourney["status"] = "complete"
+						save_state()
+						return {"action": "tournament_end",
+							"champion_id": str(tourney.get("champion_id", "")),
+							"last_place_id": str(tourney.get("last_place_id", ""))}
 					save_state()
 					return {"action": "next_match",
 						"consolation_started": true}
@@ -849,6 +888,23 @@ func advance_after_match() -> Dictionary:
 			var w := str(fin.get("winner_id", ""))
 			tourney["last_place_id"] = str(fin.get(
 				"b_id" if w == str(fin.get("a_id", "")) else "a_id", ""))
+		tourney["status"] = "complete"
+		save_state()
+		return {"action": "tournament_end",
+			"champion_id": str(tourney.get("champion_id", "")),
+			"last_place_id": str(tourney.get("last_place_id", ""))}
+	# Loser-advance converging to a 2-fighter final: both are last-two,
+	# archive them without fighting it (needs two real advancers;
+	# ghosts fall through to the normal bye/vacant machinery).
+	if _loser_mode and winners.size() == 2 and str(winners[0]) != "" and str(winners[1]) != "":
+		var names2 := {}
+		for p in tourney.get("players", []):
+			names2[str(p.get("id", ""))] = str(p.get("name", "?"))
+		var fin2 := _new_match(
+			{"id": winners[0], "name": str(names2.get(winners[0], "?"))},
+			{"id": winners[1], "name": str(names2.get(winners[1], "?"))})
+		rounds.append([fin2])
+		_resolve_skipped_final(fin2)
 		tourney["status"] = "complete"
 		save_state()
 		return {"action": "tournament_end",

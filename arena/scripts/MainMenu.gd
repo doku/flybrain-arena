@@ -588,7 +588,7 @@ func _build_tourney_column() -> VBoxContainer:
 	c.add_child(tourney_random)
 	tourney_consolation = CheckButton.new()
 	tourney_consolation.text = "Losers bracket (find last place)"
-	tourney_consolation.tooltip_text = "After the final, round-0 losers play their own bracket (needs 2/4/8); its final loser is last place."
+	tourney_consolation.tooltip_text = "After the final, round-0 losers play their own bracket (needs 2/4/8); the last two skip the final and go straight to archives."
 	tourney_consolation.button_pressed = true
 	c.add_child(tourney_consolation)
 	var pl := Label.new()

@@ -50,7 +50,10 @@ func _fight_current(d, slot: String) -> void:
 
 func _run_to_end(d) -> Array:
 	# Plays every pending match (alpha always wins) until tournament_end.
-	# Returns the advance-action log.
+	# Returns the advance-action log. Director runtime errors abort the
+	# caller frame WITHOUT failing the run, so a null/empty advance is
+	# recorded as a failure here instead of silently skipping the rest
+	# of the test.
 	var log: Array = []
 	var guard := 0
 	while guard < 200:
@@ -62,9 +65,12 @@ func _run_to_end(d) -> Array:
 				and not bool(m.get("bye", false)) \
 				and not bool(m.get("vacant", false)):
 			_fight_current(d, "alpha")
-		var adv: Dictionary = d.advance_after_match()
+		var adv = d.advance_after_match()
+		if adv == null or not (adv is Dictionary) or (adv as Dictionary).is_empty():
+			_check(false, "advance_after_match returned null/empty (director error above?)")
+			break
 		log.append(adv)
-		if str(adv.get("action", "")) == "tournament_end":
+		if str((adv as Dictionary).get("action", "")) == "tournament_end":
 			break
 	return log
 
@@ -103,22 +109,29 @@ func test_match_loser_unit(d) -> void:
 
 
 func test_size4(d) -> void:
-	# 1-match consolation: loser-advance == winner-advance outcome.
+	# 1-match consolation IS the final: skipped outright, both archived
+	# without fighting (fewer battle wins = last).
 	var brains := _fakes(4)
 	var res: Dictionary = d.build_bracket(_ids(brains), 4, 1, 0.5, 40.0,
 		false, brains, false, true)
 	_check(bool(res.get("ok", false)), "size-4 bracket builds")
 	var log := _run_to_end(d)
+	if log.is_empty():
+		_check(false, "size-4 produced an advance log")
+		return
 	var saw_cons := false
 	for a in log:
 		if bool((a as Dictionary).get("consolation_started", false)):
 			saw_cons = true
-	_check(saw_cons, "size-4 consolation started")
-	_check(int(d.tourney.get("losers_start_round", -1)) > 0, "losers rounds appended")
+	_check(not saw_cons, "size-4 final skipped, no consolation start")
+	_check(str((log[log.size() - 1] as Dictionary).get("action", "")) == "tournament_end",
+		"size-4 ends the tournament")
+	_check(int(d.tourney.get("losers_start_round", -1)) > 0, "losers round appended")
+	var fin: Dictionary = (d.tourney["rounds"][d.tourney["rounds"].size() - 1] as Array)[0]
+	_check(bool(fin.get("skipped", false)), "size-4 final marked skipped")
 	var last := str(d.tourney.get("last_place_id", ""))
 	_check(last != "", "size-4 last place decided")
 	_check(last in _r0_losers(d), "size-4 last place is an R0 loser")
-	var fin: Dictionary = (d.tourney["rounds"][d.tourney["rounds"].size() - 1] as Array)[0]
 	_check(str(fin.get("winner_id", "")) != "" and str(fin.get("winner_id", "")) != last,
 		"size-4 second-last is the final winner")
 
@@ -130,11 +143,18 @@ func test_size8(d) -> void:
 	var res: Dictionary = d.build_bracket(_ids(brains), 8, 1, 0.5, 40.0,
 		false, brains, false, true)
 	_check(bool(res.get("ok", false)), "size-8 bracket builds")
-	_run_to_end(d)
+	var log8 := _run_to_end(d)
+	if log8.is_empty():
+		_check(false, "size-8 produced an advance log")
+		return
+	_check(str((log8[log8.size() - 1] as Dictionary).get("action", "")) == "tournament_end",
+		"size-8 ends the tournament")
 	var lf := int(d.tourney.get("losers_start_round", -1))
 	_check(lf > 0, "size-8 losers rounds appended")
 	_check((d.tourney["rounds"][lf] as Array).size() == 2, "size-8 consolation R1 has 2 matches")
 	_check((d.tourney["rounds"][lf + 1] as Array).size() == 1, "size-8 consolation final has 1 match")
+	var fin0: Dictionary = (d.tourney["rounds"][lf + 1] as Array)[0]
+	_check(bool(fin0.get("skipped", false)), "size-8 final skipped, not fought")
 	# Consolation R1 losers must be the two finalists...
 	var r1_losers: Array = []
 	for m in (d.tourney["rounds"][lf] as Array):
@@ -154,6 +174,25 @@ func test_size8(d) -> void:
 			"size-8 R1 winner %s is neither last nor second-last" % w)
 
 
+func test_skipped_final_tiebreak() -> void:
+	# Fewer total battle wins = last place; ties go to b (a takes last).
+	var d = _new_director()
+	d.tourney = {"rounds": [[
+		{"a_id": "p", "b_id": "z", "wins_a": 2, "wins_b": 0, "winner_id": "p"},
+		{"a_id": "q", "b_id": "z", "wins_a": 0, "wins_b": 0, "winner_id": "z"},
+	]]}
+	var fin := {"a_id": "p", "b_id": "q", "wins_a": 0, "wins_b": 0, "winner_id": ""}
+	d._resolve_skipped_final(fin)
+	_check(str(fin.get("winner_id", "")) == "p", "more wins takes second-last")
+	_check(str(d.tourney.get("last_place_id", "")) == "q", "fewer wins is last")
+	_check(bool(fin.get("skipped", false)), "resolved final marked skipped")
+	var fin2 := {"a_id": "p", "b_id": "q", "wins_a": 0, "wins_b": 0, "winner_id": ""}
+	d.tourney = {"rounds": [[]]}
+	d._resolve_skipped_final(fin2)
+	_check(str(fin2.get("winner_id", "")) == "q", "tie goes to b")
+	_check(str(d.tourney.get("last_place_id", "")) == "p", "tie loser a is last")
+
+
 func test_skip(d) -> void:
 	# 5 players in size-8: R0 losers != 2/4/8 -> no consolation, clean end.
 	var brains := _fakes(5)
@@ -161,7 +200,9 @@ func test_skip(d) -> void:
 		false, brains, false, true)
 	_check(bool(res.get("ok", false)), "size-8/5-roster bracket builds")
 	var log := _run_to_end(d)
-	_check(not log.is_empty(), "skip run produced an advance log")
+	if log.is_empty():
+		_check(false, "skip run produced an advance log")
+		return
 	var saw_cons := false
 	for a in log:
 		if bool((a as Dictionary).get("consolation_started", false)):
@@ -200,10 +241,13 @@ func _run_to_consolation(d) -> bool:
 				and not bool(m.get("bye", false)) \
 				and not bool(m.get("vacant", false)):
 			_fight_current(d, "alpha")
-		var adv: Dictionary = d.advance_after_match()
-		if bool(adv.get("consolation_started", false)):
+		var adv = d.advance_after_match()
+		if adv == null or not (adv is Dictionary) or (adv as Dictionary).is_empty():
+			_check(false, "advance_after_match returned null/empty (director error above?)")
+			return false
+		if bool((adv as Dictionary).get("consolation_started", false)):
 			return true
-		if str(adv.get("action", "")) == "tournament_end":
+		if str((adv as Dictionary).get("action", "")) == "tournament_end":
 			return false
 	return false
 
@@ -246,6 +290,7 @@ func _initialize() -> void:
 	# Feature guards: a missing method/arity must FAIL loudly, not
 	# false-pass (runtime errors abort the test frame but not the run).
 	_check(d1.has_method("_match_loser"), "director has _match_loser (loser-advance present)")
+	_check(d1.has_method("_resolve_skipped_final"), "director has _resolve_skipped_final (final skip present)")
 	_check(d1.has_method("build_bracket"), "director has build_bracket")
 	if failures > 0:
 		printerr("CONSOLATION TESTS: missing features, aborting")
@@ -256,6 +301,7 @@ func _initialize() -> void:
 	test_size4(d2)
 	var d3 = _new_director()
 	test_size8(d3)
+	test_skipped_final_tiebreak()
 	var d4 = _new_director()
 	test_skip(d4)
 	test_tba_templates()
