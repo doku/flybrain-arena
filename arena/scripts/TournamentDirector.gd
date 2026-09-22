@@ -39,10 +39,17 @@ var active_job: Dictionary = {}
 # One-shot async vault op (e.g. generate): {pid, result_file, op} or {}.
 var pending_async: Dictionary = {}
 
+# Menu training queue: FIFO of {id, name, episodes, params}. The menu
+# enqueues while a job runs; the pump starts the head whenever the
+# shared worker slot frees up. In-memory only (menu restart drops it;
+# a running worker keeps going but is no longer polled).
+var train_queue: Array = []
+
 signal vault_changed()
 signal job_progress(episode: int, total: int)
 signal job_failed(error: String)
 signal async_done(op: String, result: Dictionary)
+signal train_queue_changed()
 
 
 func _ready() -> void:
@@ -290,6 +297,7 @@ func poll_job() -> Dictionary:
 	if float(res.get("pct", 0.0)) >= 100.0:
 		active_job = {}
 		vault_changed.emit()
+		_pump_train_queue()
 		return res
 	# Fail loud: the backend writes its result file on success AND on
 	# error. If the process is gone without reaching 100%, the job
@@ -300,7 +308,55 @@ func poll_job() -> Dictionary:
 		var err_text := _read_job_result_error(str(active_job.get("result_file", "")))
 		active_job = {}
 		job_failed.emit(err_text)
+		_pump_train_queue()
 	return res
+
+
+func enqueue_training(brain_id: String, brain_name: String, episodes: int,
+		params: Dictionary) -> int:
+	# Appends a training job; returns its 1-based queue position. The
+	# caller decides start-now vs queue (see _pump_train_queue).
+	train_queue.append({"id": brain_id, "name": brain_name,
+		"episodes": maxi(1, episodes), "params": params})
+	train_queue_changed.emit()
+	return train_queue.size()
+
+
+func cancel_queued(index: int) -> bool:
+	if index < 0 or index >= train_queue.size():
+		return false
+	train_queue.remove_at(index)
+	train_queue_changed.emit()
+	return true
+
+
+func clear_train_queue() -> void:
+	if train_queue.is_empty():
+		return
+	train_queue.clear()
+	train_queue_changed.emit()
+
+
+func pump_train_queue() -> bool:
+	# Starts the queue head when the worker slot is free. Returns true
+	# when a job launched. A failed launch keeps the head (transient
+	# spawn trouble must not eat the queue).
+	return _pump_train_queue()
+
+
+func _pump_train_queue() -> bool:
+	if not active_job.is_empty() or train_queue.is_empty():
+		return false
+	var head: Dictionary = train_queue[0]
+	var res: Dictionary = start_training(str(head.get("id", "")),
+		int(head.get("episodes", 0)), head.get("params", {}))
+	if not bool(res.get("ok", false)):
+		print("[Director] Queued training deferred for %s: %s" % [
+			str(head.get("name", "?")), str(res.get("error", "?"))])
+		return false
+	train_queue.pop_front()
+	train_queue_changed.emit()
+	return true
 
 
 func _read_job_result_error(result_file: String) -> String:

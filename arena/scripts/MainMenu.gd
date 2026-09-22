@@ -36,6 +36,8 @@ var gen_config_dlg: Window
 var gen_episodes: SpinBox
 var job_bar: ProgressBar
 var job_label: Label
+var queue_list: ItemList
+var queue_label: Label
 
 var tourney_size: OptionButton
 var tourney_bestof: OptionButton
@@ -67,6 +69,7 @@ func _ready() -> void:
 	TournamentDirector.job_progress.connect(_on_job_progress)
 	TournamentDirector.job_failed.connect(_on_job_failed)
 	TournamentDirector.async_done.connect(_on_async_done)
+	TournamentDirector.train_queue_changed.connect(_refresh_train_queue)
 	if not TournamentDirector.python_ready:
 		log_label.text = "Python not found: %s" % TournamentDirector.python_probe_error
 	set_busy("Loading vault...")
@@ -337,6 +340,27 @@ func _build_gen_column() -> VBoxContainer:
 	job_label = Label.new()
 	job_label.add_theme_font_size_override("font_size", 13)
 	c.add_child(job_label)
+	# Training queue: what's running shows above (job bar/label);
+	# everything waiting is listed here with remove/clear controls.
+	queue_label = Label.new()
+	queue_label.text = "TRAINING QUEUE (0)"
+	queue_label.add_theme_font_size_override("font_size", 13)
+	c.add_child(queue_label)
+	queue_list = ItemList.new()
+	queue_list.custom_minimum_size = Vector2(0, 84)
+	queue_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	c.add_child(queue_list)
+	var qrow := HBoxContainer.new()
+	qrow.add_theme_constant_override("separation", 6)
+	c.add_child(qrow)
+	var qrm := Button.new()
+	qrm.text = "REMOVE SELECTED"
+	qrm.pressed.connect(_on_queue_remove)
+	qrow.add_child(qrm)
+	var qclr := Button.new()
+	qclr.text = "CLEAR QUEUE"
+	qclr.pressed.connect(_on_queue_clear)
+	qrow.add_child(qclr)
 	return c
 
 
@@ -767,23 +791,61 @@ func _on_train() -> void:
 	if selected_brain.is_empty():
 		log_label.text = "Select a brain first."
 		return
-	if not TournamentDirector.active_job.is_empty():
-		job_label.text = "A training job is already running - wait or restart the menu."
-		return
 	var bid := str(selected_brain.get("id", ""))
-	var res: Dictionary = TournamentDirector.start_training(bid, int(gen_episodes.value), _retrain_params())
-	if res.get("ok", false):
-		job_bar.value = 0.0
-		job_label.text = "Training %s ..." % str(selected_brain.get("name", "?"))
-	else:
-		job_label.text = "Train failed: %s" % res.get("error", "?")
+	var bname := str(selected_brain.get("name", "?"))
+	var eps := int(gen_episodes.value)
+	# Start now when the worker slot is free, otherwise queue behind
+	# what's running (the pump starts us automatically).
+	if TournamentDirector.active_job.is_empty() \
+			and TournamentDirector.train_queue.is_empty():
+		var res: Dictionary = TournamentDirector.start_training(bid, eps, _retrain_params())
+		if res.get("ok", false):
+			job_bar.value = 0.0
+			job_label.text = "Training %s ..." % bname
+		else:
+			job_label.text = "Train failed: %s" % res.get("error", "?")
+		return
+	var pos: int = TournamentDirector.enqueue_training(
+		bid, bname, eps, _retrain_params())
+	TournamentDirector.pump_train_queue()
+	log_label.text = "Queued %s x%d (#%d in queue)." % [bname, eps, pos]
+
+
+func _on_queue_remove() -> void:
+	var sel := queue_list.get_selected_items()
+	if sel.is_empty():
+		return
+	TournamentDirector.cancel_queued(int(sel[0]))
+
+
+func _on_queue_clear() -> void:
+	TournamentDirector.clear_train_queue()
+
+
+func _queue_suffix() -> String:
+	var n := TournamentDirector.train_queue.size()
+	return "" if n == 0 else " (+%d queued)" % n
+
+
+func _refresh_train_queue() -> void:
+	if not is_instance_valid(queue_list):
+		return
+	queue_list.clear()
+	var q: Array = TournamentDirector.train_queue
+	queue_label.text = "TRAINING QUEUE (%d)" % q.size()
+	for i in range(q.size()):
+		var item: Dictionary = q[i]
+		queue_list.add_item("%d. %s - %d ep" % [i + 1,
+			str(item.get("name", "?")), int(item.get("episodes", 0))])
+	if is_instance_valid(job_label) and not _job_base.is_empty():
+		job_label.text = _job_base + _queue_suffix()
 
 
 func _on_job_progress(episode: int, total: int) -> void:
 	if total > 0:
 		job_bar.value = 100.0 * episode / total
 		_job_base = "Training... episode %d / %d" % [episode, total]
-		job_label.text = _job_base
+		job_label.text = _job_base + _queue_suffix()
 		if episode >= total:
 			_job_base = ""
 			refresh_vault()
