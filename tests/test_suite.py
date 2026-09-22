@@ -3619,13 +3619,14 @@ class TestEvoLoop(unittest.TestCase):
         b = evo.wild_name(random.Random(42), 3)
         self.assertEqual(a, b)
         self.assertTrue(a.endswith(" G3"))
+        # One-word stem plus generation tag (never "Adjective_Callsign").
         parts = a.split(" ")
-        self.assertEqual(len(parts), 3)
-        self.assertIn(parts[0], evo.WILD_ADJECTIVES)
-        self.assertIn(parts[1], evo.WILD_CALLSIGNS)
-        self.assertEqual(parts[2], "G3")
-        names = {evo.wild_name(random.Random(s), 3) for s in range(60)}
-        self.assertGreater(len(names), 50)
+        self.assertEqual(len(parts), 2)
+        self.assertIn(parts[0], evo.WILD_STEMS)
+        self.assertEqual(parts[1], "G3")
+        self.assertNotIn("_", parts[0])
+        names = {evo.wild_name(random.Random(s), 3) for s in range(40)}
+        self.assertGreater(len(names), 30)
 
     def test_unique_wild_name_collision(self):
         import random

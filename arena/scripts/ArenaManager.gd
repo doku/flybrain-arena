@@ -2671,7 +2671,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 					champ_name)
 				_update_evo_status_line()
 				if is_instance_valid(status_label):
-					status_label.text = "EVO GEN %d begun - training G%d-%s-kin + wild in background..." % [gen + 1, gen + 1, champ_name]
+					status_label.text = "EVO GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_name(champ_name, gen + 1)]
 			await get_tree().create_timer(3.0).timeout
 			_hide_arena_bracket()
 		_request_current_battle_load()
@@ -3069,8 +3069,11 @@ func _evo_queue_wild(target_gen: int) -> void:
 func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String) -> void:
 	if champ_id == "" or _evo_has_kind("clone"):
 		return
-	_evo_queue_spec("clone", "G%d-%s-kin" % [target_gen, champ_name],
-		champ_id, randi(), target_gen)
+	var director := _director()
+	var kin := champ_name
+	if director != null:
+		kin = director.kin_name(champ_name, target_gen)
+	_evo_queue_spec("clone", kin, champ_id, randi(), target_gen)
 
 
 func _evo_spawn_spec(spec: Dictionary) -> bool:

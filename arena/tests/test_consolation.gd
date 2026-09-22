@@ -193,6 +193,23 @@ func test_skipped_final_tiebreak() -> void:
 	_check(str(d.tourney.get("last_place_id", "")) == "p", "tie loser a is last")
 
 
+func test_kin_names() -> void:
+	# Clone names stay short: strip stale affixes, apply current gen,
+	# increment kin depth (never G3-G2-...-kin-kin stacking).
+	var d = _new_director()
+	_check(d.kin_name("flow2", 3) == "G3-flow2-kin1", "fresh champ")
+	_check(d.kin_name("G2-flow2-kin1", 4) == "G4-flow2-kin2",
+		"stale prefix stripped, kin incremented")
+	_check(d.kin_name("G2-flow2-kin", 3) == "G3-flow2-kin1",
+		"bare kin counts as depth 1")
+	_check(d.kin_name("Kestrel G2", 3) == "G3-Kestrel-kin1",
+		"old wild gen tag stripped")
+	_check(d.kin_name("Peppery_Rhino_G3", 4) == "G4-Peppery_Rhino-kin1",
+		"legacy wild gen tag stripped")
+	_check(d.kin_name("Viper", 2) == "G2-Viper-kin1", "plain name")
+	_check(d.kin_name("G2", 3) == "G3-G2-kin1", "degenerate falls back whole")
+
+
 func test_skip(d) -> void:
 	# 5 players in size-8: R0 losers != 2/4/8 -> no consolation, clean end.
 	var brains := _fakes(5)
@@ -302,6 +319,7 @@ func _initialize() -> void:
 	var d3 = _new_director()
 	test_size8(d3)
 	test_skipped_final_tiebreak()
+	test_kin_names()
 	var d4 = _new_director()
 	test_skip(d4)
 	test_tba_templates()

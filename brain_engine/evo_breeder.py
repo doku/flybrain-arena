@@ -29,9 +29,8 @@ WILD_CALLSIGNS = [
     "Cricket", "Beetle", "Stag", "Rhino", "Atlas", "Luna",
 ]
 
-# Adjective pool: '<Adjective> <Callsign> G<gen>' reads like a fighter
-# handle on the bracket/HUD. Kept short and punch-only; draw order
-# (adjective, then callsign) is part of the deterministic contract.
+# Adjective pool (kept for pool depth; wild names draw a single stem
+# from the combined pool below).
 WILD_ADJECTIVES = [
     "Ashen", "Brisk", "Cinder", "Dusky", "Ember", "Flint",
     "Grizzled", "Hasty", "Iron", "Jagged", "Keen", "Lithe",
@@ -40,13 +39,17 @@ WILD_ADJECTIVES = [
     "Slate", "Stormy", "Feral", "Bristle", "Gauzy", "Peppy",
 ]
 
+# Single-word stems: one draw names the brain ("Kestrel G2", never
+# "Peppery_Rhino_G2"). Combined pool maximizes uniqueness; collisions
+# still de-dupe via unique_wild_name (Mk suffix).
+WILD_STEMS = WILD_ADJECTIVES + WILD_CALLSIGNS
+
 
 def wild_name(rng, generation):
     """Deterministic wild-offspring display name from a seedable rng
     (anything with .choice, e.g. random.Random):
-    '<Adjective> <Callsign> G<gen>'."""
-    return (f"{rng.choice(WILD_ADJECTIVES)} "
-            f"{rng.choice(WILD_CALLSIGNS)} G{int(generation)}")
+    '<Stem> G<gen>' (one word plus generation tag)."""
+    return f"{rng.choice(WILD_STEMS)} G{int(generation)}"
 
 
 def unique_wild_name(rng, generation, taken):
