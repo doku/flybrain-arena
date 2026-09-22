@@ -8,7 +8,8 @@ from connectome_loader import load_or_build_csr, load_or_extract_populations
 from lif_brain import FlyBrain
 from sensory_motor import SensoryEncoder, MotorDecoder, normalize_mapping
 from dopamine_learning import DopamineReinforcement
-from experimental_wiring import experiment_arrays, experiment_suffix
+from experimental_wiring import (experiment_arrays, experiment_suffix,
+                                   build_genome_arrays, genome_suffix)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
@@ -438,7 +439,8 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                  save_name=None, seed=None, target_evasion=0.2,
                  learning_rate=0.008, dist_gain=0.15, align_bonus=(0.5, 0.2, -0.3),
                  experiment=None, init_weights=None, progress_cb=None,
-                 return_brain=False, mapping=None, yaw_bias=None, legacy=False):
+                 return_brain=False, mapping=None, yaw_bias=None, legacy=False,
+                 genome=None):
     global TREES
     cfg = VARIANTS.get(variant, {})
     label = cfg.get("label", variant)
@@ -450,7 +452,10 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     np.random.seed(seed)
     if save_name is None:
         save_name = cfg.get("save_name", "trained_homing_champion.npz")
-    if experiment:
+    if genome is not None:
+        base = save_name.removesuffix(".npz") if save_name.endswith(".npz") else save_name
+        save_name = f"{base}{genome_suffix(genome)}.npz"
+    elif experiment:
         base = save_name.removesuffix(".npz") if save_name.endswith(".npz") else save_name
         save_name = f"{base}{experiment_suffix(experiment)}.npz"
     target_evasion = cfg.get("target_evasion", target_evasion)
@@ -465,9 +470,13 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     pops = load_or_extract_populations()
 
     # Build the brain's CSR from the base connectome plus the experimental
-    # wiring (if any). Arity changes with injected edges, so checkpoints for
-    # this run carry the experiment suffix and are never mixed with base files.
-    indptr, indices, wbasis = experiment_arrays(experiment, csr, pops)
+    # wiring or genome (if any). Arity changes with injected edges, so
+    # checkpoints for this run carry the experiment/genome suffix and are
+    # never mixed with base files. Genome wins when both are given.
+    if genome is not None:
+        indptr, indices, wbasis = build_genome_arrays(genome, csr, pops)
+    else:
+        indptr, indices, wbasis = experiment_arrays(experiment, csr, pops)
     start_weights = wbasis.copy() if init_weights is None else np.ascontiguousarray(
         np.asarray(init_weights, dtype=np.float32).copy())
     if len(start_weights) != len(wbasis):

@@ -15,7 +15,8 @@ from sensory_motor import (SensoryEncoder, MotorDecoder, normalize_mapping,
 from evolution_engine import EvolutionManager
 from dopamine_learning import DopamineReinforcement
 from experimental_wiring import (experiment_arrays, experiment_suffix,
-                                   normalize_experiment, mix_label)
+                                   normalize_experiment, mix_label,
+                                   build_genome_arrays, genome_label)
 
 
 def _load_variant_weights(checkpoints_dir, names, fallback):
@@ -193,19 +194,38 @@ def _norm_experiment(value):
 
 
 def _bind_brain(rec, weights, csr, pops, struct_cache):
-    """Builds a FlyBrain on the wiring its record declares (base or
-    experimental overlay), validating the file's arity. Raises ValueError
-    on unknown wirings or corrupt/mislabeled files."""
-    exp = _norm_experiment((rec.get("generator_params", {}) or {}).get("experiment", None))
-    if exp not in struct_cache:
-        indptr, indices, _data = experiment_arrays(exp, csr, pops)
-        struct_cache[exp] = (indptr, indices)
-        print(f"[Server] Cached {len(indices):,} synapse wiring for "
-              f"experiment={mix_label(exp)}")
-    indptr, indices = struct_cache[exp]
+    """Builds a FlyBrain on the wiring its record declares (genome, base,
+    or experimental overlay), validating the file's arity. Genome wins
+    when a record carries both. Raises ValueError on unknown wirings or
+    corrupt/mislabeled files."""
+    gp = rec.get("generator_params", {}) or {}
+    genome = gp.get("genome", None)
+    if genome is not None:
+        try:
+            glabel = genome_label(genome)
+        except ValueError as e:
+            raise ValueError(
+                f"brain '{rec.get('name')}' declares a bad genome: {e}")
+        key = "genome:" + glabel
+        if key not in struct_cache:
+            indptr, indices, _data = build_genome_arrays(genome, csr, pops)
+            struct_cache[key] = (indptr, indices)
+            print(f"[Server] Cached {len(indices):,} synapse wiring for "
+                  f"genome={glabel}")
+        label = "genome " + glabel
+    else:
+        exp = _norm_experiment(gp.get("experiment", None))
+        key = exp
+        if exp not in struct_cache:
+            indptr, indices, _data = experiment_arrays(exp, csr, pops)
+            struct_cache[exp] = (indptr, indices)
+            print(f"[Server] Cached {len(indices):,} synapse wiring for "
+                  f"experiment={mix_label(exp)}")
+        label = mix_label(exp)
+    indptr, indices = struct_cache[key]
     if len(weights) != len(indices):
         raise ValueError(
-            f"brain '{rec.get('name')}' declares wiring '{mix_label(exp)}' "
+            f"brain '{rec.get('name')}' declares wiring '{label}' "
             f"but carries arity {len(weights)} != {len(indices)}; "
             f"file corrupt or mislabeled")
     return FlyBrain(indptr, indices, np.ascontiguousarray(weights, dtype=np.float32).copy())

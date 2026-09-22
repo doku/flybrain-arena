@@ -120,6 +120,7 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
         "align_bonus": list(gp.get("align_bonus", [0.5, 0.2, -0.3])),
         "evasion": gp.get("evasion", 0.2),
         "experiment": gp.get("experiment"),
+        "genome": gp.get("genome"),
         "mapping": gp.get("mapping") if mapping is None else mapping,
         "yaw_bias": gp.get("yaw_bias"),
     }
@@ -137,14 +138,22 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
 
 
 def breed_random(name, seed, episodes=50, progress_cb=None, generation=1):
-    """Fresh random brain: random wiring mix (any subset, incl. empty),
-    random mapping subset, random yaw_bias + rates. Lineage source set
-    to random. Empty name auto-generates a deterministic callsign
-    (wild_name from the same seed), so callers that can't see the pool
-    still get good names."""
+    """Fresh random brain: random wiring GENOME (grammar-constrained
+    projection rules over the pool registry) with its mapping DERIVED
+    from the genome's efferents, plus random yaw_bias + rates. Lineage
+    source set to random. Empty name auto-generates a deterministic
+    callsign (wild_name from the same seed), so callers that can't see
+    the pool still get good names. Deterministic in seed end to end
+    (dedicated np stream for the genome); seed draws for rates below
+    use the legacy random stream (its positions shifted vs pre-genome
+    code, which sampled mixes/stacks from it - seeds are not a stable
+    API across breeder versions)."""
     import random as _random
+    import numpy as _np
     from sensory_motor import draw_yaw_bias
     from train_job import generate_and_train
+    from experimental_wiring import generate_genome, derive_mapping
+    from connectome_loader import load_or_extract_populations
     r = _random.Random(int(seed))
     if not (name or "").strip():
         # Dedicated naming stream: extra adjective/callsign draws must
@@ -153,10 +162,10 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1):
         taken = {str(rec.get("name", ""))
                  for rec in vault.scan_vault(silent=True)}
         name = unique_wild_name(nr, generation, taken)
-    exps = ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
-    maps = ["muscles_up", "gyro_flow", "mbon", "retina", "flow_trans"]
-    mix = sorted(x for x in exps if r.random() < 0.4)
-    stack = sorted(x for x in maps if r.random() < 0.5)
+    grng = _np.random.default_rng(int(seed))
+    pops = load_or_extract_populations()
+    genome = generate_genome(grng, pops, 1 + int(grng.integers(0, 4)))
+    stack = list(derive_mapping(genome))
     params = {
         "variant": "custom",
         "seed": int(seed),
@@ -164,7 +173,8 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1):
         "dist_gain": round(r.uniform(0.05, 0.30), 2),
         "align_bonus": [0.5, 0.2, -0.3],
         "evasion": round(r.uniform(0.0, 0.6), 2),
-        "experiment": mix if mix else None,
+        "experiment": None,
+        "genome": genome,
         "mapping": stack if stack else None,
         "yaw_bias": draw_yaw_bias(r),
     }

@@ -36,6 +36,7 @@ DEFAULT_GENERATOR_PARAMS = {
     "align_bonus": [0.5, 0.2, -0.3],
     "evasion": 0.2,
     "experiment": None,
+    "genome": None,
     "mapping": None,
     "yaw_bias": None,
 }

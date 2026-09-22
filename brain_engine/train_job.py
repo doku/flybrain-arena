@@ -13,16 +13,20 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from connectome_loader import load_or_build_csr, load_or_extract_populations
-from experimental_wiring import experiment_arrays
+from experimental_wiring import experiment_arrays, build_genome_arrays
 from train_homing import run_training
 import brain_package as vault
 
 
-def fresh_weights(experiment=None):
-    """Untrained starting weights (base connectome + optional overlay)."""
+def fresh_weights(experiment=None, genome=None):
+    """Untrained starting weights (base connectome + optional overlay or
+    genome; genome wins when both are given)."""
     csr = load_or_build_csr()
     pops = load_or_extract_populations()
-    _, _, wbasis = experiment_arrays(experiment, csr, pops)
+    if genome is not None:
+        _, _, wbasis = build_genome_arrays(genome, csr, pops)
+    else:
+        _, _, wbasis = experiment_arrays(experiment, csr, pops)
     return np.ascontiguousarray(np.asarray(wbasis, dtype=np.float32).copy())
 
 
@@ -39,6 +43,11 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
     params = dict(params or {})
     params.setdefault("variant", "custom")
     stored = record.get("generator_params", {}) or {}
+    # Genome envelope (parallels experiment): explicit params win, else
+    # the record's stored genome, else None (base/legacy wiring).
+    resolved_genome = params.get("genome", None)
+    if resolved_genome is None:
+        resolved_genome = stored.get("genome", None)
 
     def _stored(key, default):
         # Explicit None means "not specified": fall back to the record's
@@ -83,6 +92,7 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
         dist_gain=_stored("dist_gain", 0.15),
         align_bonus=tuple(_stored("align_bonus", (0.5, 0.2, -0.3))),
         experiment=_stored("experiment", None),
+        genome=resolved_genome,
         mapping=resolved_mapping,
         yaw_bias=resolved_bias,
         legacy=legacy,
@@ -105,7 +115,7 @@ def generate_and_train(name, episodes, params=None, progress_cb=None):
     """Creates a vault brain and trains it from fresh weights."""
     params = dict(params or {})
     record = vault.new_record(name, params)
-    weights = fresh_weights(params.get("experiment"))
+    weights = fresh_weights(params.get("experiment"), params.get("genome"))
     record, weights, summary = train_brain(
         record, weights, episodes, params,
         progress_cb=progress_cb, notes="initial training", save=True)

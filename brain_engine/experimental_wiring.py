@@ -542,3 +542,67 @@ def _frozen(name, pops, fanout=None, weight=None):
             rr["weight"] = weight
         rules.append(rr)
     return compile_rules(rules, pops)
+
+
+# Schemes whose sensory pools a genome drives (mapping derivation).
+SCHEME_SOURCES = {
+    "retina": ("visual_lc11", "visual_lc15", "visual_lc17",
+               "visual_lc18"),
+    "flow_trans": ("visual_t4a", "visual_t4b", "visual_t4c",
+                   "visual_t4d", "visual_t5a", "visual_t5b",
+                   "visual_t5c", "visual_t5d"),
+    "gyro_flow": ("gyro_jo",),
+    "mbon": ("mushroom_body_kc",),
+}
+# Schemes whose readout pools a genome drives.
+SCHEME_TARGETS = {
+    "muscles_up": ("motor_flight_thrust", "motor_steer"),
+    "gyro_flow": ("flow_vs", "flow_hs"),
+    "mbon": ("mbon_app", "mbon_av"),
+}
+
+
+def derive_mapping(genome):
+    """Derive a neuro-mapping stack from a genome's efferents: a scheme
+    is live when the genome drives its sensory pools (sources) or its
+    readout pools (targets). Returns a sorted tuple shaped like
+    normalize_mapping output (() = base). Mouth-target rules (spear)
+    derive nothing - the spear readout is always active. Presence-based
+    only; strength-weighted derivation is future work (see the
+    attribution miner)."""
+    rules = validate_genome(genome)["rules"]
+    srcs = {r["source"] for r in rules}
+    tgts = {r["target"] for r in rules}
+    out = set()
+    for scheme, pools in SCHEME_SOURCES.items():
+        if srcs & set(pools):
+            out.add(scheme)
+    for scheme, pools in SCHEME_TARGETS.items():
+        if tgts & set(pools):
+            out.add(scheme)
+    return tuple(sorted(out))
+
+
+def build_genome_arrays(genome, csr, pops):
+    """(indptr, indices, data) for a genome envelope (None envelope =
+    base CSR arrays, mirroring experiment_arrays)."""
+    if genome is None:
+        return (np.ascontiguousarray(csr.indptr, dtype=np.int32),
+                np.ascontiguousarray(csr.indices, dtype=np.int32),
+                np.ascontiguousarray(csr.data, dtype=np.float32))
+    edges = compile_genome(genome, pops)
+    if edges is None:
+        return (np.ascontiguousarray(csr.indptr, dtype=np.int32),
+                np.ascontiguousarray(csr.indices, dtype=np.int32),
+                np.ascontiguousarray(csr.data, dtype=np.float32))
+    pre, post, w = edges
+    print(f"[ExpWiring] genome {genome_label(genome)}: injecting "
+          f"{len(pre):,} edges (compiled genome)")
+    return apply_overlay(csr, pre, post, w)
+
+
+def genome_suffix(genome):
+    """Filename suffix for genome checkpoints (empty when None)."""
+    if genome is None:
+        return ""
+    return "__gen_" + genome_label(genome)

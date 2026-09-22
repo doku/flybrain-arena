@@ -2104,6 +2104,41 @@ class TestWiringGenome(unittest.TestCase):
         with self.assertRaises(ValueError):
             ew.generate_genome(np.random.default_rng(3), self.pops, 0)
 
+    def test_derive_mapping(self):
+        import experimental_wiring as ew
+        # Frozen genomes derive their historical pairings (retina_wide
+        # wiring <-> retina mapping; spear's LC sources read retina too,
+        # matching historical usage - the mouth readout is always on).
+        self.assertEqual(
+            ew.derive_mapping(ew.FROZEN_GENOMES["retina_wide"]),
+            ("retina",))
+        self.assertEqual(
+            ew.derive_mapping(ew.FROZEN_GENOMES["spear_lunge"]),
+            ("retina",))
+        t4rule = {"source": "visual_t4a", "source_side": "left",
+                  "target": "descending_all", "target_side": "left",
+                  "sign": 1.0, "weight": 100.0, "fanout": 4,
+                  "topography": "random", "stream": "t", "stream_seed": 1}
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [t4rule]}),
+            ("flow_trans",))
+        mnrule = dict(t4rule, source="visual_lc11", target="motor_steer",
+                      target_side="right", stream="u")
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [t4rule, mnrule]}),
+            ("flow_trans", "muscles_up", "retina"))
+        # Scent pools have no scheme: DA1 wiring derives base ().
+        da1 = dict(t4rule, source="pheromone_da1", stream="v")
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [da1]}), ())
+        # Generated genomes always derive a valid (possibly base) stack.
+        import numpy as np
+        from sensory_motor import normalize_mapping
+        for seed in range(30):
+            g = ew.generate_genome(
+                np.random.default_rng(seed), self.pops, 3)
+            normalize_mapping(list(ew.derive_mapping(g)))
+
     def test_genome_id_stable(self):
         import numpy as np
         import experimental_wiring as ew
@@ -2116,6 +2151,69 @@ class TestWiringGenome(unittest.TestCase):
         c = ew.generate_genome(np.random.default_rng(22), self.pops, 3)
         self.assertNotEqual(ew.genome_id(a), ew.genome_id(c))
         self.assertRegex(ew.genome_label(a), r"^g[0-9a-f]{10}$")
+
+
+class TestWiringAttribution(unittest.TestCase):
+    """Attribution miner on synthetic brackets: outcome extraction,
+    vault-meta join, exactly-one-side scoring (no files, no CSR)."""
+    def _rec(self, bid, genome=None, experiment=None, mapping=None):
+        gp = {"experiment": experiment, "genome": genome,
+              "mapping": mapping}
+        return {"id": bid, "generator_params": gp}
+
+    def _tourney(self, matches):
+        # matches: [(a, b, winner)] -> rounds-shaped dict.
+        return {"rounds": [[{"a_id": a, "b_id": b, "winner_id": w}
+                            for a, b, w in matches]]}
+
+    def test_outcomes_skip_junk(self):
+        import mine_wiring_fitness as mw
+        t = {"rounds": [[
+            {"a_id": "a", "b_id": "b", "winner_id": "a"},
+            {"a_id": "c", "b_id": "", "winner_id": "c", "bye": True},
+            {"a_id": "", "b_id": "", "winner_id": "", "vacant": True},
+            {"a_id": "d", "b_id": "e", "winner_id": ""},
+        ]]}
+        self.assertEqual(mw.match_outcomes(t), [("a", "b")])
+
+    def test_pool_lift(self):
+        import mine_wiring_fitness as mw
+        import experimental_wiring as ew
+        retina = ew.FROZEN_GENOMES["retina_wide"]
+        base_rec = self._rec("base1")
+        ret_rec = self._rec("ret1", genome=dict(retina))
+        metas = {"base1": mw.brain_meta(base_rec),
+                 "ret1": mw.brain_meta(ret_rec)}
+        self.assertIn("visual_lc11", metas["ret1"]["pools"])
+        self.assertEqual(metas["base1"]["pools"], set())
+        # Retina brain beats base 3-1: pool lift must be positive.
+        outcomes = [("ret1", "base1")] * 3 + [("base1", "ret1")]
+        stats = mw.tally(outcomes, metas)
+        self.assertEqual(stats["matches"], 4)
+        w, n = stats["pools"]["visual_lc11"]
+        self.assertEqual((w, n), (3, 4))
+        # Mirror matches (both touch) never score.
+        stats2 = mw.tally([("ret1", "ret1")], metas)
+        self.assertEqual(stats2["matches"], 1)
+        self.assertNotIn("visual_lc11", stats2["pools"])
+        # Unknown brains are skipped, not crashed on.
+        stats3 = mw.tally([("ghost", "base1")], metas)
+        self.assertEqual(stats3["matches"], 0)
+
+    def test_mapping_and_rules(self):
+        import mine_wiring_fitness as mw
+        m1 = self._rec("m1", mapping=["retina"])
+        m2 = self._rec("m2", mapping=None)
+        metas = {"m1": mw.brain_meta(m1), "m2": mw.brain_meta(m2)}
+        self.assertEqual(metas["m1"]["mapping"], ("retina",))
+        self.assertEqual(metas["m2"]["mapping"], ())
+        stats = mw.tally([("m1", "m2"), ("m1", "m2"), ("m2", "m1")], metas)
+        w, n = stats["mappings"][("retina",)]
+        self.assertEqual((w, n), (2, 3))
+        self.assertAlmostEqual(stats["rules_winners"], 0.0)
+        rep = mw.report(stats, min_n=1)
+        self.assertIn("retina", rep)
+        self.assertIn("scored matches: 3", rep)
 
 
 class TestMappingMatrix(unittest.TestCase):
@@ -3095,20 +3193,24 @@ class TestEvoLoop(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_breed_random_params_valid(self):
-        # Random param construction without training: valid wiring,
-        # mapping, yaw_bias ranges (mirrors breed_random's draws).
+        # Random param construction without training: valid genome,
+        # derived mapping, yaw_bias ranges (mirrors breed_random's draws).
         import random as _random
-        from experimental_wiring import normalize_experiment
+        import numpy as _np
+        from experimental_wiring import (validate_genome, derive_mapping,
+                                         genome_label, generate_genome)
         from sensory_motor import (normalize_mapping, normalize_yaw_bias,
                                    draw_yaw_bias, YAW_BIAS_LO, YAW_BIAS_HI)
-        exps = ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
-        maps = ["muscles_up", "gyro_flow", "mbon", "retina", "flow_trans"]
+        from connectome_loader import load_or_extract_populations
+        pops = load_or_extract_populations()
         for seed in range(20):
             rr = _random.Random(seed)
-            mix = sorted(x for x in exps if rr.random() < 0.4)
-            stack = sorted(x for x in maps if rr.random() < 0.5)
-            normalize_experiment(mix or None)
+            grng = _np.random.default_rng(seed)
+            genome = generate_genome(grng, pops, 1 + int(grng.integers(0, 4)))
+            validate_genome(genome, pops)
+            stack = list(derive_mapping(genome))
             normalize_mapping(stack or None)
+            genome_label(genome)
             v = draw_yaw_bias(rr)
             normalize_yaw_bias(v)
             self.assertGreaterEqual(v, YAW_BIAS_LO)
