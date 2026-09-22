@@ -88,6 +88,23 @@ def _parse_params(a):
     return {}
 
 
+def _parse_params2(a):
+    """Stage-2 (flight school) params: --params2/--params2-file mirror
+    --params/--params-file. Absent means single-stage."""
+    if getattr(a, "params2_file", ""):
+        try:
+            with open(a.params2_file) as f:
+                return json.load(f)
+        except Exception as e:
+            return {"__error": f"bad --params2-file: {e}"}
+    if getattr(a, "params2", ""):
+        try:
+            return json.loads(a.params2)
+        except json.JSONDecodeError as e:
+            return {"__error": f"bad --params2 JSON: {e}"}
+    return None
+
+
 def _write_progress(path, ep, total):
     if not path:
         return
@@ -105,16 +122,32 @@ def cmd_train(a):
     except Exception as e:
         return out({"ok": False, "error": str(e)}, a.result_file)
     vault.snapshot_backup(rec)
-    notes = f"menu training x{a.episodes}"
+    from train_job import train_brain, train_staged, merge_summaries
+    ep2 = int(getattr(a, "episodes2", 0) or 0)
     try:
-        rec, _w, summary = train_brain(
-            rec, weights, int(a.episodes), params,
-            progress_cb=(lambda ep, total: _write_progress(a.progress, ep, total)),
-            notes=notes, save=True)
+        if ep2 > 0:
+            params2 = _parse_params2(a)
+            if isinstance(params2, dict) and params2.get("__error"):
+                return err(params2["__error"])
+            prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
+                if getattr(a, "progress", "") else None
+            rec, _w, summaries = train_staged(
+                rec, weights,
+                [(int(a.episodes), params, f"menu training x{a.episodes}"),
+                 (ep2, params2, f"menu school x{ep2}")],
+                progress_cb=prog, save=True)
+            summary = merge_summaries(summaries)
+            total = int(a.episodes) + ep2
+        else:
+            rec, _w, summary = train_brain(
+                rec, weights, int(a.episodes), params,
+                progress_cb=(lambda ep, total: _write_progress(a.progress, ep, total)),
+                notes=f"menu training x{a.episodes}", save=True)
+            total = int(a.episodes)
     except Exception as e:
         return out({"ok": False, "error": str(e)}, a.result_file)
     if a.progress:
-        _write_progress(a.progress, int(a.episodes), int(a.episodes))
+        _write_progress(a.progress, total, total)
     return out({"ok": True, "brain": rec, "summary": summary}, a.result_file)
 
 
@@ -241,15 +274,20 @@ def cmd_breed(a):
               f"episodes={a.episodes} seed={a.seed}", flush=True)
         prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
             if getattr(a, "progress", "") else None
+        ep2 = int(getattr(a, "episodes2", 0) or 0)
+        params2 = _parse_params2(a) if ep2 > 0 else None
+        if isinstance(params2, dict) and params2.get("__error"):
+            return err(params2["__error"])
         if a.strategy == "clone":
             rec, _w, summary = evo_breeder.breed_clone(
                 a.parent, a.name, int(a.seed), int(a.episodes),
                 noise=float(getattr(a, "noise", 0.05) or 0.05),
-                progress_cb=prog)
+                progress_cb=prog, episodes2=ep2 or None, params2=params2)
         elif a.strategy == "random":
             rec, _w, summary = evo_breeder.breed_random(
                 a.name, int(a.seed), int(a.episodes), progress_cb=prog,
-                generation=int(getattr(a, "gen", 1) or 1))
+                generation=int(getattr(a, "gen", 1) or 1),
+                episodes2=ep2 or None, params2=params2)
         else:
             return err(f"unknown strategy '{a.strategy}' (clone|random)")
         print(f"[breed] done: {rec.get('name')} ({rec.get('id')}) "
@@ -275,6 +313,8 @@ def main():
     q = sub.add_parser("train"); q.add_argument("--id", required=True)
     q.add_argument("--episodes", type=int, required=True)
     q.add_argument("--params", default=""); q.add_argument("--params-file", default="")
+    q.add_argument("--episodes2", type=int, default=0)
+    q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")
     q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
     q = sub.add_parser("delete"); q.add_argument("--id", required=True)
     q = sub.add_parser("rename"); q.add_argument("--id", required=True)
@@ -296,6 +336,8 @@ def main():
     q.add_argument("--name", nargs="?", default="", const="");
     q.add_argument("--episodes", type=int, required=True)
     q.add_argument("--parent", default=""); q.add_argument("--seed", type=int, required=True)
+    q.add_argument("--episodes2", type=int, default=0)
+    q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")
     q.add_argument("--noise", type=float, default=0.05)
     q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
     q.add_argument("--log-file", default=""); q.add_argument("--gen", type=int, default=1)

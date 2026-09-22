@@ -2355,6 +2355,208 @@ class TestGenomeNovelty(unittest.TestCase):
         self.assertEqual(r1, r2)
 
 
+class TestStagedTraining(unittest.TestCase):
+    """Two-step training: sequencer, summary merge, staging helper,
+    stage-2 params (all with mocked run_training - no CSR needed)."""
+    def _rec(self):
+        return {"id": "staged", "training": {"episodes": 0, "sessions": []},
+                "generator_params": {"seed": 1}}
+
+    def test_train_staged_sequences(self):
+        import train_job
+        calls = []
+
+        def fake_run_training(**kw):
+            calls.append(kw)
+            w = kw["init_weights"]
+            cb = kw.get("progress_cb")
+            for ep in range(1, kw["num_episodes"] + 1):
+                if cb is not None:
+                    cb(ep, kw["num_episodes"])
+            return ("p", w + 1.0, {"episodes": kw["num_episodes"],
+                                   "successes": kw["num_episodes"]})
+        real = train_job.run_training
+        train_job.run_training = fake_run_training
+        try:
+            import numpy as np
+            prog = []
+            rec, w, summaries = train_job.train_staged(
+                self._rec(), np.zeros(3, dtype=np.float32),
+                [(2, {"seed": 1}, "pre-train"),
+                 (3, {"seed": 1}, "school")],
+                progress_cb=lambda ep, total: prog.append((ep, total)),
+                save=False)
+            self.assertEqual(len(summaries), 2)
+            self.assertEqual(rec["training"]["episodes"], 5)
+            self.assertEqual(
+                [s["notes"] for s in rec["training"]["sessions"]],
+                ["pre-train", "school"])
+            # Weights handed stage 1 -> stage 2 (+1 each).
+            np.testing.assert_array_equal(
+                w, np.full(3, 2.0, dtype=np.float32))
+            # Progress rescaled to the combined total, monotonic.
+            self.assertEqual(prog[-1], (5, 5))
+            for (ep, total) in prog:
+                self.assertEqual(total, 5)
+            self.assertEqual(
+                [ep for ep, _t in prog], sorted(ep for ep, _t in prog))
+            merged = train_job.merge_summaries(summaries)
+            self.assertEqual(merged["episodes"], 5)
+            self.assertEqual(merged["successes"], 5)
+            self.assertEqual(len(merged["stages"]), 2)
+        finally:
+            train_job.run_training = real
+
+    def test_train_staged_stage2_failure_keeps_stage1(self):
+        import train_job
+        calls = []
+
+        def fake_run_training(**kw):
+            calls.append(kw)
+            if len(calls) > 1:
+                raise RuntimeError("school blew up")
+            return ("p", kw["init_weights"],
+                    {"episodes": kw["num_episodes"]})
+        real = train_job.run_training
+        train_job.run_training = fake_run_training
+        try:
+            import numpy as np
+            rec = self._rec()
+            with self.assertRaises(RuntimeError):
+                train_job.train_staged(
+                    rec, np.zeros(2, dtype=np.float32),
+                    [(1, {}, "pre-train"), (1, {}, "school")], save=False)
+            self.assertEqual(len(rec["training"]["sessions"]), 1)
+            self.assertEqual(rec["training"]["episodes"], 1)
+        finally:
+            train_job.run_training = real
+
+    def test_staged_or_single(self):
+        import train_job
+        import evo_breeder
+        seen = []
+
+        def fake_train_brain(record, weights, episodes, params=None,
+                             progress_cb=None, notes="", save=True):
+            seen.append((episodes, dict(params or {}), notes))
+            return record, weights, {"episodes": episodes}
+        real = train_job.train_brain
+        train_job.train_brain = fake_train_brain
+        try:
+            import numpy as np
+            rec = self._rec()
+            # Single stage: one call, params untouched.
+            evo_breeder._staged_or_single(
+                rec, np.zeros(1), 2, {"seed": 1, "a": 1}, "n1",
+                None, None, "n2", None)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], 2)
+            # Staged: stage-2 inherits unset keys, keeps its own.
+            seen.clear()
+            evo_breeder._staged_or_single(
+                rec, np.zeros(1), 2, {"seed": 1, "a": 1}, "n1",
+                3, {"b": 2}, "n2", None)
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(seen[0][0], 2)
+            self.assertEqual(seen[1][0], 3)
+            self.assertEqual(seen[1][1]["b"], 2)
+            self.assertEqual(seen[1][1]["a"], 1)
+            self.assertEqual(seen[1][1]["seed"], 1)
+        finally:
+            train_job.train_brain = real
+
+    def test_parse_params2(self):
+        import types
+        import vault_cli
+        self.assertIsNone(vault_cli._parse_params2(types.SimpleNamespace()))
+        ns = types.SimpleNamespace(params2='{"curriculum": "school"}',
+                                   params2_file="")
+        self.assertEqual(vault_cli._parse_params2(ns),
+                         {"curriculum": "school"})
+        bad = types.SimpleNamespace(params2='{oops', params2_file="")
+        self.assertIn("__error", vault_cli._parse_params2(bad))
+
+
+class TestFlightSchool(unittest.TestCase):
+    """Advanced Flight School: anchored camps, planned paths, scheduler,
+    difficulty curves (KinematicFly-level, no CSR needed)."""
+    def test_anchored_target_never_moves(self):
+        from train_homing import KinematicFly
+        t = KinematicFly(x=5.0, y=7.0, z=-3.0, heading_rad=0.7, anchored=True)
+        p0 = t.pos.copy()
+        for _ in range(20):
+            t.step(thrust=1.0, yaw_torque=0.9, pitch_cmd=0.5, dt=0.05)
+        np.testing.assert_array_equal(t.pos, p0)
+        self.assertEqual(t.last_speed, 0.0)
+        f = KinematicFly(x=5.0, y=7.0, z=-3.0, heading_rad=0.7)
+        f.step(thrust=1.0, yaw_torque=0.0, dt=0.05)
+        self.assertGreater(float(np.linalg.norm(f.pos - p0)), 0.0)
+
+    def test_plan_path_properties(self):
+        import numpy as np
+        from train_homing import plan_path
+        for arch in ("patrol", "weave", "flee", "orbit"):
+            p = plan_path(np.random.default_rng(4), 4, archetype=arch)
+            self.assertEqual(p["archetype"], arch)
+            self.assertEqual(len(p["points"]), 4)
+            for pt, sp in zip(p["points"], p["speeds"]):
+                self.assertTrue(-40.0 <= pt[0] <= 40.0)
+                self.assertTrue(4.0 <= pt[1] <= 14.0)
+                self.assertTrue(-40.0 <= pt[2] <= 40.0)
+                self.assertTrue(0.7 <= sp <= 1.0)
+        a = plan_path(np.random.default_rng(4), 3)
+        b = plan_path(np.random.default_rng(4), 3)
+        self.assertEqual(a, b)
+        c = plan_path(np.random.default_rng(5), 3)
+        self.assertNotEqual(a["points"], c["points"])
+
+    def test_step_path_target_advances(self):
+        import numpy as np
+        from train_homing import KinematicFly, plan_path, step_path_target
+        t = KinematicFly(x=-14.0, z=0.0, heading_rad=0.0)
+        path = plan_path(np.random.default_rng(9), 3)
+        state = {"wp": 0}
+        seen = {0}
+        for _ in range(400):
+            step_path_target(t, path, state, 6.0, dt=0.05)
+            seen.add(int(state["wp"]))
+            if len(seen) > 1:
+                break
+        self.assertGreater(len(seen), 1)
+
+    def test_scheduler_coverage_and_determinism(self):
+        import numpy as np
+        from train_homing import (pick_school_scenario, _school_diff,
+                                  SCHOOL_BEHAVIORS, SCHOOL_ENVS)
+        a = pick_school_scenario(np.random.default_rng(2), 0.1, {})
+        b = pick_school_scenario(np.random.default_rng(2), 0.1, {})
+        self.assertEqual(a, b)
+        self.assertIn(a[0], SCHOOL_BEHAVIORS)
+        self.assertIn(a[1], SCHOOL_ENVS)
+        kinds = set()
+        for seed in range(60):
+            kinds.add(pick_school_scenario(
+                np.random.default_rng(seed), 0.5, {})[0])
+        self.assertEqual(kinds, set(SCHOOL_BEHAVIORS))
+        self.assertAlmostEqual(_school_diff(0.0, {}, "camp_dist"), 20.0)
+        self.assertAlmostEqual(_school_diff(1.0, {}, "camp_dist"), 35.0)
+        self.assertAlmostEqual(
+            _school_diff(0.5, {"difficulty": {"camp_dist": [0.0, 10.0]}},
+                         "camp_dist"), 5.0)
+
+    def test_anchored_target_senses(self):
+        from train_homing import KinematicFly, compute_agent_senses
+        fly = KinematicFly(x=-14.0, z=0.0, heading_rad=0.0)
+        camp = KinematicFly(x=12.0, z=2.0, heading_rad=1.0, anchored=True)
+        senses, dist = compute_agent_senses(fly, camp, prev_dist=20.0)
+        self.assertGreater(dist, 20.0)
+        self.assertIn("scent_lost", senses)
+        self.assertIn("scent_cast", senses)
+        self.assertIn("scent_surge", senses)
+        self.assertGreater(senses["pheromone_conc_left"]
+                           + senses["pheromone_conc_right"], 0.0)
+
+
 class TestMappingMatrix(unittest.TestCase):
     """Certifies every wiring x mapping regime: each combination must
     integrate, decode a complete finite control set, and stay isolated

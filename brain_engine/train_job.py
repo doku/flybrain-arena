@@ -93,6 +93,7 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
         align_bonus=tuple(_stored("align_bonus", (0.5, 0.2, -0.3))),
         experiment=_stored("experiment", None),
         genome=resolved_genome,
+        curriculum=_stored("curriculum", None),
         mapping=resolved_mapping,
         yaw_bias=resolved_bias,
         legacy=legacy,
@@ -109,6 +110,60 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
     if save:
         vault.save_brain(record, new_weights)
     return record, new_weights, summary
+
+
+def train_staged(record, weights, stages, progress_cb=None, save=True):
+    """Back-to-back training stages on one record (pre-train, then
+    Advanced Flight School, ...).
+
+    stages = [(episodes, params, notes), ...]. Each stage runs train_brain
+    on the previous stage's weights, so sessions accumulate on the
+    record and the vault saves per stage (earlier work survives a later
+    failure; the exception still propagates after banking). Progress is
+    rescaled to the combined episode total. Returns
+    (record, weights, [summaries]).
+    """
+    stages = list(stages or [])
+    if not stages:
+        raise ValueError("train_staged needs at least one stage")
+    total = sum(int(ep) for ep, _p, _n in stages)
+    done = 0
+    summaries = []
+    for episodes, params, notes in stages:
+        episodes = int(episodes)
+        if episodes <= 0:
+            continue
+        base = done
+
+        def _cb(ep, _total, _base=base):
+            if progress_cb is not None:
+                progress_cb(_base + ep, total)
+
+        record, weights, summary = train_brain(
+            record, weights, episodes, params,
+            progress_cb=_cb if progress_cb is not None else None,
+            notes=notes, save=save)
+        done += episodes
+        summaries.append(summary)
+    if not summaries:
+        raise ValueError("train_staged needs at least one nonzero stage")
+    return record, weights, summaries
+
+
+def merge_summaries(summaries):
+    """Combined multi-stage verdict summary: summed episodes/successes
+    (plus any takedown/strike counters stages report) and the per-stage
+    list. Unknown keys pass through from the last stage that has them."""
+    out = {"stages": list(summaries), "episodes": 0, "successes": 0}
+    for s in summaries:
+        if not isinstance(s, dict):
+            continue
+        out["episodes"] += int(s.get("episodes", 0))
+        out["successes"] += int(s.get("successes", 0))
+        for k in ("takedowns", "strikes", "crashes"):
+            if k in s:
+                out[k] = int(out.get(k, 0)) + int(s.get(k, 0))
+    return out
 
 
 def generate_and_train(name, episodes, params=None, progress_cb=None):

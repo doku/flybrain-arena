@@ -2684,6 +2684,9 @@ func _evo_active() -> bool:
 
 
 const EVO_EPISODES := 50
+# Two-step evo breeding: half the episodes pre-train, half Advanced
+# Flight School (default school curriculum; school code selects stages).
+const EVO_SCHOOL_PARAMS := '{"curriculum": {}}'
 const EVO_NOISE := 0.05
 var evo_waiting := false
 var evo_wait_result := {}
@@ -2844,7 +2847,8 @@ func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
 		result_file.get_file().get_basename() + ".log")
 	var display := brain_name if brain_name != "" else ("wild G%d" % target_gen)
 	var args := ["breed", "--strategy", strategy,
-		"--episodes", str(EVO_EPISODES), "--seed", str(seed),
+		"--episodes", str(EVO_EPISODES / 2), "--seed", str(seed),
+		"--episodes2", str(EVO_EPISODES / 2), "--params2", EVO_SCHOOL_PARAMS,
 		"--noise", str(EVO_NOISE), "--progress", progress_path,
 		"--gen", str(target_gen),
 		"--log-file", log_path]
@@ -3060,7 +3064,8 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 		rf.get_file().get_basename() + ".log")
 	var args := ["breed", "--strategy",
 		"clone" if kind == "clone" else "random",
-		"--episodes", str(EVO_EPISODES), "--seed", str(int(spec.get("seed", 0))),
+		"--episodes", str(EVO_EPISODES / 2), "--seed", str(int(spec.get("seed", 0))),
+		"--episodes2", str(EVO_EPISODES / 2), "--params2", EVO_SCHOOL_PARAMS,
 		"--noise", str(EVO_NOISE), "--progress", str(spec.get("progress", "")),
 		"--gen", str(int(spec.get("gen", 1))),
 		"--log-file", log_path]

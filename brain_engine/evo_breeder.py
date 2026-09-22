@@ -104,9 +104,31 @@ def biggest_loser(tourney, rng=None):
                   "tied": sorted(tied)}
 
 
+def _staged_or_single(child, start_weights, ep1, params, note1,
+                      ep2, params2, note2, progress_cb):
+    """Runs stage 1 (pre-train), then stage 2 (flight school) when ep2
+    is set, on the same record. Stage-2 params inherit unset keys from
+    stage 1 (same fallback philosophy as train_brain's record fallback;
+    genome/mapping carry over so arity can never mismatch). Returns
+    (record, weights, summary) with a merged multi-stage summary."""
+    from train_job import train_brain, train_staged, merge_summaries
+    ep2 = int(ep2 or 0)
+    if ep2 <= 0:
+        return train_brain(child, start_weights, int(ep1), params,
+                           progress_cb=progress_cb, notes=note1, save=True)
+    p2 = dict(params2 or {})
+    for k, v in params.items():
+        p2.setdefault(k, v)
+    record, weights, summaries = train_staged(
+        child, start_weights,
+        [(int(ep1), params, note1), (ep2, p2, note2)],
+        progress_cb=progress_cb, save=True)
+    return record, weights, merge_summaries(summaries)
+
+
 def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
                 mapping=None, progress_cb=None, mutate_structure=True,
-                max_changes=1):
+                max_changes=1, episodes2=None, params2=None):
     """Clone a winner: weight copy + Gaussian noise, fresh seed, full
     training. mapping=None inherits the parent's stack. Genome parents
     additionally undergo structural mutation (mutate_structure, bounded
@@ -114,7 +136,10 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     inits new edges from the parent scale) and the child's mapping is
     re-derived from the mutated genome unless mapping is explicit.
     Genome-less parents (base/legacy) clone structurally identical.
-    Returns (record, weights, summary) like train_job."""
+    episodes2/params2 run a second stage (flight school) back-to-back
+    via train_staged (unset stage-2 keys inherit stage 1); omitted
+    means single-stage. Returns (record, weights, summary) like
+    train_job (multi-stage summary when staged)."""
     from train_job import train_brain
     from experimental_wiring import (mutate_genome, remap_for_genome,
                                      derive_mapping)
@@ -154,13 +179,15 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     noisy = np.ascontiguousarray(
         start_weights
         * (1.0 + rng.normal(0.0, float(noise), size=len(start_weights))).astype(np.float32))
-    return train_brain(child, noisy, int(episodes), params,
-                       progress_cb=progress_cb,
-                       notes=f"evo clone of {rec.get('name', '?')}",
-                       save=True)
+    cname = rec.get('name', '?')
+    return _staged_or_single(
+        child, noisy, episodes, params, f"evo clone of {cname} (pre-train)",
+        episodes2, params2, f"evo clone of {cname} (flight school)",
+        progress_cb)
 
 
-def breed_random(name, seed, episodes=50, progress_cb=None, generation=1):
+def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
+                 episodes2=None, params2=None):
     """Fresh random brain: random wiring GENOME (grammar-constrained
     projection rules over the pool registry) with its mapping DERIVED
     from the genome's efferents, plus random yaw_bias + rates. Lineage
@@ -170,11 +197,11 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1):
     (dedicated np stream for the genome); seed draws for rates below
     use the legacy random stream (its positions shifted vs pre-genome
     code, which sampled mixes/stacks from it - seeds are not a stable
-    API across breeder versions)."""
+    API across breeder versions). episodes2/params2 run a flight-school
+    second stage back-to-back (see breed_clone); omitted is single-stage."""
     import random as _random
     import numpy as _np
     from sensory_motor import draw_yaw_bias
-    from train_job import generate_and_train
     from experimental_wiring import generate_genome, derive_mapping
     from connectome_loader import load_or_extract_populations
     r = _random.Random(int(seed))
@@ -201,8 +228,12 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1):
         "mapping": stack if stack else None,
         "yaw_bias": draw_yaw_bias(r),
     }
-    record, weights, summary = generate_and_train(
-        name, int(episodes), params, progress_cb=progress_cb)
+    from train_job import fresh_weights
+    record = vault.new_record(name, params)
+    weights = fresh_weights(params.get("experiment"), params.get("genome"))
+    record, weights, summary = _staged_or_single(
+        record, weights, episodes, params, "evo wild pre-train",
+        episodes2, params2, "evo wild flight school", progress_cb)
     record["lineage"] = {"parent_ids": [], "source": "evo-random"}
     vault.save_brain(record, weights)
     return record, weights, summary
