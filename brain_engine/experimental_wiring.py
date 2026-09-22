@@ -467,23 +467,13 @@ def generate_genome(rng, pops, n_rules=3, name=None):
     tries = 0
     while len(rules) < n_rules and tries < 50 * n_rules:
         tries += 1
-        src = str(rng.choice(sources))
-        tgt = str(rng.choice(targets))
-        ss = str(rng.choice(["left", "right"]))
-        ts = str(rng.choice(["left", "right"]))
-        if (src, ss, tgt, ts) in seen_pairs:
+        cand = _random_rule(rng, registry, len(rules))
+        pair = (cand["source"], cand["source_side"], cand["target"],
+                cand["target_side"])
+        if pair in seen_pairs:
             continue
-        seen_pairs.add((src, ss, tgt, ts))
-        sign = 1.0 if float(rng.random()) < 0.8 else -1.0
-        rules.append({
-            "source": src, "source_side": ss, "target": tgt,
-            "target_side": ts, "sign": sign,
-            "weight": round(float(rng.uniform(50.0, 400.0)), 1),
-            "fanout": int(rng.integers(2, 17)),
-            "topography": "random",
-            "stream": "g%d" % len(rules),
-            "stream_seed": int(rng.integers(0, 2 ** 31)),
-        })
+        seen_pairs.add(pair)
+        rules.append(cand)
     if len(rules) < n_rules:
         raise ValueError(
             f"registry too small for {n_rules} distinct rule pairs")
@@ -529,6 +519,155 @@ FROZEN_GENOMES = {
         for side in ("left", "right")
     ]},
 }
+
+
+def mutate_genome(rng, genome, pops, max_changes=1):
+    """Structural mutation: up to max_changes rule edits drawn from
+    {jitter weight, jitter fanout, rewire target, add rule, drop rule,
+    flip sign}. Role-compatible (rewires/adds target motor/central
+    pools only; pairs stay unique; single-rule genomes never drop to
+    zero). Deterministic in rng. Returns a NEW validated envelope
+    (input untouched); same-arity edits (weight/sign) keep every edge,
+    structural ones change the edge set (see remap_weights)."""
+    if max_changes < 1:
+        raise ValueError("mutate_genome needs max_changes >= 1")
+    canon = validate_genome(genome, pops)
+    registry = build_pool_registry(pops)
+    targets = sorted(p for p, m in registry.items()
+                     if m["role"] in GENOME_TARGET_ROLES)
+    if not targets:
+        raise ValueError("mutate_genome needs motor/central targets")
+    rules = [dict(r) for r in canon["rules"]]
+    n_changes = 0
+    guard = 0
+    while n_changes < max_changes and guard < 20:
+        guard += 1
+        op = str(rng.choice(
+            ["jitter_weight", "jitter_fanout", "rewire_target",
+             "add_rule", "drop_rule", "flip_sign"],
+            p=[0.40, 0.15, 0.15, 0.10, 0.10, 0.10]))
+        if op == "drop_rule" and len(rules) <= 1:
+            continue
+        idx = int(rng.integers(0, len(rules)))
+        r = rules[idx]
+        if op == "jitter_weight":
+            r["weight"] = round(float(r["weight"]) * float(
+                rng.uniform(0.7, 1.4)), 1)
+        elif op == "jitter_fanout":
+            r["fanout"] = int(np.clip(
+                int(r["fanout"]) + int(rng.integers(-2, 3)),
+                1, MAX_RULE_FANOUT))
+        elif op == "rewire_target":
+            pair = None
+            for _ in range(10):
+                cand = (str(rng.choice(targets)),
+                        str(rng.choice(["left", "right"])))
+                taken = {(x["target"], x["target_side"]) for j, x in
+                         enumerate(rules) if j != idx}
+                if cand not in taken:
+                    pair = cand
+                    break
+            if pair is None:
+                continue
+            r["target"], r["target_side"] = pair
+        elif op == "add_rule":
+            seen = {(x["source"], x["source_side"], x["target"],
+                     x["target_side"]) for x in rules}
+            newr = None
+            for _ in range(20):
+                cand = _random_rule(rng, registry, len(rules))
+                pair = (cand["source"], cand["source_side"],
+                        cand["target"], cand["target_side"])
+                if pair not in seen:
+                    newr = cand
+                    break
+            if newr is None:
+                continue
+            rules.append(newr)
+        elif op == "drop_rule":
+            del rules[idx]
+        elif op == "flip_sign":
+            r["sign"] = -1.0 * float(r["sign"])
+        # Streams stay attached to their rule (draws stay reproducible);
+        # added rules get fresh streams from _random_rule.
+        n_changes += 1
+    return validate_genome({"name": canon["name"], "rules": rules}, pops)
+
+
+def _random_rule(rng, registry, stream_idx):
+    """One grammar-constrained rule (shared by generate/mutate)."""
+    sources = sorted(p for p, m in registry.items() if m["role"] == "sensory")
+    targets = sorted(p for p, m in registry.items()
+                     if m["role"] in GENOME_TARGET_ROLES)
+    src = str(rng.choice(sources))
+    tgt = str(rng.choice(targets))
+    return {
+        "source": src, "source_side": str(rng.choice(["left", "right"])),
+        "target": tgt, "target_side": str(rng.choice(["left", "right"])),
+        "sign": 1.0 if float(rng.random()) < 0.8 else -1.0,
+        "weight": round(float(rng.uniform(50.0, 400.0)), 1),
+        "fanout": int(rng.integers(2, 17)),
+        "topography": "random",
+        "stream": "g%d" % int(stream_idx),
+        "stream_seed": int(rng.integers(0, 2 ** 31)),
+    }
+
+
+def remap_weights(old_edges, new_edges, old_w, rng, fallback_scale=None):
+    """Arity surgery for structural mutation: weights for surviving
+    (pre, post) edges carry over verbatim; new edges initialize
+    N(0, sigma) with sigma = surviving-weight std (or fallback_scale,
+    defaulting to the legacy overlay scale 200.0). Returns a float32
+    array aligned to new_edges order. Deterministic in rng."""
+    if len(old_w) != len(old_edges[0]):
+        raise ValueError(
+            f"remap parent weights {len(old_w)} != parent arity "
+            f"{len(old_edges[0])}; never mix arities")
+    old_map = {}
+    for s, q, v in zip(old_edges[0].tolist(), old_edges[1].tolist(),
+                        np.asarray(old_w, dtype=np.float32).tolist()):
+        old_map[(int(s), int(q))] = float(v)
+    kept = [old_map[k] for k in
+            [(int(s), int(q)) for s, q in
+             zip(new_edges[0].tolist(), new_edges[1].tolist())]
+            if k in old_map]
+    sigma = float(np.std(kept)) if kept else float(
+        fallback_scale if fallback_scale is not None else 200.0)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = 200.0
+    out = np.empty(len(new_edges[0]), dtype=np.float32)
+    new_keys = [(int(s), int(q)) for s, q in
+                zip(new_edges[0].tolist(), new_edges[1].tolist())]
+    fresh = rng.normal(0.0, sigma, sum(1 for k in new_keys if k not in old_map))
+    fi = 0
+    for i, k in enumerate(new_keys):
+        if k in old_map:
+            out[i] = np.float32(old_map[k])
+        else:
+            out[i] = np.float32(fresh[fi])
+            fi += 1
+    return np.ascontiguousarray(out)
+
+
+def remap_for_genome(old_experiment, old_genome, new_genome, old_w,
+                     rng, pops):
+    """Breed-time arity surgery: parent weights (any old wiring: base,
+    legacy mix, or genome) remapped onto a mutated child genome.
+    Surviving edges keep trained weights; new edges init N(0, parent
+    std). Returns float32 weights aligned to the child arity. Raises on
+    uncompilable genomes like the normal build path."""
+    if old_genome is not None:
+        old_edges = compile_genome(old_genome, pops)
+    else:
+        mix = normalize_experiment(old_experiment)
+        if mix is None:
+            old_edges = None
+        else:
+            old_edges = combine_overlays(mix, pops)
+    new_edges = compile_genome(new_genome, pops)
+    if old_edges is None or new_edges is None:
+        raise ValueError("remap needs compilable old and new wirings")
+    return remap_weights(old_edges, new_edges, old_w, rng)
 
 
 def _frozen(name, pops, fanout=None, weight=None):

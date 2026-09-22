@@ -2139,6 +2139,64 @@ class TestWiringGenome(unittest.TestCase):
                 np.random.default_rng(seed), self.pops, 3)
             normalize_mapping(list(ew.derive_mapping(g)))
 
+    def test_mutate_genome(self):
+        import numpy as np
+        import experimental_wiring as ew
+        base = ew.generate_genome(np.random.default_rng(31), self.pops, 3)
+        a = ew.mutate_genome(np.random.default_rng(7), base, self.pops, 1)
+        b = ew.mutate_genome(np.random.default_rng(7), base, self.pops, 1)
+        self.assertEqual(a, b)
+        self.assertGreaterEqual(len(a["rules"]), 1)
+        # Input untouched by mutation.
+        self.assertEqual(len(base["rules"]), 3)
+        # max_changes bounds the edit count (rule-list diff).
+        for seed in range(20):
+            m = ew.mutate_genome(
+                np.random.default_rng(seed), base, self.pops, 1)
+            diff = sum(1 for r in m["rules"]
+                       if r not in base["rules"]) + sum(
+                           1 for r in base["rules"] if r not in m["rules"])
+            self.assertLessEqual(diff, 3)
+        with self.assertRaises(ValueError):
+            ew.mutate_genome(np.random.default_rng(0), base, self.pops, 0)
+
+    def test_remap_weights(self):
+        import numpy as np
+        import experimental_wiring as ew
+        base = ew.generate_genome(np.random.default_rng(41), self.pops, 2)
+        be = ew.compile_genome(base, self.pops)
+        n = len(be[0])
+        old_w = np.arange(n, dtype=np.float32)
+        # Identity remap preserves every weight.
+        same = ew.remap_weights(be, be, old_w,
+                                np.random.default_rng(1))
+        np.testing.assert_array_equal(same, old_w)
+        # Mutated child: survivors keep weights, fresh init is finite
+        # and nonzero-scaled, aligned to the child arity.
+        child = ew.mutate_genome(
+            np.random.default_rng(9), base, self.pops, 2)
+        ce = ew.compile_genome(child, self.pops)
+        new_w = ew.remap_weights(be, ce, old_w,
+                                 np.random.default_rng(2))
+        self.assertEqual(len(new_w), len(ce[0]))
+        self.assertTrue(bool(np.all(np.isfinite(new_w))))
+        old_map = {(int(s), int(q)): float(v) for s, q, v in
+                   zip(be[0].tolist(), be[1].tolist(), be[2].tolist())}
+        for i, (s, q) in enumerate(zip(ce[0].tolist(), ce[1].tolist())):
+            if (int(s), int(q)) in old_map:
+                self.assertAlmostEqual(float(new_w[i]),
+                                       old_map[(int(s), int(q))])
+        # Full pipeline entry point (legacy-mix parent included).
+        re_mix = ew.combine_overlays(("retina_wide",), self.pops)
+        old_w2 = np.arange(len(re_mix[0]), dtype=np.float32)
+        rw = ew.remap_for_genome("retina_wide", None, child, old_w2,
+                                 np.random.default_rng(3), self.pops)
+        self.assertEqual(len(rw), len(ce[0]))
+        # Arity mismatch is loud, never silent.
+        with self.assertRaises(ValueError):
+            ew.remap_for_genome("retina_wide", None, child, old_w,
+                                np.random.default_rng(3), self.pops)
+
     def test_genome_id_stable(self):
         import numpy as np
         import experimental_wiring as ew
@@ -2214,6 +2272,87 @@ class TestWiringAttribution(unittest.TestCase):
         rep = mw.report(stats, min_n=1)
         self.assertIn("retina", rep)
         self.assertIn("scored matches: 3", rep)
+
+
+class TestGenomeNovelty(unittest.TestCase):
+    """Frequency-dependent genome fitness: pool extraction, bonus math
+    and caps, persistence, kill-dominance. CSR-free (tmp checkpoint dir)."""
+    def _mgr(self):
+        import tempfile
+        from evolution_engine import EvolutionManager
+        return EvolutionManager(
+            checkpoints_dir=tempfile.mkdtemp(prefix="evo_nov_"))
+
+    def _rec(self, genome=None, experiment=None):
+        return {"id": "x", "generator_params": {"genome": genome,
+                                                "experiment": experiment}}
+
+    def test_wiring_pools(self):
+        import experimental_wiring as ew
+        from evolution_engine import EvolutionManager
+        mgr = self._mgr()
+        g = {"name": None, "rules": [dict(
+            ew.FROZEN_GENOMES["retina_wide"]["rules"][0])]}
+        pools = mgr.wiring_pools(self._rec(genome=g))
+        self.assertIn("visual_lc11", pools)
+        self.assertIn("descending_all", pools)
+        mix_pools = mgr.wiring_pools(self._rec(experiment="retina_wide"))
+        self.assertTrue(pools < mix_pools)
+        self.assertIn("visual_lc15", mix_pools)
+        self.assertEqual(mgr.wiring_pools(self._rec()), set())
+        self.assertEqual(mgr.wiring_pools({"genome": g}), pools)
+
+    def test_novelty_bonus_and_cap(self):
+        from evolution_engine import EvolutionManager
+        mgr = self._mgr()
+        self.assertEqual(mgr.genome_novelty_bonus(set()), 0.0)
+        fresh = mgr.genome_novelty_bonus({"a", "b", "c"})
+        self.assertEqual(fresh, 3 * mgr.NOVELTY_PER_POOL)
+        many = mgr.genome_novelty_bonus({f"p{i}" for i in range(50)})
+        self.assertEqual(many, mgr.NOVELTY_CAP)
+        mgr.pool_counts = {"a": 99}
+        self.assertEqual(mgr.genome_novelty_bonus({"a", "b"}),
+                         mgr.NOVELTY_PER_POOL)
+
+    def test_evaluate_match_novelty(self):
+        from evolution_engine import EvolutionManager
+        mgr = self._mgr()
+        stats = {"kills": 0, "damage_dealt": 10.0, "damage_taken": 10.0,
+                 "tracking_time_s": 5.0, "tail_time_s": 0.0,
+                 "nectar_consumed": 0.0}
+        w0, fa0, fb0 = mgr.evaluate_match(dict(stats), dict(stats))
+        # No records: legacy behavior, no novelty keys beyond zero.
+        self.assertEqual(fa0, fb0)
+        import experimental_wiring as ew
+        g = {"name": None, "rules": [dict(
+            ew.FROZEN_GENOMES["retina_wide"]["rules"][0])]}
+        ra = self._rec(genome=g)
+        rb = self._rec()
+        w1, fa1, fb1 = mgr.evaluate_match(dict(stats), dict(stats), ra, rb)
+        self.assertEqual(w1, "alpha")
+        self.assertGreater(fa1, fa0)
+        self.assertEqual(fb1, fb0)
+        self.assertEqual(mgr.history[-1]["novelty_beta"], 0.0)
+        self.assertGreater(mgr.history[-1]["novelty_alpha"], 0.0)
+        # Winner pools counted; a reloaded manager sees them (persistence).
+        mgr2 = EvolutionManager(checkpoints_dir=mgr.checkpoints_dir)
+        self.assertGreater(
+            mgr2.pool_counts.get("visual_lc11", 0), 0)
+        # Kill dominance survives novelty: a kill beats max novelty.
+        killer = dict(stats, kills=1)
+        w2, fk, _fb = mgr.evaluate_match(dict(killer), dict(stats), rb, ra)
+        self.assertEqual(w2, "alpha")
+
+    def test_evaluate_match_legacy_identical(self):
+        from evolution_engine import EvolutionManager
+        m1 = self._mgr()
+        m2 = self._mgr()
+        stats = {"kills": 0, "damage_dealt": 20.0, "damage_taken": 5.0,
+                 "tracking_time_s": 8.0, "tail_time_s": 2.0,
+                 "nectar_consumed": 0.0}
+        r1 = m1.evaluate_match(dict(stats), dict(stats))
+        r2 = m2.evaluate_match(dict(stats), dict(stats), None, None)
+        self.assertEqual(r1, r2)
 
 
 class TestMappingMatrix(unittest.TestCase):

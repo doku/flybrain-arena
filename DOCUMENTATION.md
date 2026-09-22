@@ -233,6 +233,32 @@ form). Vault files keep native arity end-to-end; mixed brackets supported
   Sharing a downstream pool (e.g. both tree-contra and retina-wide driving
   DNs) is allowed with a saturation warning, not an error.
 
+## 7b. Wiring genomes (replaces hand overlays for new brains)
+
+A genome is a list of projection **rules**
+`{source, source_side, target, target_side, sign, weight, fanout,
+topography, stream, stream_seed}` compiled to the same edge arrays the
+overlays return — the three legacy wirings above are frozen genomes
+(byte-identical output, gated by `frozen_genome_hashes.json`). New neuron
+groups become explorable by existing in the pool registry (34 pools:
+sensory/motor/modulatory/central roles), not by writing overlay code.
+- **Generation** (`generate_genome`): sensory sources → motor/central
+  targets, 80% excitatory, deterministic per seed; each rule its own draw
+  stream. Wild (`breed_random`) brains are born from fresh genomes.
+- **Mapping derivation** (`derive_mapping`): schemes go live from genome
+  efferents (retina←LC, flow_trans←T4/T5, gyro_flow←JO/VS/HS,
+  muscles_up←MN, mbon←KC/MBON) — no more silent wiring/mapping pairs.
+- **Structural mutation** (`mutate_genome`, clones only, ≤1 change/gen by
+  default): weight/fanout jitter, target rewire, rule add/drop, sign flip;
+  `remap_weights` carries surviving trained weights over and inits new
+  edges from the parent scale. Genome-less parents clone unchanged.
+- **Checkpoints:** `__gen_<id>` namespace (`genome_id` = sha1 of canonical
+  rules); records carry the envelope in `generator_params.genome`.
+- **Fitness:** genome novelty bonus in `EvolutionManager` (+8 per pool
+  touched by ≤3 past winners, capped at 80 — kill-dominance preserved;
+  counts persist in `evo_pool_counts.json`). Pool-level win rates mineable
+  via `mine_wiring_fitness.py` over finished brackets.
+
 ## 8. Dopamine learning (`dopamine_learning.py`)
 
 - **Rule:** signed dopamine (closing/gaze/tail-chase reward, retreat/crash

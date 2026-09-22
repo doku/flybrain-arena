@@ -732,7 +732,18 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             continue
                     else:
                         battle_key = None
-                    winner, fit_a, fit_b = evo_mgr.evaluate_match(stats_a, stats_b)
+                    if tournament_mode:
+                        # Genome novelty joins fitness: records bound, so
+                        # rare wiring pools pay (frequency-dependent
+                        # selection for exploration). Free battles pass no
+                        # records and score exactly as before.
+                        winner, fit_a, fit_b = evo_mgr.evaluate_match(
+                            stats_a, stats_b,
+                            rec_a=tourney_a.get("rec"),
+                            rec_b=tourney_b.get("rec"))
+                    else:
+                        winner, fit_a, fit_b = evo_mgr.evaluate_match(
+                            stats_a, stats_b)
                     # Dominance-scaled dopamine: a real kill rewrites the brain at
                     # full strength, a timeout-fitness win at half. Draws (no
                     # damage either side) carry no update.

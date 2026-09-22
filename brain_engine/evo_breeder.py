@@ -105,13 +105,36 @@ def biggest_loser(tourney, rng=None):
 
 
 def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
-                mapping=None, progress_cb=None):
+                mapping=None, progress_cb=None, mutate_structure=True,
+                max_changes=1):
     """Clone a winner: weight copy + Gaussian noise, fresh seed, full
-    training. mapping=None inherits the parent's stack. Returns
-    (record, weights, summary) like train_job."""
+    training. mapping=None inherits the parent's stack. Genome parents
+    additionally undergo structural mutation (mutate_structure, bounded
+    by max_changes; arity surgery carries surviving weights over and
+    inits new edges from the parent scale) and the child's mapping is
+    re-derived from the mutated genome unless mapping is explicit.
+    Genome-less parents (base/legacy) clone structurally identical.
+    Returns (record, weights, summary) like train_job."""
     from train_job import train_brain
+    from experimental_wiring import (mutate_genome, remap_for_genome,
+                                     derive_mapping)
+    from connectome_loader import load_or_extract_populations
     rec, weights = vault.load_brain(parent_id)
     gp = dict(rec.get("generator_params", {}) or {})
+    genome = gp.get("genome", None)
+    child_mapping = gp.get("mapping") if mapping is None else mapping
+    start_weights = np.ascontiguousarray(
+        np.asarray(weights, dtype=np.float32))
+    if genome is not None and mutate_structure:
+        pops = load_or_extract_populations()
+        mrng = np.random.default_rng(int(seed) ^ 0x5EED)
+        new_genome = mutate_genome(mrng, genome, pops, max_changes)
+        start_weights = remap_for_genome(
+            gp.get("experiment"), genome, new_genome,
+            np.asarray(weights, dtype=np.float32), mrng, pops)
+        genome = new_genome
+        if mapping is None:
+            child_mapping = list(derive_mapping(genome))
     params = {
         "variant": gp.get("variant", "custom"),
         "seed": int(seed),
@@ -120,8 +143,8 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
         "align_bonus": list(gp.get("align_bonus", [0.5, 0.2, -0.3])),
         "evasion": gp.get("evasion", 0.2),
         "experiment": gp.get("experiment"),
-        "genome": gp.get("genome"),
-        "mapping": gp.get("mapping") if mapping is None else mapping,
+        "genome": genome,
+        "mapping": child_mapping,
         "yaw_bias": gp.get("yaw_bias"),
     }
     child = vault.new_record(name, params)
@@ -129,8 +152,8 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
                         "source": f"clone:{rec.get('id', '')}"}
     rng = np.random.default_rng(int(seed))
     noisy = np.ascontiguousarray(
-        np.asarray(weights, dtype=np.float32)
-        * (1.0 + rng.normal(0.0, float(noise), size=len(weights))).astype(np.float32))
+        start_weights
+        * (1.0 + rng.normal(0.0, float(noise), size=len(start_weights))).astype(np.float32))
     return train_brain(child, noisy, int(episodes), params,
                        progress_cb=progress_cb,
                        notes=f"evo clone of {rec.get('name', '?')}",
