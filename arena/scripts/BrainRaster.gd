@@ -14,6 +14,9 @@ var tint := Color.WHITE
 var row_ids: Array = []
 var row_index := {}
 var cols: Array = []
+# Live firing count of the most recent step (vs total census below):
+# census never changes, firing does - confusing the two hid saturation.
+var last_lit := 0
 
 var brain := ""
 
@@ -27,11 +30,13 @@ func setup(p_pool: String, p_ids: Array, p_total: int, p_tint: Color, p_brain: S
 	for i in range(row_ids.size()):
 		row_index[int(row_ids[i])] = i
 	cols.clear()
+	last_lit = 0
 	queue_redraw()
 
 
 func clear() -> void:
 	cols.clear()
+	last_lit = 0
 	queue_redraw()
 
 
@@ -44,6 +49,7 @@ func push_step(spike_ids: Array) -> void:
 		if r >= 0:
 			lit[r] = true
 	cols.append(lit)
+	last_lit = lit.size()
 	while cols.size() > MAX_STEPS:
 		cols.pop_front()
 	queue_redraw()
@@ -52,8 +58,11 @@ func push_step(spike_ids: Array) -> void:
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.02, 0.02, 0.05, 0.85))
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.4, 0.4, 0.5, 0.6), false, 1.0)
-	var head := "%s%s  %d cells%s" % ["" if brain == "" else brain + " ",
-		pool, total, ("" if total <= MAX_ROWS else " (first %d)" % MAX_ROWS)]
+	var sat := row_ids.size() > 0 and float(last_lit) / float(row_ids.size()) > 0.9
+	var head := "%s%s  %d cells, %d firing%s%s" % ["" if brain == "" else brain + " ",
+		pool, total, last_lit,
+		"" if total <= MAX_ROWS else " (first %d)" % MAX_ROWS,
+		"  SATURATED" if sat else ""]
 	draw_string(ThemeDB.fallback_font, Vector2(8, 16), head,
 		HORIZONTAL_ALIGNMENT_LEFT, size.x - 16.0, 12,
 		Color(tint.r, tint.g, tint.b, 0.95))

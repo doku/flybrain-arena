@@ -199,7 +199,23 @@ class DopamineReinforcement:
                     + list(populations.get("visual_lc17", {}).get("left", []))
                     + list(populations.get("visual_lc17", {}).get("right", []))
                     + list(populations.get("visual_lc18", {}).get("left", []))
-                    + list(populations.get("visual_lc18", {}).get("right", [])))
+                    + list(populations.get("visual_lc18", {}).get("right", []))
+                    + list(populations.get("visual_t4a", {}).get("left", []))
+                    + list(populations.get("visual_t4a", {}).get("right", []))
+                    + list(populations.get("visual_t4b", {}).get("left", []))
+                    + list(populations.get("visual_t4b", {}).get("right", []))
+                    + list(populations.get("visual_t4c", {}).get("left", []))
+                    + list(populations.get("visual_t4c", {}).get("right", []))
+                    + list(populations.get("visual_t4d", {}).get("left", []))
+                    + list(populations.get("visual_t4d", {}).get("right", []))
+                    + list(populations.get("visual_t5a", {}).get("left", []))
+                    + list(populations.get("visual_t5a", {}).get("right", []))
+                    + list(populations.get("visual_t5b", {}).get("left", []))
+                    + list(populations.get("visual_t5b", {}).get("right", []))
+                    + list(populations.get("visual_t5c", {}).get("left", []))
+                    + list(populations.get("visual_t5c", {}).get("right", []))
+                    + list(populations.get("visual_t5d", {}).get("left", []))
+                    + list(populations.get("visual_t5d", {}).get("right", [])))
         jo_ids = list(populations.get("gyro_jo", {}).get("left", [])) \
             + list(populations.get("gyro_jo", {}).get("right", []))
         n = len(bindptr) - 1
@@ -258,7 +274,8 @@ class DopamineReinforcement:
                 + self.va1v_right + self.lc10_left + self.lc10_right \
                 + self.lc4_left + self.lc4_right + self.lplc2_left \
                 + self.lplc2_right + self.lc11_left + self.lc11_right \
-                + self._retina_feat
+                + self._retina_feat + self.t4["a"] + self.t4["b"] \
+                + self.t4["c"] + self.t4["d"]
             jo_ids = self.jo_left + self.jo_right
             cached = (len(brain.weights),
                       self._row_positions(indptr, sens_ids),

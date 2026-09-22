@@ -131,6 +131,11 @@ class KinematicFly:
         self.scent_prev_smooth = -1.0
         self.scent_lost_time = 0.0
         self.scent_cast_phase = 0.0
+        # Crosswind gusts: the kinematic fly moves along its nose, so
+        # without gusts lateral flow would stay exactly zero and drift
+        # behavior could only ever learn live in the arena.
+        self.gust_steps = 0
+        self.gust_val = 0.0
 
     def forward_vec(self):
         cp = float(np.cos(self.pitch))
@@ -386,8 +391,9 @@ def compute_agent_senses(agent, target, prev_dist=None):
     # Translational optic flow (mirrors FlyPhysics cell-for-cell):
     # ventral = horizontal speed over altitude (/2 so cruise reads
     # ~FLOW_CRUISE), expansion/climb from vertical speed over altitude.
-    # Lateral is always 0.0 here: the kinematic fly moves along its nose
-    # (no sideslip axis), so drift-cancel learns live in the arena.
+    # Lateral comes from crosswind gust windows (2-4 s, bounded): the
+    # kinematic fly moves along its nose, so without gusts drift-cancel
+    # could only ever learn live in the arena.
     _hspeed = float(np.linalg.norm(agent.forward_vec()[[0, 2]])
                     * agent.last_speed)
     _alt = max(float(agent.pos[1]), 1.0)
@@ -395,6 +401,14 @@ def compute_agent_senses(agent, target, prev_dist=None):
     flow_ventral = float(np.clip(_hspeed / _alt / 2.0, 0.0, 1.0))
     flow_expansion = float(np.clip(max(0.0, -_vy) / _alt / 2.0, 0.0, 1.0))
     flow_climb = float(np.clip(max(0.0, _vy) / _alt / 2.0, 0.0, 1.0))
+    if agent.gust_steps <= 0:
+        agent.gust_val = 0.0
+        if np.random.rand() < 0.008:
+            agent.gust_steps = int(np.random.uniform(40, 80))
+            agent.gust_val = float(np.random.uniform(-0.6, 0.6))
+    else:
+        agent.gust_steps -= 1
+    flow_lateral = float(np.clip(agent.gust_val, -1.0, 1.0))
     return {
         "pheromone_conc_left": c_left,
         "pheromone_conc_right": c_right,
@@ -414,7 +428,7 @@ def compute_agent_senses(agent, target, prev_dist=None):
         "altitude": float(agent.pos[1]),
         "tail_chase": tail_chase,
         "visual_flow_ventral": flow_ventral,
-        "visual_flow_lateral": 0.0,
+        "visual_flow_lateral": flow_lateral,
         "visual_flow_expansion": flow_expansion,
         "visual_flow_climb": flow_climb,
         "visual_sec_presence": sec_presence,

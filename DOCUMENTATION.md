@@ -186,11 +186,15 @@ retina.
   only — evade/parry paths untouched, rear-aspect kills preserved.
 - **flow_trans**: +translational optic flow (T4/T5 direction cells).
   Arena and trainer derive ventral flow (groundspeed ÷ altitude, cruise
-  reads ~0.35), lateral slip (signed), expansion/climb on descent/ascent
-  — trainer lateral is always 0 (no sideslip axis; drift learns live).
-  Decoder: cruise-control thrust trim toward target flow, small drift yaw
-  trim, landing flare (thrust cut on expansion). Dopamine: cruise
-  steadiness bonus + direction-pool credit, scheme-gated.
+  reads ~0.35), lateral slip (signed; trainer synthesizes crosswind gust
+  windows since its kinematic fly has no sideslip axis), expansion/climb
+  on descent/ascent. Windup guards: saccade gate (spin quiets T4 drive),
+  per-direction habituation (floor 0.3), drift trim disengages when
+  lateral pegs (saturated direction is untrustworthy). Decoder:
+  cruise-control thrust trim toward target flow, small drift yaw trim,
+  landing flare (thrust cut on expansion). Dopamine: cruise steadiness
+  bonus + direction-pool credit, scheme-gated; T4/T5 efferents sit in the
+  pinned sens pool so runaway potentiation gets pinned like the rest.
 - **yaw_bias**: per-brain DN lateralization correction (default 9.0,
   measured range 6–12, ceiling 25 for hot mixes). Menu spinbox +
   randomize draw; stamped in generator params, retrain-graduatable.
@@ -319,9 +323,9 @@ gate, 1.2 s cooldown, 0.35 s extension window, kick scale, contact reach):
 aimed committed lunges earn shaping reward, blind/wild lunges cost, and
 contact ends the episode as a strike kill; dopamine credits the
 lobula-feature→mouth efferents on paid-off lunges. Translational flow
-channels are computed kinematically (ventral/expansion exact; lateral is
-always 0 — no sideslip axis, drift-cancel learns live) with a cruise
-steadiness reward for flow_trans runs. Known shaping simplifications:
+channels are computed kinematically (ventral/expansion exact; lateral
+from crosswind gust windows so drift-cancel trains before arena day)
+with a cruise steadiness reward for flow_trans runs. Known shaping simplifications:
 kinematic (no momentum), scripted target, 6 s episodes vs 40 s rounds,
 no roll axis (JO-roll learns live).
 

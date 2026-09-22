@@ -155,6 +155,13 @@ class SensoryEncoder:
         # so single-shot tests and first encounters are unaffected; call
         # reset_odor() at episode/battle boundaries for a fresh nose.
         self.odor_gain = 1.0
+        # Optic-flow habituation + saccade gate (T4/T5 windup guard):
+        # per-direction gains adapt down under sustained saturating flow
+        # (same leaky mechanics as odor, no knee - flow legitimately reads
+        # zero), while the spin gate scales all flow drive by present
+        # angular rate (saccade suppression: vision goes quiet mid-spin,
+        # cutting the spin->flow->spin loop at its source).
+        self.flow_hab = {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0}
         self.lplc2_ref = max(len(self.lplc2_left), len(self.lplc2_right), 1)
         # Antennal gyroscope (JO), gyro_flow scheme only. Stale caches
         # predate these pools: .get keeps old vault tooling importable.
@@ -169,6 +176,9 @@ class SensoryEncoder:
     HAB_FLOOR = 0.3
     HAB_ATTACK = 1.0 / 60.0
     HAB_RECOVER = 1.0 / 400.0
+    # Flow habituation uses the same rates/floor; spin gate halves drive
+    # at |yaw|+|roll| == 1/3 and quarters it at full spin.
+    FLOW_SPIN_GAIN = 3.0
 
     @staticmethod
     def _sample(pool, k):
@@ -177,8 +187,10 @@ class SensoryEncoder:
         return np.random.choice(pool, size=k, replace=k > len(pool))
 
     def reset_odor(self):
-        """Fresh-nose reset for episode/battle boundaries."""
+        """Fresh-nose reset for episode/battle boundaries (also clears
+        flow habituation - same call, one reset path)."""
         self.odor_gain = 1.0
+        self.flow_hab = {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0}
 
     def encode(self, sensory_dict, dt=0.5, duration_ms=50.0):
         """
@@ -402,22 +414,36 @@ class SensoryEncoder:
                 "visual_flow_expansion", 0.0), 0.0, 1.0))
             climb = float(np.clip(sensory_dict.get(
                 "visual_flow_climb", 0.0), 0.0, 1.0))
+            # Saccade gate: present angular rate quiets all flow drive
+            # (vision suppresses mid-spin, cutting spin->flow->spin).
+            # Absent keys read 0, so single-shot and legacy-adjacent
+            # callers see gain exactly 1.0.
+            spin = abs(float(sensory_dict.get("angular_yaw_rate", 0.0))) \
+                + abs(float(sensory_dict.get("angular_roll_rate", 0.0)))
+            spin_gate = 1.0 / (1.0 + self.FLOW_SPIN_GAIN * spin)
             flow_groups = [
-                (ventral, (self.t4a_left, self.t4a_right,
-                           self.t5a_left, self.t5a_right)),
-                (abs(lateral), (self.t4b_left, self.t4b_right,
-                                self.t5b_left, self.t5b_right)),
-                (expansion, (self.t4d_left, self.t4d_right,
-                             self.t5d_left, self.t5d_right)),
-                (climb, (self.t4c_left, self.t4c_right,
-                         self.t5c_left, self.t5c_right)),
+                ("a", ventral, (self.t4a_left, self.t4a_right,
+                                self.t5a_left, self.t5a_right)),
+                ("b", abs(lateral), (self.t4b_left, self.t4b_right,
+                                     self.t5b_left, self.t5b_right)),
+                ("d", expansion, (self.t4d_left, self.t4d_right,
+                                  self.t5d_left, self.t5d_right)),
+                ("c", climb, (self.t4c_left, self.t4c_right,
+                              self.t5c_left, self.t5c_right)),
             ]
-            for mag, pools in flow_groups:
+            for gkey, mag, pools in flow_groups:
+                # Per-direction habituation: sustained saturating flow
+                # adapts that group down (floor 0.3, slow recovery).
+                target = max(self.HAB_FLOOR, 1.0 / (1.0 + 2.0 * mag))
+                rate = self.HAB_ATTACK if target < self.flow_hab[gkey] \
+                    else self.HAB_RECOVER
+                self.flow_hab[gkey] += (target - self.flow_hab[gkey]) * rate
+                g = self.flow_hab[gkey] * spin_gate
                 if mag > 0.05:
                     for pool in pools:
                         if len(pool) == 0:
                             continue
-                        k = min(int(mag * 30), len(pool))
+                        k = min(int(mag * 30 * g), len(pool))
                         if k > 0:
                             spikes.extend(np.random.choice(
                                 pool, size=k, replace=False))
@@ -694,8 +720,11 @@ class MotorDecoder:
         # Cruise control holds ventral flow near target by trimming
         # thrust; lateral drift trims yaw toward the slip (small,
         # magnitude-only authority, never flips the sign); expansion on
-        # descent flares (thrust cut). Legacy mode never takes this
-        # branch (pre-mapping brains never drove T4/T5).
+        # descent flares (thrust cut). A pegged lateral reading is
+        # declared untrustworthy and the drift trim disengages (a
+        # saturated direction signal steered spins, not slips). Legacy
+        # mode never takes this branch (pre-mapping brains never
+        # drove T4/T5).
         if "flow_trans" in self.schemes and not self.legacy \
                 and sensory_hint is not None:
             ventral = float(np.clip(sensory_hint.get(
@@ -707,9 +736,10 @@ class MotorDecoder:
             thrust = float(np.clip(
                 thrust + np.clip((FLOW_CRUISE - ventral) * 0.5, -0.15, 0.15),
                 0.0, 1.0))
-            yaw_torque = float(np.clip(
-                yaw_torque + np.clip(lateral * 0.2, -0.15, 0.15),
-                -1.0, 1.0))
+            if abs(lateral) < 0.95:
+                yaw_torque = float(np.clip(
+                    yaw_torque + np.clip(lateral * 0.2, -0.15, 0.15),
+                    -1.0, 1.0))
             thrust = float(np.clip(thrust * (1.0 - 0.4 * expansion),
                                    0.0, 1.0))
 

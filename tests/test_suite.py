@@ -210,6 +210,99 @@ class TestSensoryMotor(unittest.TestCase):
         rl.apply_plasticity(brain, sens, motor, 1.0)
         self.assertGreater(rl.scent_acuity(brain), a0)
 
+    def test_flow_saccade_gate(self):
+        # Spin quiets T4 drive (saccade suppression); still air reads full.
+        from sensory_motor import SensoryEncoder
+        still = SensoryEncoder(self.pops, mapping="flow_trans")
+        n_still = len(still.encode({"visual_flow_ventral": 1.0}))
+        spin = SensoryEncoder(self.pops, mapping="flow_trans")
+        n_spin = len(spin.encode({"visual_flow_ventral": 1.0,
+                                  "angular_yaw_rate": 1.0,
+                                  "angular_roll_rate": 0.0}))
+        self.assertGreater(n_still, 0)
+        self.assertLess(n_spin, n_still * 0.5)
+        # Absent angular keys behave exactly as before (gain 1.0).
+        plain = SensoryEncoder(self.pops, mapping="flow_trans")
+        n_plain = len(plain.encode({"visual_flow_ventral": 1.0}))
+        self.assertEqual(n_plain, n_still)
+
+    def test_flow_habituation(self):
+        # Sustained saturating flow adapts that group down (floor 0.3);
+        # clean air recovers; reset restores.
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        sat = {"visual_flow_ventral": 1.0}
+        enc.encode(sat)
+        for _ in range(200):
+            enc.encode(sat)
+        self.assertLess(enc.flow_hab["a"], 1.0)
+        self.assertGreaterEqual(enc.flow_hab["a"], 0.3)
+        # Untouched groups stay fresh.
+        self.assertEqual(enc.flow_hab["b"], 1.0)
+        g_low = enc.flow_hab["a"]
+        for _ in range(400):
+            enc.encode({})
+        self.assertGreater(enc.flow_hab["a"], g_low)
+        enc.reset_odor()
+        self.assertEqual(enc.flow_hab,
+                         {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0})
+
+    def test_drift_trim_disengages_saturated(self):
+        # Pegged lateral (|l|=1) skips the drift trim; mid lateral applies.
+        from sensory_motor import MotorDecoder
+        dec = MotorDecoder(self.pops, mapping="flow_trans")
+        spikes = [1, 2, 3]
+        y_sat = dec.decode(spikes, sensory_hint={
+            "visual_flow_ventral": 0.35, "visual_flow_lateral": 1.0})["yaw_torque"]
+        y_mid = dec.decode(spikes, sensory_hint={
+            "visual_flow_ventral": 0.35, "visual_flow_lateral": 0.5})["yaw_torque"]
+        self.assertLess(y_sat, y_mid)
+
+    def test_t4_pinned(self):
+        # T4/T5 efferent rows belong to the pinned sens pool.
+        import types
+        import numpy as np
+        from dopamine_learning import DopamineReinforcement
+        rl = DopamineReinforcement(self.pops)
+        need = []
+        for k in ("pheromone_da1", "visual_lc10", "visual_t4a",
+                  "visual_t5d"):
+            need += list(self.pops[k]["left"][:4])
+        top = max(need) + 2
+        indptr = np.arange(top + 1, dtype=np.int64)
+        indptr = np.append(indptr, top + 1)
+        fake = types.SimpleNamespace(
+            indptr=indptr,
+            indices=np.zeros(top + 1, dtype=np.int32),
+            weights=np.ones(top + 1, dtype=np.float32))
+        pos_sens, _jo = rl._ensure_pin_positions(fake)
+        pos_set = set(int(x) for x in np.asarray(pos_sens).tolist())
+        t4pre = int(self.pops["visual_t4a"]["left"][0])
+        self.assertIn(t4pre, pos_set)
+
+    def test_trainer_gusts(self):
+        # Gust windows produce bounded nonzero lateral slip; mechanics
+        # are deterministic when preset (no global draws involved).
+        import numpy as np
+        from train_homing import KinematicFly, compute_agent_senses
+        fly = KinematicFly()
+        tgt = KinematicFly(x=10.0, z=2.0)
+        fly.gust_steps = 100
+        fly.gust_val = 0.5
+        for _ in range(10):
+            senses, _d = compute_agent_senses(fly, tgt, prev_dist=15.0)
+            self.assertAlmostEqual(senses["visual_flow_lateral"], 0.5)
+        self.assertEqual(fly.gust_steps, 90)
+        # Fresh flies start calm; gusts appear over long runs, bounded.
+        np.random.seed(7)
+        peak = 0.0
+        f2 = KinematicFly()
+        for _ in range(3000):
+            s, _d = compute_agent_senses(f2, tgt, prev_dist=15.0)
+            peak = max(peak, abs(float(s["visual_flow_lateral"])))
+        self.assertLessEqual(peak, 0.61)
+        self.assertGreater(peak, 0.0)
+
     def test_odor_habituation(self):
         # Sustained strong odor adapts the drive down (bounded by the
         # floor); clean air recovers slowly; the floor zone never adapts.
@@ -734,7 +827,8 @@ class TestMbonMapping(unittest.TestCase):
             self.pops, base=(csr.indptr, csr.indices, csr.data.copy()))
         # Artificially inflate left-sensory rows 40x with a lateral bias.
         # Covers the full sens pool definition (DA1+VA1v+LC10+LC4+LPLC2+
-        # LC11/15/17/18 left) so the inflated mean still reads runaway.
+        # LC11/15/17/18+T4a-d/T5a-d left) so the inflated mean still
+        # reads runaway.
         left_ids = (self.pops["pheromone_da1"]["left"]
                     + self.pops["pheromone_va1v"]["left"]
                     + self.pops["visual_lc10"]["left"]
@@ -743,7 +837,15 @@ class TestMbonMapping(unittest.TestCase):
                     + self.pops["visual_lc11"]["left"]
                     + self.pops["visual_lc15"]["left"]
                     + self.pops["visual_lc17"]["left"]
-                    + self.pops["visual_lc18"]["left"])
+                    + self.pops["visual_lc18"]["left"]
+                    + self.pops["visual_t4a"]["left"]
+                    + self.pops["visual_t4b"]["left"]
+                    + self.pops["visual_t4c"]["left"]
+                    + self.pops["visual_t4d"]["left"]
+                    + self.pops["visual_t5a"]["left"]
+                    + self.pops["visual_t5b"]["left"]
+                    + self.pops["visual_t5c"]["left"]
+                    + self.pops["visual_t5d"]["left"])
         for pre in left_ids:
             s, e = int(brain.indptr[pre]), int(brain.indptr[pre + 1])
             if e > s:
