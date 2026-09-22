@@ -303,6 +303,57 @@ class TestSensoryMotor(unittest.TestCase):
         self.assertLessEqual(peak, 0.61)
         self.assertGreater(peak, 0.0)
 
+    def test_school_score(self):
+        # Scenario-weighted: takedown 10, camp 8, reach 6, crash 0,
+        # partial = closed fraction * 4 (capped); overrides honored.
+        from train_homing import _school_score
+        base = {"initial_dist": 20.0}
+        self.assertEqual(_school_score(dict(base, takedown=True), {}),
+                         10.0)
+        self.assertEqual(_school_score(dict(base, camp=True), {}), 8.0)
+        self.assertEqual(_school_score(dict(base, success=True), {}), 6.0)
+        self.assertEqual(_school_score(dict(base, crashed=True), {}), 0.0)
+        # Takedown beats camp beats reach (priority order).
+        self.assertEqual(
+            _school_score(dict(base, takedown=True, success=True), {}), 10.0)
+        # Partial: half-closed = 2.0, overshoot capped at 4.0.
+        self.assertAlmostEqual(
+            _school_score(dict(base, closed=10.0), {}), 2.0)
+        self.assertAlmostEqual(
+            _school_score(dict(base, closed=99.0), {}), 4.0)
+        # Curriculum override.
+        self.assertEqual(
+            _school_score(dict(base, success=True),
+                          {"score_weights": {"reach": 100.0}}), 100.0)
+
+    def test_score_stamping(self):
+        # Score banks on the record, accumulates across sessions, avg
+        # spans cumulative episodes; new records default 0. Production
+        # ordering: log_training_session (episodes) runs BEFORE the stamp.
+        import train_job
+        import brain_package as vault
+        r = vault.new_record("ScoreTest")
+        self.assertEqual(float(r["training"].get("score", 0.0)), 0.0)
+        vault.log_training_session(r, 25, {}, "s1")
+        train_job.stamp_train_score(r, {"score": 50.0, "episodes": 25})
+        self.assertAlmostEqual(float(r["training"]["score"]), 50.0)
+        self.assertAlmostEqual(float(r["training"]["avg_score"]), 2.0)
+        # Second session accumulates; avg recomputed over cumulative.
+        vault.log_training_session(r, 25, {}, "s2")
+        train_job.stamp_train_score(r, {"score": 150.0, "episodes": 25})
+        self.assertAlmostEqual(float(r["training"]["score"]), 200.0)
+        self.assertAlmostEqual(float(r["training"]["avg_score"]),
+                               200.0 / 50.0)
+        # Missing/None summary tolerated.
+        train_job.stamp_train_score(r, None)
+        self.assertAlmostEqual(float(r["training"]["score"]), 200.0)
+        # merge_summaries carries scores.
+        merged = train_job.merge_summaries([
+            {"episodes": 25, "successes": 10, "score": 50.0},
+            {"episodes": 25, "successes": 8, "score": 150.0}])
+        self.assertAlmostEqual(merged["score"], 200.0)
+        self.assertAlmostEqual(merged["avg_score"], 4.0)
+
     def test_odor_habituation(self):
         # Sustained strong odor adapts the drive down (bounded by the
         # floor); clean air recovers slowly; the floor zone never adapts.

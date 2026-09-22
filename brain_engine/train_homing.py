@@ -494,6 +494,32 @@ SCHOOL_DIFFICULTY = {
 }
 SCHOOL_TAKEDOWN_PAY = 4.5
 SCHOOL_TAIL_RATE = 1.0
+# Pre-training score (per episode): scenario-weighted reaching beats
+# distance partial credit; crashes earn nothing. Curriculum JSON may
+# override any weight.
+SCHOOL_SCORE_WEIGHTS = {
+    "takedown": 10.0,   # spike kill (mover/duel takedowns)
+    "camp": 8.0,        # camp capture (arrival bonus paid)
+    "reach": 6.0,       # other-scenario success (3.5m / spear contact)
+    "partial_max": 4.0, # distance-closed fraction when not reaching
+}
+
+
+def _school_score(entry, curriculum):
+    """Pre-training score for one episode from its results entry."""
+    w = dict(SCHOOL_SCORE_WEIGHTS)
+    w.update((curriculum or {}).get("score_weights", {}) or {})
+    if entry.get("takedown", False):
+        return float(w["takedown"])
+    if entry.get("camp", False):
+        return float(w["camp"])
+    if entry.get("success", False):
+        return float(w["reach"])
+    if entry.get("crashed", False):
+        return 0.0
+    initial = max(float(entry.get("initial_dist", 1.0)), 1e-6)
+    frac = float(np.clip(float(entry.get("closed", 0.0)) / initial, 0.0, 1.0))
+    return frac * float(w["partial_max"])
 
 
 def _school_stage(progress, curriculum):
@@ -1024,6 +1050,8 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             "success": success,
             "strike": strike,
             "takedown": takedown,
+            "camp": bool(school_ctx is not None
+                         and school_ctx["camp_bonus_paid"]),
             "upset": upset,
             "crashed": crashed,
             "enc": enc_type,
@@ -1090,20 +1118,27 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     if takedowns:
         print(f"[Train:{label}] Takedowns: {takedowns}/{num_episodes} spike kills.")
     by_scenario = {}
-    for r in results:
+    for r, s in zip(results, [_school_score(r, curriculum) for r in results]):
         sc = r.get("scenario", r.get("enc", "?"))
         cell = by_scenario.setdefault(sc, {"episodes": 0, "successes": 0,
-                                           "takedowns": 0})
+                                           "takedowns": 0, "score": 0.0})
         cell["episodes"] += 1
         cell["successes"] += 1 if r["success"] else 0
         cell["takedowns"] += 1 if r.get("takedown") else 0
+        cell["score"] += s
     for sc in sorted(by_scenario):
         cell = by_scenario[sc]
         print(f"[Train:{label}] {sc}: {cell['successes']}/{cell['episodes']} "
-              f"ok, {cell['takedowns']} takedowns.")
+              f"ok, {cell['takedowns']} takedowns, score {cell['score']:.1f}.")
+    scores = [_school_score(r, curriculum) for r in results]
+    total_score = float(sum(scores))
+    avg_score = total_score / max(num_episodes, 1)
+    print(f"[Train:{label}] Pre-training score: {total_score:.1f} "
+          f"(avg {avg_score:.2f}/episode).")
     summary = {"successes": successes, "episodes": num_episodes,
                "avg_closed": float(avg_closed), "crashes": crashes,
                "close_calls": close_tot, "takedowns": takedowns,
+               "score": total_score, "avg_score": avg_score,
                "by_scenario": by_scenario}
     if return_brain:
         return save_path, np.ascontiguousarray(brain.weights.copy()), summary

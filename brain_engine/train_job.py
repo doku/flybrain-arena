@@ -102,6 +102,9 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
         return_brain=True,
     )
     vault.log_training_session(record, episodes, params, notes)
+    # Pre-training score banks here (after episodes update, so avg spans
+    # cumulative sessions); scores ride the summary already.
+    stamp_train_score(record, summary)
     try:
         if save_path and os.path.isfile(save_path):
             os.remove(save_path)
@@ -152,18 +155,37 @@ def train_staged(record, weights, stages, progress_cb=None, save=True):
 
 def merge_summaries(summaries):
     """Combined multi-stage verdict summary: summed episodes/successes
-    (plus any takedown/strike counters stages report) and the per-stage
-    list. Unknown keys pass through from the last stage that has them."""
-    out = {"stages": list(summaries), "episodes": 0, "successes": 0}
+    (plus any takedown/strike counters and pre-training scores stages
+    report) and the per-stage list. Unknown keys pass through from the
+    last stage that has them."""
+    out = {"stages": list(summaries), "episodes": 0, "successes": 0,
+           "score": 0.0}
     for s in summaries:
         if not isinstance(s, dict):
             continue
         out["episodes"] += int(s.get("episodes", 0))
         out["successes"] += int(s.get("successes", 0))
+        out["score"] += float(s.get("score", 0.0))
         for k in ("takedowns", "strikes", "crashes"):
             if k in s:
                 out[k] = int(out.get(k, 0)) + int(s.get(k, 0))
+    out["avg_score"] = out["score"] / max(out["episodes"], 1)
     return out
+
+
+def stamp_train_score(record, summary):
+    """Banks the pre-training score on the record: score accumulates
+    across training sessions (like episodes), avg_score is recomputed
+    over cumulative episodes. Pre-score records (no score key) tolerate
+    missing summaries (score unchanged). Returns the record."""
+    if not isinstance(summary, dict):
+        return record
+    training = record.setdefault("training", {})
+    gained = float(summary.get("score", 0.0))
+    training["score"] = float(training.get("score", 0.0)) + gained
+    episodes = int(training.get("episodes", 0))
+    training["avg_score"] = (float(training["score"]) / max(episodes, 1))
+    return record
 
 
 def generate_and_train(name, episodes, params=None, progress_cb=None):
