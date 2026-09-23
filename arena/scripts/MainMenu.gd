@@ -53,6 +53,11 @@ var tourney_round_time: SpinBox
 var player_list: ItemList
 var bracket_status: Label
 var bracket_view: BracketView
+var bracket_main_btn: Button
+var bracket_losers_btn: Button
+var _bracket_losers := false
+var _bracket_manual := false
+var _bracket_tid := ""
 var resume_button: Button
 var quick_button: Button
 
@@ -631,6 +636,24 @@ func _build_tourney_column() -> VBoxContainer:
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	c.add_child(bracket_status)
+	var brow := HBoxContainer.new()
+	brow.add_theme_constant_override("separation", 6)
+	c.add_child(brow)
+	var bgroup := ButtonGroup.new()
+	bracket_main_btn = Button.new()
+	bracket_main_btn.text = "Main bracket"
+	bracket_main_btn.toggle_mode = true
+	bracket_main_btn.button_group = bgroup
+	bracket_main_btn.tooltip_text = "Main single-elimination bracket (no consolation rounds)."
+	bracket_main_btn.pressed.connect(_on_bracket_view.bind(false))
+	brow.add_child(bracket_main_btn)
+	bracket_losers_btn = Button.new()
+	bracket_losers_btn.text = "Losers bracket"
+	bracket_losers_btn.toggle_mode = true
+	bracket_losers_btn.button_group = bgroup
+	bracket_losers_btn.tooltip_text = "Consolation bracket on its own page."
+	bracket_losers_btn.pressed.connect(_on_bracket_view.bind(true))
+	brow.add_child(bracket_losers_btn)
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -644,15 +667,50 @@ func _build_tourney_column() -> VBoxContainer:
 	return c
 
 
+func _on_bracket_view(losers: bool) -> void:
+	_bracket_losers = losers
+	_bracket_manual = true
+	_render_bracket()
+
+
+func _live_losers_running() -> bool:
+	var t: Dictionary = TournamentDirector.tourney
+	var lf := int(t.get("losers_start_round", -1))
+	return lf > 0 and int(t.get("current_round", 0)) >= lf \
+		and str(t.get("status", "")) == "running"
+
+
 func _render_bracket() -> void:
 	if bracket_view == null:
 		return
 	if TournamentDirector.tourney.is_empty():
 		bracket_view.render_bracket({}, -1, -1)
-	else:
-		bracket_view.render_bracket(TournamentDirector.tourney,
-			int(TournamentDirector.tourney.get("current_round", 0)),
-			int(TournamentDirector.tourney.get("current_match", 0)))
+		_sync_bracket_buttons()
+		return
+	# New tournament: drop the manual pick and auto-show the losers
+	# page while consolation is live, main otherwise.
+	var tid := str(TournamentDirector.tourney.get("id", ""))
+	if tid != _bracket_tid:
+		_bracket_tid = tid
+		_bracket_manual = false
+		_bracket_losers = _live_losers_running()
+	if int(TournamentDirector.tourney.get("losers_start_round", -1)) < 0:
+		_bracket_losers = false
+	bracket_view.render_bracket(TournamentDirector.tourney,
+		int(TournamentDirector.tourney.get("current_round", 0)),
+		int(TournamentDirector.tourney.get("current_match", 0)),
+		2 if _bracket_losers else 1)
+	_sync_bracket_buttons()
+
+
+func _sync_bracket_buttons() -> void:
+	if bracket_main_btn == null or bracket_losers_btn == null:
+		return
+	var has_losers := int(TournamentDirector.tourney.get(
+		"losers_start_round", -1)) > 0
+	bracket_losers_btn.disabled = not has_losers
+	bracket_main_btn.set_pressed_no_signal(not _bracket_losers)
+	bracket_losers_btn.set_pressed_no_signal(_bracket_losers and has_losers)
 
 
 # ── Vault ───────────────────────────────────────────────────────────

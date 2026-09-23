@@ -278,6 +278,55 @@ func test_focus_losers() -> void:
 	R.queue_free()
 
 
+func test_bracket_views() -> void:
+	var R = load("res://scripts/TournamentBracket.gd").new()
+	var D = _new_director()
+	var brains := _fakes(8)
+	D.build_bracket(_ids(brains), 8, 1, 0.5, 40.0, false, brains, false, true)
+	# Fresh size-8 main page: compact pitch fits round 0 outright.
+	R.render_bracket(D.tourney, 0, 0, 1)
+	_check(absf(R.custom_minimum_size.y - 356.0) < 0.01,
+		"compact size-8 main view is 356px tall (no vertical scroll)")
+	_check(absf(R.custom_minimum_size.x - 570.0) < 0.01,
+		"main-only view keeps 3 cols + champion")
+	# No consolation rounds yet: placeholder, not a crash.
+	R.render_bracket(D.tourney, 0, 0, 2)
+	_check(R.custom_minimum_size.x == 200.0,
+		"losers view without consolation shows placeholder")
+	_check(_run_to_consolation(D), "consolation starts for view test")
+	var lf := int(D.tourney.get("losers_start_round", -1))
+	R.render_bracket(D.tourney, lf, 0, 1)
+	var seen_losers := false
+	var seen_champ := false
+	for c in R.get_children():
+		if c is Label:
+			if str(c.text).begins_with("LOSERS"):
+				seen_losers = true
+			if str(c.text) == "CHAMPION":
+				seen_champ = true
+	_check(not seen_losers, "main-only view hides losers columns")
+	_check(seen_champ, "main-only view keeps champion column")
+	# Losers page at review time: forced focus, not just while live.
+	_run_to_end(D)
+	R.render_bracket(D.tourney, -1, -1, 2)
+	var seen_losers2 := false
+	var seen_last := false
+	var seen_main := false
+	var bad := ["ROUND 1", "ROUND 2", "SEMIFINAL", "FINAL", "CHAMPION"]
+	for c in R.get_children():
+		if c is Label:
+			if str(c.text).begins_with("LOSERS"):
+				seen_losers2 = true
+			if str(c.text) == "LAST PLACE":
+				seen_last = true
+			if str(c.text) in bad:
+				seen_main = true
+	_check(seen_losers2, "losers page shows losers headers at review")
+	_check(seen_last, "losers page ends in LAST PLACE")
+	_check(not seen_main, "losers page hides main-bracket headers")
+	R.queue_free()
+
+
 func _cleanup() -> void:
 	if DirAccess.dir_exists_absolute("user://test_consolation"):
 		for f in DirAccess.get_files_at("user://test_consolation"):
@@ -306,6 +355,7 @@ func _initialize() -> void:
 	test_skip(d4)
 	test_tba_templates()
 	test_focus_losers()
+	test_bracket_views()
 	_cleanup()
 	if failures == 0:
 		print("ALL CONSOLATION TESTS PASSED")

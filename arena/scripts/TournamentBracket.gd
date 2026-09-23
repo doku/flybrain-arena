@@ -12,6 +12,9 @@ var CARD_W := 210.0
 var CARD_H := 92.0
 var GAP_X := 52.0
 var ROW_GAP := 16.0
+var CARD_PAD := 6.0
+var CARD_SEP := 2
+var ROW_H := 24.0
 const TOP_PAD := 32.0
 const SIDE_PAD := 12.0
 # Font sizes paired with the metrics above.
@@ -34,15 +37,19 @@ var segments: Array = []
 var _lf_view := -1
 
 
-func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1) -> void:
+## View modes: 0 = auto (legacy: focus-swap while live losers run,
+## combined main+losers at review), 1 = main bracket only, 2 = losers
+## bracket only (forced focus rendering, works at review time too).
+func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1, view: int = 0) -> void:
 	for c in get_children():
 		remove_child(c)
 		c.queue_free()
 	segments.clear()
 	var rounds: Array = tourney.get("rounds", [])
-	if rounds.is_empty():
+	var losers_from := int(tourney.get("losers_start_round", -1))
+	if rounds.is_empty() or (view == 2 and (losers_from < 0 or losers_from >= rounds.size())):
 		var ph := Label.new()
-		ph.text = "No tournament."
+		ph.text = "No losers bracket." if view == 2 else "No tournament."
 		ph.position = Vector2(SIDE_PAD, SIDE_PAD)
 		add_child(ph)
 		custom_minimum_size = Vector2(200, 60)
@@ -52,15 +59,32 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Focus mode: while live losers rounds are playing (and the
 	# tournament is still running), the losers bracket REPLACES the main
 	# one - 2-3 narrow columns instead of 6+, so it fits on screen.
-	# At review time (complete) the full bracket comes back.
-	var losers_from := int(tourney.get("losers_start_round", -1))
+	# At review time (complete) the full bracket comes back (auto view).
 	var focus := losers_from > 0 and cur_round >= losers_from \
 		and str(tourney.get("status", "")) == "running"
 	var shown: Array = rounds.duplicate()
+	if view == 1 and losers_from > 0:
+		# Main page: losers live on their own view, never appended here
+		# (and never focus-swapped in, even while consolation is live).
+		shown = shown.slice(0, losers_from)
+		losers_from = -1
+		focus = false
+	elif view == 2:
+		# Losers page: force focus rendering at any status.
+		focus = true
 	if focus:
 		shown = shown.slice(losers_from)
 		cur_round = cur_round - losers_from
 		losers_from = 0
+	if shown.is_empty():
+		var ph2 := Label.new()
+		ph2.text = "No tournament."
+		ph2.position = Vector2(SIDE_PAD, SIDE_PAD)
+		add_child(ph2)
+		custom_minimum_size = Vector2(200, 60)
+		size = custom_minimum_size
+		queue_redraw()
+		return
 	_lf_view = losers_from
 	# TBA templates (display-only, never written back): synthesize future
 	# main rounds from tournament size, and future losers rounds by
@@ -276,8 +300,8 @@ func _card_panel(border: Color, border_w: int) -> PanelContainer:
 	sb.set_corner_radius_all(6)
 	sb.content_margin_left = 8.0
 	sb.content_margin_right = 8.0
-	sb.content_margin_top = 6.0
-	sb.content_margin_bottom = 6.0
+	sb.content_margin_top = CARD_PAD
+	sb.content_margin_bottom = CARD_PAD
 	pc.add_theme_stylebox_override("panel", sb)
 	pc.custom_minimum_size = Vector2(CARD_W, CARD_H)
 	pc.size = Vector2(CARD_W, CARD_H)
@@ -285,24 +309,31 @@ func _card_panel(border: Color, border_w: int) -> PanelContainer:
 
 
 func _apply_metrics(cols: int, rows0: int) -> void:
-	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond
-	# (size-8 fresh = 4 cols fits at 690px). CARD_H must clear the card
-	# content (~78px: margins + header + two 24px rows) or text spills
-	# into the neighbor card.
+	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond.
+	# Compact CARD_H must clear the card content (~62px: 4+4 margins +
+	# header + separation + two 20px rows) or text spills into the
+	# neighbor card. Compact pitch is 78px/card, so a size-8 first
+	# round (4 cards) fits in 356px without scrolling.
 	if cols > 3 or rows0 > 3:
 		CARD_W = 120.0
-		CARD_H = 84.0
+		CARD_H = 72.0
 		GAP_X = 22.0
-		ROW_GAP = 8.0
+		ROW_GAP = 6.0
+		CARD_PAD = 4.0
+		CARD_SEP = 1
+		ROW_H = 20.0
 		FS_COL_HEAD = 12
 		FS_CARD_HEAD = 10
-		FS_ROW = 12
+		FS_ROW = 11
 		FS_BIG_NAME = 14
 	else:
 		CARD_W = 210.0
 		CARD_H = 92.0
 		GAP_X = 52.0
 		ROW_GAP = 16.0
+		CARD_PAD = 6.0
+		CARD_SEP = 2
+		ROW_H = 24.0
 		FS_COL_HEAD = 15
 		FS_CARD_HEAD = 12
 		FS_ROW = 15
@@ -333,7 +364,7 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 		border = Color(0.35, 0.55, 0.38)
 	var card := _card_panel(border, bw)
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 2)
+	vb.add_theme_constant_override("separation", CARD_SEP)
 	card.add_child(vb)
 	var head := Label.new()
 	var htxt := "R%d · M%d" % [r + 1, mi + 1]
@@ -365,7 +396,7 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 	var vacant: bool = bool(m.get("vacant", false))
 	nm.text = "-" if vacant else (pname if pname != "" else "TBD")
 	nm.clip_text = true
-	nm.custom_minimum_size = Vector2(CARD_W - 60.0, 24.0)
+	nm.custom_minimum_size = Vector2(CARD_W - 60.0, ROW_H)
 	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nm.add_theme_font_size_override("font_size", FS_ROW)
 	var col := Color(0.92, 0.92, 0.94)
