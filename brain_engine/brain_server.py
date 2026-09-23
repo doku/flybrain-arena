@@ -262,6 +262,28 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
               flush=True)
 
 
+_last_title_banked = {"key": None}
+
+
+def _bank_title(side_state, champ_label, key=None):
+    """Crown the champion: tournaments_won += 1 + vault save. A repeat
+    call with the same key is a no-op (duplicate crowns must not stack
+    titles). Returns True when anything was banked."""
+    global _last_title_banked
+    if key is not None and _last_title_banked.get("key") == key:
+        return False
+    import brain_package as vault_pkg
+    st = side_state
+    if st["rec"] is None:
+        return False
+    st["rec"]["record"]["tournaments_won"] += 1
+    vault_pkg.save_brain(st["rec"], st["brain"].weights,
+                         backup=False, fast=True)
+    if key is not None:
+        _last_title_banked = {"key": key}
+    return True
+
+
 def _bank_match_result(tourney_a, tourney_b, match_winner):
     """Match verdict banking as one unit (counters + match ELO + saves)
     so the message loop and tests share it. Returns True when anything
@@ -1044,14 +1066,21 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 sock.sendto(json.dumps({"status": "match_recorded"}).encode("utf-8"), client_addr)
 
             elif msg_type == "tournament_end":
-                # Crown the champion: tournaments_won += 1.
-                import brain_package as vault_pkg
+                # Crown the champion: tournaments_won += 1. Duplicate
+                # crowns (same tournament+champion) resend the ack.
                 champ = msg.get("champion", "")
                 st = tourney_a if champ == "alpha" else tourney_b
-                if st["rec"] is not None:
-                    st["rec"]["record"]["tournaments_won"] += 1
-                    vault_pkg.save_brain(st["rec"], st["brain"].weights,
-                                         backup=False, fast=True)
+                tkey = (tourney_tag.get("tournament_id") or "", champ)
+                if tkey == _last_title_banked.get("key"):
+                    print(f"[Server] Duplicate crown {tkey[0]} {champ}: "
+                          f"title already banked.", flush=True)
+                elif _bank_title(st, champ, key=tkey):
+                    print(f"[Server] Crowned {champ} champion of {tkey[0]} "
+                          f"(titles={st['rec']['record']['tournaments_won']}).",
+                          flush=True)
+                else:
+                    print(f"[Server] Crown {tkey[0]} {champ}: no record "
+                          f"bound, title skipped.", flush=True)
                 sock.sendto(json.dumps({"status": "tournament_closed"}).encode("utf-8"), client_addr)
 
             elif msg_type == "tournament_weights":

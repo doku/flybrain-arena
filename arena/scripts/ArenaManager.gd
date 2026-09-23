@@ -2741,12 +2741,22 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 func _on_match_over(match_winner: String, score: String) -> void:
 	var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
 	brain_client.request_tournament_match(match_winner, _tourney_id(), tourney_match_label)
+	# Advance synchronously BEFORE the overlay wait: advance_after_match
+	# is pure logic + save, while the 6 s await below dies with the scene
+	# if the user quits to menu mid-overlay - which used to swallow the
+	# title request (and the evo chain) after the match was already
+	# banked. Banking requests are fire-and-forget; only the ack display
+	# below is allowed to depend on the wait.
+	var adv := {"action": "next_match"}
+	var director := _director()
+	if director != null:
+		adv = director.advance_after_match()
 	# The bracket overlay carries the result: gold connectors show the
 	# path, the loser is grayed out, next lineup is visible.
 	_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, tourney_match_label, score])
 	await get_tree().create_timer(6.0).timeout
 	_hide_arena_bracket()
-	_advance_tournament()
+	_handle_advance_result(adv)
 
 
 func _battle_count() -> int:
@@ -2755,12 +2765,6 @@ func _battle_count() -> int:
 		return 0
 	var m: Dictionary = director.current_match()
 	return int(m.get("battles", 0))
-
-func _advance_tournament() -> void:
-	var director := _director()
-	if director == null:
-		return
-	_handle_advance_result(director.advance_after_match())
 
 func _handle_advance_result(res: Dictionary) -> void:
 	var director := _director()

@@ -4419,6 +4419,26 @@ class TestBattleTransaction(unittest.TestCase):
             shutil.rmtree(ckdir, ignore_errors=True)
             self.srv._last_free_verdict = {"key": None, "result": None}
 
+    def test_title_banking_idempotent(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        self.srv._last_title_banked = {"key": None}
+        try:
+            self.assertTrue(
+                self.srv._bank_title(sta, "alpha", key=("T9", "alpha")))
+            la, _w = vault_pkg.load_brain(sta["rec"]["id"])
+            self.assertEqual(la["record"]["tournaments_won"], 1)
+            # Duplicate crown: no second title.
+            self.assertFalse(
+                self.srv._bank_title(sta, "alpha", key=("T9", "alpha")))
+            la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
+            self.assertEqual(la2["record"]["tournaments_won"], 1)
+            # No record bound: nothing banked, no crash.
+            self.assertFalse(
+                self.srv._bank_title({"rec": None}, "beta",
+                                     key=("T9", "beta")))
+        finally:
+            self.srv._last_title_banked = {"key": None}
+
     def test_corrupt_journal_quarantined(self):
         p = self.srv._pending_battle_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
