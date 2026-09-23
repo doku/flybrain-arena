@@ -2330,7 +2330,9 @@ func _evo_watcher_tick(delta: float) -> void:
 	var director := _director()
 	if director != null and not evo_waiting and director.pending_async.is_empty():
 		for spec in _evo_pending():
-			if not bool((spec as Dictionary).get("launched", false)):
+			var s := spec as Dictionary
+			if not bool(s.get("launched", false)) \
+					and _evo_blocking_spec(str(s.get("kind", ""))).is_empty():
 				_evo_spawn_spec(spec)
 				break
 	evo_status_tick += delta
@@ -3172,6 +3174,36 @@ func _evo_pending() -> Array:
 	return director.tourney.get("evo", {}).get("pending", [])
 
 
+func _evo_spec_alive(spec: Dictionary) -> bool:
+	# True while a launched, unadopted spec is still working. The pid
+	# check covers the normal case; a launched spec with no verdict and
+	# no live pid proof still counts as running, so a silently cleared
+	# slot (30-min poll timeout, stale-verdict delete) can never
+	# double-launch the pipeline into parallel breeds.
+	if not bool(spec.get("launched", false)):
+		return false
+	var pid := int(spec.get("pid", 0))
+	if pid > 0 and OS.is_process_running(pid):
+		return true
+	if pid > 0:
+		return false
+	return _evo_read_result(str(spec.get("result", ""))).is_empty()
+
+
+func _evo_blocking_spec(except_kind: String) -> Dictionary:
+	# The sibling breed still in flight ({} when the lane is clear).
+	# Launch gates use this - not just the shared-slot flag - so the
+	# clone stays QUEUED behind a running wild instead of training
+	# alongside it at 0%.
+	for spec in _evo_pending():
+		var s := spec as Dictionary
+		if str(s.get("kind", "")) == except_kind:
+			continue
+		if _evo_spec_alive(s):
+			return s
+	return {}
+
+
 func _evo_done() -> Dictionary:
 	var director := _director()
 	if director == null:
@@ -3562,18 +3594,33 @@ func _evo_await_queued(kind: String) -> String:
 		var sname0 := str(s.get("name", ""))
 		var display0 := sname0 if sname0 != "" else ("wild G%d" % int(s.get("gen", 1)))
 		if not bool(s.get("launched", false)):
-			# The shared slot may still be held by the sibling breed
-			# (e.g. wild head-start unfinished at tournament end).
-			# Spawning into a busy slot fails instantly ("another
-			# operation is already running"), so wait for it instead,
-			# sweeping adoptions meanwhile. STOP aborts the wait.
+			# The lane may still be held by the sibling breed (e.g. wild
+			# head-start unfinished at tournament end): it trains on
+			# while this one shows QUEUED. Spawning into a busy slot
+			# fails instantly ("another operation is already running"),
+			# so wait for it instead, sweeping adoptions meanwhile.
+			# STOP aborts the wait.
 			var tdir := _director()
 			var swait := 0.0
-			while tdir != null and not tdir.pending_async.is_empty() and swait < EVO_AWAIT_TIMEOUT:
+			while tdir != null and (not tdir.pending_async.is_empty() \
+					or not _evo_blocking_spec(kind).is_empty()) \
+					and swait < EVO_AWAIT_TIMEOUT:
 				if not _evo_active():
 					return ""
-				_show_evo_phase("BREEDING " + display0,
-					"Waiting for the training slot (%s in progress)..." % str(tdir.pending_async.get("op", "?")))
+				var blk := _evo_blocking_spec(kind)
+				if blk.is_empty():
+					_show_evo_phase("BREEDING " + display0,
+						"Waiting for the training slot (%s in progress)..." % str(tdir.pending_async.get("op", "?")))
+				else:
+					var blabel := str(blk.get("name", ""))
+					if blabel == "":
+						blabel = "wild G%d" % int(blk.get("gen", 1))
+					var bprog := _evo_poll_file(str(blk.get("progress", "")))
+					var bep := "warming up"
+					if not bprog.is_empty():
+						bep = "ep %d/%d" % [int(bprog.get("episode", 0)), EVO_EPISODES]
+					_show_evo_phase("BREEDING " + display0,
+						"Queued behind %s (%s)..." % [blabel, bep])
 				await get_tree().create_timer(2.0).timeout
 				swait += 2.0
 				_evo_adopt_finished()
