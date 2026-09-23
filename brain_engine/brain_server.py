@@ -149,6 +149,30 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
     arena_draw = bool(msg.get("arena_draw", False))
     draw_penalty = bool(msg.get("draw_penalty", False))
     battle_winner = "draw" if arena_draw else winner
+    # Arena verdict: how the battle ended + the killing blow (absent on
+    # old clients/tests - .get defaults keep those paths working).
+    end_reason = str(msg.get("end_reason", "") or "")
+    verdict = msg.get("verdict", None) or {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+    if arena_draw:
+        report = ("draw (3rd, both ELOs docked)" if draw_penalty
+                  else "draw (clean, replay)")
+    elif end_reason == "ko":
+        blow = str(verdict.get("blow_source", "") or "?")
+        amt = float(verdict.get("blow_amount", 0.0) or 0.0)
+        loser = str(verdict.get("loser_slot", "") or "?")
+        report = (f"KO ({blow} {amt:.1f} on {loser})"
+                  if amt > 0.0 else f"KO ({blow} finisher on {loser})")
+    elif end_reason == "time":
+        da = float(verdict.get("dmg_a", 0.0) or 0.0)
+        db = float(verdict.get("dmg_b", 0.0) or 0.0)
+        report = f"TIME (damage {da:.0f}-{db:.0f}, fitness decides)"
+    else:
+        sa = msg.get("stats_alpha", None) or {}
+        sb = msg.get("stats_beta", None) or {}
+        report = ("KO" if (sa.get("kills") or sb.get("kills"))
+                  else "decided")
     records = []
     weights = {}
     for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
@@ -177,7 +201,7 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
             vault_pkg.apply_draw3_penalty(ra, rb)
     fit_a, fit_b = _sanitize_fit(fit_a), _sanitize_fit(fit_b)
     print(f"[Server] Tournament battle done id={battle_id or '?'} "
-          f"({tourney_note()}) winner={battle_winner} "
+          f"({tourney_note()}) winner={battle_winner} by {report} "
           f"fit {fit_a:.1f}-{fit_b:.1f}", flush=True)
     resp = {
         "status": "tournament_battle",
@@ -185,6 +209,10 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         "fitness_alpha": fit_a,
         "fitness_beta": fit_b,
         "battle_id": battle_id,
+        "end_reason": end_reason,
+        "verdict": verdict,
+        "report": (f"{battle_winner} wins by {report}"
+                   if not arena_draw else f"draw ({report})"),
     }
     _write_pending_battle(battle_key, resp, records, weights)
     _recover_pending_battle((tourney_a, tourney_b))
@@ -749,7 +777,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     stats_b = msg.get("stats_beta", {})
                     battle_id = str(msg.get("battle_id", ""))
                     print(f"[Server] round_over received id={battle_id or '?'} "
-                          f"({tourney_note()}) draw={bool(msg.get('arena_draw', False))}",
+                          f"({tourney_note()}) draw={bool(msg.get('arena_draw', False))} "
+                          f"end={str(msg.get('end_reason', '') or '?')}",
                           flush=True)
                     if tournament_mode and battle_id:
                         # Idempotent retry: same (tournament, match, battle)

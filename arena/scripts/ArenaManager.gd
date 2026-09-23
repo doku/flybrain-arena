@@ -179,6 +179,13 @@ var tournament_active: bool = false
 var tourney_a_name: String = "ALPHA"
 var tourney_b_name: String = "BETA"
 var tourney_match_label: String = ""
+# Battle verdict: how the round ended ("ko" | "time" | "draw", set by the
+# KO/timeout handlers before _report_battle) plus the killing blow read
+# off the victim's damage ledger. Composed into _last_verdict at report
+# time so the server reply, callout, and retry all tell the same story.
+var _end_reason := ""
+var _ko_victim := ""
+var _last_verdict := {}
 var tourney_awaiting_load: bool = false
 var bracket_overlay: Control
 var arena_bracket: BracketView
@@ -672,7 +679,8 @@ func _on_server_error(error: String) -> void:
 		brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 			bool(q.get("draw", false)), _seq_battle_id,
 			str(q.get("tournament_id", "")), str(q.get("match", "")),
-			q.get("flight_a", {}), q.get("flight_b", {}))
+			q.get("flight_a", {}), q.get("flight_b", {}),
+			false, str(q.get("end_reason", "")), q.get("verdict", {}))
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
@@ -1074,7 +1082,9 @@ func _check_seq_watchdog() -> void:
 				status_label.text = "STALLED - RETRYING BATTLE %s ..." % _seq_battle_id
 			brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 				bool(q.get("draw", false)), _seq_battle_id,
-				str(q.get("tournament_id", "")), str(q.get("match", "")))
+				str(q.get("tournament_id", "")), str(q.get("match", "")),
+				q.get("flight_a", {}), q.get("flight_b", {}),
+				false, str(q.get("end_reason", "")), q.get("verdict", {}))
 			return
 		_tourney_awaiting_battle = false
 		_clear_seq()
@@ -1118,6 +1128,9 @@ func _reset_round() -> void:
 	is_round_active = true
 	stats_alpha = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 	stats_beta  = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
+	_end_reason = ""
+	_ko_victim = ""
+	_last_verdict = {}
 	flight_alpha = {}
 	flight_beta = {}
 	bv_cad_n = 0
@@ -1193,8 +1206,10 @@ func _physics_process(delta: float) -> void:
 		var director := _director()
 		var sudden: bool = tournament_active and director != null and director.sudden_death_armed
 		if clean and not sudden:
+			_end_reason = "draw"
 			_handle_draw()
 		else:
+			_end_reason = "time"
 			_end_round()
 
 func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, feat: Label) -> void:
@@ -2099,6 +2114,73 @@ func _tourney_id() -> String:
 		return ""
 	return str(director.tourney.get("id", ""))
 
+const BLOW_NAMES := {
+	"thorax_puncture": "THORAX PUNCTURE",
+	"wing_tear": "WING TEAR (forfeit)",
+	"spike_wound": "spike wound",
+	"spike_clash": "spike clash",
+	"tree_slam": "tree slam",
+	"tree_clip": "tree clip",
+	"seizure": "seizure drain",
+}
+
+
+func _killing_blow(victim_slot: String) -> Dictionary:
+	var fly: CharacterBody3D = fly_alpha if victim_slot == "alpha" else fly_beta
+	if not is_instance_valid(fly):
+		return {"source": "", "amount": 0.0}
+	return {"source": str(fly.get("last_damage_source")),
+		"amount": float(fly.get("last_damage_amount"))}
+
+
+func _compose_verdict(draw: bool) -> Dictionary:
+	# Who/how the battle ended, for the server report, callout, and
+	# retry. Timeout winners are unknown here (server picks on fitness),
+	# so the winner slot stays empty and the line says who decides.
+	var v := {"end_reason": "draw" if draw else _end_reason,
+		"winner_slot": "", "loser_slot": "", "blow_source": "",
+		"blow_amount": 0.0, "time_left": maxf(current_round_time, 0.0),
+		"dmg_a": float(stats_alpha.get("damage_dealt", 0.0)),
+		"dmg_b": float(stats_beta.get("damage_dealt", 0.0)), "line": ""}
+	if draw:
+		v["line"] = "DRAW - time expired, nobody bled"
+	elif _end_reason == "ko" and (_ko_victim == "alpha" or _ko_victim == "beta"):
+		var winner_slot := "beta" if _ko_victim == "alpha" else "alpha"
+		var blow := _killing_blow(_ko_victim)
+		v["winner_slot"] = winner_slot
+		v["loser_slot"] = _ko_victim
+		v["blow_source"] = str(blow["source"])
+		v["blow_amount"] = float(blow["amount"])
+		var blow_src := str(v["blow_source"])
+		var blow_name := str(BLOW_NAMES[blow_src]) if BLOW_NAMES.has(blow_src) else blow_src
+		v["line"] = "%s WINS by KO - killing blow: %s %.1f on %s" % [
+			_slot_name(winner_slot), blow_name, v["blow_amount"],
+			_slot_name(_ko_victim)]
+	else:
+		v["end_reason"] = "time"
+		v["line"] = "TIME - damage %.0f-%.0f, server decides on fitness" % [
+			v["dmg_a"], v["dmg_b"]]
+	print("[Arena] Verdict: ", v["line"])
+	return v
+
+
+func _verdict_short() -> String:
+	# One-line verdict for the battle callout (full line went to the
+	# server report + console at report time).
+	var reason := str(_last_verdict.get("end_reason", ""))
+	if reason == "ko":
+		var bsrc := str(_last_verdict.get("blow_source", ""))
+		var blow := str(BLOW_NAMES[bsrc]) if BLOW_NAMES.has(bsrc) else "?"
+		var amt := float(_last_verdict.get("blow_amount", 0.0))
+		return "KO - %s %s" % [blow,
+			("%.1f" % amt) if amt > 0.0 else "finisher"]
+	if reason == "time":
+		return "TIME - dmg %.0f-%.0f" % [
+			float(_last_verdict.get("dmg_a", 0.0)),
+			float(_last_verdict.get("dmg_b", 0.0))]
+	return ""
+
+
 func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	# Single choke point for tournament battle reports: stamps the same
 	# (tournament, match, battle) id used as the server's idempotency key,
@@ -2108,20 +2190,26 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	_tourney_awaiting_battle = true
 	var fa := _flight_summary(flight_alpha, fly_alpha)
 	var fb := _flight_summary(flight_beta, fly_beta)
+	_last_verdict = _compose_verdict(draw)
 	_seq_last_round = {
 		"stats_a": stats_alpha.duplicate(), "stats_b": stats_beta.duplicate(),
 		"draw": draw, "tournament_id": _tourney_id(), "match": tourney_match_label,
-		"flight_a": fa, "flight_b": fb}
+		"flight_a": fa, "flight_b": fb,
+		"end_reason": str(_last_verdict.get("end_reason", "")),
+		"verdict": _last_verdict.duplicate()}
 	brain_client.send_round_over(stats_alpha, stats_beta, draw, _seq_battle_id,
-		_tourney_id(), tourney_match_label, fa, fb, draw_penalty)
+		_tourney_id(), tourney_match_label, fa, fb, draw_penalty,
+		str(_last_verdict.get("end_reason", "")), _last_verdict)
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
 	_arm_seq("battle")
 	var kind := "DRAW - " if draw else ""
 	_show_loading("%s %sREPORTING" % [tourney_match_label, kind],
-		"Battle %s sent, waiting for server..." % _seq_battle_id)
+		"Battle %s sent, waiting for server...\n%s" % [_seq_battle_id,
+		str(_last_verdict.get("line", ""))])
 	if is_instance_valid(status_label):
-		status_label.text = "%s %sREPORTING" % [tourney_match_label, kind]
+		status_label.text = "%s %sREPORTING - %s" % [tourney_match_label, kind,
+			str(_last_verdict.get("line", ""))]
 
 func _handle_draw() -> void:
 	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
@@ -2445,6 +2533,8 @@ func _on_wing_torn(fly_id: String, side: String) -> void:
 func _on_fly_knocked_out(victim_id: String) -> void:
 	if not is_round_active:
 		return
+	_end_reason = "ko"
+	_ko_victim = victim_id
 
 	# Draw the final state (health floor, torn wing) BEFORE the winner text.
 	_update_health_hud()
@@ -2530,7 +2620,9 @@ func _end_round() -> void:
 	var fb := _flight_summary(flight_beta, fly_beta)
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
-	brain_client.send_round_over(stats_alpha, stats_beta, false, "", "", "", fa, fb)
+	_last_verdict = _compose_verdict(false)
+	brain_client.send_round_over(stats_alpha, stats_beta, false, "", "", "", fa, fb,
+		false, str(_last_verdict.get("end_reason", "")), _last_verdict)
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
 	# Server already banked dopamine + records + weights to the vault.
@@ -2581,15 +2673,20 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		_flight_summary(flight_beta, fly_beta),
 		_bv_stream_packet())
 	var action := str(res.get("action", "next_battle"))
-	print("[Arena] Battle result: winner=", battle_winner, " action=", action)
+	print("[Arena] Battle result: winner=", battle_winner, " action=", action,
+		" verdict=", str(_last_verdict.get("line", "")))
 	var score := "%d - %d" % [int(res.get("score_a", 0)), int(res.get("score_b", 0))]
 	if action == "match_over":
 		var match_winner := str(res.get("match_winner", battle_winner))
 		_on_match_over(match_winner, score)
 	else:
+		var sub := "%s  BATTLE %d" % [tourney_match_label, _battle_count() + 1]
+		var vshort := _verdict_short()
+		if vshort != "":
+			sub += "  |  " + vshort
 		_show_callout("%s TAKES BATTLE (%s)" % [winner_name, score],
 			Color(1.0, 0.55, 0.3) if battle_winner == "alpha" else Color(0.4, 0.75, 1.0),
-			"%s  BATTLE %d" % [tourney_match_label, _battle_count() + 1], "NEXT BATTLE", false)
+			sub, "NEXT BATTLE", false)
 		await get_tree().create_timer(5.0).timeout
 		_update_tourney_status("BATTLE %d" % (_battle_count() + 1))
 		brain_client.request_match_reset(tourney_match_label)

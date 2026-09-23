@@ -7,6 +7,20 @@ signal landed_strike(target_part: String)
 
 @export var fly_id: String = "alpha" # "alpha" or "beta"
 @export var is_disabled: bool = false
+# Killing-blow ledger: every health subtraction routes through
+# take_damage so the battle report can name the final blow.
+var last_damage_source := ""
+var last_damage_amount := 0.0
+var last_damage_t := 0.0
+
+
+func take_damage(amount: float, source: String) -> void:
+	if is_disabled:
+		return
+	health -= amount
+	last_damage_source = source
+	last_damage_amount = amount
+	last_damage_t = fly_time
 @export var health: float = 100.0
 
 # Flight aerodynamics constants (fruit-fly agile: hover-capable, snap turns).
@@ -545,7 +559,7 @@ func _physics_process(delta: float) -> void:
 		seizure_events += 1
 		print(fly_id, " SEIZURE detected - draining health.")
 	if seizing:
-		health -= SEIZURE_DRAIN * delta
+		take_damage(SEIZURE_DRAIN * delta, "seizure")
 		if health <= 0.0 and not is_disabled:
 			inflict_lethal_strike()
 			print(fly_id, " seized out of the sky!")
@@ -664,11 +678,11 @@ func _handle_obstacle_impacts(impact_speed: float, delta: float) -> void:
 		# only hot flight into bark is punished.
 		if impact_speed > 11.0:
 			tear_wing("left" if randf() < 0.5 else "right")
-			health -= 50.0
+			take_damage(50.0, "tree_slam")
 			obstacle_hit_cooldown = 1.5
 			print(fly_id, " SLAMMED a tree at ", snappedf(impact_speed, 0.1), " m/s! Wing torn.")
 		elif impact_speed > 6.5:
-			health -= 15.0
+			take_damage(15.0, "tree_clip")
 			obstacle_hit_cooldown = 1.0
 			print(fly_id, " clipped a tree at ", snappedf(impact_speed, 0.1), " m/s.")
 		else:
@@ -737,6 +751,9 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		if not victim.is_disabled and _attacker_in_victim_front_arc(victim):
 			_resolve_joust(victim)
 		else:
+			victim.last_damage_source = "thorax_puncture"
+			victim.last_damage_amount = 0.0
+			victim.last_damage_t = victim.fly_time
 			victim.inflict_lethal_strike()
 			landed_strike.emit("thorax")
 			print(fly_id, " landed rear-aspect THORAX PUNCTURE on ", victim.fly_id, "!")
@@ -761,7 +778,7 @@ func _resolve_spike_clash(victim: FlyPhysics) -> void:
 	# Both sinks a spike into the other's body on the way apart.
 	for f in [self, victim]:
 		if not f.is_disabled:
-			f.health -= 25.0
+			f.take_damage(25.0, "spike_clash")
 			if f.health <= 0.0:
 				f.inflict_lethal_strike()
 				print(f.fly_id, " bled out in a spike clash!")
@@ -808,7 +825,7 @@ func _spike_wound(victim: FlyPhysics) -> void:
 	# so hits register even without a kill and bleed-outs can finish.
 	if victim.is_disabled:
 		return
-	victim.health -= 15.0
+	victim.take_damage(15.0, "spike_wound")
 	if victim.health <= 0.0:
 		victim.inflict_lethal_strike()
 		print(victim.fly_id, " bled out from spike wounds!")
@@ -828,6 +845,9 @@ func tear_wing(side: String) -> void:
 	# A torn wing forfeits the fight: the fly can no longer maneuver, so the
 	# round ends immediately and the rival is credited with the knockout.
 	if not is_disabled:
+		last_damage_source = "wing_tear"
+		last_damage_amount = 0.0
+		last_damage_t = fly_time
 		is_disabled = true
 		knocked_out.emit()
 
@@ -871,6 +891,9 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	seizure_clear = 0.0
 	seizing = false
 	seizure_events = 0
+	last_damage_source = ""
+	last_damage_amount = 0.0
+	last_damage_t = 0.0
 	basis_init = false
 	prev_rival_dist = spawn_pos.distance_to(rival.global_position) if is_instance_valid(rival) else 28.0
 	scent_prev_smooth = -1.0

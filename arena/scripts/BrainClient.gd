@@ -59,7 +59,7 @@ func send_sensory_step(sens_alpha: Dictionary, sens_beta: Dictionary) -> void:
 	var json_data = JSON.stringify(msg).to_utf8_buffer()
 	udp.put_packet(json_data)
 
-func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "", flight_alpha: Dictionary = {}, flight_beta: Dictionary = {}, draw_penalty: bool = false) -> void:
+func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "", flight_alpha: Dictionary = {}, flight_beta: Dictionary = {}, draw_penalty: bool = false, end_reason: String = "", verdict: Dictionary = {}) -> void:
 	if not is_connected_server:
 		return
 
@@ -73,7 +73,9 @@ func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw
 		"match": match_label,
 		"flight_alpha": flight_alpha,
 		"flight_beta": flight_beta,
-		"draw_penalty": draw_penalty
+		"draw_penalty": draw_penalty,
+		"end_reason": end_reason,
+		"verdict": verdict
 	}
 	var json_data = JSON.stringify(msg).to_utf8_buffer()
 	udp.put_packet(json_data)

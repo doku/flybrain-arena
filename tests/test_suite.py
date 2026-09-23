@@ -4325,6 +4325,50 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertAlmostEqual(la["record"]["elo"], 1215.0)
         self.assertAlmostEqual(lb["record"]["elo"], 1185.0)
 
+    def test_battle_verdict_echoed(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BV", "draw": False}
+        verdict = {"end_reason": "ko", "winner_slot": "alpha",
+                   "loser_slot": "beta", "blow_source": "thorax_puncture",
+                   "blow_amount": 0.0, "dmg_a": 80.0, "dmg_b": 25.0,
+                   "line": "A WINS by KO"}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "ko", "verdict": verdict},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BV", battle_key=key)
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["battle_winner"], "alpha")
+        self.assertEqual(body["end_reason"], "ko")
+        self.assertEqual(body["verdict"], verdict)
+        self.assertIn("thorax_puncture", body["report"])
+        self.assertIn("alpha wins", body["report"])
+        # Stored verdict resend carries the report too (idempotent).
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["result"]["report"], body["report"])
+        # Legacy clients without verdict keys still bank + report.
+        key2 = {"tournament_id": "T", "match": "M",
+                "battle_id": "BV2", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), {"arena_draw": False},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BV2", battle_key=key2)
+        body2 = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body2["end_reason"], "")
+        self.assertEqual(body2["verdict"], {})
+        self.assertIn("alpha wins", body2["report"])
+
     def test_corrupt_journal_quarantined(self):
         p = self.srv._pending_battle_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
