@@ -2380,6 +2380,31 @@ class TestWiringGenome(unittest.TestCase):
         self.assertEqual(payload["mapping"], ["muscles_up"])
         self.assertEqual(payload["n_rules"], 3)
 
+    def test_validator_coerces_godot_floats(self):
+        # Godot's JSON parser turns every number into a float, so menu
+        # round-tripped genomes arrive with 16.0-style values (this killed
+        # real training jobs). Integral floats coerce; the genome id is
+        # identical to the int original; non-integral stays rejected.
+        import experimental_wiring as ew
+        good = dict(ew.FROZEN_GENOMES["lplc2_contra_dn"]["rules"][0])
+        floaty = dict(good, fanout=float(good["fanout"]),
+                      stream_seed=float(good["stream_seed"]),
+                      weight=float(good["weight"]))
+        v = ew.validate_rule(floaty)
+        self.assertIs(type(v["fanout"]), int)
+        self.assertIs(type(v["stream_seed"]), int)
+        self.assertEqual(v["fanout"], good["fanout"])
+        self.assertEqual(v["stream_seed"], good["stream_seed"])
+        g_int = {"name": None, "rules": [good]}
+        g_float = {"name": None, "rules": [floaty]}
+        self.assertEqual(ew.genome_id(g_float), ew.genome_id(g_int))
+        for bad in (dict(good, fanout=16.5),
+                    dict(good, stream_seed=1.5),
+                    dict(good, fanout=True)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ew.validate_rule(bad)
+
     def test_genome_id_stable(self):
         import numpy as np
         import experimental_wiring as ew

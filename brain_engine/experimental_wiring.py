@@ -299,6 +299,24 @@ _RULE_KEYS = ("source", "source_side", "target", "target_side", "sign",
               "weight", "fanout", "topography", "stream", "stream_seed")
 
 
+def _as_int(value, field, rule, lo, hi):
+    """Coerce integral values to int (Godot's JSON parser turns every
+    number into a float, so menu-round-tripped genomes arrive with
+    16.0-style values; like seeds, these must survive the trip).
+    Rejects bools, non-integral floats, and out-of-range values."""
+    if isinstance(value, bool):
+        raise ValueError(f"rule {field} must be an int: {rule}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"rule {field} must be an int: {rule}")
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError(f"rule {field} must be an int: {rule}")
+    if not lo <= value <= hi:
+        raise ValueError(f"rule {field} must be in [{lo}, {hi}]: {rule}")
+    return value
+
+
 def validate_rule(rule):
     """Canonicalize one projection rule (raises ValueError on anything
     malformed). Returns a normalized copy; never mutates the input."""
@@ -326,12 +344,7 @@ def validate_rule(rule):
     if not 0.0 < weight <= MAX_RULE_WEIGHT:
         raise ValueError(
             f"rule weight must be in (0, {MAX_RULE_WEIGHT}]: {rule}")
-    fanout = rule["fanout"]
-    if isinstance(fanout, bool) or not isinstance(fanout, int):
-        raise ValueError(f"rule fanout must be an int: {rule}")
-    if not 1 <= fanout <= MAX_RULE_FANOUT:
-        raise ValueError(
-            f"rule fanout must be in [1, {MAX_RULE_FANOUT}]: {rule}")
+    fanout = _as_int(rule["fanout"], "fanout", rule, 1, MAX_RULE_FANOUT)
     topo = str(rule["topography"])
     if topo not in GENOME_TOPOGRAPHIES:
         raise ValueError(
@@ -339,11 +352,7 @@ def validate_rule(rule):
     stream = str(rule["stream"])
     if not stream:
         raise ValueError(f"rule stream must be a non-empty name: {rule}")
-    seed = rule["stream_seed"]
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError(f"rule stream_seed must be an int: {rule}")
-    if not 0 <= seed < 2 ** 32:
-        raise ValueError(f"rule stream_seed must be in [0, 2**32): {rule}")
+    seed = _as_int(rule["stream_seed"], "stream_seed", rule, 0, 2 ** 32 - 1)
     return {"source": src, "source_side": ss, "target": tgt,
             "target_side": ts, "sign": sign, "weight": weight,
             "fanout": fanout, "topography": topo, "stream": stream,
