@@ -358,10 +358,10 @@ def archive_brain(path_or_id, reason=""):
     return entry
 
 
-def restore_brain(name_or_id):
-    """Brings an archived brain back to the vault (re-indexed on next
-    scan). Returns the record."""
-    key = str(name_or_id)
+def _find_archive_match(key):
+    """Unique archived filename matching an id/name substring (shared by
+    restore and delete so both fail loud on ambiguity)."""
+    key = str(key)
     cands = []
     if os.path.isdir(ARCHIVE_DIR):
         for fname in sorted(os.listdir(ARCHIVE_DIR)):
@@ -373,8 +373,15 @@ def restore_brain(name_or_id):
         raise FileNotFoundError(f"No archived brain matches '{key}'")
     if len(cands) > 1:
         raise ValueError(f"Ambiguous archive match '{key}': {cands}")
-    src = os.path.join(ARCHIVE_DIR, cands[0])
-    dst = os.path.join(VAULT_DIR, cands[0])
+    return cands[0]
+
+
+def restore_brain(name_or_id):
+    """Brings an archived brain back to the vault (re-indexed on next
+    scan). Returns the record."""
+    fname = _find_archive_match(name_or_id)
+    src = os.path.join(ARCHIVE_DIR, fname)
+    dst = os.path.join(VAULT_DIR, fname)
     if os.path.exists(dst):
         raise FileExistsError(f"Vault already holds {cands[0]}")
     shutil.move(src, dst)
@@ -387,14 +394,64 @@ def restore_brain(name_or_id):
 
 
 def list_archive():
-    """Archive log entries, newest last, each with a `present` flag."""
+    """Archive log entries, newest last, each with `present` and
+    `size_mb` (0.0 when the file is gone) so space-hunters can sort
+    the fattest losers first."""
     out = []
     for e in _read_archive_log():
         e = dict(e)
-        e["present"] = os.path.isfile(
-            os.path.join(ARCHIVE_DIR, str(e.get("filename", ""))))
+        fpath = os.path.join(ARCHIVE_DIR, str(e.get("filename", "")))
+        try:
+            e["present"] = os.path.isfile(fpath)
+            e["size_mb"] = round(os.path.getsize(fpath) / 1e6, 1) \
+                if e["present"] else 0.0
+        except OSError:
+            e["present"] = False
+            e["size_mb"] = 0.0
         out.append(e)
     return out
+
+
+def delete_archived(name_or_id):
+    """Permanently deletes an archived brain (package file + .bak +
+    log entry) to free disk space. Also prunes orphan log entries
+    whose file is already gone. Returns {"id", "name", "filename",
+    "freed_bytes"}."""
+    key = str(name_or_id)
+    try:
+        fname = _find_archive_match(key)
+    except ValueError:
+        raise
+    except FileNotFoundError:
+        fname = None
+    log = _read_archive_log()
+    if fname is None:
+        # File already gone: match the orphan log entry by id/name.
+        cands = [e for e in log
+                 if key.lower() in str(e.get("id", "")).lower()
+                 or key.lower() in str(e.get("name", "")).lower()]
+        if not cands:
+            raise FileNotFoundError(f"No archived brain matches '{key}'")
+        if len(cands) > 1:
+            raise ValueError(f"Ambiguous archive match '{key}'")
+        entry = cands[0]
+        fname = str(entry.get("filename", ""))
+    else:
+        hits = [e for e in log if str(e.get("filename", "")) == fname]
+        entry = hits[0] if hits else {}
+    freed = 0
+    path = os.path.join(ARCHIVE_DIR, fname)
+    for cand in (path, path + ".bak"):
+        try:
+            if os.path.isfile(cand):
+                freed += os.path.getsize(cand)
+                os.remove(cand)
+        except OSError:
+            pass
+    _write_archive_log(
+        [e for e in log if str(e.get("filename", "")) != fname])
+    return {"id": entry.get("id", ""), "name": entry.get("name", "?"),
+            "filename": fname, "freed_bytes": freed}
 
 
 def win_rate(record):

@@ -264,6 +264,11 @@ func _build_vault_column() -> VBoxContainer:
 	restore_b.tooltip_text = "Restore the selected archived brain to the vault roster."
 	restore_b.pressed.connect(_on_archive_restore)
 	arch_row.add_child(restore_b)
+	var del_b := Button.new()
+	del_b.text = "Delete forever"
+	del_b.tooltip_text = "Permanently delete the selected archived brain and free its disk space. Cannot be undone."
+	del_b.pressed.connect(_on_archive_delete)
+	arch_row.add_child(del_b)
 	detail_label = Label.new()
 	detail_label.add_theme_font_size_override("font_size", 13)
 	detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -680,8 +685,8 @@ func _refresh_archive() -> void:
 	if is_instance_valid(archive_list_view):
 		archive_list_view.clear()
 		for e in archive_entries:
-			archive_list_view.add_item("%s  [%s]%s" % [
-				str(e.get("name", "?")), str(e.get("id", "?")),
+			archive_list_view.add_item("%s  [%.1f MB]%s" % [
+				str(e.get("name", "?")), float(e.get("size_mb", 0.0)),
 				"" if bool(e.get("present", true)) else " (missing)"])
 
 
@@ -696,6 +701,35 @@ func _on_archive_restore() -> void:
 		log_label.text = "Restore failed: %s" % str(res.get("error", "?"))
 		return
 	log_label.text = "Brought back '%s'." % str(entry.get("name", "?"))
+	refresh_vault()
+
+
+func _on_archive_delete() -> void:
+	var sel := archive_list_view.get_selected_items()
+	if sel.is_empty() or int(sel[0]) < 0 or int(sel[0]) >= archive_entries.size():
+		log_label.text = "Select an archived brain first."
+		return
+	var entry: Dictionary = archive_entries[int(sel[0])]
+	var dlg := ConfirmationDialog.new()
+	dlg.title = "Delete archived brain?"
+	dlg.dialog_text = "Permanently delete '%s'?\nFrees %.1f MB. Cannot be undone." % [
+		str(entry.get("name", "?")), float(entry.get("size_mb", 0.0))]
+	dlg.ok_button_text = "Delete"
+	dlg.canceled.connect(dlg.queue_free)
+	dlg.confirmed.connect(dlg.queue_free)
+	dlg.confirmed.connect(_on_archive_delete_confirmed.bind(
+		str(entry.get("id", "")), str(entry.get("name", "?"))))
+	add_child(dlg)
+	dlg.popup_centered()
+
+
+func _on_archive_delete_confirmed(arch_id: String, arch_name: String) -> void:
+	var res: Dictionary = TournamentDirector.delete_archived(arch_id)
+	if not bool(res.get("ok", false)):
+		log_label.text = "Delete failed: %s" % str(res.get("error", "?"))
+	else:
+		log_label.text = "Deleted '%s', freed %.1f MB." % [
+			arch_name, float(res.get("freed_mb", 0.0))]
 	refresh_vault()
 
 

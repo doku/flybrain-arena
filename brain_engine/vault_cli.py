@@ -6,6 +6,8 @@ Usage:
   python vault_cli.py generate --name Viper --params '{"seed":11,...}'
   python vault_cli.py train --id <id> --episodes 50 [--params '{...}'] [--progress path.json]
   python vault_cli.py delete --id <id>
+  python vault_cli.py archive-list
+  python vault_cli.py archive-delete --id <id>
   python vault_cli.py rename --id <id> --name NewName
   python vault_cli.py export --id <id> --out path.flybrain
   python vault_cli.py import --npz path.npz --name Name
@@ -261,6 +263,15 @@ def cmd_archive_list(_a):
     return out({"ok": True, "archived": entries})
 
 
+def cmd_archive_delete(a):
+    try:
+        info = vault.delete_archived(a.id)
+    except Exception as e:
+        return err(str(e))
+    info["freed_mb"] = round(info["freed_bytes"] / 1e6, 1)
+    return out({"ok": True, **info})
+
+
 class _TeeLog:
     # Duplicates prints to a log file (spawned workers have no console,
     # so silent deaths would otherwise leave zero evidence).
@@ -364,6 +375,7 @@ def main():
     q.add_argument("--reason", default="")
     q = sub.add_parser("restore"); q.add_argument("--id", required=True)
     q = sub.add_parser("archive-list")
+    q = sub.add_parser("archive-delete"); q.add_argument("--id", required=True)
     q = sub.add_parser("derive-mapping")
     q.add_argument("--genome", default="")
     q.add_argument("--genome-seed", type=int, default=0)
@@ -387,6 +399,7 @@ def main():
            "train": cmd_train, "delete": cmd_delete, "rename": cmd_rename,
            "export": cmd_export, "import": cmd_import, "archive": cmd_archive,
            "restore": cmd_restore, "archive-list": cmd_archive_list,
+           "archive-delete": cmd_archive_delete,
            "derive-mapping": cmd_derive_mapping,
            "breed": cmd_breed}[a.cmd]
     return fn(a)

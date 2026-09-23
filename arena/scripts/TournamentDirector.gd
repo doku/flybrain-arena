@@ -209,6 +209,13 @@ func restore_archived(arch_id: String) -> Dictionary:
 	return _run_cli(["restore", "--id", arch_id])
 
 
+func delete_archived(arch_id: String) -> Dictionary:
+	var res := _run_cli(["archive-delete", "--id", arch_id])
+	if res.get("ok", false):
+		vault_changed.emit()
+	return res
+
+
 func generate_brain_async(brain_name: String, params: Dictionary) -> Dictionary:
 	var params_file := job_dir.path_join("gen_params_%d.json" % Time.get_ticks_msec())
 	var f := FileAccess.open(params_file, FileAccess.WRITE)

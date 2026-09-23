@@ -3820,6 +3820,58 @@ class TestEvoLoop(unittest.TestCase):
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_archive_delete_frees_space(self):
+        import tempfile
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_del_test_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("DelMe", {})
+            rng = np.random.default_rng(7)
+            vault.save_brain(
+                rec, rng.random(500_000, dtype=np.float32),
+                backup=False)
+            vault.archive_brain(rec["id"], reason="space test")
+            listed = [e for e in vault.list_archive()
+                      if e["id"] == rec["id"]]
+            self.assertEqual(len(listed), 1)
+            self.assertTrue(listed[0]["present"])
+            self.assertGreater(listed[0]["size_mb"], 0.0)
+            info = vault.delete_archived(rec["id"])
+            self.assertEqual(info["id"], rec["id"])
+            self.assertGreater(info["freed_bytes"], 0)
+            self.assertFalse(os.path.isfile(
+                os.path.join(tmp, "archive", rec["filename"])))
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec["id"]], [])
+            # Deleting twice / unknown id fails loud, never silent.
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived(rec["id"])
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived("nope-not-here")
+            # Orphan log entry (file manually removed) still prunes.
+            rec2 = vault.new_record("Orphan", {})
+            vault.save_brain(
+                rec2, np.zeros(32, dtype=np.float32), backup=False)
+            vault.archive_brain(rec2["id"], reason="orphan test")
+            os.remove(os.path.join(tmp, "archive", rec2["filename"]))
+            info2 = vault.delete_archived(rec2["id"])
+            self.assertEqual(info2["freed_bytes"], 0)
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec2["id"]], [])
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_breed_random_params_valid(self):
         # Random param construction without training: valid genome,
         # derived mapping, yaw_bias ranges (mirrors breed_random's draws).
