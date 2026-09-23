@@ -323,9 +323,9 @@ func poll_job() -> Dictionary:
 		print("[Director] Job done: %s (%d/%d)" % [
 			str(active_job.get("brain_id", "?")),
 			int(res.get("episode", 0)), int(res.get("total", 0))])
-		# School trains earn an eval restamp (eval_only probe, weights
-		# untouched): the [eval N] tag tracks current capability while
-		# [score N] keeps the accumulated training totals.
+		# School trains earn a probe top-up (eval_only, weights
+		# untouched): its points bank into the single score odometer
+		# under the same rules as training.
 		var done_school := bool(active_job.get("school", false))
 		var done_id := str(active_job.get("brain_id", ""))
 		active_job = {}

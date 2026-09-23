@@ -186,10 +186,12 @@ def cmd_train(a):
 
 
 def cmd_score(a):
-    """Eval-only probe: school scenarios, no learning, weights untouched.
-    Stamps training.eval_score (+ episodes/utc) so the menu can show
-    current capability next to the accumulated training score."""
+    """Eval-only probe: school scenarios under the identical scoring
+    rules as training, weights untouched. Banks the probe points into
+    the single training.score odometer (plus its episodes, so the
+    average stays honest) - one value called score, one system."""
     from train_homing import run_training
+    from train_job import stamp_train_score
     try:
         rec, weights = vault.load_brain(a.id)
     except Exception as e:
@@ -207,19 +209,16 @@ def cmd_score(a):
             curriculum={}, return_brain=True, eval_only=True)
     except Exception as e:
         return err(str(e))
+    gained = round(float(summary.get("score", 0.0)), 1)
+    stamp_train_score(rec, {"score": gained})
     tr = rec.setdefault("training", {})
-    tr["eval_score"] = round(float(summary.get("score", 0.0)), 1)
-    tr["eval_episodes"] = eps
-    try:
-        from datetime import datetime, timezone
-        tr["eval_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    except Exception:
-        pass
+    tr["episodes"] = int(tr.get("episodes", 0)) + eps
+    tr["avg_score"] = (float(tr.get("score", 0.0)) / max(tr["episodes"], 1))
     try:
         vault.save_brain(rec, weights)
     except OSError as e:
         return err(str(e))
-    return out({"ok": True, "eval_score": tr["eval_score"],
+    return out({"ok": True, "eval_score": gained,
                 "summary": summary}, getattr(a, "result_file", None))
 
 

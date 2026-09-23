@@ -743,8 +743,7 @@ func refresh_vault() -> void:
 			int(r.get("matches", 0)), int(r.get("matches_won", 0)),
 			int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
 			int(r.get("elo", 1200.0)), score]
-		if t.has("eval_score"):
-			line += " [eval %.0f]" % float(t.get("eval_score", 0.0))
+
 		brain_list.add_item(line)
 		var brec: Dictionary = b.get("record", {})
 		player_list.add_item("%s  [elo %d]" % [str(b.get("name", "?")),
@@ -1062,7 +1061,7 @@ func _on_job_failed(error: String) -> void:
 
 
 func _on_score_stamped(brain_id: String, score: float) -> void:
-	log_label.text = "Eval score %.1f stamped for %s." % [score, brain_id]
+	log_label.text = "Probe banked +%.1f points for %s." % [score, brain_id]
 	refresh_vault()
 
 

@@ -3401,10 +3401,18 @@ class TestRetinaVision(unittest.TestCase):
             a.episodes = 2
             a.seed = 11
             a.result_file = ""
+            base_score = float(rec.get("training", {}).get("score", 0.0))
+            base_eps = int(rec.get("training", {}).get("episodes", 0))
             self.assertEqual(cmd_score(a), 0)
             rec2, w2 = vault_pkg.load_brain(rec["id"])
-            self.assertIn("eval_score", rec2.get("training", {}))
-            self.assertEqual(rec2["training"]["eval_episodes"], 2)
+            # Single odometer: probe points bank into score, episodes
+            # bumped, no second tag, weights bit-identical.
+            self.assertNotIn("eval_score", rec2.get("training", {}))
+            self.assertGreater(rec2["training"]["score"], base_score)
+            self.assertEqual(rec2["training"]["episodes"], base_eps + 2)
+            self.assertAlmostEqual(
+                rec2["training"]["avg_score"],
+                rec2["training"]["score"] / rec2["training"]["episodes"])
             np.testing.assert_array_equal(w2, w0)
         finally:
             vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
