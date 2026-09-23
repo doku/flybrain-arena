@@ -618,27 +618,36 @@ func _build_tourney_column() -> VBoxContainer:
 	player_list.select_mode = ItemList.SELECT_MULTI
 	player_list.allow_rmb_select = true
 	c.add_child(player_list)
+	# Two rows of two: one four-button row (~690px) overflows its
+	# ~416px column share and gets cut off at the window edge.
 	var srow := HBoxContainer.new()
 	srow.add_theme_constant_override("separation", 6)
 	c.add_child(srow)
 	var start := Button.new()
 	start.text = "START TOURNAMENT"
+	start.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	start.pressed.connect(_on_start_tournament)
 	srow.add_child(start)
 	resume_button = Button.new()
 	resume_button.text = "RESUME"
+	resume_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	resume_button.pressed.connect(_on_resume)
 	srow.add_child(resume_button)
+	var srow2 := HBoxContainer.new()
+	srow2.add_theme_constant_override("separation", 6)
+	c.add_child(srow2)
 	quick_button = Button.new()
 	quick_button.text = "QUICK BATTLE (pick 2)"
 	quick_button.tooltip_text = "One exhibition battle between exactly 2 selected brains."
+	quick_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	quick_button.pressed.connect(_on_quick_battle)
-	srow.add_child(quick_button)
+	srow2.add_child(quick_button)
 	var evo_button := Button.new()
 	evo_button.text = "START EVOLUTION"
 	evo_button.tooltip_text = "Eternal loop: tournament, archive biggest loser, breed 1 winner-clone + 1 random (50 eps), next generation. STOP in the arena."
+	evo_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	evo_button.pressed.connect(_on_start_evolution)
-	srow.add_child(evo_button)
+	srow2.add_child(evo_button)
 	bracket_status = Label.new()
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
