@@ -929,6 +929,14 @@ func _retrain_params() -> Dictionary:
 	return out
 
 
+func _prefill_num(v, fallback: float) -> float:
+	if v == null:
+		return fallback
+	if v is float or v is int:
+		return float(v)
+	return fallback
+
+
 func _prefill_train_widgets(p: Dictionary) -> void:
 	# Selecting a brain shows the settings a retrain will actually use.
 	# A missing mapping key means the legacy pre-mapping regime (all
@@ -939,11 +947,13 @@ func _prefill_train_widgets(p: Dictionary) -> void:
 		if gen_variant.get_item_text(i) == v:
 			v_idx = i
 	gen_variant.selected = v_idx
-	gen_seed.value = float(p.get("seed", gen_seed.value))
-	gen_lr.value = float(p.get("learning_rate", gen_lr.value))
-	gen_gain.value = float(p.get("dist_gain", gen_gain.value))
-	gen_evasion.value = float(p.get("evasion", gen_evasion.value))
-	gen_yaw_bias.value = float(p.get("yaw_bias", 9.0))
+	# Explicit-null numerics (e.g. "yaw_bias": null on ungraduated
+	# brains) must fall back like missing keys: float(null) crashes.
+	gen_seed.value = _prefill_num(p.get("seed"), gen_seed.value)
+	gen_lr.value = _prefill_num(p.get("learning_rate"), gen_lr.value)
+	gen_gain.value = _prefill_num(p.get("dist_gain"), gen_gain.value)
+	gen_evasion.value = _prefill_num(p.get("evasion"), gen_evasion.value)
+	gen_yaw_bias.value = _prefill_num(p.get("yaw_bias"), 9.0)
 	gen_yaw_random.button_pressed = false
 	var exp = p.get("experiment", null)
 	var raw: Array = []
