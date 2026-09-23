@@ -1378,7 +1378,7 @@ func _layout_match_hud() -> void:
 
 func _build_brainview() -> void:
 	# L0 pool-rate bars: one slim panel per fly, screen edges, always-on
-	# capable. 23 rows x 2 panels of tiny bars is trivial draw load; the
+	# capable. 31 rows x 2 panels of tiny bars is trivial draw load; the
 	# values arrive inside the existing motor reply (no extra packets).
 	var hud: CanvasLayer = $HUD
 	bv_panel_alpha = _make_bv_panel(hud, "BrainAlpha", Control.PRESET_BOTTOM_LEFT,
@@ -1662,15 +1662,18 @@ func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPrese
 	# below the top-corner PiP eye views (feat text ends ~226px; panel
 	# top lands ~232px at 720p).
 	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
-	panel.offset_left = 8.0 if left_side else -196.0
-	panel.offset_right = 196.0 if left_side else -8.0
+	# Compact chart: 46 label + 64 bar + 26 count = 140px wide; ~385px
+	# tall for all 31 pool rows, top tucked just below the PiP eye
+	# views, bottom clear of the menu bar (and a smaller mouse rect).
+	panel.offset_left = 8.0 if left_side else -148.0
+	panel.offset_right = 148.0 if left_side else -8.0
 	panel.offset_top = -488.0
-	panel.offset_bottom = -60.0
+	panel.offset_bottom = -103.0
 	panel.add_theme_constant_override("separation", 1)
 	hud.add_child(panel)
 	var head := Label.new()
 	head.text = title + " BRAIN"
-	head.add_theme_font_size_override("font_size", 12)
+	head.add_theme_font_size_override("font_size", 10)
 	head.add_theme_color_override("font_color", tint)
 	panel.add_child(head)
 	if pname == "BrainAlpha":
@@ -1681,25 +1684,25 @@ func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPrese
 		bv_caps[str(spec[0])] = float(spec[2])
 	for spec in BV_POOLS:
 		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 3)
+		row.add_theme_constant_override("separation", 2)
 		panel.add_child(row)
 		var nm := Label.new()
 		nm.text = spec[1]
-		nm.custom_minimum_size = Vector2(52, 0)
-		nm.add_theme_font_size_override("font_size", 10)
+		nm.custom_minimum_size = Vector2(46, 0)
+		nm.add_theme_font_size_override("font_size", 9)
 		nm.add_theme_color_override("font_color", tint)
 		row.add_child(nm)
 		var bar := ProgressBar.new()
 		bar.min_value = 0.0
 		bar.max_value = 100.0
 		bar.show_percentage = false
-		bar.custom_minimum_size = Vector2(80, 12)
+		bar.custom_minimum_size = Vector2(64, 8)
 		bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 		row.add_child(bar)
 		var num := Label.new()
 		num.text = "0"
-		num.custom_minimum_size = Vector2(30, 0)
-		num.add_theme_font_size_override("font_size", 10)
+		num.custom_minimum_size = Vector2(26, 0)
+		num.add_theme_font_size_override("font_size", 9)
 		row.add_child(num)
 		rows[str(spec[0])] = [bar, num, float(spec[2])]
 	return panel
