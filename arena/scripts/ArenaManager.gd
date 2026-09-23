@@ -2054,7 +2054,7 @@ func _current_battle_id() -> String:
 	# Correlation-only id, echoed by the server for log matching.
 	return "%s-B%d" % [tourney_match_label, _battle_count() + 1]
 
-func _show_loading(title: String, sub: String) -> void:
+func _show_loading(title: String, sub: String, title_color: Color = Color(0.85, 0.85, 0.9)) -> void:
 	# Persistent overlay (no countdown): proves the game is waiting on the
 	# server, not frozen. Hidden by _hide_loading on the matching reply.
 	# Smaller fonts than the winner callout so multi-line status text
@@ -2062,7 +2062,7 @@ func _show_loading(title: String, sub: String) -> void:
 	if is_instance_valid(winner_label):
 		winner_label.text = title
 		winner_label.add_theme_font_size_override("font_size", 44)
-		winner_label.add_theme_color_override("font_color", Color(0.85, 0.85, 0.9))
+		winner_label.add_theme_color_override("font_color", title_color)
 	if is_instance_valid(countdown_label):
 		countdown_label.text = sub
 		countdown_label.add_theme_font_size_override("font_size", 24)
@@ -2185,6 +2185,39 @@ func _verdict_short() -> String:
 	return ""
 
 
+func _draw_title() -> String:
+	# Numbered draws: the banked count doesn't include the latest one
+	# yet, so +1 (a third draw resolves the match instead of replaying).
+	var director := _director()
+	var draws := 0
+	if director != null:
+		draws = int(director.current_match().get("draws", 0))
+	return "DRAW" if draws + 1 <= 1 else "DRAW x%d" % (draws + 1)
+
+
+func _verdict_headline() -> Dictionary:
+	# Big-overlay headline for the reporting screen: the outcome first
+	# (winner + killing blow), the reporting detail beneath it.
+	var reason := str(_last_verdict.get("end_reason", ""))
+	if reason == "ko":
+		var winner_slot := str(_last_verdict.get("winner_slot", "alpha"))
+		var blow_src := str(_last_verdict.get("blow_source", ""))
+		var blow := str(BLOW_NAMES[blow_src]) if BLOW_NAMES.has(blow_src) else blow_src
+		var amt := float(_last_verdict.get("blow_amount", 0.0))
+		var detail := "%s %s" % [blow, ("%.1f" % amt)] if amt > 0.0 else blow
+		return {"text": "%s WINS BY KO" % _slot_name(winner_slot),
+			"sub": "Killing blow: %s" % detail,
+			"color": Color(1.0, 0.55, 0.3) if winner_slot == "alpha" else Color(0.4, 0.75, 1.0)}
+	if reason == "time":
+		return {"text": "TIME - SERVER DECIDES",
+			"sub": "Damage %.0f-%.0f" % [float(_last_verdict.get("dmg_a", 0.0)),
+				float(_last_verdict.get("dmg_b", 0.0))],
+			"color": Color(0.78, 0.78, 0.85)}
+	return {"text": _draw_title(),
+		"sub": "Stalemate - nobody bled",
+		"color": Color(0.78, 0.78, 0.82)}
+
+
 func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	# Single choke point for tournament battle reports: stamps the same
 	# (tournament, match, battle) id used as the server's idempotency key,
@@ -2207,13 +2240,17 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
 	_arm_seq("battle")
-	var kind := "DRAW - " if draw else ""
-	_show_loading("%s %sREPORTING" % [tourney_match_label, kind],
-		"Battle %s sent, waiting for server...\n%s" % [_seq_battle_id,
-		str(_last_verdict.get("line", ""))])
+	# Verdict headlines big on top (winner + killing blow); the
+	# reporting detail sits beneath in smaller type.
+	var head := _verdict_headline()
+	_show_loading(str(head.get("text", "")),
+		"%s\n%s - battle %s sent, waiting for server..." % [
+		str(head.get("sub", "")), tourney_match_label, _seq_battle_id],
+		head.get("color", Color(0.85, 0.85, 0.9)))
 	if is_instance_valid(status_label):
-		status_label.text = "%s %sREPORTING - %s" % [tourney_match_label, kind,
-			str(_last_verdict.get("line", ""))]
+		status_label.text = "%s - %s (%s REPORTING)" % [
+			str(head.get("text", "")), str(head.get("sub", "")),
+			tourney_match_label]
 
 func _handle_draw() -> void:
 	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
@@ -2656,10 +2693,7 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	if battle_winner == "alpha" or battle_winner == "beta":
 		_record_win(battle_winner)
 	if battle_winner == "draw":
-		# Numbered draws: the banked count doesn't include this one yet,
-		# so +1 (a third draw resolves the match instead of replaying).
-		var draw_no := int(director.current_match().get("draws", 0)) + 1
-		var draw_title := "DRAW" if draw_no <= 1 else "DRAW x%d" % draw_no
+		var draw_title := _draw_title()
 		if is_instance_valid(status_label):
 			status_label.text = "%s %s - REPLAYING" % [tourney_match_label, draw_title]
 		_begin_landing("")
