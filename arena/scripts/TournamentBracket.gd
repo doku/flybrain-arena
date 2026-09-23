@@ -294,7 +294,7 @@ func _make_header(x: String, text: String) -> Label:
 func _card_panel(border: Color, border_w: int) -> PanelContainer:
 	var pc := PanelContainer.new()
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.08, 0.08, 0.11, 0.96)
+	sb.bg_color = Color(0.08, 0.08, 0.11, 0.88)
 	sb.border_color = border
 	sb.set_border_width_all(border_w)
 	sb.set_corner_radius_all(6)
@@ -310,28 +310,28 @@ func _card_panel(border: Color, border_w: int) -> PanelContainer:
 
 func _apply_metrics(cols: int, rows0: int) -> void:
 	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond.
-	# Compact CARD_H must clear the card content (~62px: 4+4 margins +
-	# header + separation + two 20px rows) or text spills into the
-	# neighbor card. Compact pitch is 78px/card, so a size-8 first
-	# round (4 cards) fits in 356px without scrolling.
+	# Compact CARD_H must clear the card content (~56px: 3+3 margins +
+	# header + separation + two 18px rows) or text spills into the
+	# neighbor card. Compact pitch is 70px/card, so a size-8 first
+	# round (4 cards) fits in 324px without scrolling.
 	if cols > 3 or rows0 > 3:
-		CARD_W = 120.0
-		CARD_H = 72.0
-		GAP_X = 22.0
+		CARD_W = 108.0
+		CARD_H = 64.0
+		GAP_X = 16.0
 		ROW_GAP = 6.0
-		CARD_PAD = 4.0
+		CARD_PAD = 3.0
 		CARD_SEP = 1
-		ROW_H = 20.0
+		ROW_H = 18.0
 		FS_COL_HEAD = 12
 		FS_CARD_HEAD = 10
-		FS_ROW = 11
+		FS_ROW = 10
 		FS_BIG_NAME = 14
 	else:
-		CARD_W = 210.0
-		CARD_H = 92.0
-		GAP_X = 52.0
+		CARD_W = 190.0
+		CARD_H = 88.0
+		GAP_X = 40.0
 		ROW_GAP = 16.0
-		CARD_PAD = 6.0
+		CARD_PAD = 5.0
 		CARD_SEP = 2
 		ROW_H = 24.0
 		FS_COL_HEAD = 15

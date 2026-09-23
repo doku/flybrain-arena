@@ -222,8 +222,8 @@ func test_tba_templates() -> void:
 	_check((D.tourney["rounds"] as Array).size() == before,
 		"TBA synthesis does not mutate tourney rounds")
 	# Full template, compact metrics (4 cols > 3): 3 main cols + champion.
-	# width = SIDE_PAD + 3*(120+22) + 120 + SIDE_PAD = 570.
-	_check(absf(R.custom_minimum_size.x - 570.0) < 0.01,
+	# width = SIDE_PAD + 3*(108+16) + 108 + SIDE_PAD = 504.
+	_check(absf(R.custom_minimum_size.x - 504.0) < 0.01,
 		"size-8 fresh bracket renders full 3-round template, compact")
 	R.queue_free()
 
@@ -261,9 +261,9 @@ func test_focus_losers() -> void:
 	var lf := int(D.tourney.get("losers_start_round", -1))
 	R.render_bracket(D.tourney, lf, 0)
 	# Losers-only (2 cols + final) at normal metrics (3 cols, 2 rows):
-	# 12 + 2*(210+52) + 210 + 12 = 758.
-	_check(absf(R.custom_minimum_size.x - 758.0) < 0.01,
-		"focus mode renders losers-only at 758px")
+	# 12 + 2*(190+40) + 190 + 12 = 674.
+	_check(absf(R.custom_minimum_size.x - 674.0) < 0.01,
+		"focus mode renders losers-only at 674px")
 	var seen_losers := false
 	var seen_main := false
 	var bad := ["ROUND 1", "ROUND 2", "SEMIFINAL", "FINAL", "CHAMPION"]
@@ -285,9 +285,9 @@ func test_bracket_views() -> void:
 	D.build_bracket(_ids(brains), 8, 1, 0.5, 40.0, false, brains, false, true)
 	# Fresh size-8 main page: compact pitch fits round 0 outright.
 	R.render_bracket(D.tourney, 0, 0, 1)
-	_check(absf(R.custom_minimum_size.y - 356.0) < 0.01,
-		"compact size-8 main view is 356px tall (no vertical scroll)")
-	_check(absf(R.custom_minimum_size.x - 570.0) < 0.01,
+	_check(absf(R.custom_minimum_size.y - 324.0) < 0.01,
+		"compact size-8 main view is 324px tall (no vertical scroll)")
+	_check(absf(R.custom_minimum_size.x - 504.0) < 0.01,
 		"main-only view keeps 3 cols + champion")
 	# No consolation rounds yet: placeholder, not a crash.
 	R.render_bracket(D.tourney, 0, 0, 2)

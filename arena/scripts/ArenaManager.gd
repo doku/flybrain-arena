@@ -472,8 +472,10 @@ func _menu_bar_button(text: String, tip: String) -> Button:
 	return b
 
 func _build_bracket_overlay() -> void:
-	# Full-screen bracket graph: title + scrollable TournamentBracket +
-	# close. Hidden by default; auto-shown when a match completes.
+	# Edge-to-edge bracket graph: title + scrollable TournamentBracket +
+	# close. The panel fills the whole viewport (no side margins) with a
+	# slightly translucent backdrop so the arena stays faintly visible.
+	# Hidden by default; auto-shown when a match completes.
 	var hud: CanvasLayer = $HUD
 	bracket_overlay = Control.new()
 	bracket_overlay.name = "BracketOverlay"
@@ -482,35 +484,29 @@ func _build_bracket_overlay() -> void:
 	bracket_overlay.visible = false
 	hud.add_child(bracket_overlay)
 	var dim := ColorRect.new()
-	dim.color = Color(0.02, 0.02, 0.05, 0.72)
+	dim.color = Color(0.02, 0.02, 0.05, 0.55)
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bracket_overlay.add_child(dim)
-	var center := CenterContainer.new()
-	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	bracket_overlay.add_child(center)
 	var panel := PanelContainer.new()
-	# Near-fullscreen at the 1280x720 canvas (40px side / 35px vertical
-	# margins) so the bracket gets maximum room before scrolling.
-	panel.custom_minimum_size = Vector2(1200, 650)
+	panel.set_anchors_preset(Control.PRESET_FULL_RECT)
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.06, 0.06, 0.09, 0.98)
+	sb.bg_color = Color(0.06, 0.06, 0.09, 0.9)
 	sb.border_color = Color(0.4, 0.4, 0.46)
-	sb.set_border_width_all(2)
-	sb.set_corner_radius_all(8)
-	sb.content_margin_left = 12.0
-	sb.content_margin_right = 12.0
-	sb.content_margin_top = 10.0
-	sb.content_margin_bottom = 10.0
+	sb.set_border_width_all(1)
+	sb.content_margin_left = 6.0
+	sb.content_margin_right = 6.0
+	sb.content_margin_top = 4.0
+	sb.content_margin_bottom = 4.0
 	panel.add_theme_stylebox_override("panel", sb)
-	center.add_child(panel)
+	bracket_overlay.add_child(panel)
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 8)
+	vb.add_theme_constant_override("separation", 4)
 	panel.add_child(vb)
 	bracket_title = Label.new()
 	bracket_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	bracket_title.add_theme_font_size_override("font_size", 22)
+	bracket_title.add_theme_font_size_override("font_size", 18)
 	vb.add_child(bracket_title)
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -2657,10 +2653,14 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	if battle_winner == "alpha" or battle_winner == "beta":
 		_record_win(battle_winner)
 	if battle_winner == "draw":
+		# Numbered draws: the banked count doesn't include this one yet,
+		# so +1 (a third draw resolves the match instead of replaying).
+		var draw_no := int(director.current_match().get("draws", 0)) + 1
+		var draw_title := "DRAW" if draw_no <= 1 else "DRAW x%d" % draw_no
 		if is_instance_valid(status_label):
-			status_label.text = "%s DRAW - REPLAYING" % tourney_match_label
+			status_label.text = "%s %s - REPLAYING" % [tourney_match_label, draw_title]
 		_begin_landing("")
-		_show_callout("DRAW", Color(0.78, 0.78, 0.82),
+		_show_callout(draw_title, Color(0.78, 0.78, 0.82),
 			"%s STALEMATE - REPLAY" % tourney_match_label, "REMATCH", false)
 		await get_tree().create_timer(5.0).timeout
 		var draw_adv: Dictionary = director.on_battle_result("draw",
