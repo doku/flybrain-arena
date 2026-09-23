@@ -22,12 +22,35 @@ var last_sent_time: float = 0.0
 var tick_interval: float = 0.05 # 50 ms (20 Hz)
 
 func _ready() -> void:
-	var err = udp.connect_to_host(server_host, server_port)
-	if err == OK:
-		is_connected_server = true
+	if reconnect():
 		print("[BrainClient] Bound UDP to ", server_host, ":", server_port)
 	else:
-		printerr("[BrainClient] Failed to connect UDP socket: ", err)
+		printerr("[BrainClient] Failed to connect UDP socket.")
+
+
+func reconnect() -> bool:
+	# Fresh socket: on Windows a connected UDP peer poisoned by one
+	# ICMP unreachable (server restart/kill while the arena lived)
+	# fails every later send/recv until recreated. Called on any send
+	# error and before watchdog retries so the link self-heals instead
+	# of wedging at SERVER SILENT with a live server.
+	udp.close()
+	var err := udp.connect_to_host(server_host, server_port)
+	is_connected_server = err == OK
+	if not is_connected_server:
+		printerr("[BrainClient] Reconnect failed: ", err)
+	return is_connected_server
+
+
+func _send_dict(payload: Dictionary) -> void:
+	if not is_connected_server:
+		return
+	var json_data = JSON.stringify(payload).to_utf8_buffer()
+	if udp.put_packet(json_data) != OK:
+		print("[BrainClient] Send failed - reconnecting once and resending.")
+		if reconnect():
+			if udp.put_packet(json_data) != OK:
+				printerr("[BrainClient] Resend failed after reconnect.")
 
 func _process(_delta: float) -> void:
 	# Poll incoming packets from brain server
@@ -56,8 +79,7 @@ func send_sensory_step(sens_alpha: Dictionary, sens_beta: Dictionary) -> void:
 		"beta": sens_beta,
 		"detail": detail_level
 	}
-	var json_data = JSON.stringify(msg).to_utf8_buffer()
-	udp.put_packet(json_data)
+	_send_dict(msg)
 
 func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "", flight_alpha: Dictionary = {}, flight_beta: Dictionary = {}, draw_penalty: bool = false, end_reason: String = "", verdict: Dictionary = {}) -> void:
 	if not is_connected_server:
@@ -77,8 +99,7 @@ func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw
 		"end_reason": end_reason,
 		"verdict": verdict
 	}
-	var json_data = JSON.stringify(msg).to_utf8_buffer()
-	udp.put_packet(json_data)
+	_send_dict(msg)
 
 func request_tournament_load(alpha_path: String, beta_path: String, tournament_id: String, match_label: String, lr_scale: float = 0.5) -> void:
 	if not is_connected_server:
@@ -91,40 +112,39 @@ func request_tournament_load(alpha_path: String, beta_path: String, tournament_i
 		"match": match_label,
 		"lr_scale": lr_scale
 	}
-	udp.put_packet(JSON.stringify(msg).to_utf8_buffer())
+	_send_dict(msg)
 
 func request_raster_map(side: String, pool: String) -> void:
 	if not is_connected_server:
 		return
-	udp.put_packet(JSON.stringify(
-		{"type": "raster_map", "side": side, "pool": pool}).to_utf8_buffer())
+	_send_dict({"type": "raster_map", "side": side, "pool": pool})
 
 
 func request_match_reset(match_label: String = "") -> void:
 	if not is_connected_server:
 		return
-	udp.put_packet(JSON.stringify({"type": "match_reset", "match": match_label}).to_utf8_buffer())
+	_send_dict({"type": "match_reset", "match": match_label})
 
 func request_free_mode() -> void:
 	if not is_connected_server:
 		return
-	udp.put_packet(JSON.stringify({"type": "free_mode"}).to_utf8_buffer())
+	_send_dict({"type": "free_mode"})
 
 func request_tournament_match(match_winner: String, tournament_id: String = "", match_label: String = "") -> void:
 	if not is_connected_server:
 		return
-	udp.put_packet(JSON.stringify({"type": "tournament_match", "match_winner": match_winner, "tournament_id": tournament_id, "match": match_label}).to_utf8_buffer())
+	_send_dict({"type": "tournament_match", "match_winner": match_winner, "tournament_id": tournament_id, "match": match_label})
 
 func request_tournament_end(champion: String) -> void:
 	if not is_connected_server:
 		return
-	udp.put_packet(JSON.stringify({"type": "tournament_end", "champion": champion}).to_utf8_buffer())
+	_send_dict({"type": "tournament_end", "champion": champion})
 
 func request_merge() -> void:
 	if not is_connected_server:
 		return
 	var msg = { "type": "merge" }
-	udp.put_packet(JSON.stringify(msg).to_utf8_buffer())
+	_send_dict(msg)
 
 func request_restart(stats_alpha: Dictionary, stats_beta: Dictionary) -> void:
 	if not is_connected_server:
@@ -134,7 +154,7 @@ func request_restart(stats_alpha: Dictionary, stats_beta: Dictionary) -> void:
 		"stats_alpha": stats_alpha,
 		"stats_beta": stats_beta
 	}
-	udp.put_packet(JSON.stringify(msg).to_utf8_buffer())
+	_send_dict(msg)
 
 func _handle_server_response(data: Dictionary) -> void:
 	var status = data.get("status", "")
