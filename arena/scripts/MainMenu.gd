@@ -596,7 +596,7 @@ func _build_tourney_column() -> VBoxContainer:
 	pl.add_theme_font_size_override("font_size", 13)
 	c.add_child(pl)
 	player_list = ItemList.new()
-	player_list.custom_minimum_size = Vector2(280, 150)
+	player_list.custom_minimum_size = Vector2(320, 150)
 	player_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	player_list.select_mode = ItemList.SELECT_MULTI
 	player_list.allow_rmb_select = true
@@ -665,7 +665,9 @@ func refresh_vault() -> void:
 			int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
 			int(r.get("elo", 1200.0)), score]
 		brain_list.add_item(line)
-		player_list.add_item("%s" % str(b.get("name", "?")))
+		var brec: Dictionary = b.get("record", {})
+		player_list.add_item("%s  [elo %d]" % [str(b.get("name", "?")),
+			int(brec.get("elo", 1200.0))])
 	if not brains.is_empty() and selected_brain.is_empty():
 		brain_list.select(0)
 		_on_brain_selected(0)
