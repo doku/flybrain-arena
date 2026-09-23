@@ -1567,7 +1567,9 @@ func _make_bv_flow(hud: CanvasLayer, vname: String, anchor: Control.LayoutPreset
 	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
 	view.offset_left = 204.0 if left_side else -560.0
 	view.offset_right = 560.0 if left_side else -204.0
-	view.offset_top = -520.0
+	# Same top as the bar panels: every brainview layer starts just
+	# below the PiP eye views (raster copies these offsets).
+	view.offset_top = -488.0
 	view.offset_bottom = -60.0
 	view.tint = tint
 	view.mouse_filter = Control.MOUSE_FILTER_STOP
@@ -1656,12 +1658,13 @@ func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPrese
 	var panel := VBoxContainer.new()
 	panel.name = pname
 	panel.set_anchors_preset(anchor)
-	# Bottom-anchored: sits above the menu bar, clear of the top-corner
-	# PiP eye views on every resolution.
+	# Bottom-anchored: sits above the menu bar with its top tucked just
+	# below the top-corner PiP eye views (feat text ends ~226px; panel
+	# top lands ~232px at 720p).
 	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
 	panel.offset_left = 8.0 if left_side else -196.0
 	panel.offset_right = 196.0 if left_side else -8.0
-	panel.offset_top = -470.0
+	panel.offset_top = -488.0
 	panel.offset_bottom = -60.0
 	panel.add_theme_constant_override("separation", 1)
 	hud.add_child(panel)
