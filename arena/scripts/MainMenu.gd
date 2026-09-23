@@ -593,8 +593,8 @@ func _build_tourney_column() -> VBoxContainer:
 	tourney_round_time = _spin("Battle time (s)", c, 10.0, 120.0, 5.0, 40.0)
 	tourney_random = CheckButton.new()
 	tourney_random.text = "Random draw"
-	tourney_random.tooltip_text = "Shuffle entrants instead of strength seeding (byes fall luck-of-the-draw)."
-	tourney_random.button_pressed = true
+	tourney_random.tooltip_text = "ON = shuffle entrants (byes fall luck-of-the-draw). OFF = ELO strength seeding: top seeds take byes, strongest meets weakest."
+	tourney_random.button_pressed = false
 	c.add_child(tourney_random)
 	tourney_consolation = CheckButton.new()
 	tourney_consolation.text = "Losers bracket (find last place)"

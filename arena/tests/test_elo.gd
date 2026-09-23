@@ -120,6 +120,38 @@ func test_strength_elo_primary() -> void:
 	_check(d._player_elo("ghost") == 1200.0, "unknown id defaults 1200")
 
 
+func test_seeding_pairs_strong_vs_weak() -> void:
+	var d = _new_director()
+	# Distinct ELOs, deliberately unordered input: non-random builds
+	# must pair 1v8, 4v5, 2v7, 3v6 by ELO rank (seed order for size 8
+	# is [1,8,4,5,2,7,3,6]).
+	var brains := [_fake_elo("f1", 1100.0), _fake_elo("f2", 1500.0),
+		_fake_elo("f3", 1200.0), _fake_elo("f4", 1750.0),
+		_fake_elo("f5", 900.0), _fake_elo("f6", 1300.0),
+		_fake_elo("f7", 1600.0), _fake_elo("f8", 1400.0)]
+	# By ELO: f4 1750, f7 1600, f2 1500, f8 1400, f6 1300, f3 1200,
+	# f1 1100, f5 900.
+	var res: Dictionary = d.build_bracket(_ids(brains), 8, 1, 0.5, 40.0,
+		false, brains, false, false)
+	_check(bool(res.get("ok", false)), "size-8 seeded bracket builds")
+	_check(str(d.tourney.get("seeding", "")) == "strength", "non-random build marked strength")
+	var r0: Array = (d.tourney["rounds"] as Array)[0]
+	var pairs: Array = []
+	for m in r0:
+		pairs.append([str((m as Dictionary).get("a_id", "")),
+			str((m as Dictionary).get("b_id", ""))])
+	_check(pairs[0] == ["f4", "f5"], "M1 pairs strongest vs weakest")
+	_check(pairs[1] == ["f8", "f6"], "M2 pairs 4th vs 5th")
+	_check(pairs[2] == ["f7", "f1"], "M3 pairs 2nd vs 7th")
+	_check(pairs[3] == ["f2", "f3"], "M4 pairs 3rd vs 6th")
+	# Random draw keeps the flag honest (order shuffled, marked random).
+	var d2 = _new_director()
+	var res2: Dictionary = d2.build_bracket(_ids(brains), 8, 1, 0.5, 40.0,
+		false, brains, true, false)
+	_check(bool(res2.get("ok", false)), "random bracket builds")
+	_check(str(d2.tourney.get("seeding", "")) == "random", "random build marked random")
+
+
 func _cleanup() -> void:
 	if DirAccess.dir_exists_absolute("user://test_elo"):
 		for f in DirAccess.get_files_at("user://test_elo"):
@@ -139,6 +171,7 @@ func _initialize() -> void:
 	test_draw3_tie_goes_alpha()
 	test_draw3_missing_elo_defaults()
 	test_strength_elo_primary()
+	test_seeding_pairs_strong_vs_weak()
 	_cleanup()
 	if failures == 0:
 		print("ALL ELO TESTS PASSED")
