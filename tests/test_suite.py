@@ -4340,5 +4340,68 @@ class TestBattleTransaction(unittest.TestCase):
             os.remove(os.path.join(os.path.dirname(p), f))
 
 
+class TestSeizureDetection(unittest.TestCase):
+    def _fly(self, yaw_rate=0.0):
+        import types
+        return types.SimpleNamespace(
+            yaw_rate=yaw_rate, seizure_time=0.0, seizure_clear=0.0,
+            seizing=False, seizure_events=0)
+
+    def test_quiet_flight_never_triggers(self):
+        from train_homing import update_seizure
+        f = self._fly(yaw_rate=0.3)
+        for _ in range(100):  # 5 s of moderate steering
+            seizing, onset = update_seizure(f, 0.5, dt=0.05)
+            self.assertFalse(seizing)
+            self.assertFalse(onset)
+        self.assertEqual(f.seizure_events, 0)
+
+    def test_saturated_but_stuck_is_not_seizure(self):
+        # Firewall yaw against a tree: command pinned, body not turning.
+        from train_homing import update_seizure
+        f = self._fly(yaw_rate=0.0)
+        for _ in range(100):
+            seizing, _onset = update_seizure(f, 1.0, dt=0.05)
+            self.assertFalse(seizing)
+        self.assertEqual(f.seizure_events, 0)
+
+    def test_sustained_spin_triggers_with_onset_once(self):
+        from train_homing import update_seizure, SEIZURE_WINDOW
+        f = self._fly(yaw_rate=3.0)
+        steps = int(SEIZURE_WINDOW / 0.05)
+        for _ in range(steps - 1):
+            seizing, _onset = update_seizure(f, 1.0, dt=0.05)
+            self.assertFalse(seizing)
+        seizing, onset = update_seizure(f, 1.0, dt=0.05)
+        self.assertTrue(seizing)
+        self.assertTrue(onset)
+        self.assertEqual(f.seizure_events, 1)
+        seizing, onset = update_seizure(f, 1.0, dt=0.05)
+        self.assertTrue(seizing)
+        self.assertFalse(onset)
+        self.assertEqual(f.seizure_events, 1)
+
+    def test_hysteresis_and_recovery(self):
+        from train_homing import update_seizure, SEIZURE_RECOVER
+        f = self._fly(yaw_rate=3.0)
+        for _ in range(40):  # 2 s spin -> seizing
+            update_seizure(f, 1.0, dt=0.05)
+        self.assertTrue(f.seizing)
+        f.yaw_rate = 0.0  # brief pause under the recover window
+        for _ in range(int(SEIZURE_RECOVER / 0.05) - 4):
+            seizing, _onset = update_seizure(f, 0.0, dt=0.05)
+            self.assertTrue(seizing)
+        for _ in range(4):  # full clear second resets the accumulator
+            seizing, _onset = update_seizure(f, 0.0, dt=0.05)
+        self.assertFalse(seizing)
+        self.assertEqual(f.seizure_time, 0.0)
+
+    def test_drain_is_a_slow_bleed(self):
+        from train_homing import SEIZURE_DRAIN
+        self.assertLessEqual(SEIZURE_DRAIN, 5.0)
+        # Full health survives 10 s of continuous seizure.
+        self.assertGreater(100.0 - SEIZURE_DRAIN * 10.0, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

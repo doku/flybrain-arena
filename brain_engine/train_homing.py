@@ -131,6 +131,11 @@ class KinematicFly:
         self.scent_prev_smooth = -1.0
         self.scent_lost_time = 0.0
         self.scent_cast_phase = 0.0
+        # Seizure state (behavioral detector: saturated yaw + spin).
+        self.seizure_time = 0.0
+        self.seizure_clear = 0.0
+        self.seizing = False
+        self.seizure_events = 0
         # Crosswind gusts: the kinematic fly moves along its nose, so
         # without gusts lateral flow would stay exactly zero and drift
         # behavior could only ever learn live in the arena.
@@ -211,6 +216,42 @@ class KinematicFly:
             if float(dist) <= self.STRIKE_REACH:
                 event = "contact"
         return event, aimed
+
+
+# Seizure detection (behavioral, motor-output level): a saturated yaw
+# command that is actually spinning the body, sustained over
+# SEIZURE_WINDOW, latches seizing and drains health in small increments.
+# Distinct from the disproven T4-recurrence hypothesis (no neural refire
+# persists tick to tick); this watches what the body does. Thresholds
+# mirror FlyPhysics.seizure_tick — keep the two in sync.
+SEIZURE_YAW_CMD = 0.85    # |yaw_torque| above this counts as saturated
+SEIZURE_YAW_RATE = 2.0    # measured |yaw_rate| (rad/s) above this = spinning
+SEIZURE_WINDOW = 1.5      # sustained seconds before onset
+SEIZURE_RECOVER = 1.0     # clear seconds before the accumulator resets
+SEIZURE_DRAIN = 3.0       # health per second while seizing (slow bleed)
+SEIZURE_DA = -0.3         # aversive pulse per step while seizing
+
+
+def update_seizure(fly, yaw_cmd, dt=0.05):
+    """Advance the seizure state machine on fly.seizure_time/_clear/
+    seizing/seizure_events. Returns (seizing, onset). Pure enough for
+    headless unit tests (needs only fly.yaw_rate refreshed)."""
+    t = float(getattr(fly, "seizure_time", 0.0))
+    c = float(getattr(fly, "seizure_clear", 0.0))
+    was = bool(getattr(fly, "seizing", False))
+    if abs(float(yaw_cmd)) > SEIZURE_YAW_CMD \
+            and abs(float(fly.yaw_rate)) > SEIZURE_YAW_RATE:
+        t += dt
+        c = 0.0
+    else:
+        c += dt
+        if c >= SEIZURE_RECOVER:
+            t = 0.0
+    seizing = t >= SEIZURE_WINDOW and c < SEIZURE_RECOVER
+    fly.seizure_time, fly.seizure_clear, fly.seizing = t, c, seizing
+    if seizing and not was:
+        fly.seizure_events = int(getattr(fly, "seizure_events", 0)) + 1
+    return seizing, (seizing and not was)
 
 
 def apply_arena_controls(fly, ctrl, senses, dist, dt=0.05):
@@ -515,7 +556,7 @@ def _school_score(entry, curriculum):
         return float(w["camp"])
     if entry.get("success", False):
         return float(w["reach"])
-    if entry.get("crashed", False):
+    if entry.get("crashed", False) or entry.get("seized_out", False):
         return 0.0
     initial = max(float(entry.get("initial_dist", 1.0)), 1e-6)
     frac = float(np.clip(float(entry.get("closed", 0.0)) / initial, 0.0, 1.0))
@@ -890,6 +931,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         strike = False
         takedown = False
         crashed = False
+        seized_out = False
+        seizure_steps = 0
+        seizure_events = 0
         close_calls = 0
         lunges = 0
         strikes = 0
@@ -960,6 +1004,29 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             # spear lunge with cooldown + extension window + contact).
             lunge_event, lunge_aimed = apply_arena_controls(
                 fly, ctrl, senses, current_dist, dt=0.05)
+
+            # 6c. Seizure watch: saturated yaw that keeps spinning the
+            # body drains health in small increments plus a mild
+            # aversive pulse (the mapping that spins gets depressed);
+            # zero health ends the episode seized-out, scoring like a
+            # crash (0.0, not a hunt).
+            seizing, onset = update_seizure(
+                fly, float(ctrl.get("yaw_torque", 0.0)), dt=0.05)
+            if onset:
+                seizure_events += 1
+                print(f"[Episode {ep:02d}/{num_episodes:02d}] "
+                      f"SEIZURE detected - draining health.")
+            if seizing:
+                seizure_steps += 1
+                fly.health -= SEIZURE_DRAIN * 0.05
+                total_da += SEIZURE_DA
+                dopamine_rl.apply_plasticity(brain, senses, ctrl,
+                                             SEIZURE_DA,
+                                             schemes=schemes,
+                                             gain_cap=0.02)
+                if fly.health <= 0.0:
+                    seized_out = True
+                    break
             # Target behavior: school mover follows its planned path
             # (camp is anchored: step() is a heartbeat no-op); legacy
             # duel keeps the constant-speed random walk.
@@ -1054,6 +1121,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                          and school_ctx["camp_bonus_paid"]),
             "upset": upset,
             "crashed": crashed,
+            "seized_out": seized_out,
+            "seizure_steps": seizure_steps,
+            "seizure_events": seizure_events,
             "enc": enc_type,
             "scenario": school_ctx["scenario"] if school_ctx is not None else enc_type,
             "close_calls": close_calls,
@@ -1064,7 +1134,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
 
         tag = ("UPSET+" if upset else "") + (
             school_ctx["scenario"] if school_ctx is not None else enc_type)
-        if crashed:
+        if seized_out:
+            status_str = "SEIZED OUT (spun down)!"
+        elif crashed:
             status_str = "CRASHED into trunk!"
         elif strike:
             status_str = "SUCCESS (SPEAR STRIKE!)"
@@ -1104,6 +1176,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         print(f"[Train:{label}] Upset recovery: {upset_ok}/{len(upset_eps)} knock-spawn episodes recovered to strike range.")
     crashes = sum(1 for r in results if r.get("crashed"))
     print(f"[Train:{label}] Tree crashes: {crashes}/{num_episodes} episodes ended in a trunk.")
+    seized = sum(1 for r in results if r.get("seized_out"))
+    seiz_steps = sum(int(r.get("seizure_steps", 0)) for r in results)
+    print(f"[Train:{label}] Seizures: {seized}/{num_episodes} episodes seized out, {seiz_steps} seizing steps total.")
     lunges_tot = sum(r.get("lunges", 0) for r in results)
     strikes_tot = sum(r.get("strikes", 0) for r in results)
     print(f"[Train:{label}] Spear lunges: {lunges_tot} triggered, {strikes_tot} contacts.")

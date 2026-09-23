@@ -34,6 +34,35 @@ var capped_time: float = 0.0
 var fly_time: float = 0.0
 var peak_speed: float = 0.0
 var speed_exploit: bool = false
+# Seizure watch (behavioral, motor-output level): a saturated yaw command
+# that keeps spinning the body, sustained over SEIZURE_WINDOW, latches
+# `seizing` and drains health in small increments until SEIZURE_RECOVER
+# of clear flight. Punishment flows through the existing KO path
+# (health -> 0 disables, rival credited). Thresholds mirror
+# train_homing.update_seizure - keep the two in sync.
+const SEIZURE_YAW_CMD := 0.85
+const SEIZURE_YAW_RATE := 2.0
+const SEIZURE_WINDOW := 1.5
+const SEIZURE_RECOVER := 1.0
+const SEIZURE_DRAIN := 3.0
+var seizure_time := 0.0
+var seizure_clear := 0.0
+var seizing := false
+var seizure_events := 0
+
+
+func seizure_tick(yaw_cmd: float, yaw_rate: float, delta: float) -> bool:
+	# State machine only (no scene reads): headless-testable. Returns
+	# the latched seizing flag; onset counted by the caller.
+	if absf(yaw_cmd) > SEIZURE_YAW_CMD and absf(yaw_rate) > SEIZURE_YAW_RATE:
+		seizure_time += delta
+		seizure_clear = 0.0
+	else:
+		seizure_clear += delta
+		if seizure_clear >= SEIZURE_RECOVER:
+			seizure_time = 0.0
+	seizing = seizure_time >= SEIZURE_WINDOW and seizure_clear < SEIZURE_RECOVER
+	return seizing
 
 # Hard altitude limits: a tipped/crippled fly can otherwise convert its huge
 # forward speed into an endless vertical climb the soft trim can't catch.
@@ -479,7 +508,10 @@ func _physics_process(delta: float) -> void:
 	var target_speed = base_speed + (max_speed - base_speed) * current_thrust * speed_multiplier
 	var forward_vec = -global_transform.basis.z
 
-	# Yaw rotation
+	# Yaw rotation (snapshot basis first: the seizure watch measures the
+	# actual turn that results, so a saturated command against a tree
+	# reads as stuck, not seizing).
+	var _pre_yaw_basis := global_transform.basis
 	rotate_y(-yaw_cmd * turn_rate * delta)
 
 	# Pitch rotation (nose up positive). Previously nothing ever commanded
@@ -499,6 +531,24 @@ func _physics_process(delta: float) -> void:
 		rotate_z(-roll_cmd * roll_rate * delta)
 		var lvl := 2.5 if absf(roll_cmd) < 0.01 else 1.0
 		_auto_level_roll(delta, lvl)
+
+	# Seizure watch: measured yaw rate over this tick vs the applied
+	# (hold-decayed) command. Onset logs once; the drain ticks down in
+	# small increments until clear flight or knockout.
+	var yaw_rate_now := 0.0
+	if delta > 0.0:
+		var _yaw_e := (_pre_yaw_basis.inverse() * global_transform.basis).get_euler()
+		yaw_rate_now = clampf(-_yaw_e.y / delta, -8.0, 8.0)
+	var _was_seizing := seizing
+	seizure_tick(yaw_cmd, yaw_rate_now, delta)
+	if seizing and not _was_seizing:
+		seizure_events += 1
+		print(fly_id, " SEIZURE detected - draining health.")
+	if seizing:
+		health -= SEIZURE_DRAIN * delta
+		if health <= 0.0 and not is_disabled:
+			inflict_lethal_strike()
+			print(fly_id, " seized out of the sky!")
 
 	# Pitch & altitude auto-trim (stay within 2m to 12m fly combat ceiling)
 	var alt = global_position.y
@@ -817,6 +867,10 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	fly_time = 0.0
 	peak_speed = 0.0
 	speed_exploit = false
+	seizure_time = 0.0
+	seizure_clear = 0.0
+	seizing = false
+	seizure_events = 0
 	basis_init = false
 	prev_rival_dist = spawn_pos.distance_to(rival.global_position) if is_instance_valid(rival) else 28.0
 	scent_prev_smooth = -1.0
