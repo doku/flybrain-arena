@@ -758,7 +758,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                  learning_rate=0.008, dist_gain=0.15, align_bonus=(0.5, 0.2, -0.3),
                  experiment=None, init_weights=None, progress_cb=None,
                  return_brain=False, mapping=None, yaw_bias=None, legacy=False,
-                 genome=None, curriculum=None):
+                 genome=None, curriculum=None, eval_only=False):
     global TREES
     cfg = VARIANTS.get(variant, {})
     label = cfg.get("label", variant)
@@ -1020,10 +1020,11 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 seizure_steps += 1
                 fly.health -= SEIZURE_DRAIN * 0.05
                 total_da += SEIZURE_DA
-                dopamine_rl.apply_plasticity(brain, senses, ctrl,
-                                             SEIZURE_DA,
-                                             schemes=schemes,
-                                             gain_cap=0.02)
+                if not eval_only:
+                    dopamine_rl.apply_plasticity(brain, senses, ctrl,
+                                                 SEIZURE_DA,
+                                                 schemes=schemes,
+                                                 gain_cap=0.02)
                 if fly.health <= 0.0:
                     seized_out = True
                     break
@@ -1076,8 +1077,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             # branches learn only on brains generated from those schemes).
             # Micro-gain cap: 6000 calls/session must stay micro, or high
             # learning rates compound into mid-episode runaway.
-            dopamine_rl.apply_plasticity(brain, senses, ctrl, da,
-                                         schemes=schemes, gain_cap=0.02)
+            if not eval_only:
+                dopamine_rl.apply_plasticity(brain, senses, ctrl, da,
+                                             schemes=schemes, gain_cap=0.02)
 
             # 8. Trunk collision: same tiers as the arena. Two fast slams kill.
             # Crashes cost health plus a full aversive pulse (depress the
@@ -1093,8 +1095,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 if fly.health > 0.0:
                     da_crash = -2.0
                     total_da += da_crash
-                    dopamine_rl.apply_plasticity(brain, senses, ctrl, da_crash,
-                                                 schemes=schemes, gain_cap=0.02)
+                    if not eval_only:
+                        dopamine_rl.apply_plasticity(brain, senses, ctrl, da_crash,
+                                                     schemes=schemes, gain_cap=0.02)
                 else:
                     crashed = True
                     break
@@ -1153,18 +1156,25 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         # to the reference wiring (replaces the old global-mean guard,
         # which allowed localized runaway in frequently-scaled rows:
         # sensory efferents were measured at 100x base). Skipped for
-        # legacy brains, whose regime never had it.
-        dopamine_rl.pin_gains(brain, legacy=legacy)
+        # legacy brains, whose regime never had it. Skipped entirely in
+        # eval mode (scoring must not move weights).
+        if not eval_only:
+            dopamine_rl.pin_gains(brain, legacy=legacy)
         if progress_cb is not None:
             try:
                 progress_cb(ep, num_episodes)
             except Exception:
                 pass
 
-    # Save the trained variant weights
-    save_path = os.path.join(CHECKPOINTS_DIR, save_name)
-    np.savez_compressed(save_path, weights=brain.weights)
-    print(f"\n[Train:{label}] Training complete! Saved {label} weights to {save_path}")
+    # Save the trained variant weights (eval mode scores without
+    # touching weights or disk: no checkpoint, save_path None).
+    if eval_only:
+        save_path = None
+        print(f"\n[Train:{label}] Eval complete (no learning, no checkpoint).")
+    else:
+        save_path = os.path.join(CHECKPOINTS_DIR, save_name)
+        np.savez_compressed(save_path, weights=brain.weights)
+        print(f"\n[Train:{label}] Training complete! Saved {label} weights to {save_path}")
 
     # Summary statistics
     successes = sum(1 for r in results if r["success"])

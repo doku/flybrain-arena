@@ -3315,6 +3315,28 @@ class TestRetinaVision(unittest.TestCase):
         self.assertEqual(summary["episodes"], 3)
         self.assertGreater(summary["avg_closed"], 5.0)
 
+    def test_eval_only_scores_without_touching_weights(self):
+        # Pre-training score probe: 2 school episodes, plasticity and
+        # pinning disabled; returned weights must equal the reference
+        # build bit-for-bit, and the summary must carry a score.
+        from train_homing import (run_training, experiment_arrays,
+                                  load_or_build_csr)
+        from connectome_loader import load_or_extract_populations
+        csr = load_or_build_csr()
+        pops = load_or_extract_populations()
+        _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+        start = np.ascontiguousarray(np.asarray(wbasis, dtype=np.float32))
+        _save, w_out, summary = run_training(
+            num_episodes=2, variant="custom", seed=11,
+            target_evasion=0.2, experiment="retina_wide", mapping="retina",
+            init_weights=start.copy(), curriculum={},
+            return_brain=True, eval_only=True)
+        self.assertIsNone(_save)
+        np.testing.assert_array_equal(w_out, start)
+        self.assertEqual(summary["episodes"], 2)
+        self.assertIn("score", summary)
+        self.assertIn("avg_score", summary)
+
     def test_sector_wood_drives_lplc2(self):
         enc = SensoryEncoder(self.pops, mapping="retina")
         lplc2_l = set(self.pops["visual_lplc2"]["left"])
