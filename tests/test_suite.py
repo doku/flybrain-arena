@@ -4369,6 +4369,56 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(body2["verdict"], {})
         self.assertIn("alpha wins", body2["report"])
 
+    def test_free_duplicate_no_readvance(self):
+        import shutil
+        import tempfile
+        from evolution_engine import EvolutionManager
+        self.srv._last_free_verdict = {"key": None, "result": None}
+
+        class _FakeSock:
+            def __init__(self):
+                self.sent = []
+            def sendto(self, data, addr):
+                self.sent.append(json.loads(data.decode("utf-8")))
+
+        class _FakeBrain:
+            def __init__(self, w):
+                self.weights = w
+            def reset_state(self):
+                pass
+            def mutate_weights(self, idx, mutation_rate=0.08, sigma=0.15):
+                self.weights = self.weights + 1.0
+
+        ckdir = tempfile.mkdtemp(prefix="free_evo_")
+        try:
+            evo = EvolutionManager(checkpoints_dir=ckdir)
+            ba = _FakeBrain(np.arange(8, dtype=np.float32))
+            bb = _FakeBrain(-np.arange(8, dtype=np.float32))
+            sock = _FakeSock()
+            r1 = self.srv._handle_free_round_over(
+                sock, ("127.0.0.1", 1), {}, evo, ba, bb,
+                "alpha", 5.0, 4.0, "FREE-1", [])
+            self.assertEqual(r1["status"], "generation_advanced")
+            self.assertEqual(r1["new_generation"], 2)
+            self.assertEqual(evo.generation, 2)
+            wb = bb.weights.copy()
+            # Watchdog retry, same id: resend, no second advance.
+            r2 = self.srv._handle_free_round_over(
+                sock, ("127.0.0.1", 1), {}, evo, ba, bb,
+                "alpha", 5.0, 4.0, "FREE-1", [])
+            self.assertEqual(evo.generation, 2)
+            self.assertEqual(r2, r1)
+            np.testing.assert_array_equal(bb.weights, wb)
+            # Next battle, new id: advances exactly once.
+            r3 = self.srv._handle_free_round_over(
+                sock, ("127.0.0.1", 1), {}, evo, ba, bb,
+                "beta", 4.0, 6.0, "FREE-2", [])
+            self.assertEqual(r3["new_generation"], 3)
+            self.assertEqual(len(sock.sent), 3)
+        finally:
+            shutil.rmtree(ckdir, ignore_errors=True)
+            self.srv._last_free_verdict = {"key": None, "result": None}
+
     def test_corrupt_journal_quarantined(self):
         p = self.srv._pending_battle_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)

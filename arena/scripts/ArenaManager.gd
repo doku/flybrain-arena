@@ -205,7 +205,11 @@ var _seq_retried: bool = false
 var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
 const SEQ_TIMEOUT_MSEC: int = 30000
-const SEQ_BATTLE_TIMEOUT_MSEC: int = 30000
+# Battle reports routinely take ~60 s (dopamine + gain pinning over 25M
+# synapses, then two ~100 MB vault writes + journal fsync). A 30 s
+# watchdog fired on EVERY battle and doubled server work with a retry
+# that always lost the race. 90 s still fails loud on real stalls.
+const SEQ_BATTLE_TIMEOUT_MSEC: int = 90000
 # Id for the in-flight battle (match + battle number). Echoed by the
 # server for log correlation AND the idempotency key for safe retries.
 var _seq_battle_id: String = ""
@@ -358,6 +362,7 @@ func _ready() -> void:
 		# Classic free battle: make sure the server left any tournament /
 		# quick brains behind and restored the boot variants.
 		_build_menu_bar(false)
+		print("[Arena] Requesting free_mode (no director tournament).")
 		brain_client.request_free_mode()
 		_reset_round()
 
@@ -2621,7 +2626,11 @@ func _end_round() -> void:
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
 	_last_verdict = _compose_verdict(false)
-	brain_client.send_round_over(stats_alpha, stats_beta, false, "", "", "", fa, fb,
+	# Free battles carry a unique id (no vault records to key on, so the
+	# server dedups on this): a lost reply is simply lost, but a retry
+	# can never advance two generations.
+	var free_id := "FREE-%d" % Time.get_ticks_msec()
+	brain_client.send_round_over(stats_alpha, stats_beta, false, free_id, "", "", fa, fb,
 		false, str(_last_verdict.get("end_reason", "")), _last_verdict)
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
@@ -3606,6 +3615,18 @@ func _slot_of(brain_id: String) -> String:
 	return "alpha"
 
 func _on_generation_advanced(new_gen: int, winner: String) -> void:
+	if tournament_active:
+		# Wrong-mode reply mid-tournament (server lost tournament state:
+		# restart, or a stray free_mode): NEVER self-advance here. The old
+		# code reset + refought the same battle id, multi-banking one
+		# fight into many generations. Hold the battle watchdog instead;
+		# if the real verdict never comes it fails loud (QUIT TO MENU +
+		# RESUME re-sends tournament_load, which heals the server).
+		print("[Arena] Ignoring generation_advanced during tournament ",
+			"(server desync, would-be gen ", new_gen, ")")
+		if is_instance_valid(status_label):
+			status_label.text = "SERVER DESYNC - QUIT TO MENU + RESUME TO RELOAD BRAINS"
+		return
 	print("[Arena] Champion: ", winner.to_upper(), "! Evolving Generation ", new_gen, "...")
 	current_generation = new_gen
 	_record_win(winner)

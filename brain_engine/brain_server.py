@@ -129,6 +129,43 @@ def _spike_stats(spikes, pops, pool_idx=None, detail=0):
     return out
 
 
+# Last free-battle verdict (in-memory only): free round_overs carry
+# unique battle ids, so a watchdog retry resends the stored verdict
+# instead of advancing a second generation. Tournament battles use the
+# journaled verdict on disk; free battles bank no vault records, so
+# memory suffices (a crash loses the free session's brains anyway).
+_last_free_verdict = {"key": None, "result": None}
+
+
+def _handle_free_round_over(sock, client_addr, msg, evo_mgr,
+                            brain_alpha, brain_beta, winner,
+                            fit_a, fit_b, battle_id, target_pathways):
+    """Free-battle verdict: dopamine already applied by the caller;
+    advances one generation and replies. A repeated battle id resends
+    the stored verdict without re-advancing. Returns the reply dict."""
+    global _last_free_verdict
+    if battle_id and battle_id == _last_free_verdict.get("key"):
+        resp = _last_free_verdict["result"]
+        print(f"[Server] Duplicate free {battle_id}: resending stored "
+              f"verdict, no re-advance.", flush=True)
+        try:
+            sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+        except OSError as e:
+            print(f"[Server] resend failed: {e}", flush=True)
+        return resp
+    evo_mgr.advance_generation(brain_alpha, brain_beta, winner,
+                               target_pathways)
+    resp = {
+        "status": "generation_advanced",
+        "new_generation": evo_mgr.generation,
+        "previous_winner": winner,
+    }
+    if battle_id:
+        _last_free_verdict = {"key": battle_id, "result": dict(resp)}
+    sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+    return resp
+
+
 def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
                                    tourney_a, tourney_b, tourney_tag,
                                    tournament_lr_scale, pulse, tourney_note,
@@ -776,6 +813,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     stats_a = msg.get("stats_alpha", {})
                     stats_b = msg.get("stats_beta", {})
                     battle_id = str(msg.get("battle_id", ""))
+                    t_round = time.perf_counter()
+                    if battle_id and not tournament_mode:
+                        # Tournament-shaped report with no tournament
+                        # loaded (server restarted, or the arena sent
+                        # free_mode mid-event): banking as free, but LOUD,
+                        # so the arena log explains the desync instead of
+                        # silently evolving boot brains. Arena heals via
+                        # QUIT TO MENU + RESUME (re-sends tournament_load).
+                        print(f"[Server] WARNING: tournament-shaped report "
+                              f"{battle_id} while in FREE mode "
+                              f"({tourney_note()}). Banking as free; arena "
+                              f"should QUIT TO MENU + RESUME to reload.",
+                              flush=True)
                     print(f"[Server] round_over received id={battle_id or '?'} "
                           f"({tourney_note()}) draw={bool(msg.get('arena_draw', False))} "
                           f"end={str(msg.get('end_reason', '') or '?')}",
@@ -858,6 +908,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             arena_draw=bool(msg.get("arena_draw", False)))
                     finally:
                         dopamine_rl.lr = base_lr
+                    print(f"[Server] battle {battle_id or '?'}: dopamine+pin "
+                          f"{time.perf_counter() - t_round:.1f}s (vault save next)",
+                          flush=True)
                     if tournament_mode:
                         _handle_tournament_round_over(
                             sock, client_addr, msg, winner, fit_a, fit_b,
@@ -865,14 +918,10 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             tournament_lr_scale, pulse, tourney_note,
                             battle_id, battle_key)
                         continue
-                    evo_mgr.advance_generation(brain_alpha, brain_beta, winner, target_pathways)
-
-                    resp = {
-                        "status": "generation_advanced",
-                        "new_generation": evo_mgr.generation,
-                        "previous_winner": winner
-                    }
-                    sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+                    _handle_free_round_over(
+                        sock, client_addr, msg, evo_mgr,
+                        brain_alpha, brain_beta, winner, fit_a, fit_b,
+                        battle_id, target_pathways)
                 except Exception as e:
                     if original_weights is not None and not os.path.exists(_pending_battle_path()):
                         brain_alpha.weights, brain_beta.weights = original_weights
@@ -965,6 +1014,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # (full objects: a tournament brain may carry a different
                 # wiring, so restoring weights alone would corrupt the shape).
                 if tournament_mode:
+                    print(f"[Server] free_mode: leaving tournament "
+                          f"({tourney_note()}), boot brains restored.",
+                          flush=True)
                     tournament_mode = False
                     brain_alpha = FlyBrain(boot_struct[0], boot_struct[1],
                                            boot_weights_a.copy())
