@@ -59,7 +59,7 @@ func send_sensory_step(sens_alpha: Dictionary, sens_beta: Dictionary) -> void:
 	var json_data = JSON.stringify(msg).to_utf8_buffer()
 	udp.put_packet(json_data)
 
-func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "", flight_alpha: Dictionary = {}, flight_beta: Dictionary = {}) -> void:
+func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw: bool = false, battle_id: String = "", tournament_id: String = "", match_label: String = "", flight_alpha: Dictionary = {}, flight_beta: Dictionary = {}, draw_penalty: bool = false) -> void:
 	if not is_connected_server:
 		return
 
@@ -72,7 +72,8 @@ func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw
 		"tournament_id": tournament_id,
 		"match": match_label,
 		"flight_alpha": flight_alpha,
-		"flight_beta": flight_beta
+		"flight_beta": flight_beta,
+		"draw_penalty": draw_penalty
 	}
 	var json_data = JSON.stringify(msg).to_utf8_buffer()
 	udp.put_packet(json_data)
@@ -107,10 +108,10 @@ func request_free_mode() -> void:
 		return
 	udp.put_packet(JSON.stringify({"type": "free_mode"}).to_utf8_buffer())
 
-func request_tournament_match(match_winner: String) -> void:
+func request_tournament_match(match_winner: String, tournament_id: String = "", match_label: String = "") -> void:
 	if not is_connected_server:
 		return
-	udp.put_packet(JSON.stringify({"type": "tournament_match", "match_winner": match_winner}).to_utf8_buffer())
+	udp.put_packet(JSON.stringify({"type": "tournament_match", "match_winner": match_winner, "tournament_id": tournament_id, "match": match_label}).to_utf8_buffer())
 
 func request_tournament_end(champion: String) -> void:
 	if not is_connected_server:

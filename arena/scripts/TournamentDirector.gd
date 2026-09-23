@@ -540,8 +540,9 @@ func size_options() -> Array:
 
 
 func _strength(rec: Dictionary) -> Array:
+	# Primary sort key is ELO (descending); win rates stay as tiebreaks.
 	var r: Dictionary = rec.get("record", {})
-	return [int(r.get("matches_won", 0)) - int(r.get("matches_lost", 0)),
+	return [float(r.get("elo", 1200.0)),
 		_match_rate(r), _battle_rate(r), rec.get("name", "")]
 
 
@@ -805,7 +806,20 @@ func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dicti
 	if winner == "draw":
 		m["draws"] = int(m.get("draws", 0)) + 1
 		if int(m.get("draws", 0)) >= 3:
+			# Third draw resolves the match outright (no infinite
+			# rematches): higher start-of-match ELO advances, ties go
+			# alpha like fitness verdicts. Both ELOs were already
+			# docked when the draw was reported.
 			sudden_death_armed = true
+			var ea := _player_elo(str(m.get("a_id", "")))
+			var eb := _player_elo(str(m.get("b_id", "")))
+			var dslot := "alpha" if ea >= eb else "beta"
+			m["winner_id"] = str(m.get("a_id" if dslot == "alpha" else "b_id", ""))
+			save_state()
+			return {"action": "match_over", "match_winner": dslot,
+				"score_a": int(m.get("wins_a", 0)),
+				"score_b": int(m.get("wins_b", 0)),
+				"resolved_by_draw": true}
 		save_state()
 		return {"action": "replay", "sudden_death": sudden_death_armed,
 			"score_a": int(m.get("wins_a", 0)), "score_b": int(m.get("wins_b", 0))}
@@ -1022,6 +1036,15 @@ func kin_name(champ_name: String, gen: int) -> String:
 		base = champ_name.strip_edges()
 		n = 1
 	return "G%d-%s-kin%d" % [gen, base, n]
+
+
+func _player_elo(pid: String) -> float:
+	# Start-of-tournament ELO for bracket seeding tiebreaks and 3rd-draw
+	# resolution (players array is snapshotted at bracket build).
+	for p in tourney.get("players", []):
+		if str((p as Dictionary).get("id", "")) == pid:
+			return float(((p as Dictionary).get("record", {}) as Dictionary).get("elo", 1200.0))
+	return 1200.0
 
 
 func match_slot_name(slot: String) -> String:

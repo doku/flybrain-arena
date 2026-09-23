@@ -129,6 +129,13 @@ def _staged_or_single(child, start_weights, ep1, params, note1,
     return record, weights, merge_summaries(summaries)
 
 
+def inherit_elo(parent_elo):
+    """Clone ELO with regression to the mean: child starts strong but
+    below the parent (default-rated parents breed default children)."""
+    return vault.ELO_DEFAULT + (
+        float(parent_elo) - vault.ELO_DEFAULT) * vault.ELO_INHERIT
+
+
 def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
                 mapping=None, progress_cb=None, mutate_structure=True,
                 max_changes=1, episodes2=None, params2=None):
@@ -179,6 +186,11 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     child = vault.new_record(name, params)
     child["lineage"] = {"parent_ids": [rec.get("id", "")],
                         "source": f"clone:{rec.get('id', '')}"}
+    # ELO inheritance with regression to the mean: the child starts
+    # strong but below the parent (wilds take the new_record default).
+    parent_elo = float((rec.get("record", {}) or {}).get(
+        "elo", vault.ELO_DEFAULT))
+    child["record"]["elo"] = inherit_elo(parent_elo)
     rng = np.random.default_rng(int(seed))
     noisy = np.ascontiguousarray(
         start_weights

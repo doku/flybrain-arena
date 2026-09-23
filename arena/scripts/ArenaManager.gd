@@ -2099,10 +2099,11 @@ func _tourney_id() -> String:
 		return ""
 	return str(director.tourney.get("id", ""))
 
-func _report_battle(draw: bool) -> void:
+func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	# Single choke point for tournament battle reports: stamps the same
 	# (tournament, match, battle) id used as the server's idempotency key,
 	# keeps a copy for one safe retry, and arms the battle watchdog.
+	# draw_penalty marks a 3rd draw so the server docks both ELOs.
 	_seq_battle_id = _current_battle_id()
 	_tourney_awaiting_battle = true
 	var fa := _flight_summary(flight_alpha, fly_alpha)
@@ -2112,7 +2113,7 @@ func _report_battle(draw: bool) -> void:
 		"draw": draw, "tournament_id": _tourney_id(), "match": tourney_match_label,
 		"flight_a": fa, "flight_b": fb}
 	brain_client.send_round_over(stats_alpha, stats_beta, draw, _seq_battle_id,
-		_tourney_id(), tourney_match_label, fa, fb)
+		_tourney_id(), tourney_match_label, fa, fb, draw_penalty)
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
 	_arm_seq("battle")
@@ -2129,8 +2130,14 @@ func _handle_draw() -> void:
 	_begin_landing("")
 	if tournament_active:
 		# Server records the draw (no dopamine) and replies tournament_battle
-		# "draw"; sequencing continues in _on_tournament_battle.
-		_report_battle(true)
+		# "draw"; sequencing continues in _on_tournament_battle. A draw
+		# reported while two are already banked is the 3rd: flag it so
+		# the server docks both ELOs for stalling the match out.
+		var third := false
+		var director := _director()
+		if director != null:
+			third = int(director.current_match().get("draws", 0)) >= 2
+		_report_battle(true, third)
 		return
 	_show_winner_and_countdown(
 		"DRAW",
@@ -2555,10 +2562,16 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		_show_callout("DRAW", Color(0.78, 0.78, 0.82),
 			"%s STALEMATE - REPLAY" % tourney_match_label, "REMATCH", false)
 		await get_tree().create_timer(5.0).timeout
-		director.on_battle_result("draw",
+		var draw_adv: Dictionary = director.on_battle_result("draw",
 			_flight_summary(flight_alpha, fly_alpha),
 			_flight_summary(flight_beta, fly_beta),
 			_bv_stream_packet())
+		# Third draw resolves the match outright (higher ELO advances)
+		# instead of replaying forever.
+		if str(draw_adv.get("action", "")) == "match_over":
+			var draw_score := "%d - %d" % [int(draw_adv.get("score_a", 0)), int(draw_adv.get("score_b", 0))]
+			_on_match_over(str(draw_adv.get("match_winner", "alpha")), draw_score)
+			return
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 		return
@@ -2572,14 +2585,7 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	var score := "%d - %d" % [int(res.get("score_a", 0)), int(res.get("score_b", 0))]
 	if action == "match_over":
 		var match_winner := str(res.get("match_winner", battle_winner))
-		var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
-		brain_client.request_tournament_match(match_winner)
-		# The bracket overlay carries the result: gold connectors show the
-		# path, the loser is grayed out, next lineup is visible.
-		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, tourney_match_label, score])
-		await get_tree().create_timer(6.0).timeout
-		_hide_arena_bracket()
-		_advance_tournament()
+		_on_match_over(match_winner, score)
 	else:
 		_show_callout("%s TAKES BATTLE (%s)" % [winner_name, score],
 			Color(1.0, 0.55, 0.3) if battle_winner == "alpha" else Color(0.4, 0.75, 1.0),
@@ -2588,6 +2594,17 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		_update_tourney_status("BATTLE %d" % (_battle_count() + 1))
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
+
+func _on_match_over(match_winner: String, score: String) -> void:
+	var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
+	brain_client.request_tournament_match(match_winner, _tourney_id(), tourney_match_label)
+	# The bracket overlay carries the result: gold connectors show the
+	# path, the loser is grayed out, next lineup is visible.
+	_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, tourney_match_label, score])
+	await get_tree().create_timer(6.0).timeout
+	_hide_arena_bracket()
+	_advance_tournament()
+
 
 func _battle_count() -> int:
 	var director := _director()

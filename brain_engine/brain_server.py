@@ -147,6 +147,7 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
     from the stored verdict and never banked twice."""
     import brain_package as vault_pkg
     arena_draw = bool(msg.get("arena_draw", False))
+    draw_penalty = bool(msg.get("draw_penalty", False))
     battle_winner = "draw" if arena_draw else winner
     records = []
     weights = {}
@@ -165,6 +166,15 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
                 f"tournament battle {outcome} ({tourney_note()})")
         records.append({"side": side, "record": rec})
         weights[side] = st["brain"].weights
+    # ELO per battle (lands in the journaled records above, so retries
+    # can never double-apply it). Third-draw stall penalty on top.
+    ra = next((r["record"] for r in records if r["side"] == "alpha"), None)
+    rb = next((r["record"] for r in records if r["side"] == "beta"), None)
+    if ra is not None and rb is not None:
+        out_a = "draw" if arena_draw else ("win" if winner == "alpha" else "loss")
+        vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_BATTLE)
+        if arena_draw and draw_penalty:
+            vault_pkg.apply_draw3_penalty(ra, rb)
     fit_a, fit_b = _sanitize_fit(fit_a), _sanitize_fit(fit_b)
     print(f"[Server] Tournament battle done id={battle_id or '?'} "
           f"({tourney_note()}) winner={battle_winner} "
@@ -185,6 +195,32 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         # persisted, so the arena's retry will be answered from disk.
         print(f"[Server] send tournament_battle failed (kept verdict): {e}",
               flush=True)
+
+
+def _bank_match_result(tourney_a, tourney_b, match_winner):
+    """Match verdict banking as one unit (counters + match ELO + saves)
+    so the message loop and tests share it. Returns True when anything
+    was banked."""
+    import brain_package as vault_pkg
+    banked = False
+    recs = {}
+    for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
+        if st["rec"] is None:
+            continue
+        outcome = "win" if side == match_winner else "loss"
+        vault_pkg.record_match_result(st["rec"], outcome)
+        recs[side] = st["rec"]
+        banked = True
+    if "alpha" in recs and "beta" in recs:
+        vault_pkg.apply_elo(recs["alpha"], recs["beta"],
+                            "win" if match_winner == "alpha" else "loss",
+                            vault_pkg.ELO_K_MATCH)
+    for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
+        if st["rec"] is None:
+            continue
+        vault_pkg.save_brain(st["rec"], st["brain"].weights,
+                             backup=False, fast=True)
+    return banked
 
 
 def _norm_experiment(value):
@@ -422,6 +458,12 @@ def run_brain_server(host="127.0.0.1", port=9999):
     # 1. Load connectome & populations
     csr = load_or_build_csr()
     pops = load_or_extract_populations()
+    # One-time ELO migration for pre-rating vault brains (1200 + 25x
+    # W/L); stamped brains are never touched again.
+    import brain_package as _vault_boot
+    _stamped = _vault_boot.backfill_elo()
+    if _stamped:
+        print(f"[Server] Backfilled ELO on {_stamped} vault brain(s).")
     # Named-pool index for the brain-view stream (built once; detail
     # level arrives per step message from the arena menu setting).
     pool_idx = _pool_index(pops)
@@ -522,6 +564,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
     tourney_b = {"rec": None, "path": None, "brain": brain_beta,
                  "enc": encoder, "dec": decoder}
     tourney_tag = {"tournament_id": "", "match": ""}
+    # Last banked match verdict (tournament_id, match): duplicate
+    # tournament_match messages must not double-bank counters or ELO.
+    _last_match_banked = {"key": None}
 
     def tourney_note():
         tid = tourney_tag.get("tournament_id") or "?"
@@ -905,16 +950,16 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 sock.sendto(json.dumps({"status": "free_ready"}).encode("utf-8"), client_addr)
 
             elif msg_type == "tournament_match":
-                # Match verdict: bump match counters on both identities.
-                import brain_package as vault_pkg
+                # Match verdict: bump match counters + match ELO on both
+                # identities. Duplicate messages (same id) resend the ack
+                # without re-banking.
                 mw = msg.get("match_winner", "")
-                for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
-                    if st["rec"] is None:
-                        continue
-                    outcome = "win" if side == mw else "loss"
-                    vault_pkg.record_match_result(st["rec"], outcome)
-                    vault_pkg.save_brain(st["rec"], st["brain"].weights,
-                                         backup=False, fast=True)
+                mkey = (str(msg.get("tournament_id", "")),
+                        str(msg.get("match", "")))
+                if not (all(mkey) and mkey == _last_match_banked["key"]):
+                    _bank_match_result(tourney_a, tourney_b, mw)
+                    if all(mkey):
+                        _last_match_banked["key"] = mkey
                 sock.sendto(json.dumps({"status": "match_recorded"}).encode("utf-8"), client_addr)
 
             elif msg_type == "tournament_end":

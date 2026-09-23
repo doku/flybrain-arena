@@ -660,10 +660,10 @@ func refresh_vault() -> void:
 		var r: Dictionary = b.get("record", {})
 		var t: Dictionary = b.get("training", {})
 		var score: float = float(t.get("score", 0.0))
-		var line := "%s  (M%d W%d/L%d T%d) [score %.0f]" % [str(b.get("name", "?")),
+		var line := "%s  (M%d W%d/L%d T%d) [elo %d] [score %.0f]" % [str(b.get("name", "?")),
 			int(r.get("matches", 0)), int(r.get("matches_won", 0)),
 			int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
-			score]
+			int(r.get("elo", 1200.0)), score]
 		brain_list.add_item(line)
 		player_list.add_item("%s" % str(b.get("name", "?")))
 	if not brains.is_empty() and selected_brain.is_empty():
@@ -715,7 +715,7 @@ func _on_brain_selected(idx: int) -> void:
 	var score: float = float(t.get("score", 0.0))
 	var avg: float = float(t.get("avg_score", 0.0))
 	detail_label.text = ("{name}  [{id}]\nBattles {b} (W{l} L{lo} D{d}) | " + \
-		"Matches {m} (W{mw} L{ml}) | Titles {t}\nEpisodes {e} in {s} sessions | " + \
+		"Matches {m} (W{mw} L{ml}) | Titles {t} | ELO {elo}\nEpisodes {e} in {s} sessions | " + \
 		"pre-train score {sc} (avg {asc}/ep)\n" + \
 		"variant {v} seed {sd} lr {lr} gain {g} ev {ev} wiring {x} map {mp} yb {yb}\nlineage: {lin}").format({
 		"name": str(selected_brain.get("name", "?")), "id": str(selected_brain.get("id", "?")),
@@ -723,6 +723,7 @@ func _on_brain_selected(idx: int) -> void:
 		"lo": int(r.get("losses", 0)), "d": int(r.get("draws", 0)),
 		"m": int(r.get("matches", 0)), "mw": int(r.get("matches_won", 0)),
 		"ml": int(r.get("matches_lost", 0)), "t": int(r.get("tournaments_won", 0)),
+		"elo": int(r.get("elo", 1200.0)),
 		"e": int(t.get("episodes", 0)), "s": (t.get("sessions", []) as Array).size(),
 		"sc": "%.0f" % score, "asc": "%.2f" % avg,
 		"v": str(p.get("variant", "?")), "sd": str(p.get("seed", "?")),

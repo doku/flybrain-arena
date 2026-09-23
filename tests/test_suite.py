@@ -3820,6 +3820,130 @@ class TestEvoLoop(unittest.TestCase):
             self.assertLessEqual(v, YAW_BIAS_HI)
 
 
+_ELO_MISSING = object()
+
+
+class TestElo(unittest.TestCase):
+    """ELO ratings: zero-sum math, defaults, backfill, inheritance.
+    No training runs here (CSR-free); server call sites are covered by
+    mocked handler tests below."""
+    def _rec(self, elo=_ELO_MISSING, wins=0, losses=0):
+        r = {"battles": wins + losses, "wins": wins, "losses": losses,
+             "draws": 0, "matches": 0, "matches_won": 0,
+             "matches_lost": 0, "tournaments_won": 0}
+        if elo is not _ELO_MISSING:
+            r["elo"] = elo
+        return {"id": "t", "record": r}
+
+    def test_elo_zero_sum(self):
+        import brain_package as vault
+        a, b = self._rec(1200.0), self._rec(1200.0)
+        na, nb = vault.apply_elo(a, b, "win", vault.ELO_K_BATTLE)
+        self.assertAlmostEqual(na, 1205.0)
+        self.assertAlmostEqual(nb, 1195.0)
+        self.assertAlmostEqual(na + nb, 2400.0)
+
+    def test_elo_upset_swings_more(self):
+        import brain_package as vault
+        a, b = self._rec(1200.0), self._rec(1600.0)
+        na, _nb = vault.apply_elo(a, b, "win", 10.0)
+        underdog_gain = na - 1200.0
+        c, d = self._rec(1200.0), self._rec(1600.0)
+        _nc, nd = vault.apply_elo(c, d, "loss", 10.0)
+        favorite_gain = nd - 1600.0
+        self.assertGreater(underdog_gain, 5.0)
+        self.assertGreater(underdog_gain, favorite_gain)
+
+    def test_elo_draw_equal_no_change(self):
+        import brain_package as vault
+        a, b = self._rec(1200.0), self._rec(1200.0)
+        na, nb = vault.apply_elo(a, b, "draw", 10.0)
+        self.assertEqual(na, 1200.0)
+        self.assertEqual(nb, 1200.0)
+
+    def test_elo_bad_outcome_raises(self):
+        import brain_package as vault
+        with self.assertRaises(ValueError):
+            vault.apply_elo(self._rec(), self._rec(), "banana", 10.0)
+
+    def test_elo_missing_key_defaults(self):
+        import brain_package as vault
+        a, b = self._rec(), self._rec()
+        na, nb = vault.apply_elo(a, b, "win", 10.0)
+        self.assertAlmostEqual(na, 1205.0)
+        self.assertAlmostEqual(nb, 1195.0)
+        self.assertIn("elo", a["record"])
+
+    def test_draw3_penalty(self):
+        import brain_package as vault
+        a, b = self._rec(1300.0), self._rec(1100.0)
+        na, nb = vault.apply_draw3_penalty(a, b)
+        self.assertAlmostEqual(na, 1300.0 - vault.ELO_DRAW3_PENALTY)
+        self.assertAlmostEqual(nb, 1100.0 - vault.ELO_DRAW3_PENALTY)
+
+    def test_new_record_default(self):
+        import brain_package as vault
+        rec = vault.new_record("Rookie")
+        self.assertEqual(rec["record"]["elo"], vault.ELO_DEFAULT)
+
+    def test_backfill(self):
+        import tempfile
+        import shutil
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_elo_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            rec = vault.new_record("Vet")
+            del rec["record"]["elo"]
+            rec["record"]["wins"] = 6
+            rec["record"]["losses"] = 2
+            vault.save_brain(rec, np.zeros(64, dtype=np.float32))
+            rec2 = vault.new_record("Fresh")
+            vault.save_brain(rec2, np.zeros(64, dtype=np.float32))
+            self.assertEqual(vault.backfill_elo(), 1)
+            got, _w = vault.load_brain(rec["id"])
+            self.assertAlmostEqual(got["record"]["elo"], 1200.0 + 25.0 * 4)
+            self.assertEqual(vault.backfill_elo(), 0)
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_inherit_elo(self):
+        import evo_breeder as evo
+        self.assertAlmostEqual(evo.inherit_elo(1500.0), 1410.0)
+        self.assertAlmostEqual(evo.inherit_elo(1200.0), 1200.0)
+        # Below-mean parents breed upward toward the mean.
+        self.assertAlmostEqual(evo.inherit_elo(800.0), 920.0)
+
+    def test_breed_clone_stamps_inherited_elo(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3},
+                  "record": {"battles": 4, "wins": 4, "losses": 0,
+                             "draws": 0, "matches": 1, "matches_won": 1,
+                             "matches_lost": 0, "tournaments_won": 0,
+                             "elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x"}}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5, episodes=1,
+                                          mutate_structure=False)
+        self.assertAlmostEqual(rec["record"]["elo"], 1410.0)
+
+
 class TestGodotArenaHeadless(unittest.TestCase):
     """Verifies that Godot 4 compiles all GDScripts and runs each scene without errors."""
     def _run_headless(self, scene=""):
@@ -4067,6 +4191,62 @@ class TestBattleTransaction(unittest.TestCase):
         stored = self.srv._read_last_verdict()
         self.assertEqual(stored["key"], key)
         self.assertEqual(stored["result"]["battle_winner"], "draw")
+
+    def test_battle_elo_banked(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BE", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), {"arena_draw": False},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BE", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        self.assertAlmostEqual(la["record"]["elo"], 1205.0)
+        self.assertAlmostEqual(lb["record"]["elo"], 1195.0)
+
+    def test_battle_draw_penalty(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                pass
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BD3", "draw": True}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": True, "draw_penalty": True},
+            "alpha", 5.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BD3", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["draws"], 1)
+        # Normal draw moves nothing between equals; penalty docks both.
+        self.assertAlmostEqual(la["record"]["elo"], 1200.0 - 25.0)
+        self.assertAlmostEqual(lb["record"]["elo"], 1200.0 - 25.0)
+
+    def test_match_elo_banked(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        self.assertTrue(self.srv._bank_match_result(sta, stb, "alpha"))
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["matches_won"], 1)
+        self.assertEqual(lb["record"]["matches_lost"], 1)
+        self.assertAlmostEqual(la["record"]["elo"], 1215.0)
+        self.assertAlmostEqual(lb["record"]["elo"], 1185.0)
 
     def test_corrupt_journal_quarantined(self):
         p = self.srv._pending_battle_path()

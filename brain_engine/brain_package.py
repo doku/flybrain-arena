@@ -71,8 +71,8 @@ def new_record(name, params=None):
         "created_utc": _utcnow(),
         "generator_params": merged,
         "record": {"battles": 0, "wins": 0, "losses": 0, "draws": 0,
-                   "matches": 0, "matches_won": 0, "matches_lost": 0,
-                   "tournaments_won": 0},
+                 "matches": 0, "matches_won": 0, "matches_lost": 0,
+                 "tournaments_won": 0, "elo": ELO_DEFAULT},
         "training": {"episodes": 0, "sessions": [], "score": 0.0,
                      "avg_score": 0.0},
         "lineage": {"parent_ids": [], "source": "generated"},
@@ -229,6 +229,70 @@ def record_match_result(record, outcome, tournament_id=None):
     elif outcome == "loss":
         r["matches_lost"] += 1
     return record
+
+
+# ── ELO ratings ──────────────────────────────────────────────────────
+# One rating per brain, updated after every tournament battle (small K)
+# and every match verdict (large K). Standard zero-sum math; draws move
+# almost nothing between equals. Records predating ELO read the default
+# via .get("elo", ELO_DEFAULT), so no schema migration is needed.
+ELO_DEFAULT = 1200.0
+ELO_K_BATTLE = 10.0
+ELO_K_MATCH = 30.0
+ELO_DRAW3_PENALTY = 25.0
+ELO_INHERIT = 0.7
+
+
+def apply_elo(rec_a, rec_b, outcome_a, k):
+    """Zero-sum ELO update on both records' record["elo"].
+    outcome_a in {'win','loss','draw'} from alpha's perspective.
+    Returns (new_elo_a, new_elo_b)."""
+    ra = float(rec_a["record"].get("elo", ELO_DEFAULT))
+    rb = float(rec_b["record"].get("elo", ELO_DEFAULT))
+    if outcome_a == "win":
+        actual = 1.0
+    elif outcome_a == "loss":
+        actual = 0.0
+    elif outcome_a == "draw":
+        actual = 0.5
+    else:
+        raise ValueError(f"bad ELO outcome '{outcome_a}' (win|loss|draw)")
+    expected = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+    delta = float(k) * (actual - expected)
+    rec_a["record"]["elo"] = ra + delta
+    rec_b["record"]["elo"] = rb - delta
+    return ra + delta, rb - delta
+
+
+def apply_draw3_penalty(rec_a, rec_b):
+    """Third-draw resolution penalty: both sides lose a flat amount on
+    top of the normal draw update, so stalling out a match costs rating
+    for favorite and underdog alike."""
+    rec_a["record"]["elo"] = float(
+        rec_a["record"].get("elo", ELO_DEFAULT)) - ELO_DRAW3_PENALTY
+    rec_b["record"]["elo"] = float(
+        rec_b["record"].get("elo", ELO_DEFAULT)) - ELO_DRAW3_PENALTY
+    return (rec_a["record"]["elo"], rec_b["record"]["elo"])
+
+
+def backfill_elo():
+    """One-time migration: stamp missing ELO from W/L history
+    (1200 + 25 x (battle wins - losses)). Records that already carry
+    the key are never touched. Returns the count stamped."""
+    stamped = 0
+    for rec in scan_vault(silent=True):
+        r = rec.get("record", {})
+        if "elo" in r:
+            continue
+        r["elo"] = ELO_DEFAULT + 25.0 * (
+            int(r.get("wins", 0)) - int(r.get("losses", 0)))
+        try:
+            weights = load_brain(rec.get("id", ""))[1]
+        except Exception:
+            continue
+        save_brain(rec, weights)
+        stamped += 1
+    return stamped
 
 
 def log_training_session(record, episodes, params, notes=""):
