@@ -39,6 +39,7 @@ var gen_map_checks: Array = []
 var gen_config_summary: Label
 var gen_config_dlg: Window
 var gen_episodes: SpinBox
+var train_school: CheckButton
 var job_bar: ProgressBar
 var job_label: Label
 var queue_list: ItemList
@@ -78,6 +79,7 @@ func _ready() -> void:
 	TournamentDirector.vault_changed.connect(refresh_vault)
 	TournamentDirector.job_progress.connect(_on_job_progress)
 	TournamentDirector.job_failed.connect(_on_job_failed)
+	TournamentDirector.score_stamped.connect(_on_score_stamped)
 	TournamentDirector.async_done.connect(_on_async_done)
 	TournamentDirector.train_queue_changed.connect(_refresh_train_queue)
 	if not TournamentDirector.python_ready:
@@ -346,6 +348,11 @@ func _build_gen_column() -> VBoxContainer:
 	tb.text = "TRAIN SELECTED"
 	tb.pressed.connect(_on_train)
 	grow.add_child(tb)
+	train_school = CheckButton.new()
+	train_school.text = "Flight school"
+	train_school.tooltip_text = "ON = retrain through flight-school scenarios (camp/mover/duel) with scores stamped. OFF = legacy encounters."
+	train_school.button_pressed = false
+	grow.add_child(train_school)
 	job_bar = ProgressBar.new()
 	job_bar.min_value = 0
 	job_bar.max_value = 100
@@ -727,6 +734,8 @@ func refresh_vault() -> void:
 			int(r.get("matches", 0)), int(r.get("matches_won", 0)),
 			int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
 			int(r.get("elo", 1200.0)), score]
+		if t.has("eval_score"):
+			line += " [eval %.0f]" % float(t.get("eval_score", 0.0))
 		brain_list.add_item(line)
 		var brec: Dictionary = b.get("record", {})
 		player_list.add_item("%s  [elo %d]" % [str(b.get("name", "?")),
@@ -905,6 +914,10 @@ func _retrain_params() -> Dictionary:
 			"mapping", "yaw_bias"]:
 		if stored.has(k):
 			out[k] = stored[k]
+	# Flight-school retrains run the school curriculum (scores stamped
+	# like evo stage-2); unticked retrains keep legacy encounters.
+	if is_instance_valid(train_school) and train_school.button_pressed:
+		out["curriculum"] = {}
 	return out
 
 
@@ -986,9 +999,11 @@ func _on_train() -> void:
 	if selected_brain.is_empty():
 		log_label.text = "Select a brain first."
 		return
+	var school := is_instance_valid(train_school) and train_school.button_pressed
 	_start_or_queue(str(selected_brain.get("id", "")),
 		str(selected_brain.get("name", "?")), int(gen_episodes.value),
-		_retrain_params(), "Training '%s'")
+		_retrain_params(),
+		"Training '%s' (school)" if school else "Training '%s'")
 
 
 func _on_queue_remove() -> void:
@@ -1035,6 +1050,11 @@ func _on_job_failed(error: String) -> void:
 	_job_base = ""
 	job_label.text = "Train failed: %s" % error
 	log_label.text = "Train failed: %s" % error
+
+
+func _on_score_stamped(brain_id: String, score: float) -> void:
+	log_label.text = "Eval score %.1f stamped for %s." % [score, brain_id]
+	refresh_vault()
 
 
 func _on_delete() -> void:

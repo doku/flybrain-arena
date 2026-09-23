@@ -65,6 +65,23 @@ func test_pump_refuses_safely() -> void:
 	_check(d.train_queue.size() == 1, "queue intact while busy")
 
 
+func test_school_completion_attempts_score() -> void:
+	var d = _new_director()
+	# Finished school job (progress at 100%): clears the slot and
+	# attempts the eval restamp. Headless has no python, so the probe
+	# refuses cleanly instead of spawning.
+	var pp := "user://test_score_prog.json"
+	var f := FileAccess.open(pp, FileAccess.WRITE)
+	f.store_string(JSON.stringify({"episode": 5, "total": 5, "pct": 100.0}))
+	f.close()
+	d.active_job = {"pid": 0, "progress_path": pp, "result_file": "",
+		"brain_id": "fake", "episodes": 5, "school": true}
+	d.poll_job()
+	_check(d.active_job.is_empty(), "completed school job clears")
+	_check(d.score_job.is_empty(), "score probe refuses without python")
+	DirAccess.remove_absolute(pp)
+
+
 func _initialize() -> void:
 	var dd = _new_director()
 	_check(dd.has_method("enqueue_training"), "director has enqueue_training")
@@ -76,6 +93,7 @@ func _initialize() -> void:
 	test_enqueue_cancel_clear()
 	test_purge_queued()
 	test_pump_refuses_safely()
+	test_school_completion_attempts_score()
 	if failures == 0:
 		print("ALL TRAIN QUEUE TESTS PASSED")
 	else:

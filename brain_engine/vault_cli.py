@@ -6,6 +6,7 @@ Usage:
   python vault_cli.py generate --name Viper --params '{"seed":11,...}'
   python vault_cli.py train --id <id> --episodes 50 [--params '{...}'] [--progress path.json]
   python vault_cli.py delete --id <id>
+  python vault_cli.py score --id <id> [--episodes 6] [--seed 7]
   python vault_cli.py archive-list
   python vault_cli.py archive-delete --id <id>
   python vault_cli.py rename --id <id> --name NewName
@@ -182,6 +183,44 @@ def cmd_train(a):
     if a.progress:
         _write_progress(a.progress, total, total)
     return out({"ok": True, "brain": rec, "summary": summary}, a.result_file)
+
+
+def cmd_score(a):
+    """Eval-only probe: school scenarios, no learning, weights untouched.
+    Stamps training.eval_score (+ episodes/utc) so the menu can show
+    current capability next to the accumulated training score."""
+    from train_homing import run_training
+    try:
+        rec, weights = vault.load_brain(a.id)
+    except Exception as e:
+        return err(str(e))
+    gp = rec.get("generator_params", {}) or {}
+    eps = int(getattr(a, "episodes", 6) or 6)
+    seed = int(float(getattr(a, "seed", 7) or 7))
+    try:
+        _save, _w, summary = run_training(
+            num_episodes=eps, variant="custom", seed=seed,
+            save_name="score_tmp.npz",
+            experiment=gp.get("experiment"), mapping=gp.get("mapping"),
+            yaw_bias=gp.get("yaw_bias"), genome=gp.get("genome"),
+            legacy=("mapping" not in gp), init_weights=weights,
+            curriculum={}, return_brain=True, eval_only=True)
+    except Exception as e:
+        return err(str(e))
+    tr = rec.setdefault("training", {})
+    tr["eval_score"] = round(float(summary.get("score", 0.0)), 1)
+    tr["eval_episodes"] = eps
+    try:
+        from datetime import datetime, timezone
+        tr["eval_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        pass
+    try:
+        vault.save_brain(rec, weights)
+    except OSError as e:
+        return err(str(e))
+    return out({"ok": True, "eval_score": tr["eval_score"],
+                "summary": summary}, getattr(a, "result_file", None))
 
 
 def cmd_delete(a):
@@ -364,6 +403,10 @@ def main():
     q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")
     q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
     q = sub.add_parser("delete"); q.add_argument("--id", required=True)
+    q = sub.add_parser("score"); q.add_argument("--id", required=True)
+    q.add_argument("--episodes", type=int, default=6)
+    q.add_argument("--seed", default=7)
+    q.add_argument("--result-file", default="")
     q = sub.add_parser("rename"); q.add_argument("--id", required=True)
     q.add_argument("--name", required=True)
     q = sub.add_parser("export"); q.add_argument("--id", required=True)
@@ -396,7 +439,8 @@ def main():
     q.add_argument("--log-file", default=""); q.add_argument("--gen", type=int, default=1)
     a = p.parse_args()
     fn = {"list": cmd_list, "info": cmd_info, "generate": cmd_generate,
-           "train": cmd_train, "delete": cmd_delete, "rename": cmd_rename,
+           "train": cmd_train, "delete": cmd_delete, "score": cmd_score,
+           "rename": cmd_rename,
            "export": cmd_export, "import": cmd_import, "archive": cmd_archive,
            "restore": cmd_restore, "archive-list": cmd_archive_list,
            "archive-delete": cmd_archive_delete,

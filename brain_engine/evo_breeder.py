@@ -153,7 +153,8 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     from train_job import train_brain
     from experimental_wiring import (mutate_genome, remap_for_genome,
                                      derive_mapping, attach_genome)
-    from connectome_loader import load_or_extract_populations
+    from connectome_loader import (load_or_extract_populations,
+                                   load_or_build_csr)
     rec, weights = vault.load_brain(parent_id)
     gp = dict(rec.get("generator_params", {}) or {})
     genome = gp.get("genome", None)
@@ -162,11 +163,12 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
         np.asarray(weights, dtype=np.float32))
     if genome is not None and mutate_structure:
         pops = load_or_extract_populations()
+        csr = load_or_build_csr()
         mrng = np.random.default_rng(int(seed) ^ 0x5EED)
         new_genome = mutate_genome(mrng, genome, pops, max_changes)
         start_weights = remap_for_genome(
             gp.get("experiment"), genome, new_genome,
-            np.asarray(weights, dtype=np.float32), mrng, pops)
+            np.asarray(weights, dtype=np.float32), mrng, pops, csr)
         genome = new_genome
         if mapping is None:
             child_mapping = list(derive_mapping(genome))

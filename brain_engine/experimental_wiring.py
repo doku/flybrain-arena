@@ -650,56 +650,124 @@ def remap_weights(old_edges, new_edges, old_w, rng, fallback_scale=None):
     (pre, post) edges carry over verbatim; new edges initialize
     N(0, sigma) with sigma = surviving-weight std (or fallback_scale,
     defaulting to the legacy overlay scale 200.0). Returns a float32
-    array aligned to new_edges order. Deterministic in rng."""
+    array aligned to new_edges order. Deterministic in rng.
+
+    Row-wise sweep (no whole-matrix dict): old and new sides are
+    grouped by presynaptic row, so full 25M-edge breed remaps run in
+    bounded memory instead of a multi-GB key table. Survivor lookup,
+    fresh-draw count/order, and the arity guard match the legacy
+    semantics exactly."""
     if len(old_w) != len(old_edges[0]):
         raise ValueError(
             f"remap parent weights {len(old_w)} != parent arity "
             f"{len(old_edges[0])}; never mix arities")
-    old_map = {}
-    for s, q, v in zip(old_edges[0].tolist(), old_edges[1].tolist(),
-                        np.asarray(old_w, dtype=np.float32).tolist()):
-        old_map[(int(s), int(q))] = float(v)
-    kept = [old_map[k] for k in
-            [(int(s), int(q)) for s, q in
-             zip(new_edges[0].tolist(), new_edges[1].tolist())]
-            if k in old_map]
-    sigma = float(np.std(kept)) if kept else float(
-        fallback_scale if fallback_scale is not None else 200.0)
+    old_pre = np.asarray(old_edges[0])
+    old_post = np.asarray(old_edges[1])
+    new_pre = np.asarray(new_edges[0])
+    new_post = np.asarray(new_edges[1])
+    old_w = np.asarray(old_w, dtype=np.float32)
+    n_new = len(new_pre)
+    out = np.empty(n_new, dtype=np.float32)
+    if n_new == 0 or len(old_pre) == 0:
+        if n_new == 0:
+            return np.ascontiguousarray(out)
+        sigma0 = float(fallback_scale if fallback_scale is not None else 200.0)
+        out[:] = np.float32(rng.normal(0.0, sigma0, n_new))
+        return np.ascontiguousarray(out)
+    o_ord = np.argsort(old_pre, kind="stable")
+    n_ord = np.argsort(new_pre, kind="stable")
+    op, oq, ow = old_pre[o_ord], old_post[o_ord], old_w[o_ord]
+    np_s, nq = new_pre[n_ord], new_post[n_ord]
+    # Row boundaries on the already-sorted sides (no second sort).
+    o_bound = np.flatnonzero(np.diff(op) != 0) + 1
+    o_bound = np.concatenate(([0], o_bound, [len(op)]))
+    n_bound = np.flatnonzero(np.diff(np_s) != 0) + 1
+    n_bound = np.concatenate(([0], n_bound, [len(np_s)]))
+    o_rows = op[o_bound[:-1]]
+    n_rows = np_s[n_bound[:-1]]
+    # Survivor mask in NEW-edge order; sigma from running sums (exact
+    # std with O(1) memory at 25M scale).
+    is_new = np.zeros(n_new, dtype=bool)
+    kept_n = 0
+    kept_sum = 0.0
+    kept_sumsq = 0.0
+    oi = 0
+    for ni in range(len(n_rows)):
+        r = int(n_rows[ni])
+        while oi < len(o_rows) and int(o_rows[oi]) < r:
+            oi += 1
+        old_map = {}
+        if oi < len(o_rows) and int(o_rows[oi]) == r:
+            a, b = int(o_bound[oi]), int(o_bound[oi + 1])
+            for q, v in zip(oq[a:b].tolist(), ow[a:b].tolist()):
+                old_map[int(q)] = float(v)
+        c, d = int(n_bound[ni]), int(n_bound[ni + 1])
+        for j in range(c, d):
+            key = int(nq[j])
+            orig = int(n_ord[j])
+            if key in old_map:
+                v = old_map[key]
+                out[orig] = np.float32(v)
+                kept_n += 1
+                kept_sum += v
+                kept_sumsq += v * v
+            else:
+                is_new[orig] = True
+    if kept_n > 0:
+        mean = kept_sum / kept_n
+        sigma = float(max(kept_sumsq / kept_n - mean * mean, 0.0) ** 0.5)
+    else:
+        sigma = float(
+            fallback_scale if fallback_scale is not None else 200.0)
     if not np.isfinite(sigma) or sigma <= 0.0:
         sigma = 200.0
-    out = np.empty(len(new_edges[0]), dtype=np.float32)
-    new_keys = [(int(s), int(q)) for s, q in
-                zip(new_edges[0].tolist(), new_edges[1].tolist())]
-    fresh = rng.normal(0.0, sigma, sum(1 for k in new_keys if k not in old_map))
-    fi = 0
-    for i, k in enumerate(new_keys):
-        if k in old_map:
-            out[i] = np.float32(old_map[k])
-        else:
-            out[i] = np.float32(fresh[fi])
-            fi += 1
+    fresh = rng.normal(0.0, sigma, int(is_new.sum()))
+    out[is_new] = np.float32(fresh)
     return np.ascontiguousarray(out)
 
 
+def _merged_edge_lists(csr, overlay):
+    """Full (pre, post) edge lists for base CSR + an overlay (or None):
+    the exact structure training builds via apply_overlay, as key
+    arrays for arity surgery. Overlaps merge (no duplicate keys)."""
+    if overlay is None:
+        indptr = np.ascontiguousarray(csr.indptr, dtype=np.int32)
+        indices = np.ascontiguousarray(csr.indices, dtype=np.int32)
+    else:
+        pre, post, w = overlay
+        indptr, indices, _data = apply_overlay(csr, pre, post, w)
+    counts = np.diff(indptr).astype(np.int64)
+    pre_full = np.repeat(
+        np.arange(len(indptr) - 1, dtype=np.int32), counts)
+    return pre_full, np.ascontiguousarray(indices, dtype=np.int32)
+
+
 def remap_for_genome(old_experiment, old_genome, new_genome, old_w,
-                     rng, pops):
+                     rng, pops, csr):
     """Breed-time arity surgery: parent weights (any old wiring: base,
     legacy mix, or genome) remapped onto a mutated child genome.
-    Surviving edges keep trained weights; new edges init N(0, parent
-    std). Returns float32 weights aligned to the child arity. Raises on
-    uncompilable genomes like the normal build path."""
+    Both sides expand to FULL arity (base CSR + overlay) first: base
+    edges are identical parent to child, so trained base weights carry
+    over verbatim and only overlay deltas re-initialize. Surviving
+    edges keep trained weights; new edges init N(0, parent std).
+    Returns float32 weights aligned to the child arity. Raises on
+    uncompilable genomes like the normal build path, and loudly on a
+    short/long parent weight vector (never mix arities)."""
     if old_genome is not None:
-        old_edges = compile_genome(old_genome, pops)
+        old_over = compile_genome(old_genome, pops)
     else:
         mix = normalize_experiment(old_experiment)
-        if mix is None:
-            old_edges = None
-        else:
-            old_edges = combine_overlays(mix, pops)
-    new_edges = compile_genome(new_genome, pops)
-    if old_edges is None or new_edges is None:
-        raise ValueError("remap needs compilable old and new wirings")
-    return remap_weights(old_edges, new_edges, old_w, rng)
+        old_over = combine_overlays(mix, pops) if mix is not None else None
+    new_over = compile_genome(new_genome, pops)
+    if new_over is None:
+        raise ValueError("remap needs a compilable child genome")
+    old_full = _merged_edge_lists(csr, old_over)
+    new_full = _merged_edge_lists(csr, new_over)
+    if len(old_w) != len(old_full[0]):
+        raise ValueError(
+            f"remap parent weights {len(old_w)} != parent arity "
+            f"{len(old_full[0])}; never mix arities")
+    return remap_weights(old_full, new_full, old_w, rng)
 
 
 def _frozen(name, pops, fanout=None, weight=None):

@@ -33,8 +33,11 @@ var tourney: Dictionary = {}
 var sudden_death_armed: bool = false
 
 # Background training job: {pid, progress_path, result_file, brain_id,
-# episodes} or {}.
+# episodes, school} or {}.
 var active_job: Dictionary = {}
+# Eval restamp job after a school train: {pid, result_file, brain_id}
+# or {}. Separate slot from training (read-only probe, no progress).
+var score_job: Dictionary = {}
 
 # One-shot async vault op (e.g. generate): {pid, result_file, op} or {}.
 var pending_async: Dictionary = {}
@@ -50,6 +53,7 @@ signal job_progress(episode: int, total: int)
 signal job_failed(error: String)
 signal async_done(op: String, result: Dictionary)
 signal train_queue_changed()
+signal score_stamped(brain_id: String, score: float)
 
 
 func _ready() -> void:
@@ -295,7 +299,8 @@ func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dict
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
 	active_job = {"pid": pid, "progress_path": progress_path,
-		"result_file": result_file, "brain_id": brain_id, "episodes": episodes}
+		"result_file": result_file, "brain_id": brain_id,
+		"episodes": episodes, "school": params.has("curriculum")}
 	return {"ok": true, "pid": pid}
 
 
@@ -318,9 +323,16 @@ func poll_job() -> Dictionary:
 		print("[Director] Job done: %s (%d/%d)" % [
 			str(active_job.get("brain_id", "?")),
 			int(res.get("episode", 0)), int(res.get("total", 0))])
+		# School trains earn an eval restamp (eval_only probe, weights
+		# untouched): the [eval N] tag tracks current capability while
+		# [score N] keeps the accumulated training totals.
+		var done_school := bool(active_job.get("school", false))
+		var done_id := str(active_job.get("brain_id", ""))
 		active_job = {}
 		vault_changed.emit()
 		_pump_train_queue()
+		if done_school and done_id != "":
+			_launch_score(done_id)
 		return res
 	# Fail loud: the backend writes its result file on success AND on
 	# error. If the process is gone without reaching 100%, the job
@@ -425,8 +437,57 @@ func _read_job_result_error(result_file: String) -> String:
 func _process(_delta: float) -> void:
 	if not active_job.is_empty():
 		poll_job()
+	if not score_job.is_empty():
+		_poll_score()
 	if not pending_async.is_empty():
 		_poll_async()
+
+
+func _launch_score(brain_id: String) -> bool:
+	# Eval-only probe after a school train (~2 min, weights untouched).
+	# One at a time; a probe failure only logs (the train already banked).
+	if not score_job.is_empty() or not python_ready:
+		return false
+	var result_file := job_dir.path_join("score_%s_result.json" % brain_id)
+	if FileAccess.file_exists(result_file):
+		DirAccess.remove_absolute(result_file)
+	var pid := OS.create_process(python_exe,
+		_cli_argv(["score", "--id", brain_id, "--episodes", "6",
+			"--seed", "7", "--result-file", result_file]), false)
+	if pid <= 0:
+		print("[Director] Eval probe failed to spawn for %s." % brain_id)
+		return false
+	score_job = {"pid": pid, "result_file": result_file,
+		"brain_id": brain_id}
+	print("[Director] Eval probe started for %s." % brain_id)
+	return true
+
+
+func _poll_score() -> void:
+	var rf := str(score_job.get("result_file", ""))
+	var bid := str(score_job.get("brain_id", ""))
+	var f := FileAccess.open(rf, FileAccess.READ)
+	if f != null:
+		var text := f.get_as_text().strip_edges()
+		f.close()
+		if text.begins_with("{") and text.ends_with("}"):
+			var parsed = JSON.parse_string(text)
+			if parsed is Dictionary:
+				score_job = {}
+				if bool(parsed.get("ok", false)):
+					var sc := float(parsed.get("eval_score", 0.0))
+					print("[Director] Eval score %.1f stamped for %s." % [sc, bid])
+					score_stamped.emit(bid, sc)
+				else:
+					print("[Director] Eval probe failed for %s: %s" % [
+						bid, str(parsed.get("error", "?"))])
+				vault_changed.emit()
+				return
+			return  # Partial write; retry next frame.
+	var pid := int(score_job.get("pid", 0))
+	if pid > 0 and not OS.is_process_running(pid):
+		print("[Director] Eval probe died silently for %s (see brains/jobs log)." % bid)
+		score_job = {}
 
 
 # ── Tournament setup ────────────────────────────────────────────────

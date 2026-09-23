@@ -2339,16 +2339,50 @@ class TestWiringGenome(unittest.TestCase):
             if (int(s), int(q)) in old_map:
                 self.assertAlmostEqual(float(new_w[i]),
                                        old_map[(int(s), int(q))])
-        # Full pipeline entry point (legacy-mix parent included).
-        re_mix = ew.combine_overlays(("retina_wide",), self.pops)
-        old_w2 = np.arange(len(re_mix[0]), dtype=np.float32)
-        rw = ew.remap_for_genome("retina_wide", None, child, old_w2,
-                                 np.random.default_rng(3), self.pops)
-        self.assertEqual(len(rw), len(ce[0]))
+        # Full-arity entry point (the breed path): base CSR + overlays
+        # on both sides. A sparse stand-in base keeps it fast without
+        # the connectome cache.
+        from scipy import sparse as _sp
+        n = 166701
+        br = np.array([10, 10, 50000, 90000], dtype=np.int32)
+        bc = np.array([20, 30, 60000, 100000], dtype=np.int32)
+        fake_csr = _sp.csr_matrix(
+            (np.ones(4, dtype=np.float32), (br, bc)), shape=(n, n))
+        old_pre, old_post = ew._merged_edge_lists(
+            fake_csr, ew.compile_genome(base, self.pops))
+        old_w2 = np.arange(len(old_pre), dtype=np.float32)
+        rw = ew.remap_for_genome(None, base, child, old_w2,
+                                 np.random.default_rng(3), self.pops,
+                                 fake_csr)
+        new_pre, new_post = ew._merged_edge_lists(
+            fake_csr, ew.compile_genome(child, self.pops))
+        self.assertEqual(len(rw), len(new_pre))
+        old_map = {(int(s), int(q)): float(v) for s, q, v in
+                   zip(old_pre.tolist(), old_post.tolist(), old_w2.tolist())}
+        new_pairs = list(zip(new_pre.tolist(), new_post.tolist()))
+        for i, (s, q) in enumerate(new_pairs):
+            if (int(s), int(q)) in old_map:
+                self.assertAlmostEqual(float(rw[i]),
+                                       old_map[(int(s), int(q))])
+        # A base-only key (in neither overlay) keeps its trained weight:
+        # the Stag_G2 case (25.58M base carried, 3.8k overlay remapped).
+        be_keys = set((int(s), int(q)) for s, q in
+                      zip(*ew.compile_genome(base, self.pops)[:2]))
+        ce_keys = set((int(s), int(q)) for s, q in
+                      zip(*ew.compile_genome(child, self.pops)[:2]))
+        base_only = [(int(s), int(q)) for s, q in zip(br.tolist(), bc.tolist())
+                     if (int(s), int(q)) not in be_keys
+                     and (int(s), int(q)) not in ce_keys]
+        self.assertTrue(base_only)
+        old_pairs = list(zip(old_pre.tolist(), old_post.tolist()))
+        oi = old_pairs.index(base_only[0])
+        ni = new_pairs.index(base_only[0])
+        self.assertAlmostEqual(float(rw[ni]), float(old_w2[oi]))
         # Arity mismatch is loud, never silent.
         with self.assertRaises(ValueError):
-            ew.remap_for_genome("retina_wide", None, child, old_w,
-                                np.random.default_rng(3), self.pops)
+            ew.remap_for_genome(None, base, child, old_w2[:-1],
+                                np.random.default_rng(3), self.pops,
+                                fake_csr)
 
     def test_genome_from_seed_and_attach(self):
         import experimental_wiring as ew
@@ -3336,6 +3370,45 @@ class TestRetinaVision(unittest.TestCase):
         self.assertEqual(summary["episodes"], 2)
         self.assertIn("score", summary)
         self.assertIn("avg_score", summary)
+
+    def test_score_command_stamps_eval(self):
+        # vault_cli score: eval probe stamps training.eval_score and
+        # leaves the vault weights bit-identical.
+        import shutil
+        import tempfile
+        import brain_package as vault_pkg
+        from train_homing import experiment_arrays, load_or_build_csr
+        from vault_cli import cmd_score
+        tmp = tempfile.mkdtemp(prefix="score_cmd_")
+        old_vault, old_index = vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = tmp
+        vault_pkg.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            csr = load_or_build_csr()
+            pops = load_or_extract_populations()
+            _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+            rec = vault_pkg.new_record(
+                "Scorey", {"experiment": "retina_wide",
+                           "mapping": "retina"})
+            w0 = np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy())
+            vault_pkg.save_brain(rec, w0)
+
+            class _A:
+                pass
+            a = _A()
+            a.id = rec["id"]
+            a.episodes = 2
+            a.seed = 11
+            a.result_file = ""
+            self.assertEqual(cmd_score(a), 0)
+            rec2, w2 = vault_pkg.load_brain(rec["id"])
+            self.assertIn("eval_score", rec2.get("training", {}))
+            self.assertEqual(rec2["training"]["eval_episodes"], 2)
+            np.testing.assert_array_equal(w2, w0)
+        finally:
+            vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_sector_wood_drives_lplc2(self):
         enc = SensoryEncoder(self.pops, mapping="retina")
