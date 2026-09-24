@@ -183,6 +183,8 @@ func _ready() -> void:
 var body_mat: ShaderMaterial
 var eye_mat: ShaderMaterial
 var membrane_mat: ShaderMaterial
+var spear_glow: MeshInstance3D
+var spear_glow_mat: StandardMaterial3D
 var flash_energy := 0.0
 
 func set_team_color(color: Color) -> void:
@@ -190,6 +192,8 @@ func set_team_color(color: Color) -> void:
 		return
 	body_mat.set_shader_parameter("team_tint",
 		Vector3(color.r, color.g, color.b))
+	if spear_glow_mat != null:
+		spear_glow_mat.albedo_color = Color(color.r, color.g, color.b, 0.0)
 	if membrane_mat != null:
 		# Rivals shimmer out of sync; membranes keep a pearly white.
 		var phase := 0.0 if fly_id != "beta" else PI
@@ -611,9 +615,18 @@ func _physics_process(delta: float) -> void:
 		if is_instance_valid(spear_root):
 			spear_root.position.z = -ext
 		front_spike_area.position = SPIKE_BASE_POS + Vector3(0, 0, -ext)
+		# Streak sheath swells with extension (visual only).
+		if is_instance_valid(spear_glow) and spear_glow_mat != null:
+			spear_glow.visible = true
+			var glow_a := 0.55 * clampf(ext / LUNGE_DIST, 0.0, 1.0)
+			var gc := spear_glow_mat.albedo_color
+			gc.a = glow_a
+			spear_glow_mat.albedo_color = gc
 	elif is_instance_valid(spear_root) and spear_root.position.z != 0.0:
 		spear_root.position.z = 0.0
 		front_spike_area.position = SPIKE_BASE_POS
+		if is_instance_valid(spear_glow):
+			spear_glow.visible = false
 
 	# Forward motion with frame-rate-independent damping. The old per-frame
 	# *= drag made the fly's glide depend on fps (heavy/oily below 60),
@@ -1042,6 +1055,27 @@ func _spear(vm: Node3D) -> void:
 	_cone(spear_root, grip + Vector3(0, 0, -1.05), Vector3(0, 0, -1), 0.05, 0.30, steel)
 	# Crossguard bar just behind the tip cone.
 	_segment(spear_root, grip + Vector3(-0.12, 0, -1.00), grip + Vector3(0.12, 0, -1.00), 0.022, brass)
+	# Lunge streak: additive energy sheath along the shaft, visible only
+	# while the spear extends (driven in _physics_process). Team tint
+	# arrives via set_team_color; alpha is animated per-frame.
+	spear_glow_mat = StandardMaterial3D.new()
+	spear_glow_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	spear_glow_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	spear_glow_mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	spear_glow_mat.albedo_color = Color(1.0, 0.9, 0.7, 0.0)
+	spear_glow = MeshInstance3D.new()
+	spear_glow.name = "SpearGlow"
+	var gm := CylinderMesh.new()
+	gm.top_radius = 0.07
+	gm.bottom_radius = 0.07
+	gm.height = 1.7
+	gm.radial_segments = 8
+	gm.material = spear_glow_mat
+	spear_glow.mesh = gm
+	spear_glow.rotation_degrees.x = 90.0
+	spear_glow.position = grip + Vector3(0, 0, -0.35)
+	spear_glow.visible = false
+	spear_root.add_child(spear_glow)
 	# Real wing membranes + veins hung under the gameplay pivots; pivots
 	# move to the scan hinge positions from the manifest.
 	membrane_mat = ShaderMaterial.new()

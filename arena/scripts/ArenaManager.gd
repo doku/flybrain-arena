@@ -347,6 +347,7 @@ func _ready() -> void:
 
 	_build_health_hud()
 	_build_hit_flash()
+	_build_combat_fx()
 	_build_winner_overlay()
 	_layout_match_hud()
 	_build_brainview()
@@ -1993,6 +1994,9 @@ func _build_hit_flash() -> void:
 func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void:
 	_flash_victim(victim_id, 0.5)
 	_flash_attacker(attacker_id, 0.22)
+	var victim := fly_alpha if victim_id == "alpha" else fly_beta
+	if is_instance_valid(victim):
+		_fire_burst(hit_burst, victim.global_position)
 	# Don't clobber the KO/win message if the wing-loss already ended the round.
 	if is_instance_valid(status_label) and is_round_active:
 		if part == "spike_clash":
@@ -2017,6 +2021,105 @@ func _flash_rect(rect: ColorRect, color: Color, strength: float) -> void:
 	rect.color = Color(color.r, color.g, color.b, strength)
 	var tw := create_tween()
 	tw.tween_property(rect, "color:a", 0.0, 0.4)
+
+# Combat readability FX: ground-projected health rings (in-world health
+# bars with seizure/KO states + KO shockwave) and shared ember-burst
+# nodes for hits and KOs. Visual only; sim state untouched.
+var ring_alpha: MeshInstance3D
+var ring_beta: MeshInstance3D
+var ring_mat_alpha: ShaderMaterial
+var ring_mat_beta: ShaderMaterial
+var ring_shock_alpha := 0.0
+var ring_shock_beta := 0.0
+var hit_burst: GPUParticles3D
+var ko_burst: GPUParticles3D
+
+
+func _ring_material(team: Color) -> ShaderMaterial:
+	var m := ShaderMaterial.new()
+	m.shader = preload("res://scripts/health_ring.gdshader")
+	m.set_shader_parameter("team_color", Vector3(team.r, team.g, team.b))
+	return m
+
+
+func _build_combat_fx() -> void:
+	ring_mat_alpha = _ring_material(Color(1.0, 0.55, 0.30))
+	ring_mat_beta = _ring_material(Color(0.4, 0.75, 1.0))
+	for slot in [["alpha", ring_mat_alpha], ["beta", ring_mat_beta]]:
+		var quad := QuadMesh.new()
+		quad.size = Vector2(4.4, 4.4)
+		var mi := MeshInstance3D.new()
+		mi.mesh = quad
+		mi.material_override = slot[1]
+		mi.rotation_degrees.x = -90.0
+		mi.position = Vector3(0, 0.06, 0)
+		add_child(mi)
+		if str(slot[0]) == "alpha":
+			ring_alpha = mi
+		else:
+			ring_beta = mi
+	hit_burst = _make_burst(14, 0.07, Color(1.0, 0.85, 0.6))
+	ko_burst = _make_burst(42, 0.10, Color(1.0, 0.55, 0.3))
+
+
+func _make_burst(amount: int, size: float, color: Color) -> GPUParticles3D:
+	# Glowing ember sparks: tiny unshaded spheres need no textures and
+	# stay crisp on the Mobile renderer.
+	var p := GPUParticles3D.new()
+	p.amount = amount
+	p.lifetime = 0.55
+	p.one_shot = true
+	p.explosiveness = 0.9
+	p.emitting = false
+	var pm := ParticleProcessMaterial.new()
+	pm.direction = Vector3(0, 1, 0)
+	pm.spread = 180.0
+	pm.initial_velocity_min = 4.0
+	pm.initial_velocity_max = 8.0
+	pm.gravity = Vector3(0, -6, 0)
+	pm.damping_min = 1.0
+	pm.damping_max = 2.0
+	p.process_material = pm
+	var spark := SphereMesh.new()
+	spark.radius = size
+	spark.height = size * 2.0
+	spark.radial_segments = 6
+	spark.rings = 4
+	var sm := StandardMaterial3D.new()
+	sm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sm.albedo_color = color
+	spark.material = sm
+	p.draw_pass_1 = spark
+	add_child(p)
+	return p
+
+
+func _fire_burst(p: GPUParticles3D, pos: Vector3) -> void:
+	if not is_instance_valid(p):
+		return
+	p.global_position = pos
+	p.restart()
+
+
+func _update_combat_fx(delta: float) -> void:
+	for slot in [["alpha", fly_alpha, ring_alpha, ring_mat_alpha, "ring_shock_alpha"],
+			["beta", fly_beta, ring_beta, ring_mat_beta, "ring_shock_beta"]]:
+		var fly: CharacterBody3D = slot[1]
+		var mi: MeshInstance3D = slot[2]
+		var mat: ShaderMaterial = slot[3]
+		if not is_instance_valid(fly) or mi == null or mat == null:
+			continue
+		mi.global_position = Vector3(fly.global_position.x, 0.06, fly.global_position.z)
+		mat.set_shader_parameter("hp", clampf(float(fly.get("health")) / 100.0, 0.0, 1.0))
+		mat.set_shader_parameter("seizing", 1.0 if bool(fly.get("seizing")) else 0.0)
+		mat.set_shader_parameter("ko", 1.0 if bool(fly.get("is_disabled")) else 0.0)
+		var key := str(slot[4])
+		var sh := float(get(key)) + delta * 1.5
+		if sh >= 1.0:
+			sh = 0.0
+		set(key, sh)
+		mat.set_shader_parameter("shock", sh)
+
 
 func _flash_body(fly: CharacterBody3D, strength: float) -> void:
 	# Chitin-shader flash: the fly owns a decaying flash_energy uniform
@@ -2409,6 +2512,7 @@ var _shot_done := false
 
 
 func _process(delta: float) -> void:
+	_update_combat_fx(delta)
 	# Dev screenshot hook: `--shot=C:/path/out.png` saves one viewport
 	# frame ~1 s after boot. Untouched in normal runs.
 	if not _shot_done:
@@ -2631,6 +2735,13 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 	# Draw the final state (health floor, torn wing) BEFORE the winner text.
 	_update_health_hud()
 	_flash_victim(victim_id, 0.75)
+	var victim := fly_alpha if victim_id == "alpha" else fly_beta
+	if is_instance_valid(victim):
+		_fire_burst(ko_burst, victim.global_position)
+		if victim_id == "alpha":
+			ring_shock_alpha = 0.01
+		else:
+			ring_shock_beta = 0.01
 
 	if victim_id == "alpha":
 		stats_beta["kills"] += 1
