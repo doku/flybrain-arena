@@ -993,7 +993,9 @@ func _build_visual_model() -> void:
 	# walking pose, wrong for a flying fighter, so legs stay procedural.
 	# The cuticle carries tergite banding as vertex colors (albedo comes
 	# from the mesh, not the material).
-	var cuticle_mat := _vmat(Color(1, 1, 1), 0.62, 0.05)
+	# Warm mid-brown cuticle: vertex banding survives, but the torso
+	# can never wash white under the bright sun + sky ambient.
+	var cuticle_mat := _vmat(Color(0.6, 0.55, 0.5), 0.62, 0.05)
 	cuticle_mat.vertex_color_use_as_albedo = true
 	_scan_part(vm, "TorsoCuticle", "cuticle", cuticle_mat)
 	_scan_part(vm, "TorsoBristles", "dark", _vmat(Color(0.11, 0.08, 0.06), 0.60, 0.0))
