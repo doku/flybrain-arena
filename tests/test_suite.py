@@ -4290,6 +4290,24 @@ class TestGodotArenaHeadless(unittest.TestCase):
                 self.assertNotIn("SCRIPT ERROR", out, f"Godot raised script error:\n{out}")
                 self.assertNotIn("Parse Error", out, f"Godot raised parse error:\n{out}")
 
+    def test_arena_shaders_parse(self):
+        # Beauty pass gate (parse level): every beauty shader exists and
+        # the arena boot reports no shader-related errors. Headless uses
+        # the dummy rasterizer, so this catches syntax/parse faults; the
+        # windowed run per phase is the compile gate.
+        for name in ("glade_ground", "stylized_sky", "chitin", "wing",
+                     "underbrush", "health_ring"):
+            path = os.path.join(PROJECT_ROOT, "arena", "scripts",
+                                name + ".gdshader")
+            if name in ("glade_ground", "stylized_sky"):
+                self.assertTrue(os.path.isfile(path),
+                                f"missing beauty shader: {path}")
+        out = self._run_headless("res://scenes/ArenaGlade.tscn")
+        for line in out.splitlines():
+            low = line.lower()
+            if "error" in low and "shad" in low:
+                self.fail(f"Godot reported shader error:\n{line}\n--- full output ---\n{out}")
+
 
 class TestBattleTransaction(unittest.TestCase):
     """Isolated battle persistence: draw learning skip + journaled saves.

@@ -302,6 +302,7 @@ const HORIZON_RING_MIN: float = 45.0
 const HORIZON_RING_MAX: float = 180.0
 
 func _ready() -> void:
+	_apply_beauty_pass()
 	fly_alpha.fly_id = "alpha"
 	fly_beta.fly_id = "beta"
 	fly_alpha.set_team_color(Color(1.0, 0.35, 0.1))
@@ -365,6 +366,28 @@ func _ready() -> void:
 		print("[Arena] Requesting free_mode (no director tournament).")
 		brain_client.request_free_mode()
 		_reset_round()
+
+func _apply_beauty_pass() -> void:
+	# Vibrant stylized look, wired at runtime: painted ground + sky
+	# shaders ride material_override / sky_material so the tscn keeps
+	# its plain materials as a fallback if a shader ever fails to load.
+	var ground_mi := get_node_or_null("Ground/GroundMesh") as MeshInstance3D
+	if ground_mi != null:
+		var gmat := ShaderMaterial.new()
+		gmat.shader = preload("res://scripts/glade_ground.gdshader")
+		ground_mi.material_override = gmat
+	var wenv := get_node_or_null("WorldEnvironment") as WorldEnvironment
+	var env: Environment = wenv.environment if wenv != null else null
+	if env != null and env.sky != null:
+		var smat := ShaderMaterial.new()
+		smat.shader = preload("res://scripts/stylized_sky.gdshader")
+		env.sky.sky_material = smat
+		env.sky.process_mode = Sky.PROCESS_MODE_REALTIME
+		# Horizon melts into the scene fog: match it automatically.
+		var fog := env.fog_light_color
+		smat.set_shader_parameter("horizon_color",
+			Vector3(fog.r, fog.g, fog.b))
+
 
 func _director() -> Node:
 	return get_node_or_null("/root/TournamentDirector")
@@ -2378,7 +2401,28 @@ func _update_evo_status_line() -> void:
 	evo_status_line.visible = true
 
 
+var _shot_path := ""
+var _shot_frames := 0
+var _shot_done := false
+
+
 func _process(delta: float) -> void:
+	# Dev screenshot hook: `--shot=C:/path/out.png` saves one viewport
+	# frame ~1 s after boot. Untouched in normal runs.
+	if not _shot_done:
+		if _shot_path == "":
+			for a in OS.get_cmdline_user_args():
+				if str(a).begins_with("--shot="):
+					_shot_path = str(a).get_slice("=", 1)
+					_shot_frames = 0
+					break
+		if _shot_path != "":
+			_shot_frames += 1
+			if _shot_frames >= 500:
+				var img := get_viewport().get_texture().get_image()
+				var err := img.save_png(_shot_path)
+				print("[Arena] Screenshot -> %s (err=%s)" % [_shot_path, str(err)])
+				_shot_done = true
 	_evo_watcher_tick(delta)
 	# Evo spinner animation while the phase panel is up.
 	if is_instance_valid(evo_panel) and evo_panel.visible:
