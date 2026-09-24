@@ -4296,7 +4296,7 @@ class TestGodotArenaHeadless(unittest.TestCase):
         # the dummy rasterizer, so this catches syntax/parse faults; the
         # windowed run per phase is the compile gate.
         for name in ("glade_ground", "stylized_sky", "chitin", "wing",
-                     "underbrush", "health_ring"):
+                     "underbrush", "health_ring", "vignette"):
             path = os.path.join(PROJECT_ROOT, "arena", "scripts",
                                 name + ".gdshader")
             if name in ("glade_ground", "stylized_sky"):

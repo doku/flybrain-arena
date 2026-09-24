@@ -348,6 +348,7 @@ func _ready() -> void:
 	_build_health_hud()
 	_build_hit_flash()
 	_build_combat_fx()
+	_build_vignette()
 	_build_winner_overlay()
 	_layout_match_hud()
 	_build_brainview()
@@ -2119,6 +2120,22 @@ func _update_combat_fx(delta: float) -> void:
 			sh = 0.0
 		set(key, sh)
 		mat.set_shader_parameter("shock", sh)
+
+
+func _build_vignette() -> void:
+	# Cinematic frame: layer 0 sits under the HUD CanvasLayer (layer 1)
+	# and above the 3D view, so labels and overlays stay undarkened.
+	var layer := CanvasLayer.new()
+	layer.layer = 0
+	layer.name = "VignetteLayer"
+	add_child(layer)
+	var rect := ColorRect.new()
+	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var smat := ShaderMaterial.new()
+	smat.shader = preload("res://scripts/vignette.gdshader")
+	rect.material = smat
+	layer.add_child(rect)
 
 
 func _flash_body(fly: CharacterBody3D, strength: float) -> void:
