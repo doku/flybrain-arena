@@ -1313,6 +1313,50 @@ class TestBrainVault(unittest.TestCase):
         self.assertFalse(any(r["filename"] == "junk_deadbeef.flybrain" for r in recs))
         self.assertTrue(os.path.isfile(bad + ".corrupt"))
 
+    def test_incremental_index_no_scan(self):
+        import json
+        from unittest import mock
+        rec = vault_pkg.new_record("Idx", {"seed": 3})
+        vault_pkg.save_brain(rec, np.zeros(32, dtype=np.float32))
+        with open(vault_pkg.VAULT_INDEX) as f:
+            before = json.load(f)["brains"]
+        self.assertTrue(any(b["id"] == rec["id"] for b in before))
+        # A re-save must upsert without scanning: a scan here fails loudly.
+        rec["record"]["wins"] = 7
+        with mock.patch.object(vault_pkg, "scan_vault",
+                               side_effect=AssertionError("scanned")):
+            vault_pkg.save_brain(rec, np.zeros(32, dtype=np.float32))
+        with open(vault_pkg.VAULT_INDEX) as f:
+            after = json.load(f)["brains"]
+        hit = [b for b in after if b["id"] == rec["id"]]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["record"]["wins"], 7)
+
+    def test_index_fallback_and_remove(self):
+        import json
+        from unittest import mock
+        rec = vault_pkg.new_record("Gone", {})
+        vault_pkg.save_brain(rec, np.zeros(16, dtype=np.float32))
+        fname = os.path.basename(vault_pkg.package_path(rec))
+        vault_pkg.remove_index_entry(fname)
+        with open(vault_pkg.VAULT_INDEX) as f:
+            brains = json.load(f)["brains"]
+        self.assertFalse(any(b["id"] == rec["id"] for b in brains))
+        # Removing an absent entry writes nothing (mtime stable).
+        mtime = os.path.getmtime(vault_pkg.VAULT_INDEX)
+        vault_pkg.remove_index_entry(fname)
+        self.assertEqual(mtime, os.path.getmtime(vault_pkg.VAULT_INDEX))
+        # A corrupt index falls back to a full scan on save.
+        with open(vault_pkg.VAULT_INDEX, "w") as f:
+            f.write("garbage{{{")
+        with mock.patch.object(vault_pkg, "scan_vault",
+                               wraps=vault_pkg.scan_vault) as spied:
+            vault_pkg.save_brain(rec, np.zeros(16, dtype=np.float32))
+            self.assertTrue(spied.called)
+        with open(vault_pkg.VAULT_INDEX) as f:
+            brains = json.load(f)["brains"]
+        self.assertTrue(any(b["id"] == rec["id"] for b in brains))
+
     def test_import_legacy_npz(self):
         tmp_npz = os.path.join(self.tmp, "legacy.npz")
         np.savez_compressed(tmp_npz, weights=np.ones(128, dtype=np.float32))
@@ -4463,6 +4507,60 @@ class TestBattleTransaction(unittest.TestCase):
         stored = self.srv._read_last_verdict()
         self.assertEqual(stored["key"], key)
         self.assertEqual(stored["result"], resp)
+
+    def test_draw_journal_skips_weights(self):
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "draw")
+        vault_pkg.record_battle_result(rb, "draw")
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "D1", "draw": True}
+        resp = {"status": "tournament_battle", "battle_winner": "draw",
+                "fitness_alpha": 1.0, "fitness_beta": 1.0,
+                "battle_id": "D1"}
+        self.srv._write_pending_battle(
+            key, resp,
+            [{"side": "alpha", "record": ra, "weights_unchanged": True},
+             {"side": "beta", "record": rb, "weights_unchanged": True}],
+            {})
+        # Records-only journal: KBs, never the 200 MB weight payload.
+        self.assertLess(
+            os.path.getsize(self.srv._pending_battle_path()), 65536)
+        self.srv._recover_pending_battle((sta, stb))
+        la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        lb, wb2 = vault_pkg.load_brain(rec_b["id"])
+        np.testing.assert_array_equal(wa2, wa)
+        np.testing.assert_array_equal(wb2, wb)
+        self.assertEqual((la["record"]["draws"], la["record"]["battles"]),
+                         (1, 1))
+        self.assertEqual((lb["record"]["draws"], lb["record"]["battles"]),
+                         (1, 1))
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"], key)
+        self.assertEqual(stored["result"], resp)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+
+    def test_save_brain_record_only(self):
+        import zipfile
+        rec = vault_pkg.new_record("RecOnly", {})
+        w = np.arange(24, dtype=np.float32)
+        vault_pkg.save_brain(rec, w)
+        rec["record"]["wins"] = 3
+        vault_pkg.save_brain_record_only(rec)
+        rec2, w2 = vault_pkg.load_brain(rec["id"])
+        self.assertEqual(rec2["record"]["wins"], 3)
+        np.testing.assert_array_equal(w2, w)
+        # A package missing its weights entry must fail loud, never
+        # bank half a battle.
+        path = vault_pkg.package_path(rec)
+        with zipfile.ZipFile(path, "r") as zin:
+            meta = zin.read(vault_pkg.META_ENTRY)
+        with zipfile.ZipFile(path, "w") as zout:
+            zout.writestr(vault_pkg.META_ENTRY, meta)
+        with self.assertRaises(ValueError):
+            vault_pkg.save_brain_record_only(rec)
 
     def test_unkeyed_journal_preserves_previous_verdict(self):
         import copy

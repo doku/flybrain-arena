@@ -229,7 +229,7 @@ def cmd_delete(a):
         return err(str(e))
     try:
         os.remove(path)
-        vault.refresh_index()
+        vault.remove_index_entry(os.path.basename(path))
     except OSError as e:
         return err(str(e))
     return out({"ok": True, "deleted": os.path.basename(path)})
@@ -247,6 +247,7 @@ def cmd_rename(a):
         vault.save_brain(rec, weights)
         if os.path.abspath(old_path) != os.path.abspath(vault.package_path(rec)):
             os.remove(old_path)
+            vault.remove_index_entry(os.path.basename(old_path))
     except OSError as e:
         return err(str(e))
     return out({"ok": True, "brain": rec})

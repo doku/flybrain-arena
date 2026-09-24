@@ -251,6 +251,13 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         "report": (f"{battle_winner} wins by {report}"
                    if not arena_draw else f"draw ({report})"),
     }
+    if arena_draw:
+        # No plasticity on draws: weights are byte-identical, so the
+        # journal carries records-only markers and replay takes the
+        # record-only save path (no 200 MB weight payload, no zip rewrite).
+        for r in records:
+            r["weights_unchanged"] = True
+        weights = {}
     _write_pending_battle(battle_key, resp, records, weights)
     _recover_pending_battle((tourney_a, tourney_b))
     try:
@@ -461,8 +468,11 @@ def _recover_pending_battle(states=()):
             for entry in transaction["records"]:
                 if not isinstance(entry, dict) \
                         or entry.get("side") not in ("alpha", "beta") \
-                        or not isinstance(entry.get("record"), dict) \
-                        or entry["side"] not in pending:
+                        or not isinstance(entry.get("record"), dict):
+                    raise ValueError("pending battle journal has bad entry")
+                if entry.get("weights_unchanged"):
+                    continue
+                if entry["side"] not in pending:
                     raise ValueError("pending battle journal has bad entry")
                 payload[entry["side"]] = np.array(pending[entry["side"]])
     except Exception as e:
@@ -479,12 +489,18 @@ def _recover_pending_battle(states=()):
     # in place so the next message or boot retries the SAME record bumps.
     for entry in transaction["records"]:
         rec = entry["record"]
-        weights = payload[entry["side"]]
-        vault_pkg.save_brain(rec, weights, backup=False, fast=True)
+        if entry.get("weights_unchanged"):
+            vault_pkg.save_brain_record_only(rec)
+        else:
+            weights = payload[entry["side"]]
+            vault_pkg.save_brain(rec, weights, backup=False, fast=True)
         for st in states:
             if st["rec"] is not None and st["rec"]["filename"] == rec["filename"]:
                 st["rec"] = deepcopy(rec)
-                st["brain"].weights = weights.copy()
+                # Marked sides are weight-identical: only the record
+                # needs syncing, in-memory weights are already current.
+                if not entry.get("weights_unchanged"):
+                    st["brain"].weights = weights.copy()
     # Only keyed battles participate in retry idempotency. An
     # unkeyed journal must still replay its vault saves, but writing
     # a key=None verdict here would clobber the previous battle's

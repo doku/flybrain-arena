@@ -114,7 +114,39 @@ def save_brain(record, weights, backup=True, fast=False):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    refresh_index()
+    update_index_entry(record)
+    return path
+
+
+def save_brain_record_only(record):
+    """Rewrites only the meta entry of an existing package, copying the
+    weights bytes verbatim (draw path: weights provably unchanged, so no
+    numpy work and no recompress). Hot-save semantics: no .bak, then an
+    incremental index upsert. Raises on missing/corrupt weights so a
+    journal replay leaves the transaction for reconcile instead of
+    banking half a battle."""
+    os.makedirs(VAULT_DIR, exist_ok=True)
+    path = package_path(record)
+    with zipfile.ZipFile(path, "r") as zin:
+        names = set(zin.namelist())
+        if WEIGHTS_ENTRY not in names or META_ENTRY not in names:
+            raise ValueError(f"{path} is not a valid .flybrain package "
+                             f"(missing {WEIGHTS_ENTRY} or {META_ENTRY})")
+        wdata = zin.read(WEIGHTS_ENTRY)
+    # Validate the copied payload decodes before touching the file.
+    with np.load(io.BytesIO(wdata)) as z:
+        z["weights"]
+    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=VAULT_DIR)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr(WEIGHTS_ENTRY, wdata)
+            zf.writestr(META_ENTRY, json.dumps(record, indent=2))
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    update_index_entry(record)
     return path
 
 
@@ -180,6 +212,59 @@ def refresh_index():
         scan_vault(silent=True)
     except OSError:
         pass
+
+
+def _read_index():
+    """Parsed index entries, or None when the file is missing/corrupt."""
+    try:
+        with open(VAULT_INDEX) as f:
+            data = json.load(f)
+        brains = data.get("brains", [])
+        if isinstance(brains, list):
+            return brains
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_index(brains):
+    brains = sorted(brains,
+                    key=lambda r: (r.get("name", ""), r.get("id", "")))
+    tmp = VAULT_INDEX + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"updated_utc": _utcnow(), "brains": brains}, f, indent=2)
+    os.replace(tmp, VAULT_INDEX)
+
+
+def update_index_entry(record):
+    """Upserts one brain's index entry after a save — no vault scan, so
+    hot per-battle saves stop re-opening every package. The upserted
+    entry is exactly what a scan would produce (stored meta + filename),
+    same sort order. Falls back to a full scan when the index is
+    missing or corrupt."""
+    brains = _read_index()
+    if brains is None:
+        refresh_index()
+        return
+    fname = os.path.basename(package_path(record))
+    entry = dict(record)
+    entry["filename"] = fname
+    brains = [b for b in brains if b.get("filename") != fname]
+    brains.append(entry)
+    _write_index(brains)
+
+
+def remove_index_entry(filename):
+    """Drops one filename from the index after a vault delete/archive/
+    rename (no vault scan). Missing index falls back to a full scan;
+    an already-absent entry writes nothing at all."""
+    brains = _read_index()
+    if brains is None:
+        refresh_index()
+        return
+    kept = [b for b in brains if b.get("filename") != filename]
+    if len(kept) != len(brains):
+        _write_index(kept)
 
 
 def import_legacy_npz(npz_path, name, params=None):
@@ -354,7 +439,7 @@ def archive_brain(path_or_id, reason=""):
     log = _read_archive_log()
     log.append(entry)
     _write_archive_log(log)
-    refresh_index()
+    remove_index_entry(os.path.basename(dst))
     return entry
 
 
@@ -389,7 +474,7 @@ def restore_brain(name_or_id):
     if os.path.isfile(bak):
         shutil.move(bak, dst + ".bak")
     rec, _w = load_brain(dst)
-    refresh_index()
+    update_index_entry(rec)
     return rec
 
 
