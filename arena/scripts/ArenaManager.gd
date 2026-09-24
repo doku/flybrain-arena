@@ -929,6 +929,19 @@ func _tree_mesh(key: String) -> Mesh:
 	return m
 
 
+func _sway_material(base: Color, amp: float, bend: float, half_h: float) -> ShaderMaterial:
+	# One wind-sway instance per palette entry (bushes x2, grass x1);
+	# instances share the mesh + shader, phase comes from each node's
+	# origin hash in-shader.
+	var m := ShaderMaterial.new()
+	m.shader = preload("res://scripts/underbrush.gdshader")
+	m.set_shader_parameter("base_color", Vector3(base.r, base.g, base.b))
+	m.set_shader_parameter("sway_amp", amp)
+	m.set_shader_parameter("bend_amount", bend)
+	m.set_shader_parameter("mesh_half_height", half_h)
+	return m
+
+
 func _add_tree_part(parent: Node3D, pname: String, mesh: Mesh, pos: Vector3, mat: Material, scl: Vector3 = Vector3.ONE) -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	mi.name = pname
@@ -987,18 +1000,14 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 	var under := Node3D.new()
 	under.name = "Underbrush"
 	forest_root.add_child(under)
-	var bush_mat_a := StandardMaterial3D.new()
-	bush_mat_a.albedo_color = Color(0.13, 0.30, 0.11)
-	bush_mat_a.roughness = 0.9
-	var bush_mat_b := StandardMaterial3D.new()
-	bush_mat_b.albedo_color = Color(0.18, 0.36, 0.13)
-	bush_mat_b.roughness = 0.9
+	# Wind-swayed bushes + grass (trees keep StandardMaterials for the
+	# occlusion-fade system). Rocks stay still, exactly as before.
+	var bush_mat_a := _sway_material(Color(0.13, 0.30, 0.11), 0.05, 0.3, 0.85)
+	var bush_mat_b := _sway_material(Color(0.18, 0.36, 0.13), 0.05, 0.3, 0.85)
 	var rock_mat := StandardMaterial3D.new()
 	rock_mat.albedo_color = Color(0.45, 0.44, 0.42)
 	rock_mat.roughness = 0.95
-	var grass_mat := StandardMaterial3D.new()
-	grass_mat.albedo_color = Color(0.24, 0.47, 0.17)
-	grass_mat.roughness = 0.9
+	var grass_mat := _sway_material(Color(0.24, 0.47, 0.17), 0.15, 1.0, 0.55)
 	var spots: Array[Vector2] = []
 	var made_bush := 0
 	var tries := 0
