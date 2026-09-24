@@ -4299,9 +4299,8 @@ class TestGodotArenaHeadless(unittest.TestCase):
                      "underbrush", "health_ring", "vignette"):
             path = os.path.join(PROJECT_ROOT, "arena", "scripts",
                                 name + ".gdshader")
-            if name in ("glade_ground", "stylized_sky"):
-                self.assertTrue(os.path.isfile(path),
-                                f"missing beauty shader: {path}")
+            self.assertTrue(os.path.isfile(path),
+                            f"missing beauty shader: {path}")
         out = self._run_headless("res://scenes/ArenaGlade.tscn")
         for line in out.splitlines():
             low = line.lower()

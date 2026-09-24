@@ -2115,10 +2115,12 @@ func _update_combat_fx(delta: float) -> void:
 		mat.set_shader_parameter("seizing", 1.0 if bool(fly.get("seizing")) else 0.0)
 		mat.set_shader_parameter("ko", 1.0 if bool(fly.get("is_disabled")) else 0.0)
 		var key := str(slot[4])
-		var sh := float(get(key)) + delta * 1.5
-		if sh >= 1.0:
-			sh = 0.0
-		set(key, sh)
+		var sh := float(get(key))
+		if sh > 0.0:
+			sh += delta * 1.5
+			if sh >= 1.0:
+				sh = 0.0
+			set(key, sh)
 		mat.set_shader_parameter("shock", sh)
 
 
