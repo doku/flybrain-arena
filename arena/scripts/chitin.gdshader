@@ -10,7 +10,7 @@ uniform vec3 shell_dark : source_color = vec3(0.10, 0.06, 0.05);
 uniform float rim_strength : hint_range(0.0, 2.0) = 1.2;
 uniform float iridescence : hint_range(0.0, 1.0) = 0.35;
 uniform float flash_energy : hint_range(0.0, 3.0) = 0.0;
-uniform float roughness_lo : hint_range(0.0, 1.0) = 0.35;
+uniform float roughness_lo : hint_range(0.0, 1.0) = 0.55;
 
 void fragment() {
 	float fres = pow(1.0 - max(dot(normalize(NORMAL), normalize(VIEW)), 0.0), 2.5);
@@ -22,7 +22,7 @@ void fragment() {
 	// Hit flash: hot white strike bloom.
 	vec3 flash_col = vec3(1.0, 0.96, 0.88) * flash_energy;
 	ALBEDO = col + flash_col * 0.6;
-	EMISSION = team_tint * fres * rim_strength * 0.35 + flash_col * 1.2;
+	EMISSION = team_tint * fres * rim_strength * 0.25 + flash_col * 1.2;
 	ROUGHNESS = roughness_lo;
-	SPECULAR = 0.6;
+	SPECULAR = 0.3;
 }
