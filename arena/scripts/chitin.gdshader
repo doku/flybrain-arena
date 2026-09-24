@@ -14,8 +14,8 @@ uniform float roughness_lo : hint_range(0.0, 1.0) = 0.35;
 
 void fragment() {
 	float fres = pow(1.0 - max(dot(normalize(NORMAL), normalize(VIEW)), 0.0), 2.5);
-	// Dark shell core, team color blooming toward the silhouette.
-	vec3 col = mix(shell_dark, team_tint, 0.25 + 0.55 * fres);
+	// Team color reads at every angle, blooming toward the silhouette.
+	vec3 col = mix(shell_dark, team_tint, 0.45 + 0.45 * fres);
 	// Oil-slick sheen: channel-swapped tint riding the rim.
 	vec3 slick = team_tint.brg * vec3(0.85, 1.0, 1.15);
 	col = mix(col, slick, iridescence * fres * 0.6);

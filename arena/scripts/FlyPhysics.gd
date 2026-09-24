@@ -182,6 +182,7 @@ func _ready() -> void:
 # their own uniforms.
 var body_mat: ShaderMaterial
 var eye_mat: ShaderMaterial
+var cuticle_mat: StandardMaterial3D
 var membrane_mat: ShaderMaterial
 var spear_glow: MeshInstance3D
 var spear_glow_mat: StandardMaterial3D
@@ -192,6 +193,10 @@ func set_team_color(color: Color) -> void:
 		return
 	body_mat.set_shader_parameter("team_tint",
 		Vector3(color.r, color.g, color.b))
+	if cuticle_mat != null:
+		# Vertex colors multiply the albedo, so the tergite banding
+		# survives while the whole torso takes the team hue.
+		cuticle_mat.albedo_color = color
 	if spear_glow_mat != null:
 		spear_glow_mat.albedo_color = Color(color.r, color.g, color.b, 0.0)
 	if membrane_mat != null:
@@ -993,7 +998,7 @@ func _build_visual_model() -> void:
 	# walking pose, wrong for a flying fighter, so legs stay procedural.
 	# The cuticle carries tergite banding as vertex colors (albedo comes
 	# from the mesh, not the material).
-	var cuticle_mat := _vmat(Color(1, 1, 1), 0.62, 0.05)
+	cuticle_mat = _vmat(Color(1, 1, 1), 0.62, 0.05)
 	cuticle_mat.vertex_color_use_as_albedo = true
 	_scan_part(vm, "TorsoCuticle", "cuticle", cuticle_mat)
 	_scan_part(vm, "TorsoBristles", "dark", _vmat(Color(0.11, 0.08, 0.06), 0.60, 0.0))

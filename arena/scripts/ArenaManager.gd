@@ -305,8 +305,8 @@ func _ready() -> void:
 	_apply_beauty_pass()
 	fly_alpha.fly_id = "alpha"
 	fly_beta.fly_id = "beta"
-	fly_alpha.set_team_color(Color(1.0, 0.35, 0.1))
-	fly_beta.set_team_color(Color(0.15, 0.6, 1.0))
+	fly_alpha.set_team_color(Color(1.0, 0.55, 0.30))
+	fly_beta.set_team_color(Color(0.4, 0.75, 1.0))
 	if is_instance_valid(brain_alpha_label):
 		brain_alpha_label.add_theme_color_override("font_color", Color(1.0, 0.55, 0.3))
 	if is_instance_valid(brain_beta_label):
