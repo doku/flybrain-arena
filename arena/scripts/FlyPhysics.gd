@@ -175,16 +175,28 @@ func _ready() -> void:
 	_build_visual_model()
 	front_spike_area.area_entered.connect(_on_spike_hit_area)
 
+# Beauty-pass material refs: chitin (thorax + eyes) and wing membranes
+# are per-fly ShaderMaterials; the manager pushes team colors + hit
+# flashes here instead of poking StandardMaterial3D (see set_team_color
+# / flash_hit). Shared scan meshes are untouched, so both rivals keep
+# their own uniforms.
+var body_mat: ShaderMaterial
+var eye_mat: ShaderMaterial
+var membrane_mat: ShaderMaterial
+var flash_energy := 0.0
+
 func set_team_color(color: Color) -> void:
-	# Per-instance body tint (material_override, so the shared scene material
-	# stays untouched and the two rivals keep their own colors).
-	var body_mesh = $VisualModel/BodyMesh as MeshInstance3D
-	if is_instance_valid(body_mesh):
-		var mat := StandardMaterial3D.new()
-		mat.albedo_color = color
-		mat.metallic = 0.4
-		mat.roughness = 0.6
-		body_mesh.material_override = mat
+	if body_mat == null:
+		return
+	body_mat.set_shader_parameter("team_tint",
+		Vector3(color.r, color.g, color.b))
+	if membrane_mat != null:
+		# Rivals shimmer out of sync; membranes keep a pearly white.
+		var phase := 0.0 if fly_id != "beta" else PI
+		membrane_mat.set_shader_parameter("phase", phase)
+
+func flash_hit(strength: float = 1.0) -> void:
+	flash_energy = maxf(flash_energy, strength)
 
 func apply_brain_controls(ctrl: Dictionary) -> void:
 	if is_disabled:
@@ -487,6 +499,13 @@ func _landing_step(delta: float) -> void:
 
 func _physics_process(delta: float) -> void:
 	clash_cooldown = maxf(0.0, clash_cooldown - delta)
+	# Hit-flash decay (visual only, never touches sim state).
+	if flash_energy > 0.0:
+		flash_energy = maxf(0.0, flash_energy - delta * 2.5)
+		if body_mat != null:
+			body_mat.set_shader_parameter("flash_energy", flash_energy)
+		if eye_mat != null:
+			eye_mat.set_shader_parameter("flash_energy", flash_energy * 0.7)
 	if landing_mode > 0:
 		_landing_step(delta)
 		return
@@ -965,8 +984,16 @@ func _build_visual_model() -> void:
 	cuticle_mat.vertex_color_use_as_albedo = true
 	_scan_part(vm, "TorsoCuticle", "cuticle", cuticle_mat)
 	_scan_part(vm, "TorsoBristles", "dark", _vmat(Color(0.11, 0.08, 0.06), 0.60, 0.0))
-	_scan_part(vm, "BodyMesh", "thorax", _vmat(Color(0.55, 0.45, 0.30), 0.55, 0.10))
-	_scan_part(vm, "EyeMesh", "eyes", _vmat(Color(0.62, 0.12, 0.10), 0.15, 0.25))
+	# Beetle-shell thorax + glossy crimson eyes (team tint arrives later
+	# via set_team_color; default matches the old neutral tan).
+	body_mat = ShaderMaterial.new()
+	body_mat.shader = preload("res://scripts/chitin.gdshader")
+	_scan_part(vm, "BodyMesh", "thorax", body_mat)
+	eye_mat = ShaderMaterial.new()
+	eye_mat.shader = preload("res://scripts/chitin.gdshader")
+	eye_mat.set_shader_parameter("team_tint", Vector3(0.62, 0.12, 0.10))
+	eye_mat.set_shader_parameter("rim_strength", 1.6)
+	_scan_part(vm, "EyeMesh", "eyes", eye_mat)
 	_scan_part(vm, "HaltereMesh", "halteres", _vmat(Color(0.70, 0.64, 0.48), 0.50, 0.10))
 	# Six jointed legs in a tucked flight pose.
 	var hip_z := [-0.28, -0.02, 0.24]
@@ -1017,9 +1044,8 @@ func _spear(vm: Node3D) -> void:
 	_segment(spear_root, grip + Vector3(-0.12, 0, -1.00), grip + Vector3(0.12, 0, -1.00), 0.022, brass)
 	# Real wing membranes + veins hung under the gameplay pivots; pivots
 	# move to the scan hinge positions from the manifest.
-	var membrane_mat := _vmat(Color(0.90, 0.93, 1.0, 0.42), 0.08, 0.15)
-	membrane_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	membrane_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	membrane_mat = ShaderMaterial.new()
+	membrane_mat.shader = preload("res://scripts/wing.gdshader")
 	var vein_mat := _vmat(Color(0.25, 0.18, 0.12), 0.50, 0.10)
 	_hang_scan_wing("Left", "wingL_membrane", "wingL_veins", membrane_mat, vein_mat)
 	_hang_scan_wing("Right", "wingR_membrane", "wingR_veins", membrane_mat, vein_mat)

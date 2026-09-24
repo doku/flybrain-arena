@@ -1996,34 +1996,27 @@ func _flash_victim(victim_id: String, strength: float) -> void:
 	var rect := alpha_hit_flash if victim_id == "alpha" else beta_hit_flash
 	if rect != null:
 		_flash_rect(rect, Color(1.0, 0.2, 0.15), strength)
-	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, Color(1.0, 0.3, 0.2))
+	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
 
 func _flash_attacker(attacker_id: String, strength: float) -> void:
 	var rect := alpha_hit_flash if attacker_id == "alpha" else beta_hit_flash
 	if rect != null:
 		_flash_rect(rect, Color(1.0, 1.0, 0.8), strength)
-	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, Color(1.0, 0.9, 0.6))
+	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, 0.6)
 
 func _flash_rect(rect: ColorRect, color: Color, strength: float) -> void:
 	rect.color = Color(color.r, color.g, color.b, strength)
 	var tw := create_tween()
 	tw.tween_property(rect, "color:a", 0.0, 0.4)
 
-func _flash_body(fly: CharacterBody3D, color: Color) -> void:
+func _flash_body(fly: CharacterBody3D, strength: float) -> void:
+	# Chitin-shader flash: the fly owns a decaying flash_energy uniform
+	# (FlyPhysics.flash_hit); the old StandardMaterial3D emission poke
+	# died with the flat team-blob material.
 	if not is_instance_valid(fly):
 		return
-	var mesh := fly.get_node_or_null("VisualModel/BodyMesh") as MeshInstance3D
-	if mesh == null:
-		return
-	var mat := mesh.get_active_material(0) as StandardMaterial3D
-	if mat == null:
-		return
-	mat.emission_enabled = true
-	mat.emission = color
-	mat.emission_energy_multiplier = 3.0
-	var tw := create_tween()
-	tw.tween_property(mat, "emission_energy_multiplier", 0.0, 0.45)
-	tw.tween_callback(func(): mat.emission_enabled = false)
+	if fly.has_method("flash_hit"):
+		fly.call("flash_hit", strength)
 
 func _build_winner_overlay() -> void:
 	# Full-screen dim + big centered winner callout + countdown. Hidden by

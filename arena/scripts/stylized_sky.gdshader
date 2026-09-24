@@ -46,7 +46,7 @@ vec3 sky_color(vec3 dir) {
 	float h = clamp(dir.y, -1.0, 1.0);
 	vec3 col;
 	if (h >= 0.0) {
-		vec3 low = mix(mid_color, horizon_color, pow(1.0 - h, 3.0));
+		vec3 low = mix(mid_color, horizon_color, pow(1.0 - h, 2.0));
 		col = mix(low, zenith_color, smoothstep(0.15, 0.85, h));
 	} else {
 		col = mix(mid_color * 0.9, ground_haze, smoothstep(0.0, -0.4, h));
@@ -64,7 +64,7 @@ vec3 sky_color(vec3 dir) {
 	if (LIGHT0_ENABLED) {
 		float sun_d = dot(dir, -LIGHT0_DIRECTION);
 		float disc = smoothstep(0.9992, 0.9997, sun_d);
-		float glow = pow(clamp(sun_d, 0.0, 1.0), 24.0) * 0.35;
+		float glow = pow(clamp(sun_d, 0.0, 1.0), 24.0) * 0.22;
 		col += LIGHT0_COLOR * (disc * 2.2 + glow) * LIGHT0_ENERGY * step(0.0, h);
 	}
 	// Dither against RGB10A2 banding.
