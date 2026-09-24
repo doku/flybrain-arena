@@ -49,6 +49,7 @@ var tourney_size: OptionButton
 var tourney_bestof: OptionButton
 var tourney_random: CheckButton
 var tourney_consolation: CheckButton
+var evo_mutate_traits: CheckButton
 var tourney_lr: SpinBox
 var tourney_round_time: SpinBox
 var player_list: ItemList
@@ -648,6 +649,11 @@ func _build_tourney_column() -> VBoxContainer:
 	evo_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	evo_button.pressed.connect(_on_start_evolution)
 	srow2.add_child(evo_button)
+	evo_mutate_traits = CheckButton.new()
+	evo_mutate_traits.text = "Mutate kin traits"
+	evo_mutate_traits.tooltip_text = "ON = each generation's winner-clone re-rolls one random trait (learning rate, dist gain, evasion, yaw bias) alongside genome structural mutation. OFF = exact hyperparameter copy."
+	evo_mutate_traits.button_pressed = true
+	c.add_child(evo_mutate_traits)
 	bracket_status = Label.new()
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1166,7 +1172,9 @@ func _on_start_evolution() -> void:
 		bracket_status.text = "Cannot start: %s" % str(res.get("error", "?"))
 		return
 	TournamentDirector.tourney["evo"] = {"active": true, "generation": 1,
-		"episodes": 50}
+		"episodes": 50,
+		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
+			and evo_mutate_traits.button_pressed else 0}
 	TournamentDirector.save_state()
 	bracket_status.text = "EVOLUTION gen 1 ready (%s)." % str(res.get("tournament_id", ""))
 	_render_bracket()

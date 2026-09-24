@@ -3304,6 +3304,10 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	var p2 := _evo_params2_file(rf)
 	if p2 != "":
 		args += ["--params2-file", p2]
+	# Kin trait mutation rides the tournament's evo settings (menu
+	# toggle at START EVOLUTION, preserved across generations).
+	var evod: Dictionary = director.tourney.get("evo", {})
+	args += ["--mutate-traits", str(int(evod.get("mutate_traits", 1)))]
 	# Never emit an empty argv element: Godot drops it on Windows, so
 	# `--name ""` arrives as a bare `--name` and argparse aborts the
 	# worker (this killed every wild breed). Empty = wild auto-christen.
@@ -3527,7 +3531,8 @@ func _run_evo_generation() -> void:
 		_evo_abort("next bracket failed: %s" % str(res.get("error", "?")))
 		return
 	director.tourney["evo"] = {"active": true, "generation": gen + 1,
-		"episodes": EVO_EPISODES}
+		"episodes": EVO_EPISODES,
+		"mutate_traits": int((director.tourney.get("evo", {}) as Dictionary).get("mutate_traits", 1))}
 	director.save_state()
 	# Pipeline: kick off the next generation's wild breed immediately
 	_evo_queue_wild(gen + 2)

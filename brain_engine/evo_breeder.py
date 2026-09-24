@@ -129,6 +129,45 @@ def _staged_or_single(child, start_weights, ep1, params, note1,
     return record, weights, merge_summaries(summaries)
 
 
+# Kin trait mutation: each clone re-rolls up to N hyperparameters
+# (genes mutate separately via structural genome mutation). Fresh draws
+# use the same ranges as wilds so mutants stay in-distribution.
+# align_bonus keeps its pursuit shaping; yaw_bias only mutates when the
+# parent carries one (None stays ungraduated).
+TRAIT_RANGES = {
+    "learning_rate": (0.003, 0.010),
+    "dist_gain": (0.05, 0.30),
+    "evasion": (0.0, 0.6),
+}
+
+
+def mutate_kin_traits(params, seed, n=1):
+    """Re-roll up to n trait keys in place on a dedicated seed stream
+    (deterministic per seed, never shifts other draws). Returns
+    {key: [old, new]} for the lineage stamp."""
+    import random as _random
+    r = _random.Random(int(seed) ^ 0x7A17)
+    cands = [k for k in ("learning_rate", "dist_gain", "evasion")
+             if k in params]
+    if params.get("yaw_bias", None) is not None:
+        cands.append("yaw_bias")
+    mutated = {}
+    for key in r.sample(cands, max(0, min(int(n), len(cands)))):
+        old = params[key]
+        if key in TRAIT_RANGES:
+            lo, hi = TRAIT_RANGES[key]
+            prec = 4 if key == "learning_rate" else 2
+            new = round(r.uniform(lo, hi), prec)
+        elif key == "yaw_bias":
+            from sensory_motor import draw_yaw_bias
+            new = draw_yaw_bias(r)
+        else:
+            continue
+        params[key] = new
+        mutated[key] = [old, new]
+    return mutated
+
+
 def inherit_elo(parent_elo):
     """Clone ELO with regression to the mean: child starts strong but
     below the parent (default-rated parents breed default children)."""
@@ -138,7 +177,8 @@ def inherit_elo(parent_elo):
 
 def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
                 mapping=None, progress_cb=None, mutate_structure=True,
-                max_changes=1, episodes2=None, params2=None):
+                max_changes=1, episodes2=None, params2=None,
+                mutate_traits=1):
     """Clone a winner: weight copy + Gaussian noise, fresh seed, full
     training. mapping=None inherits the parent's stack. Genome parents
     additionally undergo structural mutation (mutate_structure, bounded
@@ -146,6 +186,9 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     inits new edges from the parent scale) and the child's mapping is
     re-derived from the mutated genome unless mapping is explicit.
     Genome-less parents (base/legacy) clone structurally identical.
+    mutate_traits re-rolls that many hyperparameter traits at random
+    (learning_rate/dist_gain/evasion, plus yaw_bias when carried; 0
+    disables) with the change stamped into the lineage.
     episodes2/params2 run a second stage (flight school) back-to-back
     via train_staged (unset stage-2 keys inherit stage 1); omitted
     means single-stage. Returns (record, weights, summary) like
@@ -183,11 +226,15 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
         "mapping": child_mapping,
         "yaw_bias": gp.get("yaw_bias"),
     }
+    mutated = {}
+    if int(mutate_traits or 0) > 0:
+        mutated = mutate_kin_traits(params, int(seed), int(mutate_traits))
     if genome is not None:
         attach_genome(params, genome)
     child = vault.new_record(name, params)
     child["lineage"] = {"parent_ids": [rec.get("id", "")],
-                        "source": f"clone:{rec.get('id', '')}"}
+                        "source": f"clone:{rec.get('id', '')}",
+                        "trait_mutations": mutated}
     # ELO inheritance with regression to the mean: the child starts
     # strong but below the parent (wilds take the new_record default).
     parent_elo = float((rec.get("record", {}) or {}).get(

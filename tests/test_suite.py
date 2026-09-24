@@ -4172,6 +4172,89 @@ class TestElo(unittest.TestCase):
                                           mutate_structure=False)
         self.assertAlmostEqual(rec["record"]["elo"], 1410.0)
 
+    def test_mutate_kin_traits(self):
+        import evo_breeder as evo
+        base = {"learning_rate": 0.008, "dist_gain": 0.15,
+                "evasion": 0.2, "yaw_bias": 9.0,
+                "align_bonus": [0.5, 0.2, -0.3]}
+        # One random trait moves, in range, everything else identical.
+        p1 = dict(base)
+        m1 = evo.mutate_kin_traits(p1, seed=11, n=1)
+        self.assertEqual(len(m1), 1)
+        key = next(iter(m1))
+        self.assertEqual(m1[key][0], base[key])
+        self.assertNotEqual(m1[key][1], base[key])
+        if key == "learning_rate":
+            self.assertTrue(0.003 <= p1[key] <= 0.010)
+        elif key == "dist_gain":
+            self.assertTrue(0.05 <= p1[key] <= 0.30)
+        elif key == "evasion":
+            self.assertTrue(0.0 <= p1[key] <= 0.6)
+        elif key == "yaw_bias":
+            self.assertTrue(6.0 <= p1[key] <= 12.0)
+        for k in base:
+            if k != key:
+                self.assertEqual(p1[k], base[k])
+        # Deterministic per seed; zero disables; None bias never mutates.
+        p2 = dict(base)
+        self.assertEqual(evo.mutate_kin_traits(p2, seed=11, n=1), m1)
+        p3 = dict(base)
+        self.assertEqual(evo.mutate_kin_traits(p3, seed=11, n=0), {})
+        self.assertEqual(p3, base)
+        p4 = dict(base, yaw_bias=None)
+        for _ in range(20):
+            q = dict(p4)
+            mutated = evo.mutate_kin_traits(q, seed=_, n=4)
+            self.assertNotIn("yaw_bias", mutated)
+            self.assertIsNone(q["yaw_bias"])
+
+    def test_breed_clone_trait_mutation(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3, "learning_rate": 0.008,
+                                       "dist_gain": 0.15, "evasion": 0.2,
+                                       "yaw_bias": 9.0},
+                  "record": {"battles": 4, "wins": 4, "losses": 0,
+                             "draws": 0, "matches": 1, "matches_won": 1,
+                             "matches_lost": 0, "tournaments_won": 0,
+                             "elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x"}}
+        seen = {}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            seen.update(params)
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5, episodes=1,
+                                          mutate_structure=False,
+                                          mutate_traits=2)
+        changed = [k for k in ("learning_rate", "dist_gain", "evasion",
+                               "yaw_bias")
+                   if seen.get(k) != parent["generator_params"][k]]
+        self.assertEqual(len(changed), 2)
+        self.assertEqual(set(rec["lineage"]["trait_mutations"].keys()),
+                         set(changed))
+        # Disabled: hyperparameters copy over exactly (seed always fresh).
+        seen.clear()
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            evo.breed_clone("p1", "Kid2", seed=6, episodes=1,
+                            mutate_structure=False, mutate_traits=0)
+        for k in ("learning_rate", "dist_gain", "evasion", "yaw_bias"):
+            self.assertEqual(seen.get(k), parent["generator_params"][k])
+
 
 class TestGodotArenaHeadless(unittest.TestCase):
     """Verifies that Godot 4 compiles all GDScripts and runs each scene without errors."""

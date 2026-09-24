@@ -367,7 +367,9 @@ def cmd_breed(a):
             rec, _w, summary = evo_breeder.breed_clone(
                 a.parent, a.name, int(a.seed), int(a.episodes),
                 noise=float(getattr(a, "noise", 0.05) or 0.05),
-                progress_cb=prog, episodes2=ep2 or None, params2=params2)
+                progress_cb=prog, episodes2=ep2 or None, params2=params2,
+                mutate_traits=int(float(
+                    getattr(a, "mutate_traits", 1) or 0)))
         elif a.strategy == "random":
             rec, _w, summary = evo_breeder.breed_random(
                 a.name, int(a.seed), int(a.episodes), progress_cb=prog,
@@ -376,6 +378,7 @@ def cmd_breed(a):
         else:
             return err(f"unknown strategy '{a.strategy}' (clone|random)")
         print(f"[breed] done: {rec.get('name')} ({rec.get('id')}) "
+              f"traits={((rec.get('lineage', {}) or {}).get('trait_mutations', {}))} "
               f"summary={summary}", flush=True)
     except Exception as e:
         print(f"[breed] FAILED: {e}\n{traceback.format_exc()}", flush=True)
@@ -434,6 +437,7 @@ def main():
     q.add_argument("--episodes2", type=int, default=0)
     q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")
     q.add_argument("--noise", type=float, default=0.05)
+    q.add_argument("--mutate-traits", default=1)
     q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
     q.add_argument("--log-file", default=""); q.add_argument("--gen", type=int, default=1)
     a = p.parse_args()
