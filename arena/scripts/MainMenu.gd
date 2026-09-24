@@ -761,14 +761,46 @@ func refresh_vault() -> void:
 	_update_bracket_preview()
 
 
+func _archive_tooltip(e: Dictionary) -> String:
+	# Hall-of-shame hover card: career stats + build, same vocabulary as
+	# the vault detail readout (old log entries may lack record/params).
+	var r: Dictionary = e.get("record", {})
+	var p: Dictionary = e.get("generator_params", {})
+	var reason := str(e.get("reason", ""))
+	var when := str(e.get("archived_utc", "?"))
+	var head := "%s  [%.1f MB]" % [str(e.get("name", "?")),
+		float(e.get("size_mb", 0.0))]
+	if not bool(e.get("present", true)):
+		head += " (missing)"
+	if reason != "":
+		head += "\narchived %s: %s" % [when, reason]
+	else:
+		head += "\narchived %s" % when
+	var gid := str(p.get("genome_id", ""))
+	var wiring := "genome " + gid if gid != "" else str(p.get("experiment", "base"))
+	return head + "\nBattles %d (W%d L%d D%d) | Matches %d (W%d L%d) | Titles %d | ELO %d" % [
+		int(r.get("battles", 0)), int(r.get("wins", 0)),
+		int(r.get("losses", 0)), int(r.get("draws", 0)),
+		int(r.get("matches", 0)), int(r.get("matches_won", 0)),
+		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
+		int(r.get("elo", 1200.0))] + \
+		"\nvariant %s seed %s lr %s gain %s ev %s yb %s wiring %s" % [
+		str(p.get("variant", "?")), str(p.get("seed", "?")),
+		str(p.get("learning_rate", "?")), str(p.get("dist_gain", "?")),
+		str(p.get("evasion", "?")), str(p.get("yaw_bias", "?")), wiring]
+
+
 func _refresh_archive() -> void:
 	archive_entries = TournamentDirector.archive_list()
 	if is_instance_valid(archive_list_view):
 		archive_list_view.clear()
+		var idx := 0
 		for e in archive_entries:
 			archive_list_view.add_item("%s  [%.1f MB]%s" % [
 				str(e.get("name", "?")), float(e.get("size_mb", 0.0)),
 				"" if bool(e.get("present", true)) else " (missing)"])
+			archive_list_view.set_item_tooltip(idx, _archive_tooltip(e))
+			idx += 1
 
 
 func _on_archive_restore() -> void:
