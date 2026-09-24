@@ -1006,6 +1006,9 @@ func _build_visual_model() -> void:
 	eye_mat.shader = preload("res://scripts/chitin.gdshader")
 	eye_mat.set_shader_parameter("team_tint", Vector3(0.62, 0.12, 0.10))
 	eye_mat.set_shader_parameter("rim_strength", 1.6)
+	eye_mat.set_shader_parameter("roughness_lo", 0.25)
+	eye_mat.set_shader_parameter("specular_amt", 0.6)
+	eye_mat.set_shader_parameter("iridescence", 0.0)
 	_scan_part(vm, "EyeMesh", "eyes", eye_mat)
 	_scan_part(vm, "HaltereMesh", "halteres", _vmat(Color(0.70, 0.64, 0.48), 0.50, 0.10))
 	# Six jointed legs in a tucked flight pose.
