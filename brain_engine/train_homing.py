@@ -535,6 +535,30 @@ SCHOOL_DIFFICULTY = {
 }
 SCHOOL_TAKEDOWN_PAY = 4.5
 SCHOOL_TAIL_RATE = 1.0
+# Mover path lessons: archetype draw is stage-gated like behaviors
+# (early tiers drill weave/zigzag/slow-circle; double-back and fast
+# circle unlock late). Curriculum JSON may override the whole table
+# via "mover_archetypes". Speed mults pace each lesson relative to
+# mover_speed (double-back slightly faster; circles split slow/fast).
+MOVER_ARCHETYPES = ("patrol", "weave", "flee", "orbit",
+                    "zigzag", "doubleback", "circle_slow", "circle_fast")
+MOVER_ARCHETYPE_STAGES = [
+    {"until": 0.30,
+     "archetypes": {"patrol": 0.2, "weave": 0.2, "flee": 0.15,
+                    "orbit": 0.15, "zigzag": 0.2, "doubleback": 0.0,
+                    "circle_slow": 0.1, "circle_fast": 0.0}},
+    {"until": 0.65,
+     "archetypes": {"patrol": 0.15, "weave": 0.15, "flee": 0.1,
+                    "orbit": 0.1, "zigzag": 0.2, "doubleback": 0.1,
+                    "circle_slow": 0.15, "circle_fast": 0.05}},
+    {"until": 1.01,
+     "archetypes": {"patrol": 0.1, "weave": 0.1, "flee": 0.1,
+                    "orbit": 0.1, "zigzag": 0.15, "doubleback": 0.2,
+                    "circle_slow": 0.1, "circle_fast": 0.15}},
+]
+ARCHETYPE_SPEED_MULT = {"patrol": 1.0, "weave": 1.0, "flee": 1.1,
+                        "orbit": 1.0, "zigzag": 1.0, "doubleback": 1.15,
+                        "circle_slow": 0.8, "circle_fast": 1.2}
 # Pre-training score (per episode): scenario-weighted reaching beats
 # distance partial credit; crashes earn nothing. Curriculum JSON may
 # override any weight.
@@ -599,11 +623,27 @@ def pick_school_scenario(rng, progress, curriculum):
             _school_draw(rng, stage.get("envs", {}), list(SCHOOL_ENVS)))
 
 
+def _mover_archetype(rng, progress, curriculum):
+    """Stage-gated path lesson for mover episodes (curriculum JSON may
+    override the tier tables via "mover_archetypes")."""
+    tables = ((curriculum or {}).get("mover_archetypes", None)
+              or MOVER_ARCHETYPE_STAGES)
+    for stage in tables:
+        if progress <= float(stage.get("until", 1.0)):
+            return _school_draw(rng, stage.get("archetypes", {}),
+                                list(MOVER_ARCHETYPES))
+    return _school_draw(rng, tables[-1].get("archetypes", {}),
+                        list(MOVER_ARCHETYPES))
+
+
 def plan_path(rng, n_waypoints, extent=30.0, archetype=None):
     """Planned target path: waypoints + per-leg speeds + archetype.
 
     Archetypes (sampled, mirrored): patrol (loop), weave (sinusoid),
-    flee (outward spiral), orbit (circle). Returns
+    flee (outward spiral), orbit (circle), zigzag (tight high-frequency
+    lateral chase), doubleback (pole-to-pole ping-pong with 180-degree
+    reversals), circle_slow / circle_fast (large steady-pace loops;
+    pace comes from ARCHETYPE_SPEED_MULT, geometry is shared). Returns
     {"points": [(x, y, z)], "speeds": [...], "archetype": str}.
     Altitudes wander 4..14 m so climbs/dives train too.
     """
@@ -613,9 +653,15 @@ def plan_path(rng, n_waypoints, extent=30.0, archetype=None):
     cx = float(rng.uniform(-10.0, 10.0))
     cz = float(rng.uniform(-10.0, 10.0)) * mirror
     r = float(rng.uniform(10.0, extent))
+    steady = 0.0
+    if arch in ("circle_slow", "circle_fast"):
+        rr = float(0.7 * extent + 0.3 * r)
+        steady = float(rng.uniform(0.8, 0.9))
     for i in range(max(int(n_waypoints), 2)):
         t = i / max(int(n_waypoints) - 1, 1)
-        ang = t * 2.0 * np.pi * (1 if arch in ("patrol", "orbit") else 0.5)
+        ang = t * 2.0 * np.pi * (1 if arch in ("patrol", "orbit",
+                                               "circle_slow",
+                                               "circle_fast") else 0.5)
         if arch == "weave":
             px = cx + (t - 0.5) * 2.0 * r
             pz = cz + mirror * np.sin(t * 4.0 * np.pi) * r * 0.4
@@ -623,13 +669,26 @@ def plan_path(rng, n_waypoints, extent=30.0, archetype=None):
             rr = 8.0 + t * r
             px = cx + np.cos(ang + 1.0) * rr
             pz = cz + np.sin(ang + 1.0) * rr
+        elif arch == "zigzag":
+            px = cx + (t - 0.5) * 2.0 * r
+            pz = cz + mirror * np.sin(t * 6.0 * np.pi) * r * 0.5
+        elif arch == "doubleback":
+            pole = 1.0 if i % 2 == 0 else -1.0
+            px = cx + pole * r
+            pz = cz + mirror * (t - 0.5) * r
+        elif arch in ("circle_slow", "circle_fast"):
+            px = cx + np.cos(ang) * rr
+            pz = cz + np.sin(ang) * rr
         else:
             px = cx + np.cos(ang) * r
             pz = cz + np.sin(ang) * r
         py = float(np.clip(7.0 + np.sin(t * 3.0 + r) * 5.0, 4.0, 14.0))
         pts.append((float(np.clip(px, -40.0, 40.0)), py,
                     float(np.clip(pz, -40.0, 40.0))))
-        speeds.append(float(rng.uniform(0.7, 1.0)))
+        if arch in ("circle_slow", "circle_fast"):
+            speeds.append(steady)
+        else:
+            speeds.append(float(rng.uniform(0.7, 1.0)))
     return {"points": pts, "speeds": speeds, "archetype": arch,
             "mirror": mirror}
 
@@ -687,6 +746,7 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
     path = None
     path_state = {"wp": 0}
     base_speed = 4.35
+    arch = ""
     if behavior == "camp":
         dist = diff("camp_dist")
         ang = float(rngs["target"].uniform(0.0, 2.0 * np.pi))
@@ -698,7 +758,8 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
     elif behavior == "mover":
         target = KinematicFly(x=target_x, z=target_z, heading_rad=np.pi)
         nwp = max(2, int(round(diff("mover_waypoints"))))
-        path = plan_path(rngs["path"], nwp)
+        arch = _mover_archetype(rngs["path"], progress, curriculum)
+        path = plan_path(rngs["path"], nwp, archetype=arch)
         base_speed = diff("mover_speed")
     else:
         target = KinematicFly(x=target_x, z=target_z, heading_rad=np.pi)
@@ -747,6 +808,8 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
            "scenario": behavior.upper() + "+" + env.upper(),
            "path": path, "path_state": path_state,
            "base_speed": base_speed,
+           "archetype": arch,
+           "speed_mult": float(ARCHETYPE_SPEED_MULT.get(arch, 1.0)),
            "wobble": diff("mover_wobble"),
            "camp_bonus_paid": False,
            "contact_pay": SCHOOL_TAKEDOWN_PAY}
@@ -1035,7 +1098,9 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                     and school_ctx["behavior"] == "mover":
                 step_path_target(target, school_ctx["path"],
                                  school_ctx["path_state"],
-                                 school_ctx["base_speed"], dt=0.05,
+                                 float(school_ctx["base_speed"])
+                                 * float(school_ctx.get("speed_mult", 1.0)),
+                                 dt=0.05,
                                  wobble=school_ctx["wobble"],
                                  jrng=school_rngs["target"])
             elif school_ctx is not None \
@@ -1129,6 +1194,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             "seizure_events": seizure_events,
             "enc": enc_type,
             "scenario": school_ctx["scenario"] if school_ctx is not None else enc_type,
+            "archetype": school_ctx.get("archetype", "") if school_ctx is not None else "",
             "close_calls": close_calls,
             "lunges": lunges,
             "strikes": strikes,
@@ -1215,6 +1281,19 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         cell = by_scenario[sc]
         print(f"[Train:{label}] {sc}: {cell['successes']}/{cell['episodes']} "
               f"ok, {cell['takedowns']} takedowns, score {cell['score']:.1f}.")
+    by_archetype = {}
+    for r, s in zip(results, [_school_score(r, curriculum) for r in results]):
+        ak = r.get("archetype", "") or "none"
+        cell = by_archetype.setdefault(ak, {"episodes": 0, "successes": 0,
+                                            "takedowns": 0, "score": 0.0})
+        cell["episodes"] += 1
+        cell["successes"] += 1 if r["success"] else 0
+        cell["takedowns"] += 1 if r.get("takedown") else 0
+        cell["score"] += s
+    for ak in sorted(by_archetype):
+        cell = by_archetype[ak]
+        print(f"[Train:{label}] path {ak}: {cell['successes']}/{cell['episodes']} "
+              f"ok, {cell['takedowns']} takedowns, score {cell['score']:.1f}.")
     scores = [_school_score(r, curriculum) for r in results]
     total_score = float(sum(scores))
     avg_score = total_score / max(num_episodes, 1)
@@ -1224,7 +1303,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                "avg_closed": float(avg_closed), "crashes": crashes,
                "close_calls": close_tot, "takedowns": takedowns,
                "score": total_score, "avg_score": avg_score,
-               "by_scenario": by_scenario}
+               "by_scenario": by_scenario, "by_archetype": by_archetype}
     if return_brain:
         return save_path, np.ascontiguousarray(brain.weights.copy()), summary
     return save_path

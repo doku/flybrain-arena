@@ -2736,8 +2736,12 @@ class TestFlightSchool(unittest.TestCase):
 
     def test_plan_path_properties(self):
         import numpy as np
-        from train_homing import plan_path
-        for arch in ("patrol", "weave", "flee", "orbit"):
+        from train_homing import plan_path, MOVER_ARCHETYPES
+        self.assertEqual(set(MOVER_ARCHETYPES),
+                         {"patrol", "weave", "flee", "orbit",
+                          "zigzag", "doubleback",
+                          "circle_slow", "circle_fast"})
+        for arch in MOVER_ARCHETYPES:
             p = plan_path(np.random.default_rng(4), 4, archetype=arch)
             self.assertEqual(p["archetype"], arch)
             self.assertEqual(len(p["points"]), 4)
@@ -2751,6 +2755,25 @@ class TestFlightSchool(unittest.TestCase):
         self.assertEqual(a, b)
         c = plan_path(np.random.default_rng(5), 3)
         self.assertNotEqual(a["points"], c["points"])
+        # New lessons: geometry signatures.
+        z = plan_path(np.random.default_rng(4), 6, archetype="zigzag")
+        pzs = [pt[2] for pt in z["points"]]
+        diffs = [b - a for a, b in zip(pzs, pzs[1:])]
+        signs = set(1 if d > 0 else -1 for d in diffs if abs(d) > 1e-9)
+        self.assertGreater(len(signs), 1,
+                           "zigzag oscillates laterally")
+        d = plan_path(np.random.default_rng(4), 4, archetype="doubleback")
+        pxs = [pt[0] for pt in d["points"]]
+        self.assertAlmostEqual(pxs[0], pxs[2])
+        self.assertAlmostEqual(pxs[1], pxs[3])
+        self.assertNotAlmostEqual(pxs[0], pxs[1])
+        for c in ("circle_slow", "circle_fast"):
+            cp = plan_path(np.random.default_rng(4), 6, archetype=c)
+            first, last = cp["points"][0], cp["points"][-1]
+            self.assertAlmostEqual(first[0], last[0], places=4)
+            self.assertAlmostEqual(first[2], last[2], places=4)
+            self.assertTrue(all(s == cp["speeds"][0] for s in cp["speeds"]),
+                            "circle legs run at a steady pace")
 
     def test_step_path_target_advances(self):
         import numpy as np
@@ -2785,6 +2808,32 @@ class TestFlightSchool(unittest.TestCase):
         self.assertAlmostEqual(
             _school_diff(0.5, {"difficulty": {"camp_dist": [0.0, 10.0]}},
                          "camp_dist"), 5.0)
+
+    def test_mover_archetype_staging(self):
+        import numpy as np
+        from train_homing import _mover_archetype, MOVER_ARCHETYPES
+        a = _mover_archetype(np.random.default_rng(2), 0.1, {})
+        b = _mover_archetype(np.random.default_rng(2), 0.1, {})
+        self.assertEqual(a, b)
+        self.assertIn(a, MOVER_ARCHETYPES)
+        # Early training never draws the advanced lessons.
+        early = set()
+        for seed in range(60):
+            early.add(_mover_archetype(
+                np.random.default_rng(seed), 0.0, {}))
+        self.assertNotIn("doubleback", early)
+        self.assertNotIn("circle_fast", early)
+        # Late training covers the full lesson set.
+        late = set()
+        for seed in range(200):
+            late.add(_mover_archetype(
+                np.random.default_rng(seed), 1.0, {}))
+        self.assertEqual(late, set(MOVER_ARCHETYPES))
+        # Curriculum override respected.
+        ov = {"mover_archetypes": [{"until": 1.01,
+                                    "archetypes": {"zigzag": 1.0}}]}
+        self.assertEqual(
+            _mover_archetype(np.random.default_rng(0), 0.0, ov), "zigzag")
 
     def test_anchored_target_senses(self):
         from train_homing import KinematicFly, compute_agent_senses
