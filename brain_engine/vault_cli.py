@@ -385,8 +385,13 @@ def cmd_breed(a):
                 progress_cb=prog, episodes2=ep2 or None, params2=params2,
                 mutate_traits=int(float(
                     getattr(a, "mutate_traits", 1) or 0)))
+        elif a.strategy == "reference":
+            rec, _w, summary = evo_breeder.breed_reference(
+                a.name, int(a.seed), int(a.episodes),
+                progress_cb=prog, episodes2=ep2 or None, params2=params2)
         else:
-            return err("unknown strategy '%s' (clone|random|crossover)"
+            return err("unknown strategy '%s' "
+                       "(clone|random|crossover|reference)"
                        % str(a.strategy))
         print(f"[breed] done: {rec.get('name')} ({rec.get('id')}) "
               f"traits={((rec.get('lineage', {}) or {}).get('trait_mutations', {}))} "

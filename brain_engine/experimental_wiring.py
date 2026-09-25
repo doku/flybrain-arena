@@ -855,65 +855,88 @@ def genome_suffix(genome):
 # pool cells, crossover recombines parents - so every novel feature
 # stays attributable to the bundle (or cross) that introduced it.
 
-def _ref_rule(source, sside, target, tside, weight, fanout, seed):
+def _ref_rule(source, sside, target, tside, weight, fanout, seed,
+              sign=1.0):
     return {"source": source, "source_side": sside,
             "target": target, "target_side": tside,
-            "sign": 1.0, "weight": float(weight), "fanout": int(fanout),
+            "sign": float(sign), "weight": float(weight),
+            "fanout": int(fanout),
             "topography": "random", "stream": "reference",
             "stream_seed": int(seed)}
 
 
 REFERENCE_SUBSYSTEMS = {
-    # Small-target pursuit drive, bilateral like frozen retina_wide.
+    # Small-target pursuit drive: full documented LC set, ipsilateral
+    # like frozen retina_wide (measured pursuit-toward tuning).
     "pursuit": [
-        _ref_rule("visual_lc11", "left", "descending_all", "left",
-                  200.0, 6, 101),
-        _ref_rule("visual_lc11", "right", "descending_all", "right",
-                  200.0, 6, 102),
+        _ref_rule(pool, side, "descending_all", side, 150.0, 6, seed)
+        for seed, (pool, side) in enumerate(
+            [(p, s) for p in ("visual_lc11", "visual_lc15",
+                              "visual_lc17", "visual_lc18")
+             for s in ("left", "right")], start=101)
     ],
-    # Loom evasion, crossed like frozen lplc2_contra_dn.
+    # Loom evasion: measured LPLC2-contra path (base wiring is 99.9%
+    # ipsilateral and steers INTO trees) plus rival-loom LC4-contra.
     "loom": [
+        _ref_rule("visual_lplc2", "left", "descending_all", "right",
+                  260.0, 16, 109),
+        _ref_rule("visual_lplc2", "right", "descending_all", "left",
+                  260.0, 16, 110),
         _ref_rule("visual_lc4", "left", "descending_all", "right",
-                  260.0, 16, 103),
+                  150.0, 10, 111),
         _ref_rule("visual_lc4", "right", "descending_all", "left",
-                  260.0, 16, 104),
+                  150.0, 10, 112),
     ],
-    # Optic-flow cruise drive.
+    # Optic-flow cruise: T4a excites DN drive and MN cruise thrust;
+    # T4d INHIBITS DN (descent brake - expansion must cut drive for
+    # the landing flare, never feed it).
     "flow": [
         _ref_rule("visual_t4a", "left", "descending_all", "left",
-                  200.0, 6, 105),
+                  150.0, 6, 113),
         _ref_rule("visual_t4a", "right", "descending_all", "right",
-                  200.0, 6, 106),
+                  150.0, 6, 114),
+        _ref_rule("visual_t4a", "left", "motor_flight_thrust", "left",
+                  150.0, 6, 115),
+        _ref_rule("visual_t4a", "right", "motor_flight_thrust", "right",
+                  150.0, 6, 116),
+        _ref_rule("visual_t4d", "left", "descending_all", "left",
+                  150.0, 6, 133, sign=-1.0),
+        _ref_rule("visual_t4d", "right", "descending_all", "right",
+                  150.0, 6, 134, sign=-1.0),
     ],
     # Gyro stabilization readout.
     "gyro": [
         _ref_rule("gyro_jo", "left", "motor_steer", "left",
-                  200.0, 6, 107),
+                  150.0, 6, 117),
         _ref_rule("gyro_jo", "right", "motor_steer", "right",
-                  200.0, 6, 108),
+                  150.0, 6, 118),
     ],
-    # Frontal-approach (ram) drive.
+    # Ram-readout priming: the documented charge fires at >=2
+    # DNpe017 spikes, so frontal input lowers its threshold. (Frontal
+    # approach drive itself lives in pursuit: LC15->DN same-side.)
     "ram": [
-        _ref_rule("visual_lc15", "left", "descending_all", "left",
-                  200.0, 6, 109),
-        _ref_rule("visual_lc15", "right", "descending_all", "right",
-                  200.0, 6, 110),
+        _ref_rule("visual_lc15", "left", "motor_ram_dnpe017", "left",
+                  150.0, 6, 121),
+        _ref_rule("visual_lc15", "right", "motor_ram_dnpe017", "right",
+                  150.0, 6, 122),
     ],
-    # Spear lunge readout, like frozen spear_lunge.
+    # Spear lunge readout: full frozen set (measured ~0->6 MNxm
+    # spikes, clean strike signal).
     "spear": [
-        _ref_rule("visual_lc11", "left", "motor_mouth", "all",
-                  200.0, 3, 111),
-        _ref_rule("visual_lc11", "right", "motor_mouth", "all",
-                  200.0, 3, 112),
+        _ref_rule(pool, side, "motor_mouth", "all", 200.0, 3, seed)
+        for seed, (pool, side) in enumerate(
+            [(p, s) for p in ("visual_lc11", "visual_lc15",
+                              "visual_lc17", "visual_lc18")
+             for s in ("left", "right")], start=123)
     ],
     # Valence memory: odor-approach and loom-avoid associations.
     # (mushroom_body_kc is a sideless list in pops, outside the rule
     # registry - it feeds mbon via plasticity, never wiring edges.)
     "memory": [
         _ref_rule("pheromone_va1v", "left", "mbon_app", "left",
-                  200.0, 6, 113),
+                  150.0, 6, 131),
         _ref_rule("visual_lc4", "right", "mbon_av", "right",
-                  200.0, 6, 114),
+                  150.0, 6, 132),
     ],
 }
 

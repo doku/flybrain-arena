@@ -322,6 +322,56 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
     return record, weights, summary
 
 
+REFERENCE_BRAIN_NAME = "Reference"
+
+
+def breed_reference(name="Reference", seed=7, episodes=50,
+                    progress_cb=None, episodes2=None, params2=None):
+    """Canonical breeding stock: the pinned reference genome, derived
+    mapping, FIXED canonical rates (stock is reproducible, not another
+    roll), full training pipeline. Refuses when the vault already holds
+    the reference genome (one canonical stock). Lineage source
+    "reference". Returns (record, weights, summary) like breed_random."""
+    from experimental_wiring import (reference_genome, derive_mapping,
+                                     attach_genome, genome_label)
+    from sensory_motor import YAW_BIAS_DEFAULT
+    genome = reference_genome()
+    gid = genome_label(genome)
+    for rec in vault.scan_vault(silent=True):
+        gp = rec.get("generator_params", {}) or {}
+        if str(gp.get("genome_id", "")) == gid:
+            raise ValueError(
+                f"reference stock already in vault: {rec.get('name')} "
+                f"({rec.get('id')})")
+    stack = list(derive_mapping(genome))
+    params = {
+        "variant": "custom",
+        "seed": int(seed),
+        "learning_rate": 0.008,
+        "dist_gain": 0.15,
+        "align_bonus": [0.5, 0.2, -0.3],
+        "evasion": 0.2,
+        "experiment": None,
+        "mapping": stack if stack else None,
+        "yaw_bias": float(YAW_BIAS_DEFAULT),
+        "explore_mode": "reference",
+    }
+    attach_genome(params, genome)
+    from train_job import fresh_weights
+    record = vault.new_record((name or "").strip() or REFERENCE_BRAIN_NAME,
+                              params)
+    weights = fresh_weights(None, genome)
+    record, weights, summary = _staged_or_single(
+        record, weights, episodes, params, "reference pre-train",
+        episodes2, params2, "reference flight school", progress_cb)
+    record["lineage"] = {"parent_ids": [], "source": "reference",
+                         "explore_mode": "reference",
+                         "provenance": {"mode": "reference",
+                                        "reference_id": gid}}
+    vault.save_brain(record, weights)
+    return record, weights, summary
+
+
 def _crossover_parent_genome(gp):
     """Envelope for a crossover parent: its genome, else its frozen
     experiment mix expanded to rules. Base/legacy parents carry no

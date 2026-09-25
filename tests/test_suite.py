@@ -2502,9 +2502,9 @@ class TestWiringGenome(unittest.TestCase):
         import numpy as np
         import experimental_wiring as ew
         g = ew.reference_genome()
-        self.assertEqual(ew.genome_id(g), "4d27e91482")
-        self.assertEqual(ew.genome_label(g), "g4d27e91482")
-        self.assertEqual(len(g["rules"]), 14)
+        self.assertEqual(ew.genome_id(g), "3fabb451f5")
+        self.assertEqual(ew.genome_label(g), "g3fabb451f5")
+        self.assertEqual(len(g["rules"]), 32)
         art_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "brain_engine", "reference_genome.json")
@@ -4527,7 +4527,8 @@ class TestElo(unittest.TestCase):
         from experimental_wiring import (reference_genome, FROZEN_GENOMES)
         g = evo._crossover_parent_genome(
             {"genome": reference_genome()})
-        self.assertEqual(len(g["rules"]), 14)
+        self.assertEqual(len(g["rules"]),
+                         len(reference_genome()["rules"]))
         g2 = evo._crossover_parent_genome({"experiment": "retina_wide"})
         self.assertEqual(len(g2["rules"]),
                          len(FROZEN_GENOMES["retina_wide"]["rules"]))
@@ -4536,6 +4537,50 @@ class TestElo(unittest.TestCase):
             with self.subTest(params=bad):
                 with self.assertRaises(ValueError):
                     evo._crossover_parent_genome(bad)
+
+    def test_breed_reference(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        from experimental_wiring import (reference_genome, genome_label,
+                                         derive_mapping)
+        gid = genome_label(reference_genome())
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        saved = {}
+        with mock.patch("train_job.train_brain",
+                        side_effect=fake_train_brain), \
+                mock.patch.object(vault_pkg, "save_brain",
+                                  side_effect=lambda r, w: saved.update(
+                                      rec=r, weights=w) or "mock-path"):
+            rec, w, _s = evo.breed_reference(
+                "Reference", seed=7, episodes=4)
+        gp = rec["generator_params"]
+        self.assertEqual(gp["genome_id"], gid)
+        self.assertEqual(len(gp["genome"]["rules"]),
+                         len(reference_genome()["rules"]))
+        self.assertTrue(len(list(derive_mapping(gp["genome"]))) > 0)
+        self.assertEqual(
+            (gp["learning_rate"], gp["dist_gain"], gp["evasion"],
+             gp["yaw_bias"]),
+            (0.008, 0.15, 0.2, 9.0))
+        self.assertEqual(rec["lineage"]["source"], "reference")
+        self.assertEqual(rec["lineage"]["explore_mode"], "reference")
+        self.assertEqual(saved["rec"]["id"], rec["id"])
+        np.testing.assert_array_equal(
+            np.asarray(saved["weights"], dtype=np.float32),
+            np.asarray(w, dtype=np.float32))
+        # Single canonical stock: a vault already holding the
+        # reference genome refuses a second.
+        ghost = {"id": "ghost", "name": "Reference",
+                 "generator_params": {"genome_id": gid}}
+        with mock.patch.object(vault_pkg, "scan_vault",
+                               return_value=[ghost]):
+            with self.assertRaises(ValueError):
+                evo.breed_reference("Reference", seed=7, episodes=1)
 
 
 class TestGodotArenaHeadless(unittest.TestCase):

@@ -349,6 +349,11 @@ func _build_gen_column() -> VBoxContainer:
 	tb.text = "TRAIN SELECTED"
 	tb.pressed.connect(_on_train)
 	grow.add_child(tb)
+	var rb := Button.new()
+	rb.text = "BREED REFERENCE"
+	rb.tooltip_text = "Breed the canonical reference stock (pinned best-known wiring, fixed rates) as breeding material. Trains Episodes pre-train eps (+ Episodes school eps when Flight school is ticked). One stock only - refuses duplicates."
+	rb.pressed.connect(_on_breed_reference)
+	grow.add_child(rb)
 	train_school = CheckButton.new()
 	train_school.text = "Flight school"
 	train_school.tooltip_text = "ON = retrain through flight-school scenarios (camp/mover/duel) with scores stamped. OFF = legacy encounters."
@@ -946,6 +951,42 @@ func _on_async_done(op: String, result: Dictionary) -> void:
 		_start_or_queue(str(brain.get("id", "")),
 			str(brain.get("name", "?")), int(gen_episodes.value),
 			_gen_params(), "Generated '%s'")
+		return
+	if op == "breed_reference":
+		if not result.get("ok", false):
+			log_label.text = "Reference breed failed: %s" % str(result.get("error", "?"))
+			return
+		refresh_vault()
+		var ref: Dictionary = result.get("brain", {})
+		log_label.text = "Reference stock ready: '%s' - use it as crossover stock." % str(ref.get("name", "?"))
+
+
+func _on_breed_reference() -> void:
+	if not TournamentDirector.python_ready:
+		log_label.text = "Breed failed: %s" % TournamentDirector.python_probe_error
+		return
+	var eps := int(gen_episodes.value)
+	var school := is_instance_valid(train_school) and train_school.button_pressed
+	var args := ["breed", "--strategy", "reference", "--name", "Reference",
+		"--seed", str(int(gen_seed.value)), "--episodes", str(eps)]
+	if school:
+		var p2 := TournamentDirector.job_dir.path_join("reference_params2.json")
+		var f := FileAccess.open(p2, FileAccess.WRITE)
+		if f == null:
+			log_label.text = "Breed failed: cannot write school params."
+			return
+		f.store_string('{"curriculum": {}}')
+		f.close()
+		args += ["--episodes2", str(eps), "--params2-file", p2]
+	var result_file := TournamentDirector.job_dir.path_join("breed_reference_result.json")
+	set_busy("Breeding reference stock...")
+	await get_tree().process_frame
+	var res: Dictionary = TournamentDirector.run_cli_async("breed_reference", args, result_file)
+	if not res.get("ok", false):
+		clear_busy()
+		log_label.text = "Breed failed: %s" % str(res.get("error", "?"))
+		return
+	log_label.text = "Breeding reference stock in background (pid %s)..." % str(res.get("pid", "?"))
 
 
 func _retrain_params() -> Dictionary:
