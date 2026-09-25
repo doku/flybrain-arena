@@ -845,3 +845,308 @@ def genome_suffix(genome):
     if genome is None:
         return ""
     return "__gen_" + genome_label(genome)
+
+
+# ── Reference fly + modular exploration ──────────────────────────
+# The reference is the canonical wiring: one rule group per fly
+# mechanic, each attached to its neuron bundle (frozen-genome style:
+# explicit rules, fixed streams). Wilds explore AROUND it - grafts add
+# onto one bundle, shuffles deal subsystem hands, novelty seeks empty
+# pool cells, crossover recombines parents - so every novel feature
+# stays attributable to the bundle (or cross) that introduced it.
+
+def _ref_rule(source, sside, target, tside, weight, fanout, seed):
+    return {"source": source, "source_side": sside,
+            "target": target, "target_side": tside,
+            "sign": 1.0, "weight": float(weight), "fanout": int(fanout),
+            "topography": "random", "stream": "reference",
+            "stream_seed": int(seed)}
+
+
+REFERENCE_SUBSYSTEMS = {
+    # Small-target pursuit drive, bilateral like frozen retina_wide.
+    "pursuit": [
+        _ref_rule("visual_lc11", "left", "descending_all", "left",
+                  200.0, 6, 101),
+        _ref_rule("visual_lc11", "right", "descending_all", "right",
+                  200.0, 6, 102),
+    ],
+    # Loom evasion, crossed like frozen lplc2_contra_dn.
+    "loom": [
+        _ref_rule("visual_lc4", "left", "descending_all", "right",
+                  260.0, 16, 103),
+        _ref_rule("visual_lc4", "right", "descending_all", "left",
+                  260.0, 16, 104),
+    ],
+    # Optic-flow cruise drive.
+    "flow": [
+        _ref_rule("visual_t4a", "left", "descending_all", "left",
+                  200.0, 6, 105),
+        _ref_rule("visual_t4a", "right", "descending_all", "right",
+                  200.0, 6, 106),
+    ],
+    # Gyro stabilization readout.
+    "gyro": [
+        _ref_rule("gyro_jo", "left", "motor_steer", "left",
+                  200.0, 6, 107),
+        _ref_rule("gyro_jo", "right", "motor_steer", "right",
+                  200.0, 6, 108),
+    ],
+    # Frontal-approach (ram) drive.
+    "ram": [
+        _ref_rule("visual_lc15", "left", "descending_all", "left",
+                  200.0, 6, 109),
+        _ref_rule("visual_lc15", "right", "descending_all", "right",
+                  200.0, 6, 110),
+    ],
+    # Spear lunge readout, like frozen spear_lunge.
+    "spear": [
+        _ref_rule("visual_lc11", "left", "motor_mouth", "all",
+                  200.0, 3, 111),
+        _ref_rule("visual_lc11", "right", "motor_mouth", "all",
+                  200.0, 3, 112),
+    ],
+    # Valence memory: odor-approach and loom-avoid associations.
+    # (mushroom_body_kc is a sideless list in pops, outside the rule
+    # registry - it feeds mbon via plasticity, never wiring edges.)
+    "memory": [
+        _ref_rule("pheromone_va1v", "left", "mbon_app", "left",
+                  200.0, 6, 113),
+        _ref_rule("visual_lc4", "right", "mbon_av", "right",
+                  200.0, 6, 114),
+    ],
+}
+
+REFERENCE_ORDER = ("pursuit", "loom", "flow", "gyro", "ram", "spear",
+                   "memory")
+
+
+def reference_genome():
+    """Canonical reference envelope (fixed rule order, fixed streams)."""
+    rules = []
+    for sub in REFERENCE_ORDER:
+        rules.extend(dict(r) for r in REFERENCE_SUBSYSTEMS[sub])
+    return validate_genome({"name": "reference", "rules": rules})
+
+
+def reference_distance(genome):
+    """1 - Jaccard overlap of (source, target) pairs vs the reference
+    (0.0 = same bundles wired, 1.0 = disjoint)."""
+    ref = {(r["source"], r["target"])
+           for r in reference_genome()["rules"]}
+    mine = {(r["source"], r["target"])
+            for r in validate_genome(genome)["rules"]}
+    if not ref and not mine:
+        return 0.0
+    return 1.0 - len(ref & mine) / len(ref | mine)
+
+
+EXPLORE_MODES = ("legacy", "graft", "shuffle", "novelty", "crossover")
+
+
+def rule_budget(generation):
+    """Extra-rule budget ramping with generation: 1 at gen 1-2, +1 per
+    2 gens, capped at 4 (young lineages explore small genomes)."""
+    return min(4, 1 + (max(1, int(generation)) - 1) // 2)
+
+
+def _registry_targets(registry):
+    return sorted(p for p, m in registry.items()
+                  if m["role"] in GENOME_TARGET_ROLES)
+
+
+def _available_sides(registry, pool):
+    sides = list((registry.get(pool, {}) or {}).get("sides", {}).keys())
+    for prefer in ("left", "right", "all"):
+        if prefer in sides:
+            return prefer
+    return sides[0] if sides else "left"
+
+
+def _forced_target_rule(rng, registry, target, tside, stream_idx, seen):
+    """_random_rule with a fixed target bundle (graft/novelty adds)."""
+    sources = sorted(p for p, m in registry.items()
+                     if m["role"] == "sensory")
+    for _ in range(20):
+        cand = {
+            "source": str(rng.choice(sources)),
+            "source_side": str(rng.choice(["left", "right"])),
+            "target": target, "target_side": tside,
+            "sign": 1.0 if float(rng.random()) < 0.8 else -1.0,
+            "weight": round(float(rng.uniform(50.0, 400.0)), 1),
+            "fanout": int(rng.integers(2, 17)),
+            "topography": "random",
+            "stream": "graft%d" % int(stream_idx),
+            "stream_seed": int(rng.integers(0, 2 ** 31)),
+        }
+        pair = (cand["source"], cand["source_side"], cand["target"],
+                cand["target_side"])
+        if pair not in seen:
+            return cand
+    raise ValueError("registry too small for distinct graft pairs")
+
+
+def graft_genome(rng, pops, budget=1):
+    """Reference genome plus `budget` extra rules sampled onto ONE
+    randomly chosen motor/central target bundle. Returns (envelope,
+    provenance); every novel edge is attributable to added_bundle."""
+    registry = build_pool_registry(pops)
+    targets = _registry_targets(registry)
+    if not targets:
+        raise ValueError("graft needs motor/central targets")
+    target = str(rng.choice(targets))
+    tside = _available_sides(registry, target)
+    ref = reference_genome()["rules"]
+    seen = {(r["source"], r["source_side"], r["target"],
+             r["target_side"]) for r in ref}
+    rules = [dict(r) for r in ref]
+    added = []
+    for k in range(max(0, int(budget))):
+        cand = _forced_target_rule(rng, registry, target, tside, k, seen)
+        seen.add((cand["source"], cand["source_side"], cand["target"],
+                  cand["target_side"]))
+        rules.append(cand)
+        added.append(len(rules) - 1)
+    env = validate_genome({"name": None, "rules": rules}, pops)
+    return env, {"mode": "graft", "added_bundle": [target, tside],
+                 "added_rules": added,
+                 "reference_id": genome_label(reference_genome())}
+
+
+def shuffle_genome(rng, pops, budget=1):
+    """Deal a random hand of reference subsystems (at least 2, at most
+    all), kept verbatim, plus `budget` random-fill rules. Returns
+    (envelope, provenance)."""
+    subs = list(REFERENCE_ORDER)
+    n_keep = int(rng.integers(2, len(subs) + 1))
+    kept = sorted(rng.choice(subs, size=n_keep, replace=False).tolist())
+    rules = []
+    for sub in REFERENCE_ORDER:
+        if sub in kept:
+            rules.extend(dict(r) for r in REFERENCE_SUBSYSTEMS[sub])
+    seen = {(r["source"], r["source_side"], r["target"],
+             r["target_side"]) for r in rules}
+    registry = build_pool_registry(pops)
+    filled = []
+    for k in range(max(0, int(budget))):
+        cand = None
+        for _ in range(20):
+            c = _random_rule(rng, registry, 100 + k)
+            pair = (c["source"], c["source_side"], c["target"],
+                    c["target_side"])
+            if pair not in seen:
+                cand = c
+                seen.add(pair)
+                break
+        if cand is None:
+            raise ValueError("registry too small for shuffle fill")
+        rules.append(cand)
+        filled.append(len(rules) - 1)
+    env = validate_genome({"name": None, "rules": rules}, pops)
+    return env, {"mode": "shuffle", "kept_subsystems": kept,
+                 "filled_rules": filled,
+                 "reference_id": genome_label(reference_genome())}
+
+
+def load_pool_counts():
+    """Winner pool counts for novelty guidance (same file the novelty
+    bonus reads); {} when absent so novelty degrades to uniform."""
+    try:
+        from evolution_engine import EvolutionManager
+        return dict(EvolutionManager().pool_counts)
+    except Exception:
+        return {}
+
+
+def novelty_genome(rng, pops, budget=1, pool_counts=None,
+                   prefer_weak=True):
+    """Graft onto the emptiest motor/central target bundle (lowest
+    winner count, ties broken randomly among the 3 emptiest), with
+    sustained-losing bundles (<50% over 5+ fights) preferred first.
+    Returns (envelope, provenance)."""
+    registry = build_pool_registry(pops)
+    targets = _registry_targets(registry)
+    if not targets:
+        raise ValueError("novelty needs motor/central targets")
+    counts = dict(pool_counts) if pool_counts is not None \
+        else load_pool_counts()
+    weak = set()
+    if prefer_weak:
+        try:
+            from mine_wiring_fitness import weak_bundles
+            weak = {p for p, _w, _n in weak_bundles()}
+        except Exception:
+            weak = set()
+    ranked = sorted(targets,
+                    key=lambda p: (0 if p in weak else 1,
+                                   counts.get(p, 0), p))
+    cands = ranked[:min(3, len(ranked))]
+    target = str(cands[int(rng.integers(0, len(cands)))])
+    tside = _available_sides(registry, target)
+    ref = reference_genome()["rules"]
+    seen = {(r["source"], r["source_side"], r["target"],
+             r["target_side"]) for r in ref}
+    rules = [dict(r) for r in ref]
+    added = []
+    for k in range(max(0, int(budget))):
+        cand = _forced_target_rule(rng, registry, target, tside, k, seen)
+        seen.add((cand["source"], cand["source_side"], cand["target"],
+                  cand["target_side"]))
+        rules.append(cand)
+        added.append(len(rules) - 1)
+    env = validate_genome({"name": None, "rules": rules}, pops)
+    return env, {"mode": "novelty", "added_bundle": [target, tside],
+                 "added_rules": added, "bundle_count": counts.get(target, 0),
+                 "weak_target": target in weak,
+                 "reference_id": genome_label(reference_genome())}
+
+
+def crossover_genomes(rng, genome_a, genome_b, pops):
+    """Rule-level uniform crossover: each slot inherited from a random
+    parent (first-wins on pair collisions), then one structural
+    mutate_genome step. Returns (envelope, provenance with per-slot
+    parent tags + parent genome ids)."""
+    ra = validate_genome(genome_a)["rules"]
+    rb = validate_genome(genome_b)["rules"]
+    rules = []
+    prov = []
+    for i in range(max(len(ra), len(rb))):
+        picks = []
+        if i < len(ra):
+            picks.append(("a", ra[i]))
+        if i < len(rb):
+            picks.append(("b", rb[i]))
+        tag, rule = picks[int(rng.integers(0, len(picks)))]
+        rules.append(dict(rule))
+        prov.append(tag)
+    seen = set()
+    deduped = []
+    dprov = []
+    for r, t in zip(rules, prov):
+        pair = (r["source"], r["source_side"], r["target"],
+                r["target_side"])
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(r)
+        dprov.append(t)
+    child = mutate_genome(rng, {"name": None, "rules": deduped}, pops, 1)
+    return child, {"mode": "crossover",
+                   "parent_ids": [genome_label(genome_a),
+                                  genome_label(genome_b)],
+                   "slot_parents": dprov, "post_mutated": True}
+
+
+def generate_exploratory_genome(rng, pops, mode="graft", budget=1,
+                                pool_counts=None):
+    """Seed-based exploration dispatcher (graft/shuffle/novelty).
+    Legacy and crossover go through their own breeders. Returns
+    (envelope, provenance)."""
+    if mode == "graft":
+        return graft_genome(rng, pops, budget)
+    if mode == "shuffle":
+        return shuffle_genome(rng, pops, budget)
+    if mode == "novelty":
+        return novelty_genome(rng, pops, budget, pool_counts)
+    raise ValueError(f"unknown explore mode '{mode}' "
+                     f"(graft|shuffle|novelty)")

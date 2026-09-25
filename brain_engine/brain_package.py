@@ -40,6 +40,7 @@ DEFAULT_GENERATOR_PARAMS = {
     "genome_id": None,
     "mapping": None,
     "yaw_bias": None,
+    "explore_mode": "legacy",
 }
 
 

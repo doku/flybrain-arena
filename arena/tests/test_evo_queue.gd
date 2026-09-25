@@ -50,10 +50,25 @@ func test_dead_worker_blocks_nothing() -> void:
 	a.queue_free()
 
 
+func test_wild_mode_rotation() -> void:
+	var a = _new_arena()
+	_check(a._evo_wild_mode(1) == "graft", "gen 1 wild grafts")
+	_check(a._evo_wild_mode(2) == "shuffle", "gen 2 wild shuffles")
+	_check(a._evo_wild_mode(3) == "novelty", "gen 3 wild seeks novelty")
+	_check(a._evo_wild_mode(4) == "graft", "rotation wraps at gen 4")
+	_check(a._evo_wild_mode(7) == "graft", "gen 7 wild grafts")
+	_check(a._evo_clone_parent2(3, "champ") == "",
+		"non-4th gen never crosses over")
+	_check(a._evo_clone_parent2(4, "champ") == "",
+		"no director means no crossover partner")
+	a.queue_free()
+
+
 func _initialize() -> void:
 	test_unlaunched_never_blocks()
 	test_launched_without_verdict_blocks()
 	test_dead_worker_blocks_nothing()
+	test_wild_mode_rotation()
 	if failures == 0:
 		print("ALL EVO-QUEUE TESTS PASSED")
 	else:

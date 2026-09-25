@@ -2496,6 +2496,139 @@ class TestWiringGenome(unittest.TestCase):
         self.assertNotEqual(ew.genome_id(a), ew.genome_id(c))
         self.assertRegex(ew.genome_label(a), r"^g[0-9a-f]{10}$")
 
+    def test_reference_pin(self):
+        import json
+        import os
+        import numpy as np
+        import experimental_wiring as ew
+        g = ew.reference_genome()
+        self.assertEqual(ew.genome_id(g), "4d27e91482")
+        self.assertEqual(ew.genome_label(g), "g4d27e91482")
+        self.assertEqual(len(g["rules"]), 14)
+        art_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "brain_engine", "reference_genome.json")
+        with open(art_path) as f:
+            art = json.load(f)
+        self.assertEqual(ew.genome_id(art), ew.genome_id(g))
+        # Every subsystem compiles real edges (attached, not decorative).
+        for sub in ew.REFERENCE_ORDER:
+            with self.subTest(subsystem=sub):
+                e = ew.compile_rules(ew.REFERENCE_SUBSYSTEMS[sub],
+                                     self.pops)
+                self.assertIsNotNone(e)
+                self.assertGreater(len(e[0]), 0)
+        self.assertEqual(ew.reference_distance(g), 0.0)
+        rnd = ew.generate_genome(np.random.default_rng(7), self.pops, 3)
+        self.assertGreater(ew.reference_distance(rnd), 0.5)
+
+    def test_rule_budget(self):
+        import experimental_wiring as ew
+        self.assertEqual(
+            [ew.rule_budget(g) for g in (1, 2, 3, 4, 5, 7, 100)],
+            [1, 1, 2, 2, 3, 4, 4])
+
+    def test_graft(self):
+        import numpy as np
+        import experimental_wiring as ew
+        ref_id = ew.genome_label(ew.reference_genome())
+        a, pa = ew.graft_genome(np.random.default_rng(31), self.pops, 2)
+        b, _pb = ew.graft_genome(np.random.default_rng(31), self.pops, 2)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertEqual(pa["mode"], "graft")
+        self.assertEqual(pa["reference_id"], ref_id)
+        self.assertEqual(len(pa["added_rules"]), 2)
+        # All novel edges land on ONE motor/central bundle.
+        tgt = tuple(pa["added_bundle"])
+        rules = ew.validate_genome(a)["rules"]
+        added = [rules[i] for i in pa["added_rules"]]
+        self.assertTrue(all((r["target"], r["target_side"]) == tgt
+                            for r in added))
+        self.assertIn(ew.pool_role(tgt[0]), ("motor", "central"))
+        untouched = [r for i, r in enumerate(rules)
+                     if i not in pa["added_rules"]]
+        self.assertEqual(
+            [(r["source"], r["target"]) for r in untouched],
+            [(r["source"], r["target"])
+             for r in ew.reference_genome()["rules"]])
+
+    def test_shuffle(self):
+        import numpy as np
+        import experimental_wiring as ew
+        a, pa = ew.shuffle_genome(np.random.default_rng(77), self.pops, 2)
+        b, _pb = ew.shuffle_genome(np.random.default_rng(77), self.pops, 2)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertGreaterEqual(len(pa["kept_subsystems"]), 2)
+        self.assertTrue(set(pa["kept_subsystems"]) <= set(ew.REFERENCE_ORDER))
+        self.assertEqual(len(pa["filled_rules"]), 2)
+        ref_pairs = {(r["source"], r["source_side"], r["target"],
+                      r["target_side"])
+                     for sub in pa["kept_subsystems"]
+                     for r in ew.REFERENCE_SUBSYSTEMS[sub]}
+        rules = ew.validate_genome(a)["rules"]
+        for i, r in enumerate(rules):
+            pair = (r["source"], r["source_side"], r["target"],
+                    r["target_side"])
+            if i in pa["filled_rules"]:
+                self.assertNotIn(pair, ref_pairs)
+            else:
+                self.assertIn(pair, ref_pairs)
+
+    def test_novelty(self):
+        import numpy as np
+        import experimental_wiring as ew
+        targets = sorted(
+            p for p, m in ew.build_pool_registry(self.pops).items()
+            if m["role"] in ew.GENOME_TARGET_ROLES)
+        counts = {t: i for i, t in enumerate(targets)}
+        a, pa = ew.novelty_genome(np.random.default_rng(5), self.pops, 1,
+                                  counts)
+        # Choice lands among the emptiest bundles however the rng falls.
+        self.assertLessEqual(counts[pa["added_bundle"][0]], 2)
+        self.assertEqual(pa["bundle_count"],
+                         counts[pa["added_bundle"][0]])
+        self.assertEqual(len(pa["added_rules"]), 1)
+
+    def test_crossover(self):
+        import numpy as np
+        import experimental_wiring as ew
+        ga = ew.reference_genome()
+        gb = ew.generate_genome(np.random.default_rng(9), self.pops, 2)
+        a, pa = ew.crossover_genomes(np.random.default_rng(13), ga, gb,
+                                     self.pops)
+        b, _pb = ew.crossover_genomes(np.random.default_rng(13), ga, gb,
+                                      self.pops)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertEqual(pa["mode"], "crossover")
+        self.assertEqual(pa["parent_ids"],
+                         [ew.genome_label(ga), ew.genome_label(gb)])
+        self.assertTrue(set(pa["slot_parents"]) <= {"a", "b"})
+        self.assertIn("a", pa["slot_parents"])
+        self.assertIn("b", pa["slot_parents"])
+        # One post-mutation step: at most one novel pair beyond the union.
+        union = {(r["source"], r["source_side"], r["target"],
+                  r["target_side"])
+                 for g in (ga, gb) for r in ew.validate_genome(g)["rules"]}
+        novel = [(r["source"], r["source_side"], r["target"],
+                  r["target_side"])
+                 for r in ew.validate_genome(a)["rules"]
+                 if (r["source"], r["source_side"], r["target"],
+                     r["target_side"]) not in union]
+        self.assertLessEqual(len(novel), 1)
+
+    def test_exploratory_dispatcher(self):
+        import numpy as np
+        import experimental_wiring as ew
+        for mode in ("graft", "shuffle", "novelty"):
+            with self.subTest(mode=mode):
+                a, pa = ew.generate_exploratory_genome(
+                    np.random.default_rng(3), self.pops, mode, 1)
+                self.assertEqual(pa["mode"], mode)
+                self.assertIsNotNone(ew.compile_genome(a, self.pops))
+        with self.assertRaises(ValueError):
+            ew.generate_exploratory_genome(
+                np.random.default_rng(3), self.pops, "crossover", 1)
+
 
 class TestWiringAttribution(unittest.TestCase):
     """Attribution miner on synthetic brackets: outcome extraction,
@@ -2543,6 +2676,22 @@ class TestWiringAttribution(unittest.TestCase):
         # Unknown brains are skipped, not crashed on.
         stats3 = mw.tally([("ghost", "base1")], metas)
         self.assertEqual(stats3["matches"], 0)
+
+    def test_weak_from_stats(self):
+        import mine_wiring_fitness as mw
+        stats = {"pools": {"strong": (9, 10), "weak": (1, 8),
+                           "tiny": (0, 2), "even": (5, 10)},
+                 "mappings": {}, "rules_winners": 0.0,
+                 "rules_losers": 0.0, "matches": 30}
+        weak = mw.weak_from_stats(stats)
+        self.assertEqual([(p, w, n) for p, w, n in weak],
+                         [("weak", 1, 8)])
+        # Custom floor/ceiling.
+        weak2 = mw.weak_from_stats(stats, min_n=2, max_rate=0.5)
+        self.assertEqual([p for p, _w, _n in weak2], ["tiny", "weak"])
+        self.assertEqual(mw.weak_from_stats(
+            {"pools": {}, "mappings": {}, "rules_winners": 0.0,
+             "rules_losers": 0.0, "matches": 0}), [])
 
     def test_mapping_and_rules(self):
         import mine_wiring_fitness as mw
@@ -4346,6 +4495,29 @@ class TestElo(unittest.TestCase):
                             mutate_structure=False, mutate_traits=0)
         for k in ("learning_rate", "dist_gain", "evasion", "yaw_bias"):
             self.assertEqual(seen.get(k), parent["generator_params"][k])
+
+    def test_breed_random_rejects_bad_mode(self):
+        import evo_breeder as evo
+        # Validation fires before any vault scan or training.
+        with self.assertRaises(ValueError):
+            evo.breed_random("X", seed=1, episodes=1, mode="bogus")
+        with self.assertRaises(ValueError):
+            evo.breed_random("X", seed=1, episodes=1, mode="crossover")
+
+    def test_crossover_parent_genome(self):
+        import evo_breeder as evo
+        from experimental_wiring import (reference_genome, FROZEN_GENOMES)
+        g = evo._crossover_parent_genome(
+            {"genome": reference_genome()})
+        self.assertEqual(len(g["rules"]), 14)
+        g2 = evo._crossover_parent_genome({"experiment": "retina_wide"})
+        self.assertEqual(len(g2["rules"]),
+                         len(FROZEN_GENOMES["retina_wide"]["rules"]))
+        for bad in ({"experiment": None}, {},
+                    {"experiment": ["retina_wide", "spear_lunge"]}):
+            with self.subTest(params=bad):
+                with self.assertRaises(ValueError):
+                    evo._crossover_parent_genome(bad)
 
 
 class TestGodotArenaHeadless(unittest.TestCase):

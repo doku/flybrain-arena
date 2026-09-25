@@ -146,6 +146,40 @@ def report(stats, min_n=5):
     return "\n".join(lines)
 
 
+def weak_from_stats(stats, min_n=5, max_rate=0.5):
+    """[(pool, wins, n)] below max_rate over min_n+ samples, weakest
+    first. Pure (no IO): the novelty mode's graft-target preference."""
+    rows = [(p, w, n) for p, (w, n) in stats.get("pools", {}).items()
+            if n >= min_n and n > 0 and (w / n) < max_rate]
+    rows.sort(key=lambda r: (r[1] / r[2], -r[2]))
+    return rows
+
+
+def weak_bundles(tdir=None, min_n=5, max_rate=0.5):
+    """Weak bundles from finished brackets + vault (same assay as the
+    CLI report). [] on any IO problem so callers degrade gracefully."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tdir = tdir or os.path.join(root, "tournaments")
+    try:
+        recs = vault.scan_vault(silent=True)
+        metas = {str(r.get("id", "")): brain_meta(r) for r in recs}
+        outcomes = []
+        for path in sorted(glob.glob(os.path.join(tdir, "*.json"))):
+            if os.path.basename(path).startswith("_"):
+                continue
+            try:
+                with open(path) as f:
+                    tourney = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(tourney, dict) or "rounds" not in tourney:
+                continue
+            outcomes.extend(match_outcomes(tourney))
+        return weak_from_stats(tally(outcomes, metas), min_n, max_rate)
+    except Exception:
+        return []
+
+
 def main():
     ap = argparse.ArgumentParser(description="Mine wiring-vs-fitness "
                                  "attribution from tournament brackets.")

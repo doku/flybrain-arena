@@ -252,24 +252,30 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
 
 
 def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
-                 episodes2=None, params2=None):
-    """Fresh random brain: random wiring GENOME (grammar-constrained
-    projection rules over the pool registry) with its mapping DERIVED
-    from the genome's efferents, plus random yaw_bias + rates. Lineage
-    source set to random. Empty name auto-generates a deterministic
-    callsign (wild_name from the same seed), so callers that can't see
-    the pool still get good names. Deterministic in seed end to end
-    (dedicated np stream for the genome); seed draws for rates below
-    use the legacy random stream (its positions shifted vs pre-genome
-    code, which sampled mixes/stacks from it - seeds are not a stable
-    API across breeder versions). episodes2/params2 run a flight-school
-    second stage back-to-back (see breed_clone); omitted is single-stage."""
+                 episodes2=None, params2=None, mode="graft"):
+    """Fresh random brain: wiring genome plus random yaw_bias + rates.
+    mode="legacy" keeps the exact historical behavior (1-4 fully random
+    rules); graft/shuffle/novelty explore around the pinned reference
+    fly (see experimental_wiring) with a generation-ramped rule budget,
+    so every novel feature stays attached to a neuron bundle. Empty
+    name auto-generates a deterministic callsign (wild_name from the
+    same seed), so callers that can't see the pool still get good
+    names. Deterministic in seed end to end (dedicated np stream for
+    the genome); rate draws use the legacy random stream (positions
+    shifted vs pre-genome code - seeds are not a stable API across
+    breeder versions). episodes2/params2 run a flight-school second
+    stage back-to-back (see breed_clone); omitted is single-stage."""
     import random as _random
     import numpy as _np
     from sensory_motor import draw_yaw_bias
-    from experimental_wiring import (generate_genome, derive_mapping,
-                                     attach_genome)
+    from experimental_wiring import (
+        generate_genome, derive_mapping, attach_genome,
+        generate_exploratory_genome, rule_budget, EXPLORE_MODES)
     from connectome_loader import load_or_extract_populations
+    if mode not in EXPLORE_MODES:
+        raise ValueError(f"unknown explore mode '{mode}' {EXPLORE_MODES}")
+    if mode == "crossover":
+        raise ValueError("crossover needs two parents: use breed_crossover")
     r = _random.Random(int(seed))
     if not (name or "").strip():
         # Dedicated naming stream: extra adjective/callsign draws must
@@ -280,7 +286,16 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
         name = unique_wild_name(nr, generation, taken)
     grng = _np.random.default_rng(int(seed))
     pops = load_or_extract_populations()
-    genome = generate_genome(grng, pops, 1 + int(grng.integers(0, 4)))
+    provenance = {"mode": "legacy"}
+    if mode == "legacy":
+        genome = generate_genome(grng, pops, 1 + int(grng.integers(0, 4)))
+    else:
+        budget = rule_budget(generation)
+        genome, provenance = generate_exploratory_genome(
+            grng, pops, mode, budget)
+        provenance = dict(provenance)
+        provenance["budget"] = budget
+        provenance["generation"] = int(generation)
     stack = list(derive_mapping(genome))
     params = {
         "variant": "custom",
@@ -292,6 +307,7 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
         "experiment": None,
         "mapping": stack if stack else None,
         "yaw_bias": draw_yaw_bias(r),
+        "explore_mode": mode,
     }
     attach_genome(params, genome)
     from train_job import fresh_weights
@@ -300,6 +316,98 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
     record, weights, summary = _staged_or_single(
         record, weights, episodes, params, "evo wild pre-train",
         episodes2, params2, "evo wild flight school", progress_cb)
-    record["lineage"] = {"parent_ids": [], "source": "evo-random"}
+    record["lineage"] = {"parent_ids": [], "source": "evo-random",
+                         "explore_mode": mode, "provenance": provenance}
     vault.save_brain(record, weights)
     return record, weights, summary
+
+
+def _crossover_parent_genome(gp):
+    """Envelope for a crossover parent: its genome, else its frozen
+    experiment mix expanded to rules. Base/legacy parents carry no
+    crossable content (ValueError - the caller falls back to clone)."""
+    from experimental_wiring import FROZEN_GENOMES
+    genome = gp.get("genome", None)
+    if genome is not None:
+        return genome
+    exp = gp.get("experiment", None)
+    names = []
+    if isinstance(exp, str) and exp not in ("", "base", "none"):
+        names = [exp]
+    elif isinstance(exp, (list, tuple)) and len(exp) == 1:
+        names = [str(exp[0])]
+    if len(names) == 1 and names[0] in FROZEN_GENOMES:
+        frozen = FROZEN_GENOMES[names[0]]
+        return {"name": frozen["name"],
+                "rules": [dict(r) for r in frozen["rules"]]}
+    raise ValueError("crossover parent has no genome content "
+                     "(base/legacy/multi-mix)")
+
+
+def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=50,
+                    noise=0.05, progress_cb=None, mutate_traits=1,
+                    episodes2=None, params2=None):
+    """Sexual reproduction: rule-level uniform crossover of two parents'
+    genomes plus one structural mutation step, weights remapped from
+    parent A (donor) with Gaussian noise, fresh seed, full training.
+    ELO regresses from the parents' mean. Genome-less base/legacy
+    parents (or multi-mixes) raise ValueError - breed_clone instead.
+    Mapping derives from the child genome; traits mutate like a clone.
+    Returns (record, weights, summary) like breed_clone."""
+    import numpy as _np
+    from experimental_wiring import (
+        crossover_genomes, remap_for_genome, derive_mapping,
+        attach_genome)
+    from connectome_loader import (load_or_extract_populations,
+                                   load_or_build_csr)
+    rec_a, weights_a = vault.load_brain(parent_a_id)
+    rec_b, weights_b = vault.load_brain(parent_b_id)
+    gp_a = dict(rec_a.get("generator_params", {}) or {})
+    gp_b = dict(rec_b.get("generator_params", {}) or {})
+    genome_a = _crossover_parent_genome(gp_a)
+    genome_b = _crossover_parent_genome(gp_b)
+    pops = load_or_extract_populations()
+    csr = load_or_build_csr()
+    rng = _np.random.default_rng(int(seed))
+    genome, provenance = crossover_genomes(rng, genome_a, genome_b, pops)
+    mrng = _np.random.default_rng(int(seed) ^ 0xC205E)
+    start_weights = remap_for_genome(
+        gp_a.get("experiment"), gp_a.get("genome"), genome,
+        _np.asarray(weights_a, dtype=_np.float32), mrng, pops, csr)
+    child_mapping = list(derive_mapping(genome))
+    params = {
+        "variant": gp_a.get("variant", "custom"),
+        "seed": int(seed),
+        "learning_rate": gp_a.get("learning_rate", 0.008),
+        "dist_gain": gp_a.get("dist_gain", 0.15),
+        "align_bonus": list(gp_a.get("align_bonus", [0.5, 0.2, -0.3])),
+        "evasion": gp_a.get("evasion", 0.2),
+        "experiment": None,
+        "mapping": child_mapping,
+        "yaw_bias": gp_a.get("yaw_bias"),
+        "explore_mode": "crossover",
+    }
+    mutated = {}
+    if int(mutate_traits or 0) > 0:
+        mutated = mutate_kin_traits(params, int(seed), int(mutate_traits))
+    attach_genome(params, genome)
+    child = vault.new_record(name, params)
+    child["lineage"] = {
+        "parent_ids": [rec_a.get("id", ""), rec_b.get("id", "")],
+        "source": f"crossover:{rec_a.get('id', '')}x{rec_b.get('id', '')}",
+        "trait_mutations": mutated, "explore_mode": "crossover",
+        "provenance": provenance}
+    elo_a = float((rec_a.get("record", {}) or {}).get(
+        "elo", vault.ELO_DEFAULT))
+    elo_b = float((rec_b.get("record", {}) or {}).get(
+        "elo", vault.ELO_DEFAULT))
+    child["record"]["elo"] = inherit_elo((elo_a + elo_b) / 2.0)
+    noisy = _np.ascontiguousarray(
+        start_weights
+        * (1.0 + rng.normal(0.0, float(noise),
+                            size=len(start_weights))).astype(_np.float32))
+    cname = "%s x %s" % (rec_a.get("name", "?"), rec_b.get("name", "?"))
+    return _staged_or_single(
+        child, noisy, episodes, params, f"evo crossover of {cname} (pre-train)",
+        episodes2, params2, f"evo crossover of {cname} (flight school)",
+        progress_cb)

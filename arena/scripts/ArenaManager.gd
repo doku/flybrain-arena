@@ -392,6 +392,10 @@ func _apply_beauty_pass() -> void:
 
 
 func _director() -> Node:
+	# Bare-instance safe (headless unit tests): absolute lookup outside
+	# the tree errors in the log, so report null the quiet way.
+	if not is_inside_tree():
+		return null
 	return get_node_or_null("/root/TournamentDirector")
 
 func _enter_tournament_mode() -> void:
@@ -2507,6 +2511,9 @@ func _update_evo_status_line() -> void:
 		var label := str(s.get("name", ""))
 		if label == "":
 			label = "wild G%d" % int(s.get("gen", gen + 1))
+		var smode := str(s.get("mode", ""))
+		if smode != "":
+			label += " [%s]" % smode
 		if bool(s.get("launched", false)):
 			var prog := _evo_poll_file(str(s.get("progress", "")))
 			if prog.is_empty():
@@ -3012,8 +3019,9 @@ func _handle_advance_result(res: Dictionary) -> void:
 				var evo: Dictionary = director.tourney.get("evo", {})
 				var gen := int(evo.get("generation", 1))
 				var champ_name: String = director.champion_name()
-				_evo_queue_clone(gen + 1, str(director.tourney.get("champion_id", "")),
-					champ_name)
+				var champ_id := str(director.tourney.get("champion_id", ""))
+				_evo_queue_clone(gen + 1, champ_id, champ_name,
+					_evo_clone_parent2(gen + 1, champ_id))
 				_update_evo_status_line()
 				if is_instance_valid(status_label):
 					status_label.text = "EVO GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_name(champ_name, gen + 1)]
@@ -3429,8 +3437,16 @@ func _evo_has_kind(kind: String) -> bool:
 	return _evo_done().has(kind)
 
 
+# Exploration rotation for wilds: graft -> shuffle -> novelty across
+# generations (crossover rides the clone slot every 4th gen instead).
+const WILD_MODE_CYCLE := ["graft", "shuffle", "novelty"]
+# Crossable wirings mirrored from experimental_wiring.FROZEN_GENOMES
+# (genome parents always qualify; these legacy mixes expand to rules).
+const FROZEN_WIRINGS := ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
+
+
 func _evo_queue_spec(kind: String, brain_name: String, parent_id: String,
-		seed: int, target_gen: int) -> void:
+		seed: int, target_gen: int, mode: String = "") -> void:
 	var pending := _evo_pending()
 	for spec in pending:
 		if str((spec as Dictionary).get("kind", "")) == kind:
@@ -3438,26 +3454,81 @@ func _evo_queue_spec(kind: String, brain_name: String, parent_id: String,
 	var paths := _evo_spec_paths(kind, target_gen)
 	pending.append({"kind": kind, "name": brain_name, "parent": parent_id,
 		"seed": seed, "gen": target_gen, "progress": paths[0],
-		"result": paths[1], "pid": 0, "launched": false})
+		"result": paths[1], "pid": 0, "launched": false, "mode": mode})
 	_evo_save_queue(pending, _evo_done())
 
 
-func _evo_queue_wild(target_gen: int) -> void:
+func _evo_wild_mode(target_gen: int) -> String:
+	return WILD_MODE_CYCLE[(maxi(target_gen, 1) - 1) % WILD_MODE_CYCLE.size()]
+
+
+func _evo_queue_wild(target_gen: int, mode: String = "") -> void:
 	# Random needs nothing but a generation: name "" lets Python
 	# christen it deterministically (wild_name from seed).
 	if _evo_has_kind("wild"):
 		return
-	_evo_queue_spec("wild", "", "", randi(), target_gen)
+	if mode == "":
+		mode = _evo_wild_mode(target_gen)
+	_evo_queue_spec("wild", "", "", randi(), target_gen, mode)
 
 
-func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String) -> void:
+func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String,
+		parent2_id: String = "") -> void:
 	if champ_id == "" or _evo_has_kind("clone"):
 		return
 	var director := _director()
 	var kin := champ_name
 	if director != null:
 		kin = director.kin_name(champ_name, target_gen)
-	_evo_queue_spec("clone", kin, champ_id, randi(), target_gen)
+	_evo_queue_spec("clone", kin, champ_id, randi(), target_gen, "")
+	if parent2_id != "":
+		# Crossover child: same clone slot/done-key, second parent noted.
+		for spec in _evo_pending():
+			var s := spec as Dictionary
+			if str(s.get("kind", "")) == "clone":
+				s["parent2"] = parent2_id
+				break
+		_evo_save_queue(_evo_pending(), _evo_done())
+
+
+func _evo_crossover_partner(champ_id: String) -> String:
+	# Highest-ELO roster brain that can cross (genome or single frozen
+	# mix; base/legacy/multi-mix parents would fail breeding and abort
+	# the generation, so they never qualify here).
+	var director := _director()
+	if director == null:
+		return ""
+	var best := ""
+	var best_elo := -1.0
+	for p in director.tourney.get("players", []):
+		var pd := p as Dictionary
+		var pid := str(pd.get("id", ""))
+		if pid == "" or pid == champ_id:
+			continue
+		var gp: Dictionary = pd.get("generator_params", {})
+		var ok := gp.get("genome", null) != null
+		if not ok:
+			var exp = gp.get("experiment", null)
+			if exp is String and str(exp) in FROZEN_WIRINGS:
+				ok = true
+			elif exp is Array and exp.size() == 1 \
+					and str(exp[0]) in FROZEN_WIRINGS:
+				ok = true
+		if not ok:
+			continue
+		var elo := float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))
+		if elo > best_elo:
+			best_elo = elo
+			best = pid
+	return best
+
+
+func _evo_clone_parent2(target_gen: int, champ_id: String) -> String:
+	# Crossover every 4th generation: champion x strongest crossable
+	# rival. All other generations clone asexually as before.
+	if target_gen % 4 != 0:
+		return ""
+	return _evo_crossover_partner(champ_id)
 
 
 func _evo_spawn_spec(spec: Dictionary) -> bool:
@@ -3470,13 +3541,19 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	var rf := str(spec.get("result", ""))
 	var log_path := rf.get_base_dir().path_join(
 		rf.get_file().get_basename() + ".log")
-	var args := ["breed", "--strategy",
-		"clone" if kind == "clone" else "random",
+	var parent2 := str(spec.get("parent2", ""))
+	var strategy := "random"
+	if kind == "clone":
+		strategy = "crossover" if parent2 != "" else "clone"
+	var args := ["breed", "--strategy", strategy,
 		"--episodes", str(EVO_EPISODES / 2), "--seed", str(int(spec.get("seed", 0))),
 		"--episodes2", str(EVO_EPISODES / 2),
 		"--noise", str(EVO_NOISE), "--progress", str(spec.get("progress", "")),
 		"--gen", str(int(spec.get("gen", 1))),
+		"--explore-mode", str(spec.get("mode", "")) if str(spec.get("mode", "")) != "" else "graft",
 		"--log-file", log_path]
+	if parent2 != "":
+		args += ["--parent2", parent2]
 	var p2 := _evo_params2_file(rf)
 	if p2 != "":
 		args += ["--params2-file", p2]
@@ -3642,7 +3719,8 @@ func _run_evo_generation() -> void:
 	var id2 := _evo_done_id("wild")
 	# Queue missing specs (watcher will launch them when the slot is free)
 	if id1 == "" and not _evo_has_kind("clone"):
-		_evo_queue_clone(target_gen, champ_id, champ_name)
+		_evo_queue_clone(target_gen, champ_id, champ_name,
+			_evo_clone_parent2(target_gen, champ_id))
 	if id2 == "" and not _evo_has_kind("wild"):
 		_evo_queue_wild(target_gen)
 	# Tournament is over: show whatever is left in training before
