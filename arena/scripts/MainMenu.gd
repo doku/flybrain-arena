@@ -349,11 +349,15 @@ func _build_gen_column() -> VBoxContainer:
 	tb.text = "TRAIN SELECTED"
 	tb.pressed.connect(_on_train)
 	grow.add_child(tb)
+	var grow2 := HBoxContainer.new()
+	grow2.add_theme_constant_override("separation", 6)
+	c.add_child(grow2)
 	var rb := Button.new()
 	rb.text = "BREED REFERENCE"
 	rb.tooltip_text = "Breed the canonical reference stock (pinned best-known wiring, fixed rates) as breeding material. Trains Episodes pre-train eps (+ Episodes school eps when Flight school is ticked). One stock only - refuses duplicates."
 	rb.pressed.connect(_on_breed_reference)
-	grow.add_child(rb)
+	rb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grow2.add_child(rb)
 	train_school = CheckButton.new()
 	train_school.text = "Flight school"
 	train_school.tooltip_text = "ON = retrain through flight-school scenarios (camp/mover/duel) with scores stamped. OFF = legacy encounters."
