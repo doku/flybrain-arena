@@ -1194,8 +1194,11 @@ func _on_start_evolution() -> void:
 	var size := int(TournamentDirector.size_options()[tourney_size.selected])
 	var bestof := int(TournamentDirector.best_of_options()[tourney_bestof.selected])
 	var ids := _selected_player_ids()
-	if ids.size() < 2:
-		bracket_status.text = "Pick at least 2 brains (Ctrl+click)."
+	# Evolution demands a FULL roster: a short bracket yields 7 (or 3)
+	# round-0 losers, consolation can never start (needs 2/4/8), and
+	# the shortness self-perpetuates every generation after.
+	if ids.size() != size:
+		bracket_status.text = "Evolution needs a full %d-brain roster (picked %d) - Ctrl+click to fill it." % [size, ids.size()]
 		return
 	# Evo always runs the losers bracket: bottom-two elimination must
 	# come through combat, never the ranking fallback.

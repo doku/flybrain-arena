@@ -3675,6 +3675,17 @@ func _run_evo_generation() -> void:
 		if id2 == "" and _evo_active():
 			_evo_abort("random breeding failed - %s" % _evo_spawn_why())
 			return
+	# STOP/quit during the handoff must freeze the loop, never emit a
+	# short bracket: the 15-roster cascade came from an empty id
+	# appended after a stop, then reactivated at rebuild below.
+	# A missing offspring on a live loop is equally fatal: abort
+	# instead of a TBA bracket (7 round-0 losers can never start
+	# consolation, so the shortness would self-perpetuate).
+	if not _evo_active():
+		return
+	if id1 == "" or id2 == "":
+		_evo_abort("missing offspring - refusing a short bracket")
+		return
 	# --- Rebuild bracket at constant roster size ---
 	var size := int(director.tourney.get("size", 8))
 	var gone := [last_id, second_id]
@@ -3686,6 +3697,24 @@ func _run_evo_generation() -> void:
 			roster.append(pid)
 	roster.append(id1)
 	roster.append(id2)
+	# Self-heal for pre-fix short rosters (a survivor whose vault file
+	# vanished mid-event): breed wild top-ups until the bracket is full.
+	# Bounded; failure aborts instead of a TBA bracket.
+	var topups := 0
+	while roster.size() < size and topups < 2 and _evo_active():
+		var tkind := "topup%d" % topups
+		_evo_queue_spec(tkind, "", "", randi(), target_gen)
+		_show_evo_phase("EVO GENERATION %d" % target_gen,
+			"Short roster (%d/%d) - breeding top-up %d..." % [roster.size(), size, topups + 1])
+		var tid := await _evo_await_queued(tkind)
+		if tid == "" or tid in roster:
+			_evo_abort("top-up breeding failed - %s" % _evo_spawn_why())
+			return
+		roster.append(tid)
+		topups += 1
+	if roster.size() < size:
+		_evo_abort("roster still short after top-ups - refusing a TBA bracket")
+		return
 	while roster.size() > size:
 		var extra := ""
 		for pid in director.evo_ranking():
@@ -3750,6 +3779,14 @@ func _evo_offspring_summary(target_gen: int) -> String:
 				lines.append("%s - queued" % label)
 		if not found:
 			lines.append("%s - queued" % kind)
+	# Top-up heals (short-roster repair) ride the same queue machinery.
+	for spec in _evo_pending():
+		var sk := str((spec as Dictionary).get("kind", ""))
+		if sk != "" and not (sk in ["clone", "wild"]):
+			lines.append("%s - training (top-up)" % sk)
+	for dk in _evo_done().keys():
+		if not (str(dk) in ["clone", "wild"]):
+			lines.append("%s - done" % _evo_done_name(str(dk)))
 	return "\n".join(lines)
 
 
