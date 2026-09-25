@@ -1050,12 +1050,21 @@ def shuffle_genome(rng, pops, budget=1):
 
 def load_pool_counts():
     """Winner pool counts for novelty guidance (same file the novelty
-    bonus reads); {} when absent so novelty degrades to uniform."""
-    try:
-        from evolution_engine import EvolutionManager
-        return dict(EvolutionManager().pool_counts)
-    except Exception:
-        return {}
+    bonus reads). Breed workers inherit Godot's CWD (arena/), so the
+    module-adjacent checkpoints dir comes first and the CWD-relative
+    one second; {} when absent so novelty degrades to uniform."""
+    cands = [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "checkpoints", "evo_pool_counts.json"),
+             os.path.join("checkpoints", "evo_pool_counts.json")]
+    for path in cands:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def novelty_genome(rng, pops, budget=1, pool_counts=None,
@@ -1096,7 +1105,8 @@ def novelty_genome(rng, pops, budget=1, pool_counts=None,
         added.append(len(rules) - 1)
     env = validate_genome({"name": None, "rules": rules}, pops)
     return env, {"mode": "novelty", "added_bundle": [target, tside],
-                 "added_rules": added, "bundle_count": counts.get(target, 0),
+                 "added_rules": added,
+                 "bundle_count": int(counts.get(target, 0)),
                  "weak_target": target in weak,
                  "reference_id": genome_label(reference_genome())}
 
