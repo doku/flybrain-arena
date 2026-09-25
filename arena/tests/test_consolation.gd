@@ -327,6 +327,33 @@ func test_bracket_views() -> void:
 	R.queue_free()
 
 
+func test_review_shows_main_only() -> void:
+	# End-of-tournament review (status complete): auto view shows the
+	# winners' bracket only - no appended losers columns. Losers stay
+	# one toggle away (view 2).
+	var R = load("res://scripts/TournamentBracket.gd").new()
+	var D = _new_director()
+	var brains := _fakes(8)
+	D.build_bracket(_ids(brains), 8, 1, 0.5, 40.0, false, brains, false, true)
+	_run_to_end(D)
+	_check(str(D.tourney.get("status", "")) == "complete",
+		"review fixture finished the tournament")
+	R.render_bracket(D.tourney,
+		int(D.tourney.get("current_round", 0)),
+		int(D.tourney.get("current_match", 0)))
+	var seen_losers := false
+	var seen_champ := false
+	for c in R.get_children():
+		if c is Label:
+			if str(c.text).begins_with("LOSERS"):
+				seen_losers = true
+			if str(c.text) == "CHAMPION":
+				seen_champ = true
+	_check(not seen_losers, "review auto view hides losers columns")
+	_check(seen_champ, "review auto view ends in CHAMPION")
+	R.queue_free()
+
+
 func _cleanup() -> void:
 	if DirAccess.dir_exists_absolute("user://test_consolation"):
 		for f in DirAccess.get_files_at("user://test_consolation"):
@@ -356,6 +383,7 @@ func _initialize() -> void:
 	test_tba_templates()
 	test_focus_losers()
 	test_bracket_views()
+	test_review_shows_main_only()
 	_cleanup()
 	if failures == 0:
 		print("ALL CONSOLATION TESTS PASSED")

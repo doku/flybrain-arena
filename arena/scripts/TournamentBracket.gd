@@ -37,9 +37,10 @@ var segments: Array = []
 var _lf_view := -1
 
 
-## View modes: 0 = auto (legacy: focus-swap while live losers run,
-## combined main+losers at review), 1 = main bracket only, 2 = losers
-## bracket only (forced focus rendering, works at review time too).
+## View modes: 0 = auto (focus-swap while live losers run, main
+## bracket only at review - the appended losers rounds jumble the
+## single-elim layout), 1 = main bracket only, 2 = losers bracket
+## only (forced focus rendering, works at review time too).
 func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1, view: int = 0) -> void:
 	for c in get_children():
 		remove_child(c)
@@ -63,6 +64,9 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	var focus := losers_from > 0 and cur_round >= losers_from \
 		and str(tourney.get("status", "")) == "running"
 	var shown: Array = rounds.duplicate()
+	if view == 0 and str(tourney.get("status", "")) != "running":
+		# Review time: auto view shows the winners' bracket only.
+		view = 1
 	if view == 1 and losers_from > 0:
 		# Main page: losers live on their own view, never appended here
 		# (and never focus-swapped in, even while consolation is live).
