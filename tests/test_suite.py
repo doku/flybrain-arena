@@ -4008,6 +4008,11 @@ class TestEvoLoop(unittest.TestCase):
             self.assertEqual(back["id"], rec["id"])
             self.assertTrue(os.path.isfile(
                 os.path.join(tmp, rec["filename"])))
+            # Restored brains leave the archive entirely: no row, not
+            # even a "(missing)" ghost.
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec["id"]], [])
             with self.assertRaises(FileNotFoundError):
                 vault.restore_brain("nope-not-here")
         finally:

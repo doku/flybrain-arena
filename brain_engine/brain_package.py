@@ -475,6 +475,12 @@ def restore_brain(name_or_id):
         shutil.move(bak, dst + ".bak")
     rec, _w = load_brain(dst)
     update_index_entry(rec)
+    # No longer archived: drop the log entry so the Hall of Shame stops
+    # listing the restored brain (previously it lingered as "(missing)").
+    log = _read_archive_log()
+    kept = [e for e in log if str(e.get("filename", "")) != fname]
+    if len(kept) != len(log):
+        _write_archive_log(kept)
     return rec
 
 
