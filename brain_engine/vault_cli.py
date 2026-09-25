@@ -99,8 +99,31 @@ def cmd_generate(a):
             genome = ew.genome_from_seed(params.get("genome_seed"),
                                          params.get("genome_rules", 3))
             ew.attach_genome(params, genome)
+        if genome is not None:
+            # Raw envelopes (menu-forwarded, never hashed menu-side):
+            # stamp the id and derive the mapping when the caller left
+            # them out. Explicit values are never overwritten.
+            if params.get("genome_id", None) is None:
+                ew.attach_genome(params, genome)
+            if not params.get("mapping"):
+                stack = list(ew.derive_mapping(genome))
+                params["mapping"] = stack if stack else None
+        if params.get("reference_stock"):
+            gid = ew.genome_label(genome) if genome is not None else ""
+            for rec in vault.scan_vault(silent=True):
+                gp = rec.get("generator_params", {}) or {}
+                if gid != "" and str(gp.get("genome_id", "")) == gid:
+                    return err(
+                        f"reference stock already in vault: "
+                        f"{rec.get('name')} ({rec.get('id')})")
         weights = fresh_weights(params.get("experiment"), genome)
         rec = vault.new_record(a.name, params)
+        if params.get("reference_stock"):
+            rec["lineage"] = {"parent_ids": [], "source": "reference",
+                              "explore_mode": "reference",
+                              "provenance": {
+                                  "mode": "reference",
+                                  "reference_id": params.get("genome_id")}}
         vault.save_brain(rec, weights)
     except Exception as e:
         return err(str(e))

@@ -4555,7 +4555,9 @@ class TestElo(unittest.TestCase):
                         side_effect=fake_train_brain), \
                 mock.patch.object(vault_pkg, "save_brain",
                                   side_effect=lambda r, w: saved.update(
-                                      rec=r, weights=w) or "mock-path"):
+                                      rec=r, weights=w) or "mock-path"), \
+                mock.patch.object(vault_pkg, "scan_vault",
+                                  return_value=[]):
             rec, w, _s = evo.breed_reference(
                 "Reference", seed=7, episodes=4)
         gp = rec["generator_params"]
@@ -4581,6 +4583,56 @@ class TestElo(unittest.TestCase):
                                return_value=[ghost]):
             with self.assertRaises(ValueError):
                 evo.breed_reference("Reference", seed=7, episodes=1)
+
+    def test_cmd_generate_reference_stock(self):
+        # Menu two-phase path: raw envelope in params gets its id
+        # stamped, mapping derived, lineage set, duplicate refused.
+        import json
+        import shutil
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        import vault_cli
+        from experimental_wiring import (reference_genome, genome_label,
+                                         derive_mapping)
+        gid = genome_label(reference_genome())
+        params = {"variant": "custom", "seed": 7,
+                  "learning_rate": 0.008, "dist_gain": 0.15,
+                  "align_bonus": [0.5, 0.2, -0.3], "evasion": 0.2,
+                  "experiment": None, "mapping": None, "yaw_bias": 9.0,
+                  "explore_mode": "reference",
+                  "genome": reference_genome(), "reference_stock": True}
+        tmp = tempfile.mkdtemp(prefix="refgen_")
+        try:
+            rf = os.path.join(tmp, "result.json")
+            a = SimpleNamespace(name="Reference",
+                                params=json.dumps(params), params_file="",
+                                result_file=rf, log_file="")
+            with mock.patch.object(
+                    vault_pkg, "save_brain",
+                    return_value=os.path.join(tmp, "x.flybrain")), \
+                    mock.patch.object(vault_pkg, "scan_vault",
+                                      return_value=[]):
+                self.assertEqual(vault_cli.cmd_generate(a), 0)
+            with open(rf) as f:
+                res = json.load(f)
+            self.assertTrue(res["ok"])
+            rec = res["brain"]
+            gp = rec["generator_params"]
+            self.assertEqual(gp["genome_id"], gid)
+            self.assertEqual(list(gp["mapping"]),
+                             list(derive_mapping(gp["genome"])))
+            self.assertEqual(rec["lineage"]["source"], "reference")
+            ghost = {"id": "g", "name": "Reference",
+                     "generator_params": {"genome_id": gid}}
+            a2 = SimpleNamespace(name="Reference",
+                                 params=json.dumps(params), params_file="",
+                                 result_file="", log_file="")
+            with mock.patch.object(vault_pkg, "scan_vault",
+                                   return_value=[ghost]):
+                self.assertEqual(vault_cli.cmd_generate(a2), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestGodotArenaHeadless(unittest.TestCase):

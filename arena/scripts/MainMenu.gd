@@ -44,6 +44,9 @@ var job_bar: ProgressBar
 var job_label: Label
 var queue_list: ItemList
 var queue_label: Label
+# True while a reference-stock generate is in flight: its completion
+# detours into the training queue instead of the normal generate flow.
+var _ref_bridging := false
 
 var tourney_size: OptionButton
 var tourney_bestof: OptionButton
@@ -354,7 +357,7 @@ func _build_gen_column() -> VBoxContainer:
 	c.add_child(grow2)
 	var rb := Button.new()
 	rb.text = "BREED REFERENCE"
-	rb.tooltip_text = "Breed the canonical reference stock (pinned best-known wiring, fixed rates) as breeding material. Trains Episodes pre-train eps (+ Episodes school eps when Flight school is ticked). One stock only - refuses duplicates."
+	rb.tooltip_text = "Breed the canonical reference stock (pinned best-known wiring, fixed rates) as breeding material. Builds it, then trains Episodes eps through the training queue below (Flight school per its toggle). One stock only - refuses duplicates."
 	rb.pressed.connect(_on_breed_reference)
 	rb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	grow2.add_child(rb)
@@ -948,54 +951,70 @@ func _on_async_done(op: String, result: Dictionary) -> void:
 	clear_busy()
 	if op == "generate":
 		if not result.get("ok", false):
+			_ref_bridging = false
 			log_label.text = "Generate failed: %s" % result.get("error", "?")
 			return
 		refresh_vault()
 		var brain: Dictionary = result.get("brain", {})
+		if _ref_bridging:
+			# Reference stock built: hand it to the training queue
+			# (progress bar + queue list) instead of the generate flow.
+			_ref_bridging = false
+			var school := is_instance_valid(train_school) and train_school.button_pressed
+			var sparams := {}
+			if school:
+				sparams["curriculum"] = {}
+			_start_or_queue(str(brain.get("id", "")),
+				str(brain.get("name", "?")), int(gen_episodes.value),
+				sparams, "Reference stock '%s' (school)" if school else "Reference stock '%s'")
+			return
 		_start_or_queue(str(brain.get("id", "")),
 			str(brain.get("name", "?")), int(gen_episodes.value),
 			_gen_params(), "Generated '%s'")
-		return
-	if op == "breed_reference":
-		if not result.get("ok", false):
-			log_label.text = "Reference breed failed: %s" % str(result.get("error", "?"))
-			return
-		refresh_vault()
-		var ref: Dictionary = result.get("brain", {})
-		log_label.text = "Reference stock ready: '%s' - use it as crossover stock." % str(ref.get("name", "?"))
 
 
 func _on_breed_reference() -> void:
+	# Two-phase stock build: a fast untrained generate (reference genome
+	# forwarded opaquely, never hashed menu-side), then the training
+	# queue owns it with the shared progress bar.
 	if not TournamentDirector.python_ready:
 		log_label.text = "Breed failed: %s" % TournamentDirector.python_probe_error
 		return
-	var eps := int(gen_episodes.value)
-	var school := is_instance_valid(train_school) and train_school.button_pressed
-	var args := ["breed", "--strategy", "reference", "--name", "Reference",
-		"--seed", str(int(gen_seed.value)), "--episodes", str(eps)]
-	if school:
-		var p2 := TournamentDirector.job_dir.path_join("reference_params2.json")
-		var f := FileAccess.open(p2, FileAccess.WRITE)
-		if f == null:
-			log_label.text = "Breed failed: cannot write school params."
+	for b in brains:
+		var lin: Dictionary = (b as Dictionary).get("lineage", {})
+		if str(lin.get("source", "")) == "reference":
+			log_label.text = "Reference stock already in vault."
 			return
-		f.store_string('{"curriculum": {}}')
-		f.close()
-		args += ["--episodes2", str(eps), "--params2-file", p2]
-	var result_file := TournamentDirector.job_dir.path_join("breed_reference_result.json")
-	set_busy("Breeding reference stock...")
+	var art_path := TournamentDirector.project_root().path_join(
+		"brain_engine/reference_genome.json")
+	var af := FileAccess.open(art_path, FileAccess.READ)
+	if af == null:
+		log_label.text = "Breed failed: cannot read reference_genome.json."
+		return
+	var envelope = JSON.parse_string(af.get_as_text())
+	af.close()
+	if not (envelope is Dictionary):
+		log_label.text = "Breed failed: reference_genome.json is corrupt."
+		return
+	var params := {
+		"variant": "custom", "seed": int(gen_seed.value),
+		"learning_rate": 0.008, "dist_gain": 0.15,
+		"align_bonus": [0.5, 0.2, -0.3], "evasion": 0.2,
+		"experiment": null, "mapping": null, "yaw_bias": 9.0,
+		"explore_mode": "reference", "genome": envelope,
+		"reference_stock": true,
+	}
+	set_busy("Building reference stock...")
 	await get_tree().process_frame
-	# Episodes-proportional poll budget (80 s/ep + 2 min headroom): a
-	# 50-ep breed trains ~40+ min, past the default 30-min poll timeout.
-	var eps_total := eps + (eps if school else 0)
-	var budget_msec := int(eps_total * 80.0 * 1000.0) + 120000
-	var res: Dictionary = TournamentDirector.run_cli_async(
-		"breed_reference", args, result_file, budget_msec)
+	_ref_bridging = true
+	var res: Dictionary = TournamentDirector.generate_brain_async(
+		"Reference", params)
 	if not res.get("ok", false):
+		_ref_bridging = false
 		clear_busy()
 		log_label.text = "Breed failed: %s" % str(res.get("error", "?"))
 		return
-	log_label.text = "Breeding reference stock in background (pid %s)..." % str(res.get("pid", "?"))
+	log_label.text = "Building reference stock, training queues next..."
 
 
 func _retrain_params() -> Dictionary:
