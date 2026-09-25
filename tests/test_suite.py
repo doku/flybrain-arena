@@ -2581,13 +2581,31 @@ class TestWiringGenome(unittest.TestCase):
             p for p, m in ew.build_pool_registry(self.pops).items()
             if m["role"] in ew.GENOME_TARGET_ROLES)
         counts = {t: i for i, t in enumerate(targets)}
+        # Isolated from the live vault: weak preference off.
         a, pa = ew.novelty_genome(np.random.default_rng(5), self.pops, 1,
-                                  counts)
+                                  counts, prefer_weak=False)
         # Choice lands among the emptiest bundles however the rng falls.
         self.assertLessEqual(counts[pa["added_bundle"][0]], 2)
         self.assertEqual(pa["bundle_count"],
                          counts[pa["added_bundle"][0]])
         self.assertEqual(len(pa["added_rules"]), 1)
+        self.assertFalse(pa["weak_target"])
+
+    def test_novelty_prefers_weak(self):
+        import numpy as np
+        from unittest import mock
+        import experimental_wiring as ew
+        weak3 = [("motor_mouth", 1, 8), ("motor_steer", 0, 6),
+                 ("mbon_app", 2, 9)]
+        counts = {p: 50 for p, _w, _n in weak3}
+        with mock.patch("mine_wiring_fitness.weak_bundles",
+                        return_value=list(weak3)):
+            a, pa = ew.novelty_genome(np.random.default_rng(5), self.pops,
+                                      1, counts)
+        # All three weak pools outrank every 50-count bundle, and the
+        # rng picks among exactly those three - deterministic either way.
+        self.assertIn(pa["added_bundle"][0], [p for p, _w, _n in weak3])
+        self.assertTrue(pa["weak_target"])
 
     def test_crossover(self):
         import numpy as np

@@ -3501,14 +3501,18 @@ func _evo_crossover_partner(champ_id: String) -> String:
 	var best := ""
 	var best_elo := -1.0
 	for p in director.tourney.get("players", []):
+		if not (p is Dictionary):
+			continue
 		var pd := p as Dictionary
 		var pid := str(pd.get("id", ""))
 		if pid == "" or pid == champ_id:
 			continue
-		var gp: Dictionary = pd.get("generator_params", {})
-		var ok := gp.get("genome", null) != null
+		var gp = pd.get("generator_params", {})
+		if not (gp is Dictionary):
+			continue
+		var ok := (gp as Dictionary).get("genome", null) != null
 		if not ok:
-			var exp = gp.get("experiment", null)
+			var exp = (gp as Dictionary).get("experiment", null)
 			if exp is String and str(exp) in FROZEN_WIRINGS:
 				ok = true
 			elif exp is Array and exp.size() == 1 \
@@ -3516,7 +3520,10 @@ func _evo_crossover_partner(champ_id: String) -> String:
 				ok = true
 		if not ok:
 			continue
-		var elo := float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))
+		var rec = pd.get("record", {})
+		var elo := 1200.0
+		if rec is Dictionary:
+			elo = float((rec as Dictionary).get("elo", 1200.0))
 		if elo > best_elo:
 			best_elo = elo
 			best = pid
