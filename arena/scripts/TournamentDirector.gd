@@ -147,9 +147,13 @@ func _run_cli(args: Array) -> Dictionary:
 	return _parse_cli_output(out, code)
 
 
-func run_cli_async(op: String, args: Array, result_file: String) -> Dictionary:
+func run_cli_async(op: String, args: Array, result_file: String,
+		timeout_msec: int = 1800000) -> Dictionary:
 	# Non-blocking vault op: the CLI writes its result JSON to result_file;
 	# _process polls it and emits async_done(op, result). Keeps the menu alive.
+	# timeout_msec bounds the wait (default 30 min); long breeds pass an
+	# episodes-proportional budget so a still-training worker is never
+	# reported timed-out while it keeps working.
 	if not python_ready:
 		return {"ok": false, "error": "no working python found (%s)" % python_probe_error}
 	if not pending_async.is_empty():
@@ -161,7 +165,7 @@ func run_cli_async(op: String, args: Array, result_file: String) -> Dictionary:
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
 	pending_async = {"pid": pid, "result_file": result_file, "op": op,
-		"started": Time.get_ticks_msec()}
+		"started": Time.get_ticks_msec(), "timeout_msec": timeout_msec}
 	return {"ok": true, "pid": pid}
 
 
@@ -186,10 +190,11 @@ func _poll_async() -> void:
 		if result.get("ok", false):
 			vault_changed.emit()
 		async_done.emit(op, result)
-	elif Time.get_ticks_msec() - int(pending_async.get("started", 0)) > 1800000:
+	elif Time.get_ticks_msec() - int(pending_async.get("started", 0)) \
+			> int(pending_async.get("timeout_msec", 1800000)):
 		var op2 := str(pending_async.get("op", ""))
 		pending_async = {}
-		async_done.emit(op2, {"ok": false, "error": "operation timed out (30 min)"})
+		async_done.emit(op2, {"ok": false, "error": "operation timed out"})
 
 
 func list_brains() -> Array:

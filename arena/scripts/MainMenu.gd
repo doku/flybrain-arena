@@ -981,7 +981,12 @@ func _on_breed_reference() -> void:
 	var result_file := TournamentDirector.job_dir.path_join("breed_reference_result.json")
 	set_busy("Breeding reference stock...")
 	await get_tree().process_frame
-	var res: Dictionary = TournamentDirector.run_cli_async("breed_reference", args, result_file)
+	# Episodes-proportional poll budget (80 s/ep + 2 min headroom): a
+	# 50-ep breed trains ~40+ min, past the default 30-min poll timeout.
+	var eps_total := eps + (eps if school else 0)
+	var budget_msec := int(eps_total * 80.0 * 1000.0) + 120000
+	var res: Dictionary = TournamentDirector.run_cli_async(
+		"breed_reference", args, result_file, budget_msec)
 	if not res.get("ok", false):
 		clear_busy()
 		log_label.text = "Breed failed: %s" % str(res.get("error", "?"))
