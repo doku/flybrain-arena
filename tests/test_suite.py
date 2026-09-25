@@ -4021,6 +4021,49 @@ class TestEvoLoop(unittest.TestCase):
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_delete_orphan_duplicates(self):
+        # One brain archived twice leaves two "(missing)" rows after the
+        # files vanish; deleting by id must clear both, never fail as
+        # "ambiguous". Unknown ids still fail loud.
+        import shutil
+        import tempfile
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_orphan_test_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("Ghost", {})
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32),
+                             backup=False)
+            vault.archive_brain(rec["id"], reason="first loss")
+            # Restored pre-prune and re-archived: duplicate log rows.
+            shutil.move(
+                os.path.join(tmp, "archive", rec["filename"]),
+                os.path.join(tmp, rec["filename"]))
+            vault.archive_brain(rec["id"], reason="second loss")
+            rows = [e for e in vault.list_archive()
+                    if e["id"] == rec["id"]]
+            self.assertEqual(len(rows), 2)
+            for fn in {row["filename"] for row in rows}:
+                os.remove(os.path.join(tmp, "archive", fn))
+            info = vault.delete_archived(rec["id"])
+            self.assertEqual(info["id"], rec["id"])
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec["id"]], [])
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived(rec["id"])
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived("never-existed")
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_archive_delete_frees_space(self):
         import tempfile
         import brain_package as vault

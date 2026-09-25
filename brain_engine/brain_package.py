@@ -516,31 +516,43 @@ def delete_archived(name_or_id):
     except FileNotFoundError:
         fname = None
     log = _read_archive_log()
+    fnames = []
     if fname is None:
-        # File already gone: match the orphan log entry by id/name.
+        # File already gone: match orphan log rows by id/name. An exact
+        # id or filename hits first; one brain archived twice leaves
+        # duplicate rows, and deleting the brain clears all of them
+        # together (that used to fail as "ambiguous", stranding every
+        # "(missing)" row the Delete button was asked to remove).
         cands = [e for e in log
-                 if key.lower() in str(e.get("id", "")).lower()
-                 or key.lower() in str(e.get("name", "")).lower()]
+                 if key == str(e.get("id", ""))
+                 or key == str(e.get("filename", ""))]
+        if not cands:
+            cands = [e for e in log
+                     if key.lower() in str(e.get("id", "")).lower()
+                     or key.lower() in str(e.get("name", "")).lower()]
         if not cands:
             raise FileNotFoundError(f"No archived brain matches '{key}'")
-        if len(cands) > 1:
+        if len({str(e.get("id", "")) for e in cands}) > 1:
             raise ValueError(f"Ambiguous archive match '{key}'")
         entry = cands[0]
-        fname = str(entry.get("filename", ""))
+        fnames = sorted({str(e.get("filename", "")) for e in cands})
+        fname = fnames[0] if fnames else ""
     else:
         hits = [e for e in log if str(e.get("filename", "")) == fname]
         entry = hits[0] if hits else {}
+        fnames = [fname]
     freed = 0
-    path = os.path.join(ARCHIVE_DIR, fname)
-    for cand in (path, path + ".bak"):
-        try:
-            if os.path.isfile(cand):
-                freed += os.path.getsize(cand)
-                os.remove(cand)
-        except OSError:
-            pass
+    for fn in fnames:
+        path = os.path.join(ARCHIVE_DIR, fn)
+        for cand in (path, path + ".bak"):
+            try:
+                if os.path.isfile(cand):
+                    freed += os.path.getsize(cand)
+                    os.remove(cand)
+            except OSError:
+                pass
     _write_archive_log(
-        [e for e in log if str(e.get("filename", "")) != fname])
+        [e for e in log if str(e.get("filename", "")) not in fnames])
     return {"id": entry.get("id", ""), "name": entry.get("name", "?"),
             "filename": fname, "freed_bytes": freed}
 
