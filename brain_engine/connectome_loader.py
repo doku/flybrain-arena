@@ -145,6 +145,12 @@ def load_or_extract_populations(force_regen=False):
     # the spear_lunge wiring drives them; the decoder reads them for all
     # brains (silent pools read 0 = no lunge, safe by default).
     motor_mouth = get_indices(types.str.match(r"^MNxm", na=False))
+    # Roll-motor readout (learned banks): haltere motor neurons, clean
+    # bilateral 11L/10R. Halteres are the fly's equilibrium organs, so
+    # their motor laterality driving roll is honest dipteran biology.
+    # Anchored: only MNhl* rows match. Silent without wiring (read 0 =
+    # wings level), so unwired brains fly exactly as before.
+    motor_roll_mnhl = get_indices(types.str.match(r"^MNhl", na=False))
 
     # --- Dopaminergic Reinforcement & Mushroom Body ---
     dopamine_pam = get_indices(types.str.contains("PAM", na=False))
@@ -199,6 +205,8 @@ def load_or_extract_populations(force_regen=False):
         "motor_ram_dnpe017": motor_ram_dnpe017,
         # Mouthpart motor readout (spear lunge)
         "motor_mouth": motor_mouth,
+        # Haltere roll-motor readout (learned banks)
+        "motor_roll_mnhl": motor_roll_mnhl,
         # Reinforcement
         "dopamine_pam": dopamine_pam,
         "dopamine_ppl1": dopamine_ppl1,

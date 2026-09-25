@@ -242,6 +242,30 @@
       "stream_seed": 118
     },
     {
+      "source": "gyro_jo",
+      "source_side": "left",
+      "target": "motor_roll_mnhl",
+      "target_side": "left",
+      "sign": 1.0,
+      "weight": 150.0,
+      "fanout": 6,
+      "topography": "random",
+      "stream": "reference",
+      "stream_seed": 135
+    },
+    {
+      "source": "gyro_jo",
+      "source_side": "right",
+      "target": "motor_roll_mnhl",
+      "target_side": "right",
+      "sign": 1.0,
+      "weight": 150.0,
+      "fanout": 6,
+      "topography": "random",
+      "stream": "reference",
+      "stream_seed": 136
+    },
+    {
       "source": "visual_lc15",
       "source_side": "left",
       "target": "motor_ram_dnpe017",

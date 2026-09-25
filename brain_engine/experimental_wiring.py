@@ -904,12 +904,18 @@ REFERENCE_SUBSYSTEMS = {
         _ref_rule("visual_t4d", "right", "descending_all", "right",
                   150.0, 6, 134, sign=-1.0),
     ],
-    # Gyro stabilization readout.
+    # Gyro stabilization readout, plus the equilibrium arc onto the
+    # haltere roll-motor pool (without it the stabilization path has
+    # no learned bank actuator).
     "gyro": [
         _ref_rule("gyro_jo", "left", "motor_steer", "left",
                   150.0, 6, 117),
         _ref_rule("gyro_jo", "right", "motor_steer", "right",
                   150.0, 6, 118),
+        _ref_rule("gyro_jo", "left", "motor_roll_mnhl", "left",
+                  150.0, 6, 135),
+        _ref_rule("gyro_jo", "right", "motor_roll_mnhl", "right",
+                  150.0, 6, 136),
     ],
     # Ram-readout priming: the documented charge fires at >=2
     # DNpe017 spikes, so frontal input lowers its threshold. (Frontal

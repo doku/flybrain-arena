@@ -527,6 +527,12 @@ class MotorDecoder:
         mn_steer = populations.get("motor_steer", {})
         self.mn_steer_left = set(mn_steer.get("left", []))
         self.mn_steer_right = set(mn_steer.get("right", []))
+        # Haltere roll-motor readout (learned banks; stale-cache safe).
+        # Silent pools read 0 = wings level, so brains without roll
+        # wiring fly exactly as before.
+        mnhl = populations.get("motor_roll_mnhl", {})
+        self.mnhl_left = set(mnhl.get("left", []))
+        self.mnhl_right = set(mnhl.get("right", []))
         flow_vs = populations.get("flow_vs", {})
         self.vs_left = set(flow_vs.get("left", []))
         self.vs_right = set(flow_vs.get("right", []))
@@ -701,6 +707,14 @@ class MotorDecoder:
             flow = ((vs_r / n_vs_r - vs_l / n_vs_l) * self.vs_ref
                     + 0.5 * (hs_r / n_hs_r - hs_l / n_hs_l) * self.hs_ref)
             roll_torque = float(np.clip(np.tanh(flow / 6.0) * 0.8, -1.0, 1.0))
+        # Learned banks: haltere-motor laterality under muscles_up, same
+        # sign convention as the MNad yaw vote (R-L positive = right).
+        # The VS/HS closed-loop trim above stays untouched.
+        if "muscles_up" in self.schemes and not self.legacy:
+            mnhl_r = sum(counts.get(s, 0) for s in self.mnhl_right)
+            mnhl_l = sum(counts.get(s, 0) for s in self.mnhl_left)
+            roll_mn = float(np.tanh((mnhl_r - mnhl_l) / 8.0) * 0.5)
+            roll_torque = float(np.clip(roll_torque + roll_mn, -1.0, 1.0))
 
         # 6. Learned value (MBON balance): mbon scheme only. Approach
         # (ACh MBONs) over avoid (Glu/GABA MBONs) scales thrust up and

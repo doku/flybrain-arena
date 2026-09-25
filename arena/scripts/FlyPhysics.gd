@@ -556,18 +556,15 @@ func _physics_process(delta: float) -> void:
 	# nose pointed until it hit the ceiling.
 	rotate_x(pitch_cmd * pitch_rate * delta)
 
-	# Roll rotation (bank right positive). The brain commands the bank and
-	# a gentle auto-level mops up residual drift. During an emergency
-	# evade the reflex owns the roll axis outright (full auto-level, no
-	# brain command) so the two can never fight each other. With no roll
-	# command (base scheme) the full legacy leveling rate applies, so
-	# uncommanded flight is exactly as stable as before.
-	if is_emergency_evade:
-		_auto_level_roll(delta)
-	else:
-		rotate_z(-roll_cmd * roll_rate * delta)
-		var lvl := 2.5 if absf(roll_cmd) < 0.01 else 1.0
-		_auto_level_roll(delta, lvl)
+	# Roll rotation (bank right positive). The brain commands the bank
+	# through the haltere roll-motor readout and a gentle auto-level
+	# mops up residual drift - rolls are learned, never scripted. The
+	# emergency dive below never touches this axis. With no roll
+	# command (unwired brains) the full legacy leveling rate applies,
+	# so uncommanded flight is exactly as stable as before.
+	rotate_z(-roll_cmd * roll_rate * delta)
+	var lvl := 2.5 if absf(roll_cmd) < 0.01 else 1.0
+	_auto_level_roll(delta, lvl)
 
 	# Seizure watch: measured yaw rate over this tick vs the applied
 	# (hold-decayed) command. Onset logs once; the drain ticks down in
@@ -596,9 +593,10 @@ func _physics_process(delta: float) -> void:
 	else:
 		velocity.y *= pow(0.9, delta * 60.0)
 
-	# Emergency evade reflex (Giant Fiber)
+	# Emergency evade dive (Giant Fiber): pure vertical escape. Roll
+	# used to snap here by script (rotate_z) - now banks are brain-
+	# commanded through the roll readout, so this stays hands-off.
 	if is_emergency_evade:
-		rotate_z(8.0 * delta)
 		velocity.y -= 25.0 * delta
 
 	# Spear lunge attack (mouth-motor driven): a forward impulse plus a

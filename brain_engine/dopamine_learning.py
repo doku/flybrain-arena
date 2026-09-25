@@ -57,6 +57,11 @@ class DopamineReinforcement:
         # Antennal-gyro pools (JO, gyro_flow scheme). Stale-cache safe.
         jo = populations.get("gyro_jo", {})
         self.jo_left = list(jo.get("left", []))
+        # Haltere roll-motor pools (learned banks, muscles_up scheme).
+        # Stale-cache safe: empty lists scale nothing.
+        mnhl = populations.get("motor_roll_mnhl", {})
+        self.mnhl_left = list(mnhl.get("left", []))
+        self.mnhl_right = list(mnhl.get("right", []))
         self.jo_right = list(jo.get("right", []))
         # Translational-flow pools (T4/T5, flow_trans scheme). Direction
         # groups combine T4+T5 of one tuning (a progressive, b
@@ -131,6 +136,8 @@ class DopamineReinforcement:
                             ("lplc2", self.lplc2_left), ("lplc2", self.lplc2_right),
                             ("lc11", self.lc11_left), ("lc11", self.lc11_right),
                             ("jo", self.jo_left), ("jo", self.jo_right),
+                            ("mnhl", self.mnhl_left),
+                            ("mnhl", self.mnhl_right),
                             ("t4a", self.t4["a"]), ("t4b", self.t4["b"]),
                             ("t4c", self.t4["c"]), ("t4d", self.t4["d"])):
             self._pool_of[id(_lst)] = _name
@@ -467,6 +474,7 @@ class DopamineReinforcement:
         azimuth = sensory_dict.get("visual_target_azimuth", 0.0)
 
         yaw = motor_dict.get("yaw_torque", 0.0)
+        roll = motor_dict.get("roll_torque", 0.0)
 
         left_active = (c_left > c_right + 0.03) or (azimuth < -15.0)
         right_active = (c_right > c_left + 0.03) or (azimuth > 15.0)
@@ -491,6 +499,25 @@ class DopamineReinforcement:
                 mag = self.lr * max(abs(da_signal), 0.3)
                 self._scale_incoming(brain, "left", 1.0 - mag * 0.5)
                 self._scale_incoming(brain, "right", 1.0 + mag * 0.5)
+
+        # Haltere roll-motor credit (learned banks): coordinated turns
+        # bank into the yaw. Correct-side roll with a correct turn
+        # potentiates that side's MNhl drive; fighting roll depresses
+        # it. Empty pools (unwired/stale-cache brains) scale nothing.
+        if left_active and not right_active:
+            if yaw < -0.05 and roll < -0.05:
+                self._scale_outgoing(brain, self.mnhl_left,
+                                     1.0 + self.lr * da_signal)
+            elif yaw < -0.05 and roll > 0.05:
+                dep = 1.0 - self.lr * abs(da_signal) * 0.5
+                self._scale_outgoing(brain, self.mnhl_left, dep)
+        elif right_active and not left_active:
+            if yaw > 0.05 and roll > 0.05:
+                self._scale_outgoing(brain, self.mnhl_right,
+                                     1.0 + self.lr * da_signal)
+            elif yaw > 0.05 and roll < -0.05:
+                dep = 1.0 - self.lr * abs(da_signal) * 0.5
+                self._scale_outgoing(brain, self.mnhl_right, dep)
 
         # Lateralized case: stimulus clearly on one side
         if left_active and not right_active:

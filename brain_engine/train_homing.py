@@ -122,10 +122,14 @@ class KinematicFly:
         self.health = 100.0
         self.last_speed = 0.0
         # Body angular rates (rad/s), refreshed every step: the trainer's
-        # JO-gyro synth. No roll axis here (2D heading + pitch), so roll
-        # trains later via live arena dopamine, not pre-training.
+        # JO-gyro synth. Roll integrates from roll_cmd with auto-level
+        # toward wings-level (mirrors the arena); zero command holds
+        # zero bank, so legacy episodes (roll_cmd 0) are byte-identical.
         self.yaw_rate = 0.0
         self.pitch_rate_applied = 0.0
+        self.roll = 0.0
+        self.roll_rate = 3.0
+        self.roll_rate_applied = 0.0
         # Scent dynamics (mirrors FlyPhysics cell-for-cell): smoothed
         # total for surge, lost-timer for search, free-running cast.
         self.scent_prev_smooth = -1.0
@@ -151,11 +155,14 @@ class KinematicFly:
         # Horizontal right vector for the dual-antenna scent model.
         return np.array([np.sin(self.heading), 0.0, -np.cos(self.heading)], dtype=np.float32)
 
-    def step(self, thrust, yaw_torque, pitch_cmd=0.0, dt=0.05, arena_radius=55.0):
-        prev_heading, prev_pitch = self.heading, self.pitch
+    def step(self, thrust, yaw_torque, pitch_cmd=0.0, dt=0.05,
+             arena_radius=55.0, roll_cmd=0.0):
+        prev_heading, prev_pitch, prev_roll = \
+            self.heading, self.pitch, self.roll
         if self.anchored:
             self.yaw_rate = 0.0
             self.pitch_rate_applied = 0.0
+            self.roll_rate_applied = 0.0
             self.last_speed = 0.0
             return
         # Update heading and pitch (pitch self-stabilizes toward level)
@@ -163,6 +170,16 @@ class KinematicFly:
         self.heading = (self.heading + np.pi) % (2.0 * np.pi) - np.pi
         self.pitch += (pitch_cmd * self.pitch_rate - self.pitch * 1.2) * dt
         self.pitch = float(np.clip(self.pitch, -1.2, 1.2))
+        # Roll integrates from command, auto-levels toward wings-level
+        # (mirrors FlyPhysics: strong level at ~0 command, weak in a
+        # bank). Banked turns couple into heading like the arena's
+        # rotated body axes. Zero command holds zero: legacy identical.
+        self.roll += float(roll_cmd) * self.roll_rate * dt
+        lvl = 2.5 if abs(float(roll_cmd)) < 0.01 else 1.0
+        self.roll += (0.0 - self.roll) * min(1.0, lvl * dt)
+        self.roll = float(np.clip(self.roll, -0.9, 0.9))
+        self.heading -= self.roll * 1.5 * dt
+        self.heading = (self.heading + np.pi) % (2.0 * np.pi) - np.pi
 
         # Forward speed along the 3D nose vector
         speed = self.base_speed + (self.max_speed - self.base_speed) * np.clip(thrust, 0.0, 1.0)
@@ -187,6 +204,7 @@ class KinematicFly:
         dh = (self.heading - prev_heading + np.pi) % (2.0 * np.pi) - np.pi
         self.yaw_rate = float(np.clip(dh / dt, -8.0, 8.0))
         self.pitch_rate_applied = float(np.clip((self.pitch - prev_pitch) / dt, -3.0, 3.0))
+        self.roll_rate_applied = float(np.clip((self.roll - prev_roll) / dt, -3.0, 3.0))
 
     def update_lunge(self, spear_cmd, senses, dist, dt=0.05):
         """Arena-like spear strike. Returns (event, aimed).
@@ -257,11 +275,10 @@ def update_seizure(fly, yaw_cmd, dt=0.05):
 def apply_arena_controls(fly, ctrl, senses, dist, dt=0.05):
     """Applies the full decoder control set the way the arena does.
 
-    Consumes every control key (thrust, yaw/pitch, ram burst, evade dive,
-    spear lunge) so headless training cannot silently drop a channel.
-    approach_bias is pre-folded into thrust/yaw by the decoder;
-    roll_torque has no axis in this 2D-heading trainer (JO-roll learns
-    live in the arena). Returns the lunge (event, aimed) tuple.
+    Consumes every control key (thrust, yaw/pitch/roll, ram burst,
+    evade dive, spear lunge) so headless training cannot silently drop
+    a channel. approach_bias is pre-folded into thrust/yaw by the
+    decoder. Returns the lunge (event, aimed) tuple.
     """
     thrust_eff = float(ctrl.get("thrust", 0.2))
     if ctrl.get("emergency_evade", False):
@@ -272,10 +289,10 @@ def apply_arena_controls(fly, ctrl, senses, dist, dt=0.05):
     if ctrl.get("ram_burst", False):
         thrust_eff *= 1.5  # mirrors the arena's 1.5x ram speed
     _ = float(ctrl.get("approach_bias", 0.0))
-    _ = float(ctrl.get("roll_torque", 0.0))
     fly.step(thrust=thrust_eff,
              yaw_torque=float(ctrl.get("yaw_torque", 0.0)),
-             pitch_cmd=pitch_eff, dt=dt)
+             pitch_cmd=pitch_eff, dt=dt,
+             roll_cmd=float(ctrl.get("roll_torque", 0.0)))
     return fly.update_lunge(ctrl.get("spear_thrust", 0.0), senses, dist, dt)
 
 
@@ -477,13 +494,13 @@ def compute_agent_senses(agent, target, prev_dist=None):
         "visual_sec_loom": sec_loom,
         "visual_sec_tree": sec_tree,
         # JO-gyro synth: trainer-frame angular rates normalized like the
-        # arena (yaw/turn_rate, pitch/pitch_rate). No roll axis in 2D.
+        # arena (yaw/turn_rate, pitch/pitch_rate, roll/roll_rate).
         # Sign: trainer heading DECREASES on right turns (heading -= yaw
         # * rate), so dh/dt is negative for rightward spin while the
         # arena/conventions read + as right - negate to match.
         "angular_yaw_rate": float(np.clip(-agent.yaw_rate / 8.0, -1.0, 1.0)),
         "angular_pitch_rate": float(np.clip(agent.pitch_rate_applied / 2.5, -1.0, 1.0)),
-        "angular_roll_rate": 0.0
+        "angular_roll_rate": float(np.clip(agent.roll_rate_applied / 3.0, -1.0, 1.0))
     }, dist
 
 
@@ -507,17 +524,20 @@ VARIANTS = {
 # learn goals (close the tail, spike the target, dodge wood), not
 # patterns. Activated by run_training(curriculum={...}); None (default)
 # runs the legacy curriculum byte-identically.
-SCHOOL_BEHAVIORS = ("camp", "mover", "duel")
+SCHOOL_BEHAVIORS = ("camp", "mover", "duel", "dodge")
 SCHOOL_ENVS = ("open", "slalom", "forest")
 SCHOOL_STAGES = [
     {"until": 0.30,
-     "behaviors": {"camp": 0.6, "mover": 0.2, "duel": 0.2},
+     "behaviors": {"camp": 0.55, "mover": 0.2, "duel": 0.2,
+                   "dodge": 0.05},
      "envs": {"open": 0.5, "slalom": 0.3, "forest": 0.2}},
     {"until": 0.65,
-     "behaviors": {"camp": 0.3, "mover": 0.4, "duel": 0.3},
+     "behaviors": {"camp": 0.25, "mover": 0.35, "duel": 0.3,
+                   "dodge": 0.1},
      "envs": {"open": 0.3, "slalom": 0.35, "forest": 0.35}},
     {"until": 1.01,
-     "behaviors": {"camp": 0.2, "mover": 0.5, "duel": 0.3},
+     "behaviors": {"camp": 0.2, "mover": 0.35, "duel": 0.3,
+                   "dodge": 0.15},
      "envs": {"open": 0.2, "slalom": 0.3, "forest": 0.5}},
 ]
 # Difficulty endpoints [start, end] lerped by progress; curriculum JSON
@@ -532,6 +552,8 @@ SCHOOL_DIFFICULTY = {
     "gap": [3.5, 2.2],
     "upset": [0.3, 0.7],
     "heading_jitter": [0.4, 1.2],
+    "dodge_speed": [4.0, 9.0],
+    "dodge_dist": [15.0, 25.0],
 }
 SCHOOL_TAKEDOWN_PAY = 4.5
 SCHOOL_TAIL_RATE = 1.0
@@ -761,8 +783,23 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
         arch = _mover_archetype(rngs["path"], progress, curriculum)
         path = plan_path(rngs["path"], nwp, archetype=arch)
         base_speed = diff("mover_speed")
+    elif behavior == "dodge":
+        # Head-on threat: spawned ahead along the fly's nose at dodge
+        # dist, homing straight at the agent every step (see dispatch).
+        # The lesson is the near-miss: bank away, don't get touched.
+        dist = diff("dodge_dist")
+        hx = float(np.cos(start_heading))
+        hz = float(np.sin(start_heading))
+        tx = float(np.clip(start_x + hx * dist, -40.0, 40.0))
+        tz = float(np.clip(start_z + hz * dist, -40.0, 40.0))
+        ty = float(np.clip(
+            fly.pos[1] + float(rngs["target"].uniform(-2.0, 2.0)),
+            4.0, 14.0))
+        target = KinematicFly(x=tx, y=ty, z=tz,
+                              heading_rad=start_heading + np.pi)
     else:
         target = KinematicFly(x=target_x, z=target_z, heading_rad=np.pi)
+    gate_line = None
     if env == "open":
         extra = []
     elif env == "slalom":
@@ -775,6 +812,7 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
         gap = diff("gap")
         extra = [(gx + px * off, gz + pz * off, 0.9, 16.0)
                  for off in (-gap, 0.0, gap)]
+        gate_line = (gx, gz, px, pz, gap)
     else:
         ntrees = max(1, int(round(diff("trunks"))))
         mx = (start_x + target.pos[0]) / 2.0 + float(
@@ -804,6 +842,13 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
             cz = float(target.pos[2] + np.sin(ang) * rad)
             extra.append((cx, cz, 0.9, 16.0))
             placed_r += 1
+    gates = []
+    if gate_line is not None:
+        # Bonus openings between the trunk posts (posts sit at -gap,
+        # 0, +gap off the start->target line; openings at half-gaps).
+        gx, gz, px, pz, gap = gate_line
+        gates = [(gx - px * gap / 2.0, gz - pz * gap / 2.0),
+                 (gx + px * gap / 2.0, gz + pz * gap / 2.0)]
     ctx = {"behavior": behavior, "env": env,
            "scenario": behavior.upper() + "+" + env.upper(),
            "path": path, "path_state": path_state,
@@ -812,7 +857,12 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
            "speed_mult": float(ARCHETYPE_SPEED_MULT.get(arch, 1.0)),
            "wobble": diff("mover_wobble"),
            "camp_bonus_paid": False,
-           "contact_pay": SCHOOL_TAKEDOWN_PAY}
+           "contact_pay": SCHOOL_TAKEDOWN_PAY,
+           "threat_speed": diff("dodge_speed"),
+           "min_dist": float("inf"),
+           "dodge_failed": False,
+           "gates": gates,
+           "gate_paid": False}
     return target, fly, upset, env, extra, ctx
 
 
@@ -1044,6 +1094,33 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                         and current_dist < 6.0:
                     school_ctx["camp_bonus_paid"] = True
                     da += 0.5
+                if school_ctx["behavior"] == "dodge":
+                    # Near-miss lesson: track closest approach; contact
+                    # (<1.2m) fails the dodge with an aversive pulse but
+                    # the threat flies through, so the episode continues.
+                    school_ctx["min_dist"] = min(
+                        float(school_ctx.get("min_dist", 1e9)),
+                        current_dist)
+                    if not bool(school_ctx.get("dodge_failed", False)) \
+                            and current_dist < 1.2:
+                        school_ctx["dodge_failed"] = True
+                        da -= 1.0
+                    # Bank-away shaping: bank magnitude on the opposite
+                    # side of the threat azimuth pays (dead-ahead reads
+                    # zero - symmetric threats teach nothing).
+                    az = float(senses.get("visual_target_azimuth", 0.0))
+                    away = -float(np.sign(az)) * float(fly.roll)
+                    if away > 0.15:
+                        da += 0.3
+                # Slalom gate bonus: first pass within 1.5m of either
+                # opening midpoint pays once (threading, not ramming).
+                if not bool(school_ctx.get("gate_paid", False)):
+                    for gx, gz in (school_ctx.get("gates", []) or []):
+                        if float(np.hypot(fly.pos[0] - gx,
+                                          fly.pos[2] - gz)) < 1.5:
+                            school_ctx["gate_paid"] = True
+                            da += 0.5
+                            break
             # Recovery shaping: penalize knocked attitudes and ceiling/floor
             # excursions so the brain learns pursuit policies that stay
             # flyable (level, in-band) instead of, e.g., firewalling thrust
@@ -1106,6 +1183,20 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             elif school_ctx is not None \
                     and school_ctx["behavior"] == "camp":
                 target.step(thrust=0.0, yaw_torque=0.0, dt=0.05)
+            elif school_ctx is not None \
+                    and school_ctx["behavior"] == "dodge":
+                # Head-on threat: home straight at the agent every step
+                # (deterministic, no draws). The agent learns the
+                # near-miss; the threat never dodges back.
+                to_a = fly.pos - target.pos
+                hd = float(np.hypot(to_a[0], to_a[2])) + 1e-4
+                target.heading = float(np.arctan2(to_a[2], to_a[0]))
+                spd = float(school_ctx.get("threat_speed", 6.0))
+                thr = float(np.clip(
+                    (spd - target.base_speed)
+                    / max(target.max_speed - target.base_speed, 1e-4),
+                    0.0, 1.0))
+                target.step(thrust=thr, yaw_torque=0.0, dt=0.05)
             elif school_ctx is not None:
                 # School duel: legacy random walk on the school stream so
                 # school episodes never consume global draws.
@@ -1170,8 +1261,12 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             prev_dist = current_dist
 
             # Success threshold: spear contact kills outright; otherwise
-            # closing within striking distance (3.5m) ends the hunt.
-            if strike or current_dist < 3.5:
+            # closing within striking distance (3.5m) ends the hunt. A
+            # touched dodge threat never counts: the pass already failed.
+            dodge_bad = bool(school_ctx is not None
+                             and school_ctx.get("behavior", "") == "dodge"
+                             and school_ctx.get("dodge_failed", False))
+            if strike or (current_dist < 3.5 and not dodge_bad):
                 success = True
                 break
 
@@ -1187,6 +1282,14 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             "takedown": takedown,
             "camp": bool(school_ctx is not None
                          and school_ctx["camp_bonus_paid"]),
+            "dodge": bool(school_ctx is not None
+                          and school_ctx.get("behavior", "") == "dodge"),
+            "dodge_failed": bool(school_ctx is not None
+                                 and school_ctx.get("dodge_failed", False)),
+            "min_dist": float(school_ctx.get("min_dist", -1.0))
+            if school_ctx is not None else -1.0,
+            "gate_paid": bool(school_ctx is not None
+                              and school_ctx.get("gate_paid", False)),
             "upset": upset,
             "crashed": crashed,
             "seized_out": seized_out,

@@ -467,6 +467,25 @@ class TestSensoryMotor(unittest.TestCase):
         ctrl = self.decoder.decode(gf_neurons)
         self.assertTrue(ctrl["emergency_evade"])
 
+    def test_roll_readout_mnhl(self):
+        # Haltere-motor laterality drives roll under muscles_up only:
+        # right-bank positive, silent pool reads wings-level, and base
+        # + legacy brains never roll from MNhl spikes.
+        from sensory_motor import MotorDecoder
+        dec = MotorDecoder(self.pops, mapping=["muscles_up"])
+        mnhl_r = self.pops["motor_roll_mnhl"]["right"]
+        mnhl_l = self.pops["motor_roll_mnhl"]["left"]
+        self.assertGreater(
+            dec.decode([mnhl_r[0]] * 20)["roll_torque"], 0.3)
+        self.assertLess(
+            dec.decode([mnhl_l[0]] * 20)["roll_torque"], -0.3)
+        self.assertEqual(dec.decode([], None)["roll_torque"], 0.0)
+        self.assertEqual(
+            self.decoder.decode([mnhl_r[0]] * 20)["roll_torque"], 0.0)
+        leg = MotorDecoder(self.pops, mapping=["muscles_up"], legacy=True)
+        self.assertEqual(
+            leg.decode([mnhl_r[0]] * 20)["roll_torque"], 0.0)
+
     def test_gf_evade_gated_on_visible_frontal_rival(self):
         # Phantom case: GF spikes from an unseen (or side) rival must NOT
         # roll/dive the fly; the arena reports loom without a visibility
@@ -1639,6 +1658,71 @@ class TestLegacyCompat(unittest.TestCase):
         pos = DopamineReinforcement._row_positions(indptr, sens)
         return rl, _make, pos, sens
 
+    def test_mnhl_roll_credit_assignment(self):
+        # Coordinated banks earn credit: left stimulus + left yaw +
+        # left roll potentiates left MNhl efferents; fighting roll
+        # depresses them; the quiet side is untouched either way.
+        from dopamine_learning import DopamineReinforcement
+        rng = np.random.default_rng(21)
+        n, deg = 200, 6
+        indptr = np.arange(n + 1, dtype=np.int32) * deg
+        indices = rng.integers(0, n, size=n * deg).astype(np.int32)
+        base_w = rng.normal(4.0, 0.5, size=n * deg).astype(np.float32)
+        fake_pops = {
+            "pheromone_da1": {"left": list(range(0, 10)),
+                              "right": list(range(10, 20))},
+            "pheromone_va1v": {"left": [], "right": []},
+            "visual_lc10": {"left": [], "right": []},
+            "visual_lc4": {"left": [], "right": []},
+            "visual_lplc2": {"left": [], "right": []},
+            "visual_lc11": {"left": [], "right": []},
+            "gyro_jo": {"left": [], "right": []},
+            "dopamine_pam": {"all": []}, "dopamine_ppl1": {"all": []},
+            "motor_turn_dnp20": {"left": [100], "right": [101]},
+            "motor_thrust_dnp09": {"all": [102]},
+            "motor_ram_dnpe017": {"all": [103]},
+            "motor_giant_fiber": {"all": [104]},
+            "motor_roll_mnhl": {"left": [110], "right": [111]},
+            "descending_all": {"left": [100], "right": [101],
+                               "all": [100, 101, 102]},
+            "mushroom_body_kc": [], "mbon_app": {"all": []},
+            "mbon_av": {"all": []},
+        }
+        rl = DopamineReinforcement(fake_pops)
+
+        class _Brain:
+            pass
+
+        def _make():
+            b = _Brain()
+            b.indptr = indptr
+            b.indices = indices
+            b.weights = base_w.copy()
+            return b
+
+        pos_l = DopamineReinforcement._row_positions(indptr, [110])
+        pos_r = DopamineReinforcement._row_positions(indptr, [111])
+        left_stim = {"pheromone_conc_left": 0.8,
+                     "pheromone_conc_right": 0.2,
+                     "visual_target_azimuth": -30.0}
+        b = _make()
+        rl.begin_episode(b)
+        rl.apply_plasticity(b, left_stim,
+                            {"yaw_torque": -0.5, "roll_torque": -0.5},
+                            1.0, gain_cap=0.3)
+        self.assertGreater(float(np.abs(b.weights[pos_l]).mean()),
+                           float(np.abs(base_w[pos_l]).mean()))
+        np.testing.assert_array_equal(b.weights[pos_r], base_w[pos_r])
+        # Fighting roll (bank right while turning left) depresses it.
+        b2 = _make()
+        rl.begin_episode(b2)
+        rl.apply_plasticity(b2, left_stim,
+                            {"yaw_torque": -0.5, "roll_torque": 0.5},
+                            1.0, gain_cap=0.3)
+        self.assertLess(float(np.abs(b2.weights[pos_l]).mean()),
+                        float(np.abs(base_w[pos_l]).mean()))
+        np.testing.assert_array_equal(b2.weights[pos_r], base_w[pos_r])
+
     def test_spear_branch_credit_assignment(self):
         # Aimed lunges with positive DA potentiate the lobula-feature
         # efferents; punished lunges depress them; sub-threshold or
@@ -2502,9 +2586,9 @@ class TestWiringGenome(unittest.TestCase):
         import numpy as np
         import experimental_wiring as ew
         g = ew.reference_genome()
-        self.assertEqual(ew.genome_id(g), "3fabb451f5")
-        self.assertEqual(ew.genome_label(g), "g3fabb451f5")
-        self.assertEqual(len(g["rules"]), 32)
+        self.assertEqual(ew.genome_id(g), "f66baac62c")
+        self.assertEqual(ew.genome_label(g), "gf66baac62c")
+        self.assertEqual(len(g["rules"]), 34)
         art_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "brain_engine", "reference_genome.json")
@@ -2521,6 +2605,18 @@ class TestWiringGenome(unittest.TestCase):
         self.assertEqual(ew.reference_distance(g), 0.0)
         rnd = ew.generate_genome(np.random.default_rng(7), self.pops, 3)
         self.assertGreater(ew.reference_distance(rnd), 0.5)
+
+    def test_roll_pool_registered(self):
+        import experimental_wiring as ew
+        self.assertEqual(ew.pool_role("motor_roll_mnhl"), "motor")
+        reg = ew.build_pool_registry(self.pops)
+        self.assertIn("motor_roll_mnhl", reg)
+        self.assertEqual(reg["motor_roll_mnhl"]["role"], "motor")
+        # sides maps side -> cell count (bilateral, graft-targetable).
+        self.assertGreater(
+            reg["motor_roll_mnhl"]["sides"].get("left", 0), 0)
+        self.assertGreater(
+            reg["motor_roll_mnhl"]["sides"].get("right", 0), 0)
 
     def test_rule_budget(self):
         import experimental_wiring as ew
@@ -2944,6 +3040,71 @@ class TestFlightSchool(unittest.TestCase):
         f = KinematicFly(x=5.0, y=7.0, z=-3.0, heading_rad=0.7)
         f.step(thrust=1.0, yaw_torque=0.0, dt=0.05)
         self.assertGreater(float(np.linalg.norm(f.pos - p0)), 0.0)
+
+    def test_roll_axis(self):
+        # Roll integrates from command (right-bank positive, turning
+        # right with it), auto-levels to wings-level, and stays exactly
+        # zero without commands (legacy flight identical).
+        from train_homing import KinematicFly, apply_arena_controls
+        f = KinematicFly(x=0.0, y=7.0, z=0.0, heading_rad=0.0)
+        h0 = f.heading
+        f.step(thrust=0.2, yaw_torque=0.0, dt=0.05)
+        self.assertEqual(f.roll, 0.0)
+        self.assertEqual(f.heading, h0)
+        self.assertEqual(f.roll_rate_applied, 0.0)
+        f.step(thrust=0.2, yaw_torque=0.0, dt=0.05, roll_cmd=1.0)
+        self.assertGreater(f.roll, 0.0)
+        self.assertLessEqual(f.roll, 0.9)
+        self.assertLess(f.heading, h0)
+        self.assertGreater(f.roll_rate_applied, 0.0)
+        for _ in range(400):
+            f.step(thrust=0.2, yaw_torque=0.0, dt=0.05)
+        self.assertAlmostEqual(f.roll, 0.0, places=2)
+        f2 = KinematicFly(x=0.0, y=7.0, z=0.0, heading_rad=0.0)
+        apply_arena_controls(
+            f2, {"thrust": 0.2, "yaw_torque": 0.0, "roll_torque": 0.6,
+                 "spear_thrust": 0.0}, {}, 10.0)
+        self.assertGreater(f2.roll, 0.0)
+
+    def test_dodge_episode(self):
+        # Dodge-only curriculum: head-on threat spawned ahead along the
+        # nose, homing at the agent; slalom envs carry two gate points.
+        import numpy as np
+        from train_homing import _school_episode
+        rngs = {k: np.random.default_rng(11)
+                for k in ("spawn", "path", "forest", "target")}
+        curriculum = {"stages": [{"until": 1.01,
+                                  "behaviors": {"dodge": 1.0},
+                                  "envs": {"open": 1.0}}]}
+        target, fly, _upset, env, _extra, ctx = _school_episode(
+            rngs, 0.5, curriculum, 0.0, 0.0, 30.0, 0.0)
+        self.assertEqual(ctx["behavior"], "dodge")
+        self.assertEqual(ctx["gates"], [])
+        self.assertEqual(ctx["min_dist"], float("inf"))
+        to_t = target.pos - fly.pos
+        fwd = np.array([np.cos(fly.heading), 0.0, np.sin(fly.heading)])
+        ahead = float(np.dot(to_t[[0, 2]], fwd[[0, 2]]))
+        self.assertGreater(ahead, 0.0)
+        # Threat nose points back at the agent (collision course).
+        back = fly.pos - target.pos
+        tdir = np.array([np.cos(target.heading), 0.0,
+                         np.sin(target.heading)])
+        self.assertGreater(float(np.dot(back[[0, 2]], tdir[[0, 2]])), 0.0)
+
+    def test_slalom_gates(self):
+        import numpy as np
+        from train_homing import _school_episode
+        rngs = {k: np.random.default_rng(11)
+                for k in ("spawn", "path", "forest", "target")}
+        curriculum = {"stages": [{"until": 1.01,
+                                  "behaviors": {"dodge": 1.0},
+                                  "envs": {"slalom": 1.0}}]}
+        _t, _f, _u, env, extra, ctx = _school_episode(
+            rngs, 0.5, curriculum, 0.0, 0.0, 30.0, 0.0)
+        self.assertEqual(env, "slalom")
+        self.assertEqual(len(extra), 3)
+        self.assertEqual(len(ctx["gates"]), 2)
+        self.assertFalse(ctx["gate_paid"])
 
     def test_plan_path_properties(self):
         import numpy as np
