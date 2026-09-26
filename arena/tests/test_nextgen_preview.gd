@@ -138,6 +138,31 @@ func test_strip_absent() -> void:
 	a.queue_free()
 
 
+func test_awaited_spec_progress() -> void:
+	# The handoff detaches awaited specs from pending: strip, gallery
+	# and status must read the in-flight spec or flatline for the
+	# whole (long) await. Simulated by hand-filling the member.
+	var a = _new_manager()
+	var pf := "user://test_nextgen_prog.json"
+	var f := FileAccess.open(pf, FileAccess.WRITE)
+	f.store_string('{"episode": 20, "total": 50}')
+	f.close()
+	a.evo_await_spec = {"kind": "wild", "name": "", "gen": 5,
+		"progress": pf, "launched": true, "mode": "graft"}
+	var res: Array = a._offspring_progress("wild")
+	_check(str(res[0]) == "wild G5", "awaited label resolves")
+	_check(absf(float(res[1]) - 40.0) < 0.01, "awaited pct tracks ep file")
+	var res2: Array = a._offspring_progress("clone")
+	_check(float(res2[1]) < 0.0, "other kinds still absent")
+	var card: Dictionary = a._gallery_card("", "wild G5 (training)")
+	_check(str(card.get("rows", "")).contains("ep 20/50"),
+		"gallery training card tracks awaited spec")
+	a.evo_await_spec = {}
+	var res3: Array = a._offspring_progress("wild")
+	_check(float(res3[1]) < 0.0, "cleared await reads absent again")
+	a.queue_free()
+
+
 func _cleanup() -> void:
 	if DirAccess.dir_exists_absolute("user://test_nextgen"):
 		for f in DirAccess.get_files_at("user://test_nextgen"):
@@ -151,6 +176,7 @@ func _initialize() -> void:
 	test_gallery_cards()
 	test_gallery_rotation()
 	test_strip_absent()
+	test_awaited_spec_progress()
 	_cleanup()
 	if failures == 0:
 		print("ALL NEXTGEN-PREVIEW TESTS PASSED")

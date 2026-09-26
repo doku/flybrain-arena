@@ -217,6 +217,17 @@ var nextgen_champ_id := ""
 var nextgen_champ_name := ""
 var nextgen_clone_name := ""
 var bracket_close_btn: Button
+var bracket_close_row: HBoxContainer
+# In-flight awaited breed: _evo_await_queued DETACHES its spec from
+# pending, so every progress readout (strip, gallery, status line)
+# must consult this fallback or flatline for the whole (long) await.
+var evo_await_spec := {}
+
+
+func _evo_awaited_spec(kind: String) -> Dictionary:
+	if str(evo_await_spec.get("kind", "")) == kind:
+		return evo_await_spec
+	return {}
 const NEXTGEN_GALLERY_EVERY := 7.0
 const NEXTGEN_STRIP_EVERY := 1.0
 var bracket_button: Button
@@ -588,6 +599,34 @@ func _build_bracket_overlay() -> void:
 	bracket_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	bracket_title.add_theme_font_size_override("font_size", 18)
 	vb.add_child(bracket_title)
+	# Training strip FIRST (next-gen waiting room only): progress must
+	# stay visible even when a tall bracket fills the scroll area below.
+	strip_box = HBoxContainer.new()
+	strip_box.add_theme_constant_override("separation", 16)
+	strip_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	strip_box.visible = false
+	vb.add_child(strip_box)
+	for slot in ["clone", "wild"]:
+		var cell := VBoxContainer.new()
+		cell.add_theme_constant_override("separation", 2)
+		cell.custom_minimum_size = Vector2(300, 0)
+		strip_box.add_child(cell)
+		var lab := Label.new()
+		lab.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lab.add_theme_font_size_override("font_size", 14)
+		cell.add_child(lab)
+		var bar := ProgressBar.new()
+		bar.min_value = 0.0
+		bar.max_value = 100.0
+		bar.custom_minimum_size = Vector2(300, 20)
+		bar.show_percentage = true
+		cell.add_child(bar)
+		if slot == "clone":
+			strip_clone_label = lab
+			strip_clone_bar = bar
+		else:
+			strip_wild_label = lab
+			strip_wild_bar = bar
 	# Bracket row: gallery column (next-gen waiting room only, hidden
 	# otherwise so mid-tournament views render exactly as before).
 	var brow := HBoxContainer.new()
@@ -622,41 +661,13 @@ func _build_bracket_overlay() -> void:
 	arena_bracket.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	arena_bracket.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.add_child(arena_bracket)
-	# Training strip (next-gen waiting room only): clone/wild progress
-	# stays visible over the bracket for the whole wait.
-	strip_box = HBoxContainer.new()
-	strip_box.add_theme_constant_override("separation", 16)
-	strip_box.alignment = BoxContainer.ALIGNMENT_CENTER
-	strip_box.visible = false
-	vb.add_child(strip_box)
-	for slot in ["clone", "wild"]:
-		var cell := VBoxContainer.new()
-		cell.add_theme_constant_override("separation", 2)
-		cell.custom_minimum_size = Vector2(300, 0)
-		strip_box.add_child(cell)
-		var lab := Label.new()
-		lab.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		lab.add_theme_font_size_override("font_size", 14)
-		cell.add_child(lab)
-		var bar := ProgressBar.new()
-		bar.min_value = 0.0
-		bar.max_value = 100.0
-		bar.custom_minimum_size = Vector2(300, 20)
-		bar.show_percentage = true
-		cell.add_child(bar)
-		if slot == "clone":
-			strip_clone_label = lab
-			strip_clone_bar = bar
-		else:
-			strip_wild_label = lab
-			strip_wild_bar = bar
 	var close_btn := Button.new()
 	close_btn.text = "CLOSE"
 	close_btn.pressed.connect(_hide_arena_bracket)
-	bracket_close_btn = close_btn
 	var hbox := HBoxContainer.new()
 	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
 	hbox.add_child(close_btn)
+	bracket_close_row = hbox
 	vb.add_child(hbox)
 
 func _show_arena_bracket(title_text: String) -> void:
@@ -2735,8 +2746,12 @@ func _update_evo_status_line() -> void:
 	var evo: Dictionary = director.tourney.get("evo", {})
 	var gen := int(evo.get("generation", 1))
 	var parts: Array = []
-	for spec in _evo_pending():
+	# The awaited spec is detached from pending: without the fallback
+	# this line flatlines for the whole (long) await, same as the strip.
+	for spec in _evo_pending() + [evo_await_spec]:
 		var s := spec as Dictionary
+		if s.is_empty():
+			continue
 		var label := str(s.get("name", ""))
 		if label == "":
 			label = "wild G%d" % int(s.get("gen", gen + 1))
@@ -4267,6 +4282,8 @@ func _show_nextgen_overlay(title_text: String) -> void:
 		strip_box.visible = true
 	if is_instance_valid(bracket_close_btn):
 		bracket_close_btn.visible = false
+	if is_instance_valid(bracket_close_row):
+		bracket_close_row.visible = false
 	_refresh_nextgen_preview()
 	if is_instance_valid(bracket_title):
 		bracket_title.text = title_text
@@ -4283,6 +4300,8 @@ func _hide_nextgen() -> void:
 		strip_box.visible = false
 	if is_instance_valid(bracket_close_btn):
 		bracket_close_btn.visible = true
+	if is_instance_valid(bracket_close_row):
+		bracket_close_row.visible = true
 	if is_instance_valid(bracket_overlay):
 		bracket_overlay.visible = false
 
@@ -4317,10 +4336,13 @@ func _refresh_nextgen_preview() -> void:
 func _gallery_card(pid: String, pname: String) -> Dictionary:
 	var rec: Dictionary = nextgen_brains.get(pid, {}) if pid != "" else {}
 	if rec.is_empty():
-		# Training card: ep progress from the matching pending spec.
+		# Training card: ep progress from the matching pending spec
+		# (or the awaited-detached one, same blind spot as the strip).
 		var detail := "queued"
-		for spec in _evo_pending():
+		for spec in _evo_pending() + [evo_await_spec]:
 			var s := spec as Dictionary
+			if s.is_empty():
+				continue
 			var sk := str(s.get("kind", ""))
 			var m := (str(s.get("name", "")) != "" and str(s.get("name", "")) == pname) \
 				or (sk == "wild" and pname.begins_with("wild G"))
@@ -4404,17 +4426,19 @@ func _offspring_progress(kind: String) -> Array:
 	var label := ""
 	if _evo_done().has(kind):
 		return [_evo_done_name(kind), 100.0]
+	var cands: Array = []
 	for spec in _evo_pending():
+		cands.append(spec)
+	var aw := _evo_awaited_spec(kind)
+	if not aw.is_empty():
+		cands.append(aw)
+	for spec in cands:
 		var s := spec as Dictionary
 		if str(s.get("kind", "")) != kind:
 			continue
 		label = str(s.get("name", ""))
 		if label == "":
-			var director := _director()
-			var gen := int(nextgen_gen)
-			if director != null:
-				gen = int((director.tourney.get("evo", {}) as Dictionary).get("generation", 1)) + 1
-			label = "wild G%d" % gen
+			label = "wild G%d" % int(s.get("gen", nextgen_gen))
 		if not bool(s.get("launched", false)):
 			return [label + " queued", 0.0]
 		var prog := _evo_poll_file(str(s.get("progress", "")))
@@ -4458,6 +4482,11 @@ func _evo_await_queued(kind: String) -> String:
 		pending.remove_at(i)
 		_evo_save_queue(pending, _evo_done())
 		var sname0 := str(s.get("name", ""))
+		evo_await_spec = {"kind": kind, "name": sname0,
+			"gen": int(s.get("gen", 1)),
+			"progress": str(s.get("progress", "")),
+			"launched": bool(s.get("launched", false)),
+			"mode": str(s.get("mode", ""))}
 		var display0 := sname0 if sname0 != "" else ("wild G%d" % int(s.get("gen", 1)))
 		if not bool(s.get("launched", false)):
 			# The lane may still be held by the sibling breed (e.g. wild
@@ -4472,6 +4501,7 @@ func _evo_await_queued(kind: String) -> String:
 					or not _evo_blocking_spec(kind).is_empty()) \
 					and swait < EVO_AWAIT_TIMEOUT:
 				if not _evo_active():
+					evo_await_spec = {}
 					return ""
 				var blk := _evo_blocking_spec(kind)
 				if blk.is_empty():
@@ -4492,14 +4522,17 @@ func _evo_await_queued(kind: String) -> String:
 				_evo_adopt_finished()
 				tdir = _director()
 			if tdir == null:
+				evo_await_spec = {}
 				return ""
 			if not tdir.pending_async.is_empty():
 				_show_evo_phase("BREEDING " + display0,
 					"Training slot never freed - check brains/jobs log")
+				evo_await_spec = {}
 				return ""
 			if not _evo_spawn_spec(s):
 				_show_evo_phase("BREEDING " + display0,
 					"Breed failed to start: %s" % evo_last_spawn_error)
+				evo_await_spec = {}
 				return ""
 		# Fresh spawns and watcher-launched jobs alike: the await loop's
 		# liveness gate and kill path key off evo_breed_pid.
@@ -4513,6 +4546,7 @@ func _evo_await_queued(kind: String) -> String:
 			var done := _evo_done()
 			done[kind] = {"id": bred, "name": evo_last_bred_name}
 			_evo_save_queue(_evo_pending(), done)
+		evo_await_spec = {}
 		return bred
 	return ""
 
@@ -4527,6 +4561,7 @@ func _evo_abort(reason: String) -> void:
 		var evo: Dictionary = director.tourney["evo"]
 		evo["active"] = false
 		director.save_state()
+	evo_await_spec = {}
 	_hide_nextgen()
 	_hide_evo_phase()
 	if is_instance_valid(status_label):
@@ -4556,6 +4591,7 @@ func _on_evo_stop() -> void:
 		director.pending_async = {}
 	# Clear pipeline queue so the watcher stops trying to spawn/adopt.
 	_evo_save_queue([], {})
+	evo_await_spec = {}
 	_evo_abort("stopped by user")
 
 
