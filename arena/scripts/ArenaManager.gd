@@ -951,6 +951,11 @@ func _generate_forest() -> void:
 	var canopy_opaque_b := StandardMaterial3D.new()
 	canopy_opaque_b.albedo_color = Color(0.22, 0.44, 0.15)
 	canopy_opaque_b.roughness = 0.85
+	# Horizon ring baked into 5 MultiMeshes (was 1100 individual
+	# nodes): identical pixels, a handful of draws. Buckets split
+	# trunk/canopy by material (even/odd canopy hues). Distant trees
+	# never fade or collide, so static instancing is exact.
+	var h_buckets := {}
 	var h_made := 0
 	var h_tries := 0
 	while h_made < HORIZON_TREE_COUNT and h_tries < HORIZON_TREE_COUNT * 20:
@@ -959,16 +964,57 @@ func _generate_forest() -> void:
 		var hrad = HORIZON_RING_MIN + (HORIZON_RING_MAX - HORIZON_RING_MIN) * sqrt(rng.randf())
 		var hp := Vector2(cos(hang) * hrad, sin(hang) * hrad)
 		var hs = rng.randf_range(1.0, 2.2)
-		var htree := Node3D.new()
-		htree.position = Vector3(hp.x, 0, hp.y)
-		htree.rotation.y = rng.randf_range(0.0, TAU)
-		htree.scale = Vector3(hs, hs, hs)
-		forest_root.add_child(htree)
-		_build_tree_visuals(htree, decor, bark_opaque,
-			canopy_opaque_a if h_made % 2 == 0 else canopy_opaque_b, false)
+		var hrot := rng.randf_range(0.0, TAU)
+		var tb := Basis(Vector3.UP, hrot).scaled(Vector3(hs, hs, hs))
+		var tp := Vector3(hp.x, 0, hp.y)
+		for spec in _tree_parts(decor, false):
+			var sd := spec as Dictionary
+			var pb: Basis = (sd["basis"] as Basis).scaled(sd["scl"] as Vector3)
+			var mat: Material
+			var key := str(sd.get("meshkey", "?"))
+			if bool(sd.get("wood", true)):
+				mat = bark_opaque
+				key = "wood:" + key
+			elif h_made % 2 == 0:
+				mat = canopy_opaque_a
+				key = "canA:" + key
+			else:
+				mat = canopy_opaque_b
+				key = "canB:" + key
+			if not h_buckets.has(key):
+				h_buckets[key] = {"mesh": sd["mesh"], "mat": mat,
+					"xforms": []}
+			((h_buckets[key] as Dictionary)["xforms"] as Array).append(
+				Transform3D(tb * pb, tp + tb * (sd["pos"] as Vector3)))
 		h_made += 1
+	for key in h_buckets.keys():
+		var bd := h_buckets[key] as Dictionary
+		_add_multimesh(forest_root, bd["mesh"] as Mesh,
+			bd["mat"] as Material, bd["xforms"] as Array,
+			AABB(Vector3(-200, -5, -200), Vector3(400, 45, 400)))
 	print("[Arena] Horizon forest: ", h_made, " distant trees.")
 	_build_underbrush(forest_root, decor, placed, spawn_a, spawn_b)
+
+
+func _add_multimesh(parent: Node3D, mesh: Mesh, mat: Material,
+		xforms: Array, bounds: AABB) -> void:
+	# One draw call for a static crowd sharing mesh + material.
+	# Explicit custom AABB: MultiMesh has no auto-bounds, and a wrong
+	# one culls the whole crowd at some camera angles.
+	if xforms.is_empty() or mesh == null:
+		return
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = mesh
+	mm.instance_count = xforms.size()
+	for i in range(xforms.size()):
+		mm.set_instance_transform(i, xforms[i])
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	mmi.custom_aabb = bounds
+	if mat != null:
+		mmi.material_override = mat
+	parent.add_child(mmi)
 
 
 # Shared procedural tree/dressing meshes, built once and reused by every
@@ -1064,6 +1110,55 @@ func _add_tree_part(parent: Node3D, pname: String, mesh: Mesh, pos: Vector3, mat
 	return mi
 
 
+func _tree_parts(decor: RandomNumberGenerator, full: bool) -> Array:
+	# Shared tree layout math as ordered part specs (pname, meshkey,
+	# mesh, pos, scl, basis, wood). _build_tree_visuals instantiates
+	# them (combat trees, fadeable); the horizon ring bakes the same
+	# specs into MultiMeshes instead. Decor draw ORDER is load-bearing
+	# (layout stream bit-identity) - keep every draw in place.
+	var parts: Array = []
+	parts.append({"pname": "Roots", "meshkey": "flare",
+		"mesh": _tree_mesh("flare"), "pos": Vector3(0, 0.9, 0),
+		"scl": Vector3.ONE, "basis": Basis.IDENTITY, "wood": true})
+	parts.append({"pname": "Trunk", "meshkey": "trunk_low",
+		"mesh": _tree_mesh("trunk_low"), "pos": Vector3(0, 5.8, 0),
+		"scl": Vector3.ONE, "basis": Basis.IDENTITY, "wood": true})
+	var tilt_ang := decor.randf_range(0.0, 0.07)
+	var tilt_az := decor.randf_range(0.0, TAU)
+	var tilt_dir := Vector3(cos(tilt_az), 0.0, sin(tilt_az))
+	var axis := Vector3.UP.cross(tilt_dir)
+	if axis.length() < 0.01:
+		axis = Vector3.RIGHT
+	var top_basis := Basis(axis.normalized(), tilt_ang)
+	var top_base := Vector3(0, 9.8, 0)
+	parts.append({"pname": "TrunkTop", "meshkey": "trunk_top",
+		"mesh": _tree_mesh("trunk_top"),
+		"pos": top_base + top_basis * Vector3(0, 4.0, 0),
+		"scl": Vector3.ONE, "basis": top_basis, "wood": true})
+	var top_pos: Vector3 = top_base + top_basis * Vector3(0, 8.0, 0)
+	# Main canopy blob (scaled half-height 1.98) tangent on the trunk top.
+	var canopy_main := top_pos + Vector3(0, 1.98, 0)
+	parts.append({"pname": "Canopy", "meshkey": "blob",
+		"mesh": _tree_mesh("blob"), "pos": canopy_main,
+		"scl": Vector3(1.15, 0.90, 1.15), "basis": Basis.IDENTITY,
+		"wood": false})
+	var a2 := decor.randf_range(0.0, TAU)
+	var side_dir := Vector3(cos(a2), 0.0, sin(a2))
+	parts.append({"pname": "Canopy2", "meshkey": "blob",
+		"mesh": _tree_mesh("blob"),
+		"pos": canopy_main + side_dir * 1.8 + Vector3(0, -1.0, 0),
+		"scl": Vector3(0.72, 0.58, 0.72), "basis": Basis.IDENTITY,
+		"wood": false})
+	if full:
+		# Crown blob (scaled half-height 1.35) tangent on the main mass.
+		parts.append({"pname": "Canopy3", "meshkey": "blob_small",
+			"mesh": _tree_mesh("blob_small"),
+			"pos": canopy_main + tilt_dir * 0.2 + Vector3(0, 3.33, 0),
+			"scl": Vector3(1.0, 0.90, 1.0), "basis": Basis.IDENTITY,
+			"wood": false})
+	return parts
+
+
 func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Material, cmat: Material, full: bool) -> void:
 	# Butt joints, no overlaps: each section starts exactly where the one
 	# below ends (flare 0-1.8, trunk 1.8-9.8, trunk-top 9.8-17.8, canopy
@@ -1074,34 +1169,13 @@ func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Mat
 	# Canopy side blobs stay merged foliage masses by design - only the
 	# wood-to-wood and wood-to-canopy joints abut. Mesh names feed the
 	# dynamic-fade system.
-	_add_tree_part(parent, "Roots", _tree_mesh("flare"), Vector3(0, 0.9, 0), tmat)
-	_add_tree_part(parent, "Trunk", _tree_mesh("trunk_low"), Vector3(0, 5.8, 0), tmat)
-	var tilt_ang := decor.randf_range(0.0, 0.07)
-	var tilt_az := decor.randf_range(0.0, TAU)
-	var tilt_dir := Vector3(cos(tilt_az), 0.0, sin(tilt_az))
-	var axis := Vector3.UP.cross(tilt_dir)
-	if axis.length() < 0.01:
-		axis = Vector3.RIGHT
-	var top_basis := Basis(axis.normalized(), tilt_ang)
-	var top_base := Vector3(0, 9.8, 0)
-	var top_part := _add_tree_part(parent, "TrunkTop", _tree_mesh("trunk_top"), top_base, tmat)
-	top_part.position = top_base + top_basis * Vector3(0, 4.0, 0)
-	top_part.basis = top_basis
-	var top_pos: Vector3 = top_base + top_basis * Vector3(0, 8.0, 0)
-	# Main canopy blob (scaled half-height 1.98) tangent on the trunk top.
-	var canopy_main := top_pos + Vector3(0, 1.98, 0)
-	_add_tree_part(parent, "Canopy", _tree_mesh("blob"), canopy_main, cmat,
-		Vector3(1.15, 0.90, 1.15))
-	var a2 := decor.randf_range(0.0, TAU)
-	var side_dir := Vector3(cos(a2), 0.0, sin(a2))
-	_add_tree_part(parent, "Canopy2", _tree_mesh("blob"),
-		canopy_main + side_dir * 1.8 + Vector3(0, -1.0, 0), cmat,
-		Vector3(0.72, 0.58, 0.72))
-	if full:
-		# Crown blob (scaled half-height 1.35) tangent on the main mass.
-		_add_tree_part(parent, "Canopy3", _tree_mesh("blob_small"),
-			canopy_main + tilt_dir * 0.2 + Vector3(0, 3.33, 0), cmat,
-			Vector3(1.0, 0.90, 1.0))
+	for spec in _tree_parts(decor, full):
+		var sd := spec as Dictionary
+		var mat = tmat if bool(sd.get("wood", true)) else cmat
+		var mi := _add_tree_part(parent, str(sd.get("pname", "?")),
+			sd["mesh"] as Mesh, sd["pos"] as Vector3, mat,
+			sd["scl"] as Vector3)
+		mi.basis = (sd["basis"] as Basis).scaled(sd["scl"] as Vector3)
 
 
 func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed: Array, spawn_a: Vector2, spawn_b: Vector2) -> void:
@@ -1119,6 +1193,12 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 	rock_mat.albedo_color = Color(0.45, 0.44, 0.42)
 	rock_mat.roughness = 0.95
 	var grass_mat := _sway_material(Color(0.24, 0.47, 0.17), 0.15, 1.0, 0.55)
+	# MultiMesh instance transforms (one draw per crowd instead of one
+	# per bush/rock/blade). Draw ORDER below is untouched.
+	var bush_a_x: Array = []
+	var bush_b_x: Array = []
+	var rock_x: Array = []
+	var grass_x: Array = []
 	var spots: Array[Vector2] = []
 	var made_bush := 0
 	var tries := 0
@@ -1136,14 +1216,16 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 			continue
 		spots.append(bp)
 		made_bush += 1
-		var bush := MeshInstance3D.new()
-		bush.mesh = _tree_mesh("bush")
-		bush.position = Vector3(bp.x, 0.55, bp.y)
-		bush.rotation.y = decor.randf_range(0.0, TAU)
+		var brot := decor.randf_range(0.0, TAU)
 		var bs := decor.randf_range(0.7, 1.5)
-		bush.scale = Vector3(bs, bs * decor.randf_range(0.60, 0.80), bs)
-		bush.material_override = bush_mat_a if made_bush % 2 == 0 else bush_mat_b
-		under.add_child(bush)
+		var bsq := decor.randf_range(0.60, 0.80)
+		var bxform := Transform3D(
+			Basis(Vector3.UP, brot).scaled(Vector3(bs, bs * bsq, bs)),
+			Vector3(bp.x, 0.55, bp.y))
+		if made_bush % 2 == 0:
+			bush_a_x.append(bxform)
+		else:
+			bush_b_x.append(bxform)
 	var made_rock := 0
 	tries = 0
 	while made_rock < 12 and tries < 400:
@@ -1159,13 +1241,11 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 		if not clear:
 			continue
 		made_rock += 1
-		var rock := MeshInstance3D.new()
-		rock.mesh = _tree_mesh("rock")
-		rock.position = Vector3(rp.x, 0.25, rp.y)
-		rock.rotation = Vector3(decor.randf_range(-0.2, 0.2), decor.randf_range(0.0, TAU), decor.randf_range(-0.2, 0.2))
-		rock.scale = Vector3(decor.randf_range(0.8, 1.8), decor.randf_range(0.5, 0.8), decor.randf_range(0.8, 1.6))
-		rock.material_override = rock_mat
-		under.add_child(rock)
+		var rrot := Vector3(decor.randf_range(-0.2, 0.2), decor.randf_range(0.0, TAU), decor.randf_range(-0.2, 0.2))
+		var rscl := Vector3(decor.randf_range(0.8, 1.8), decor.randf_range(0.5, 0.8), decor.randf_range(0.8, 1.6))
+		rock_x.append(Transform3D(
+			Basis.from_euler(rrot).scaled(rscl),
+			Vector3(rp.x, 0.25, rp.y)))
 	var made_grass := 0
 	for i in range(70):
 		var gp := Vector2(decor.randf_range(-38.0, 38.0), decor.randf_range(-38.0, 38.0))
@@ -1173,14 +1253,19 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 			continue
 		made_grass += 1
 		for b in range(3):
-			var blade := MeshInstance3D.new()
-			blade.mesh = _tree_mesh("grass")
-			blade.position = Vector3(gp.x + decor.randf_range(-0.4, 0.4), 0.45, gp.y + decor.randf_range(-0.4, 0.4))
-			blade.rotation = Vector3(decor.randf_range(-0.15, 0.15), decor.randf_range(0.0, TAU), decor.randf_range(-0.15, 0.15))
+			var bpos := Vector3(gp.x + decor.randf_range(-0.4, 0.4), 0.45, gp.y + decor.randf_range(-0.4, 0.4))
+			var brot := Vector3(decor.randf_range(-0.15, 0.15), decor.randf_range(0.0, TAU), decor.randf_range(-0.15, 0.15))
 			var gs := decor.randf_range(0.7, 1.3)
-			blade.scale = Vector3(gs, gs, gs)
-			blade.material_override = grass_mat
-			under.add_child(blade)
+			grass_x.append(Transform3D(
+				Basis.from_euler(brot).scaled(Vector3(gs, gs, gs)), bpos))
+	_add_multimesh(under, _tree_mesh("bush"), bush_mat_a, bush_a_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
+	_add_multimesh(under, _tree_mesh("bush"), bush_mat_b, bush_b_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
+	_add_multimesh(under, _tree_mesh("rock"), rock_mat, rock_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
+	_add_multimesh(under, _tree_mesh("grass"), grass_mat, grass_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
 	print("[Arena] Underbrush: ", made_bush, " bushes, ", made_rock, " rocks, ", made_grass, " grass tufts.")
 
 func _seq_timeout_for(context: String) -> int:

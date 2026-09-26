@@ -19,8 +19,10 @@ varying float local_h;
 void vertex() {
 	world_xz = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xz;
 	local_h = clamp((VERTEX.y + mesh_half_height) / (2.0 * mesh_half_height), 0.0, 1.0);
-	vec2 origin = vec2(MODEL_MATRIX[3][0], MODEL_MATRIX[3][2]);
-	float phase = fract(sin(dot(origin, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831;
+	// Per-instance phase: underbrush renders as MultiMeshes, so the
+	// origin hash is replaced by the instance id (guaranteed unique
+	// per instance on all renderers).
+	float phase = fract(float(INSTANCE_ID) * 0.6180339 + 0.13) * 6.2831;
 	float gust = 0.6 + 0.4 * sin(TIME * 0.7 + phase * 1.7);
 	float w = mix(1.0, smoothstep(0.0, 1.0, local_h), bend_amount);
 	VERTEX.xz += wind_dir * (sway_amp * w * gust);
