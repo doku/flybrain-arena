@@ -339,7 +339,9 @@ func poll_job() -> Dictionary:
 		vault_changed.emit()
 		_pump_train_queue()
 		if done_school and done_id != "":
-			_launch_score(done_id)
+			# Via the queue (never silently dropped when a batch
+			# probe holds the slot; id doubles as display name).
+			enqueue_score(done_id, done_id)
 		return res
 	# Fail loud: the backend writes its result file on success AND on
 	# error. If the process is gone without reaching 100%, the job
@@ -466,11 +468,11 @@ func enqueue_score(brain_id: String, brain_name: String) -> int:
 		if str((item as Dictionary).get("id", "")) == brain_id:
 			return 0
 	score_queue.append({"id": brain_id, "name": brain_name})
-	print("[Director] Queued scoring %s (#%d)" % [
-		brain_name, score_queue.size()])
+	var pos := score_queue.size()
+	print("[Director] Queued scoring %s (#%d)" % [brain_name, pos])
 	score_queue_changed.emit()
 	pump_score_queue()
-	return score_queue.size()
+	return pos
 
 
 func cancel_score_queued(index: int) -> void:

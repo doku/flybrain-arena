@@ -238,12 +238,30 @@ def cmd_score(a):
     if getattr(a, "progress", ""):
         _write_progress(a.progress, eps, eps)
     gained = round(float(summary.get("score", 0.0)), 1)
-    stamp_train_score(rec, {"score": gained})
-    tr = rec.setdefault("training", {})
+    # Merge onto a fresh reload: batch scoring overlaps training now
+    # (separate slots), so a concurrent train may have saved newer
+    # weights/counters since this probe loaded. Stamping onto the
+    # stale copy would silently revert them.
+    try:
+        cur_rec, cur_w = vault.load_brain(a.id)
+    except Exception:
+        cur_rec, cur_w = rec, weights
+    try:
+        import numpy as _np
+        same_weights = bool(_np.array_equal(
+            _np.asarray(cur_w, dtype=_np.float32),
+            _np.asarray(weights, dtype=_np.float32)))
+    except Exception:
+        same_weights = False
+    stamp_train_score(cur_rec, {"score": gained})
+    tr = cur_rec.setdefault("training", {})
     tr["episodes"] = int(tr.get("episodes", 0)) + eps
     tr["avg_score"] = (float(tr.get("score", 0.0)) / max(tr["episodes"], 1))
     try:
-        vault.save_brain(rec, weights)
+        if same_weights:
+            vault.save_brain(cur_rec, weights)
+        else:
+            vault.save_brain_record_only(cur_rec)
     except OSError as e:
         return err(str(e))
     return out({"ok": True, "eval_score": gained,

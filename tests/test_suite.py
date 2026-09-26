@@ -3922,6 +3922,66 @@ class TestRetinaVision(unittest.TestCase):
             vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_score_merges_concurrent_train(self):
+        # A train landing mid-probe must survive the probe's save:
+        # counters merge onto the fresh record, newer weights kept.
+        import shutil
+        import tempfile
+        from unittest import mock
+        import brain_package as vault_pkg
+        from train_homing import experiment_arrays, load_or_build_csr
+        from vault_cli import cmd_score
+        tmp = tempfile.mkdtemp(prefix="score_merge_")
+        old_vault, old_index = vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = tmp
+        vault_pkg.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            csr = load_or_build_csr()
+            pops = load_or_extract_populations()
+            _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+            rec = vault_pkg.new_record(
+                "Mergey", {"experiment": "retina_wide",
+                           "mapping": "retina"})
+            w0 = np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy())
+            vault_pkg.save_brain(rec, w0)
+            # A concurrent train saves different weights + counters.
+            w1 = np.ascontiguousarray(w0 + 1.0)
+            rec_train, _ = vault_pkg.load_brain(rec["id"])
+            rec_train["training"]["score"] = 50.0
+            rec_train["training"]["episodes"] = 25
+            vault_pkg.save_brain(rec_train, w1)
+
+            class _A:
+                pass
+            a = _A()
+            a.id = rec["id"]
+            a.episodes = 2
+            a.seed = 11
+            a.result_file = ""
+            loads = {"n": 0}
+            real_load = vault_pkg.load_brain
+
+            def _flaky_load(bid):
+                # First load (probe start) sees pre-train weights;
+                # merge reload sees the train's newer save.
+                loads["n"] += 1
+                if loads["n"] == 1:
+                    return rec, w0.copy()
+                return real_load(bid)
+
+            with mock.patch.object(vault_pkg, "load_brain",
+                                   side_effect=_flaky_load):
+                self.assertEqual(cmd_score(a), 0)
+            rec2, w2 = vault_pkg.load_brain(rec["id"])
+            # Train's weights kept, both counters merged.
+            np.testing.assert_array_equal(w2, w1)
+            self.assertEqual(rec2["training"]["episodes"], 25 + 2)
+            self.assertGreater(rec2["training"]["score"], 50.0)
+        finally:
+            vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_sector_wood_drives_lplc2(self):
         enc = SensoryEncoder(self.pops, mapping="retina")
         lplc2_l = set(self.pops["visual_lplc2"]["left"])
