@@ -524,20 +524,20 @@ VARIANTS = {
 # learn goals (close the tail, spike the target, dodge wood), not
 # patterns. Activated by run_training(curriculum={...}); None (default)
 # runs the legacy curriculum byte-identically.
-SCHOOL_BEHAVIORS = ("camp", "mover", "duel", "dodge")
+SCHOOL_BEHAVIORS = ("camp", "mover", "duel", "dodge", "stalk")
 SCHOOL_ENVS = ("open", "slalom", "forest")
 SCHOOL_STAGES = [
     {"until": 0.30,
-     "behaviors": {"camp": 0.55, "mover": 0.2, "duel": 0.2,
-                   "dodge": 0.05},
+     "behaviors": {"camp": 0.5, "mover": 0.2, "duel": 0.2,
+                   "dodge": 0.05, "stalk": 0.05},
      "envs": {"open": 0.5, "slalom": 0.3, "forest": 0.2}},
     {"until": 0.65,
-     "behaviors": {"camp": 0.25, "mover": 0.35, "duel": 0.3,
-                   "dodge": 0.1},
+     "behaviors": {"camp": 0.25, "mover": 0.3, "duel": 0.3,
+                   "dodge": 0.1, "stalk": 0.05},
      "envs": {"open": 0.3, "slalom": 0.35, "forest": 0.35}},
     {"until": 1.01,
-     "behaviors": {"camp": 0.2, "mover": 0.35, "duel": 0.3,
-                   "dodge": 0.15},
+     "behaviors": {"camp": 0.15, "mover": 0.35, "duel": 0.25,
+                   "dodge": 0.15, "stalk": 0.1},
      "envs": {"open": 0.2, "slalom": 0.3, "forest": 0.5}},
 ]
 # Difficulty endpoints [start, end] lerped by progress; curriculum JSON
@@ -579,8 +579,13 @@ MOVER_ARCHETYPE_STAGES = [
                     "circle_slow": 0.1, "circle_fast": 0.15}},
 ]
 ARCHETYPE_SPEED_MULT = {"patrol": 1.0, "weave": 1.0, "flee": 1.1,
-                        "orbit": 1.0, "zigzag": 1.0, "doubleback": 1.15,
-                        "circle_slow": 0.8, "circle_fast": 1.2}
+                         "orbit": 1.0, "zigzag": 1.0, "doubleback": 1.15,
+                         "circle_slow": 0.8, "circle_fast": 1.2}
+# Stalk gaze lessons want lateral sweepers, never fleeing targets:
+# flat table (no tier gating), curriculum "mover_archetypes" still wins.
+STALK_ARCHETYPES = {"zigzag": 0.30, "weave": 0.25, "doubleback": 0.15,
+                    "circle_slow": 0.10, "circle_fast": 0.10,
+                    "patrol": 0.05, "orbit": 0.05, "flee": 0.0}
 # Pre-training score (per episode): scenario-weighted reaching beats
 # distance partial credit; crashes earn nothing. Curriculum JSON may
 # override any weight.
@@ -638,6 +643,18 @@ def _school_diff(progress, curriculum, key):
     return float(lo) + (float(hi) - float(lo)) * progress
 
 
+def stalk_gaze_pay(behavior, visible, az_abs, dist):
+    """Gaze-tracking reward for the stalk lesson only: (pay, locked).
+    Peaks dead-ahead inside spear geometry (dist <= 3m), tapering to
+    zero at 35 degrees / 9 m. Every other behavior pays exactly 0.0,
+    so tracking can never outbid killing elsewhere."""
+    if behavior != "stalk" or not visible or az_abs > 35.0:
+        return 0.0, False
+    az_factor = 1.0 - az_abs / 35.0
+    range_factor = float(np.clip((9.0 - dist) / 6.0, 0.0, 1.0))
+    return 0.4 * az_factor * range_factor, True
+
+
 def pick_school_scenario(rng, progress, curriculum):
     """(behavior, env) for this episode from the stage weight tables."""
     stage = _school_stage(progress, curriculum)
@@ -645,11 +662,19 @@ def pick_school_scenario(rng, progress, curriculum):
             _school_draw(rng, stage.get("envs", {}), list(SCHOOL_ENVS)))
 
 
-def _mover_archetype(rng, progress, curriculum):
+def _mover_archetype(rng, progress, curriculum, behavior="mover"):
     """Stage-gated path lesson for mover episodes (curriculum JSON may
-    override the tier tables via "mover_archetypes")."""
-    tables = ((curriculum or {}).get("mover_archetypes", None)
-              or MOVER_ARCHETYPE_STAGES)
+    override the tier tables via "mover_archetypes"). Stalk episodes
+    draw lateral sweepers from STALK_ARCHETYPES instead (same override
+    wins)."""
+    override = (curriculum or {}).get("mover_archetypes", None)
+    if override:
+        tables = override
+    elif behavior == "stalk":
+        return _school_draw(rng, STALK_ARCHETYPES,
+                            list(MOVER_ARCHETYPES))
+    else:
+        tables = MOVER_ARCHETYPE_STAGES
     for stage in tables:
         if progress <= float(stage.get("until", 1.0)):
             return _school_draw(rng, stage.get("archetypes", {}),
@@ -777,10 +802,13 @@ def _school_episode(rngs, progress, curriculum, start_x, start_z,
         ty = float(rngs["target"].uniform(4.0, 14.0))
         th = float(rngs["target"].uniform(-np.pi, np.pi))
         target = KinematicFly(x=tx, y=ty, z=tz, heading_rad=th, anchored=True)
-    elif behavior == "mover":
+    elif behavior in ("mover", "stalk"):
+        # Stalk is a mover with lateral-sweeper paths (gaze targets):
+        # same catchable mechanics, same takedown pay.
         target = KinematicFly(x=target_x, z=target_z, heading_rad=np.pi)
         nwp = max(2, int(round(diff("mover_waypoints"))))
-        arch = _mover_archetype(rngs["path"], progress, curriculum)
+        arch = _mover_archetype(rngs["path"], progress, curriculum,
+                                behavior)
         path = plan_path(rngs["path"], nwp, archetype=arch)
         base_speed = diff("mover_speed")
     elif behavior == "dodge":
@@ -1121,6 +1149,20 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                             school_ctx["gate_paid"] = True
                             da += 0.5
                             break
+                # Stalk gaze reward (THIS lesson only): keeping the
+                # target in the front eye pays, best at spear geometry
+                # and tapering to the 35-degree gate. Catchable target,
+                # so takedown pay still dominates and stare-then-lunge
+                # combos can emerge instead of fixation.
+                pay, locked = stalk_gaze_pay(
+                    school_ctx["behavior"],
+                    bool(senses.get("visual_target_visible", False)),
+                    abs(float(senses.get("visual_target_azimuth", 0.0))),
+                    current_dist)
+                da += pay
+                if locked:
+                    school_ctx["gaze_locks"] = int(
+                        school_ctx.get("gaze_locks", 0)) + 1
             # Recovery shaping: penalize knocked attitudes and ceiling/floor
             # excursions so the brain learns pursuit policies that stay
             # flyable (level, in-band) instead of, e.g., firewalling thrust
@@ -1172,7 +1214,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             # (camp is anchored: step() is a heartbeat no-op); legacy
             # duel keeps the constant-speed random walk.
             if school_ctx is not None \
-                    and school_ctx["behavior"] == "mover":
+                    and school_ctx["behavior"] in ("mover", "stalk"):
                 step_path_target(target, school_ctx["path"],
                                  school_ctx["path_state"],
                                  float(school_ctx["base_speed"])
@@ -1290,6 +1332,11 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             if school_ctx is not None else -1.0,
             "gate_paid": bool(school_ctx is not None
                               and school_ctx.get("gate_paid", False)),
+            "gaze_lock_frac": (
+                float(school_ctx.get("gaze_locks", 0)) / (step + 1)
+                if school_ctx is not None
+                and school_ctx.get("behavior", "") == "stalk"
+                else 0.0),
             "upset": upset,
             "crashed": crashed,
             "seized_out": seized_out,

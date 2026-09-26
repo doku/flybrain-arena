@@ -3091,6 +3091,53 @@ class TestFlightSchool(unittest.TestCase):
                          np.sin(target.heading)])
         self.assertGreater(float(np.dot(back[[0, 2]], tdir[[0, 2]])), 0.0)
 
+    def test_stalk_gaze_pay(self):
+        # Spear-geometry shaped, stalk-only: max dead-ahead close,
+        # tapering to the 35-degree gate; everything else pays zero.
+        from train_homing import stalk_gaze_pay
+        pay, locked = stalk_gaze_pay("stalk", True, 0.0, 2.0)
+        self.assertAlmostEqual(pay, 0.4)
+        self.assertTrue(locked)
+        pay, _locked = stalk_gaze_pay("stalk", True, 17.5, 2.0)
+        self.assertAlmostEqual(pay, 0.2)
+        pay, locked = stalk_gaze_pay("stalk", True, 0.0, 9.0)
+        self.assertEqual(pay, 0.0)
+        self.assertTrue(locked)
+        self.assertEqual(stalk_gaze_pay("stalk", True, 35.1, 2.0),
+                         (0.0, False))
+        self.assertEqual(stalk_gaze_pay("stalk", False, 0.0, 2.0),
+                         (0.0, False))
+        # Other lessons never pay for staring (no fixation farming).
+        for behavior in ("camp", "mover", "duel", "dodge"):
+            self.assertEqual(stalk_gaze_pay(behavior, True, 0.0, 2.0),
+                             (0.0, False))
+
+    def test_stalk_episode(self):
+        # Stalk-only curriculum: lateral-sweeper archetypes (never
+        # flee), deterministic layouts, gaze keys present.
+        import numpy as np
+        from train_homing import _school_episode, STALK_ARCHETYPES
+        curriculum = {"stages": [{"until": 1.01,
+                                  "behaviors": {"stalk": 1.0},
+                                  "envs": {"open": 1.0}}]}
+
+        def _build(seed):
+            rngs = {k: np.random.default_rng(seed)
+                    for k in ("spawn", "path", "forest", "target")}
+            return _school_episode(rngs, 0.5, curriculum,
+                                   0.0, 0.0, 30.0, 0.0)
+
+        t1, _f1, _u1, _e1, _x1, ctx1 = _build(21)
+        t2, _f2, _u2, _e2, _x2, ctx2 = _build(21)
+        self.assertEqual(ctx1["behavior"], "stalk")
+        self.assertIn(ctx1["archetype"], STALK_ARCHETYPES)
+        self.assertNotEqual(ctx1["archetype"], "flee")
+        self.assertIsNotNone(ctx1["path"])
+        # Deterministic: same seed rebuilds the same lesson.
+        self.assertEqual(ctx1["archetype"], ctx2["archetype"])
+        np.testing.assert_array_equal(t1.pos, t2.pos)
+        self.assertEqual(ctx1.get("gaze_locks", 0), 0)
+
     def test_slalom_gates(self):
         import numpy as np
         from train_homing import _school_episode
