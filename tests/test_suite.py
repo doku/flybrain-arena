@@ -326,6 +326,42 @@ class TestSensoryMotor(unittest.TestCase):
             _school_score(dict(base, success=True),
                           {"score_weights": {"reach": 100.0}}), 100.0)
 
+    def test_school_skill_scores(self):
+        # Skill composition: dodge passes, stalk lock, gate threading.
+        # Takedown stays on top; crashes stay absolute zero.
+        from train_homing import _school_score
+        base = {"initial_dist": 20.0}
+        clean = dict(base, dodge=True, success=True, dodge_failed=False,
+                     min_dist=5.0)
+        self.assertEqual(_school_score(clean, {}), 8.0)
+        touched = dict(base, dodge=True, success=True, dodge_failed=True,
+                       min_dist=0.5)
+        self.assertEqual(_school_score(touched, {}), 6.0)
+        far = dict(base, dodge=True, success=True, dodge_failed=False,
+                   min_dist=12.0)
+        self.assertEqual(_school_score(far, {}), 6.0)
+        failed = dict(base, dodge=True, success=False)
+        self.assertEqual(_school_score(failed, {}), 0.0)
+        self.assertAlmostEqual(
+            _school_score(dict(base, gaze_lock_frac=0.5), {}), 2.0)
+        self.assertAlmostEqual(
+            _school_score(dict(base, gaze_lock_frac=1.0,
+                               gate_paid=True), {}),
+            6.0)
+        self.assertEqual(
+            _school_score(dict(base, success=True, gate_paid=True), {}),
+            8.0)
+        self.assertEqual(
+            _school_score(dict(base, takedown=True, gate_paid=True), {}),
+            10.0)
+        self.assertEqual(
+            _school_score(dict(base, crashed=True, gate_paid=True), {}),
+            0.0)
+        self.assertEqual(
+            _school_score(dict(clean, gate_paid=True),
+                          {"score_weights": {"dodge": 5.0, "gate": 1.0}}),
+            6.0)
+
     def test_score_stamping(self):
         # Score banks on the record, accumulates across sessions, avg
         # spans cumulative episodes; new records default 0. Production

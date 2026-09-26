@@ -587,13 +587,19 @@ STALK_ARCHETYPES = {"zigzag": 0.30, "weave": 0.25, "doubleback": 0.15,
                     "circle_slow": 0.10, "circle_fast": 0.10,
                     "patrol": 0.05, "orbit": 0.05, "flee": 0.0}
 # Pre-training score (per episode): scenario-weighted reaching beats
-# distance partial credit; crashes earn nothing. Curriculum JSON may
-# override any weight.
+# distance partial credit; skill skills (dodge/stalk/gates) score the
+# lessons themselves; crashes earn nothing. Curriculum JSON may
+# override any weight. NOTE: skill composition re-baselines stamped
+# scores - pre-skill eval numbers are not comparable with post-skill
+# ones (ELO/battles/titles are separate systems, unaffected).
 SCHOOL_SCORE_WEIGHTS = {
     "takedown": 10.0,   # spike kill (mover/duel takedowns)
     "camp": 8.0,        # camp capture (arrival bonus paid)
+    "dodge": 8.0,       # clean head-on pass (untouched, min_dist < 8m)
     "reach": 6.0,       # other-scenario success (3.5m / spear contact)
     "partial_max": 4.0, # distance-closed fraction when not reaching
+    "gaze": 4.0,        # stalk lock fraction when not reaching
+    "gate": 2.0,        # slalom gate threaded (stacks, capped at takedown)
 }
 
 
@@ -604,14 +610,32 @@ def _school_score(entry, curriculum):
     if entry.get("takedown", False):
         return float(w["takedown"])
     if entry.get("camp", False):
-        return float(w["camp"])
-    if entry.get("success", False):
-        return float(w["reach"])
-    if entry.get("crashed", False) or entry.get("seized_out", False):
+        base = float(w["camp"])
+    elif entry.get("dodge", False) and entry.get("success", False) \
+            and not entry.get("dodge_failed", False) \
+            and float(entry.get("min_dist", 1e9)) < 8.0:
+        base = float(w["dodge"])
+    elif entry.get("success", False):
+        base = float(w["reach"])
+    elif entry.get("crashed", False) or entry.get("seized_out", False):
         return 0.0
-    initial = max(float(entry.get("initial_dist", 1.0)), 1e-6)
-    frac = float(np.clip(float(entry.get("closed", 0.0)) / initial, 0.0, 1.0))
-    return frac * float(w["partial_max"])
+    elif entry.get("dodge", False):
+        # Failed dodge passes earn nothing (the lesson is the miss).
+        base = 0.0
+    elif float(entry.get("gaze_lock_frac", 0.0)) > 0.0:
+        # Stalk tracking quality replaces distance partial credit.
+        base = float(np.clip(float(entry.get("gaze_lock_frac", 0.0)),
+                             0.0, 1.0)) * float(w["gaze"])
+    else:
+        initial = max(float(entry.get("initial_dist", 1.0)), 1e-6)
+        frac = float(np.clip(float(entry.get("closed", 0.0)) / initial,
+                             0.0, 1.0))
+        base = frac * float(w["partial_max"])
+    if bool(entry.get("gate_paid", False)):
+        # Threading bonus stacks, capped at takedown supremacy (explicit
+        # weight overrides still punch through uncapped).
+        base = min(base + float(w["gate"]), float(w["takedown"]))
+    return base
 
 
 def _school_stage(progress, curriculum):
