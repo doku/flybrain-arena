@@ -135,10 +135,11 @@ func request_tournament_match(match_winner: String, tournament_id: String = "", 
 		return
 	_send_dict({"type": "tournament_match", "match_winner": match_winner, "tournament_id": tournament_id, "match": match_label})
 
-func request_tournament_end(champion: String) -> void:
+func request_tournament_end(champion: String, champion_id: String = "") -> void:
 	if not is_connected_server:
 		return
-	_send_dict({"type": "tournament_end", "champion": champion})
+	_send_dict({"type": "tournament_end", "champion": champion,
+		"champion_id": champion_id})
 
 func request_merge() -> void:
 	if not is_connected_server:

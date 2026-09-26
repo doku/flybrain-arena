@@ -1598,6 +1598,43 @@ class TestTournamentProtocol(unittest.TestCase):
         self.assertEqual(rb["record"]["losses"], 1)
         self.assertGreaterEqual(len(ra["training"]["sessions"]), 1)
 
+    def test_crown_by_id_not_slot(self):
+        # Regression: at close time the slots hold consolation fighters,
+        # not the champion. The title must land on champion_id; the slot
+        # holders must not gain titles. Duplicate crowns must not stack.
+        ckpt = os.path.join(PROJECT_ROOT, "checkpoints",
+                            "trained_homing_A.npz")
+        champ = vault_pkg.import_legacy_npz(ckpt, "ProtoChamp")
+        champ_id = champ["id"]
+        try:
+            res = self._rpc({"type": "tournament_load",
+                             "alpha_path": self.path_a,
+                             "beta_path": self.path_b,
+                             "tournament_id": "UTCROWN",
+                             "match": "R9M9", "lr_scale": 0.5})
+            self.assertEqual(res.get("status"), "brains_loaded")
+            e = self._rpc({"type": "tournament_end", "champion": "alpha",
+                           "champion_id": champ_id})
+            self.assertEqual(e.get("status"), "tournament_closed")
+            rc, _w = vault_pkg.load_brain(champ_id)
+            self.assertEqual(rc["record"]["tournaments_won"], 1)
+            ra, _w2 = vault_pkg.load_brain(self.id_a)
+            self.assertEqual(ra["record"]["tournaments_won"], 0)
+            e2 = self._rpc({"type": "tournament_end", "champion": "alpha",
+                            "champion_id": champ_id})
+            self.assertEqual(e2.get("status"), "tournament_closed")
+            rc2, _w3 = vault_pkg.load_brain(champ_id)
+            self.assertEqual(rc2["record"]["tournaments_won"], 1)
+            f = self._rpc({"type": "free_mode"})
+            self.assertEqual(f.get("status"), "free_ready")
+        finally:
+            try:
+                os.remove(vault_pkg.package_path(
+                    vault_pkg.load_brain(champ_id)[0]))
+            except OSError:
+                pass
+            vault_pkg.refresh_index()
+
 
 class TestLegacyCompat(unittest.TestCase):
     """Pre-mapping brains (records WITHOUT the 'mapping' key) run the

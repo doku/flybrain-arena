@@ -276,6 +276,13 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
 _last_title_banked = {"key": None}
 
 
+class _WeightsBox:
+    """Minimal brain stand-in so id-based title banking can reuse
+    _bank_title (which only touches rec + brain.weights)."""
+    def __init__(self, weights):
+        self.weights = weights
+
+
 def _bank_title(side_state, champ_label, key=None):
     """Crown the champion: tournaments_won += 1 + vault save. A repeat
     call with the same key is a no-op (duplicate crowns must not stack
@@ -1093,9 +1100,26 @@ def run_brain_server(host="127.0.0.1", port=9999):
             elif msg_type == "tournament_end":
                 # Crown the champion: tournaments_won += 1. Duplicate
                 # crowns (same tournament+champion) resend the ack.
+                # Banked BY VAULT ID: by close time the slot holders
+                # are consolation fighters, not the champion, so the
+                # legacy slot alone crowned the wrong brain. Falls
+                # back to the slot when no id is given (old clients).
                 champ = msg.get("champion", "")
+                champ_id = str(msg.get("champion_id", "") or "")
+                import brain_package as vault_pkg
                 st = tourney_a if champ == "alpha" else tourney_b
                 tkey = (tourney_tag.get("tournament_id") or "", champ)
+                if champ_id:
+                    tkey = (tourney_tag.get("tournament_id") or "",
+                            champ_id)
+                    try:
+                        crec, cweights = vault_pkg.load_brain(champ_id)
+                        st = {"rec": crec,
+                              "brain": _WeightsBox(cweights)}
+                    except Exception as e:
+                        print(f"[Server] Crown {champ_id}: vault load "
+                              f"failed ({e}), falling back to slot.",
+                              flush=True)
                 if tkey == _last_title_banked.get("key"):
                     print(f"[Server] Duplicate crown {tkey[0]} {champ}: "
                           f"title already banked.", flush=True)

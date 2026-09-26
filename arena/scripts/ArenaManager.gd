@@ -3261,7 +3261,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 			return
 		var champ_slot := _slot_of(champ_id)
 		_tourney_close_ack = false
-		brain_client.request_tournament_end(champ_slot)
+		brain_client.request_tournament_end(champ_slot, champ_id)
 		var champ_name: String = director.champion_name()
 		# Evolution mode: skip the review-wait and breed the next
 		# generation instead (champion display happens inside).
