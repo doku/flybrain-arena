@@ -144,9 +144,38 @@ func test_short15() -> void:
 		"15-bracket decides no last place (would need ranking fallback)")
 
 
+func test_genome_bearing() -> void:
+	# Crossover gate: genome and single frozen mixes qualify; base,
+	# legacy, multi-mix, unknown and malformed entries never do (a
+	# base champion once killed a whole generation this way).
+	var d = _new_director()
+	d.tourney = {"players": [
+		{"id": "g", "generator_params": {"genome": {"rules": []}}},
+		{"id": "f", "generator_params": {"experiment": "retina_wide"}},
+		{"id": "fl", "generator_params": {"experiment": ["spear_lunge"]}},
+		{"id": "b", "generator_params": {"experiment": null}},
+		{"id": "l", "generator_params": {}},
+		{"id": "m", "generator_params": {"experiment": ["retina_wide", "spear_lunge"]}},
+		{"id": "n", "generator_params": "oops"},
+		"oops-a-string",
+		{"id": "e", "record": "oops"},
+	]}
+	_check(d.is_genome_bearing("g"), "genome parent qualifies")
+	_check(d.is_genome_bearing("f"), "frozen mix string qualifies")
+	_check(d.is_genome_bearing("fl"), "frozen mix list qualifies")
+	_check(not d.is_genome_bearing("b"), "base parent refused")
+	_check(not d.is_genome_bearing("l"), "legacy parent refused")
+	_check(not d.is_genome_bearing("m"), "multi-mix parent refused")
+	_check(not d.is_genome_bearing("n"), "non-dict params refused")
+	_check(not d.is_genome_bearing("oops-a-string"), "non-dict player refused")
+	_check(not d.is_genome_bearing("ghost"), "unknown id refused")
+	_check(not d.is_genome_bearing("e"), "param-less entry refused without crashing")
+
+
 func _initialize() -> void:
 	test_full16()
 	test_short15()
+	test_genome_bearing()
 	if failures == 0:
 		print("ALL EVO-BRACKET-FILL TESTS PASSED")
 	else:

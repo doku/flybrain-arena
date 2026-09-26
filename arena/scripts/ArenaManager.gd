@@ -3440,9 +3440,6 @@ func _evo_has_kind(kind: String) -> bool:
 # Exploration rotation for wilds: graft -> shuffle -> novelty across
 # generations (crossover rides the clone slot every 4th gen instead).
 const WILD_MODE_CYCLE := ["graft", "shuffle", "novelty"]
-# Crossable wirings mirrored from experimental_wiring.FROZEN_GENOMES
-# (genome parents always qualify; these legacy mixes expand to rules).
-const FROZEN_WIRINGS := ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
 
 
 func _evo_queue_spec(kind: String, brain_name: String, parent_id: String,
@@ -3492,11 +3489,11 @@ func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String,
 
 
 func _evo_crossover_partner(champ_id: String) -> String:
-	# Highest-ELO roster brain that can cross (genome or single frozen
-	# mix; base/legacy/multi-mix parents would fail breeding and abort
-	# the generation, so they never qualify here).
+	# Highest-ELO crossable roster rival (director owns the bearing
+	# check; base/legacy/multi-mix parents would fail breeding and
+	# abort the generation, so they never qualify here).
 	var director := _director()
-	if director == null:
+	if director == null or not director.has_method("is_genome_bearing"):
 		return ""
 	var best := ""
 	var best_elo := -1.0
@@ -3507,18 +3504,7 @@ func _evo_crossover_partner(champ_id: String) -> String:
 		var pid := str(pd.get("id", ""))
 		if pid == "" or pid == champ_id:
 			continue
-		var gp = pd.get("generator_params", {})
-		if not (gp is Dictionary):
-			continue
-		var ok := (gp as Dictionary).get("genome", null) != null
-		if not ok:
-			var exp = (gp as Dictionary).get("experiment", null)
-			if exp is String and str(exp) in FROZEN_WIRINGS:
-				ok = true
-			elif exp is Array and exp.size() == 1 \
-					and str(exp[0]) in FROZEN_WIRINGS:
-				ok = true
-		if not ok:
+		if not bool(director.call("is_genome_bearing", pid)):
 			continue
 		var rec = pd.get("record", {})
 		var elo := 1200.0
@@ -3532,8 +3518,15 @@ func _evo_crossover_partner(champ_id: String) -> String:
 
 func _evo_clone_parent2(target_gen: int, champ_id: String) -> String:
 	# Crossover every 4th generation: champion x strongest crossable
-	# rival. All other generations clone asexually as before.
+	# rival - but only when the CHAMPION itself can cross (a
+	# base/legacy/multi-mix champion killed gen 4 this way). Anything
+	# else clones asexually as before.
 	if target_gen % 4 != 0:
+		return ""
+	var director := _director()
+	if director == null or not director.has_method("is_genome_bearing"):
+		return ""
+	if not bool(director.call("is_genome_bearing", champ_id)):
 		return ""
 	return _evo_crossover_partner(champ_id)
 
@@ -3960,7 +3953,12 @@ func _evo_await_queued(kind: String) -> String:
 func _evo_abort(reason: String) -> void:
 	var director := _director()
 	if director != null:
-		director.tourney["evo"] = {"active": false}
+		# Freeze, don't wipe: pending/done stay as forensic evidence
+		# (a wiped queue once hid a whole failed generation).
+		if not director.tourney.has("evo"):
+			director.tourney["evo"] = {}
+		var evo: Dictionary = director.tourney["evo"]
+		evo["active"] = false
 		director.save_state()
 	_hide_evo_phase()
 	if is_instance_valid(status_label):

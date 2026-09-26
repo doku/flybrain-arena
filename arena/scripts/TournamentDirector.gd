@@ -1081,6 +1081,36 @@ func champion_name() -> String:
 	return "?"
 
 
+# Crossable wirings mirrored from experimental_wiring.FROZEN_GENOMES
+# (genome parents always qualify; these legacy mixes expand to rules).
+const CROSSABLE_MIXES := ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
+
+
+func is_genome_bearing(pid: String) -> bool:
+	# True when a roster brain can parent a crossover (genome or single
+	# frozen mix). Base/legacy/multi-mix brains would fail breeding and
+	# abort the generation, so the evo loop must never pick them.
+	for p in tourney.get("players", []):
+		if not (p is Dictionary):
+			continue
+		var pd := p as Dictionary
+		if str(pd.get("id", "")) != pid:
+			continue
+		var gp = pd.get("generator_params", {})
+		if not (gp is Dictionary):
+			return false
+		if (gp as Dictionary).get("genome", null) != null:
+			return true
+		var exp = (gp as Dictionary).get("experiment", null)
+		if exp is String and str(exp) in CROSSABLE_MIXES:
+			return true
+		if exp is Array and exp.size() == 1 \
+				and str(exp[0]) in CROSSABLE_MIXES:
+			return true
+		return false
+	return false
+
+
 func kin_name(champ_name: String, gen: int) -> String:
 	# Clone display name that stays short across generations: strip one
 	# leading G<N>- prefix, one trailing -kin[N] suffix (remembering N),
