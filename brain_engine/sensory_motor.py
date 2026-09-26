@@ -552,7 +552,11 @@ class MotorDecoder:
         mbon_av = populations.get("mbon_av", {})
         self.mbon_av_ids = set(mbon_av.get("all", []))
 
-    def decode(self, fired_spikes, sensory_hint=None):
+    def decode(self, fired_spikes, sensory_hint=None, _counts_out=None):
+        # _counts_out: optional caller-owned dict to fill instead of a
+        # fresh one (the live loop reuses it for stats: one count build
+        # per brain per tick instead of two). Omit it and behavior is
+        # exactly as before.
         spike_set = list(fired_spikes)
         if len(spike_set) == 0:
             base = {
@@ -583,7 +587,7 @@ class MotorDecoder:
                 "spear_thrust": 0.0
             }
 
-        counts = {}
+        counts = _counts_out if _counts_out is not None else {}
         for s in spike_set:
             counts[s] = counts.get(s, 0) + 1
 

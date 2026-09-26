@@ -61,8 +61,9 @@ def _run_side_integrate(dec, brain, stim, sens, pops, pool_idx, detail):
     Poisson sampler uses the shared global RandomState, which must
     never be touched from two threads at once."""
     spikes = brain.integrate_50ms(stim)
-    ctrl = dec.decode(spikes, sensory_hint=sens)
-    stats = _spike_stats(spikes, pops, pool_idx, detail)
+    counts = {}
+    ctrl = dec.decode(spikes, sensory_hint=sens, _counts_out=counts)
+    stats = _spike_stats(spikes, pops, pool_idx, detail, _counts=counts)
     return ctrl, stats, sens, spikes
 
 
@@ -73,12 +74,13 @@ def _raster_ids(pool_idx, pool, cap=RASTER_CAP):
     return ids[:cap], len(ids)
 
 
-def _spike_stats(spikes, pops, pool_idx=None, detail=0):
+def _spike_stats(spikes, pops, pool_idx=None, detail=0, _counts=None):
     """Compact brain-activation summary for the HUD + brain view.
 
     Always carries the legacy HUD keys plus a per-pool count dict
     (~20 ints, cheap). detail>=2 additionally carries capped raw spike
     ids for raster drill-down (truncation-guarded for UDP size).
+    _counts: prebuilt spike->count dict from decode (skips its build).
     """
     if len(spikes) == 0:
         base = {"spikes": 0, "dn_left": 0, "dn_right": 0, "lplc2": 0,
@@ -99,10 +101,12 @@ def _spike_stats(spikes, pops, pool_idx=None, detail=0):
         lplc2 = pool_idx["visual_lplc2"]
         mn_thrust = pool_idx["motor_flight_thrust"]
         vs_flow = pool_idx["flow_vs"] | pool_idx["flow_hs"]
-    counts = {}
-    for s in spikes:
-        s = int(s)
-        counts[s] = counts.get(s, 0) + 1
+    if _counts is None:
+        _counts = {}
+        for s in spikes:
+            s = int(s)
+            _counts[s] = _counts.get(s, 0) + 1
+    counts = _counts
     out = {
         "spikes": int(len(spikes)),
         "dn_left": int(sum(counts.get(s, 0) for s in dn_left)),
@@ -701,11 +705,14 @@ def run_brain_server(host="127.0.0.1", port=9999):
           "on this hardware, so step bursts collapse to newest (stale "
           "controls fly drunk); control messages are never dropped.")
 
-    def _is_step(data):
+    def _parse_step(data):
+        # Single parse per packet (the old _is_step + re-parse decoded
+        # every burst packet twice): (is_step, msg_or_None).
         try:
-            return json.loads(data.decode("utf-8")).get("type", "step") == "step"
+            m = json.loads(data.decode("utf-8"))
         except (ValueError, UnicodeDecodeError, AttributeError):
-            return False
+            return False, None
+        return m.get("type", "step") == "step", m
 
     stash = None  # one-slot buffer for a non-step found mid-drain
     step_dropped = 0
@@ -732,6 +739,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # Collapse the burst: keep draining while steps arrive and
                 # integrate only the newest. A non-step found mid-drain is
                 # stashed for the next iteration (never lost, never late).
+                # msg already holds the parsed newest packet; drained
+                # packets carry their parse along (never decoded twice).
                 sock.settimeout(0.0)
                 try:
                     while True:
@@ -739,15 +748,15 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             d2, a2 = sock.recvfrom(65535)
                         except (BlockingIOError, socket.timeout):
                             break
-                        if _is_step(d2):
-                            data, client_addr = d2, a2
+                        is_st, m2 = _parse_step(d2)
+                        if is_st:
+                            data, client_addr, msg = d2, a2, m2
                             step_dropped += 1
                         else:
                             stash = (d2, a2)
                             break
                 finally:
                     sock.settimeout(None)
-                msg = json.loads(data.decode("utf-8"))
                 msg_type = msg.get("type", "step")
                 step_count += 1
                 _t_step = time.monotonic()

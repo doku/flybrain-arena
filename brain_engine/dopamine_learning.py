@@ -1,4 +1,5 @@
 import numpy as np
+from sensory_motor import FLOW_CRUISE
 
 
 class DopamineReinforcement:
@@ -435,9 +436,8 @@ class DopamineReinforcement:
             r_align = bad
 
         # 3. Cruise steadiness (flow_trans only): ventral flow near target.
-        from sensory_motor import FLOW_CRUISE
         r_flow = 0.0
-        if "flow_trans" in tuple(schemes or ()):
+        if "flow_trans" in (schemes or ()):
             v = float(np.clip(ventral, 0.0, 1.0))
             r_flow = 0.2 * (1.0 - min(abs(v - FLOW_CRUISE) / FLOW_CRUISE, 1.0))
 
