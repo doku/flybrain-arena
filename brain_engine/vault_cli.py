@@ -222,6 +222,8 @@ def cmd_score(a):
     gp = rec.get("generator_params", {}) or {}
     eps = int(getattr(a, "episodes", 6) or 6)
     seed = int(float(getattr(a, "seed", 7) or 7))
+    prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
+        if getattr(a, "progress", "") else None
     try:
         _save, _w, summary = run_training(
             num_episodes=eps, variant="custom", seed=seed,
@@ -229,9 +231,12 @@ def cmd_score(a):
             experiment=gp.get("experiment"), mapping=gp.get("mapping"),
             yaw_bias=gp.get("yaw_bias"), genome=gp.get("genome"),
             legacy=("mapping" not in gp), init_weights=weights,
-            curriculum={}, return_brain=True, eval_only=True)
+            curriculum={}, return_brain=True, eval_only=True,
+            progress_cb=prog)
     except Exception as e:
         return err(str(e))
+    if getattr(a, "progress", ""):
+        _write_progress(a.progress, eps, eps)
     gained = round(float(summary.get("score", 0.0)), 1)
     stamp_train_score(rec, {"score": gained})
     tr = rec.setdefault("training", {})
@@ -447,6 +452,7 @@ def main():
     q = sub.add_parser("score"); q.add_argument("--id", required=True)
     q.add_argument("--episodes", type=int, default=6)
     q.add_argument("--seed", default=7)
+    q.add_argument("--progress", default="")
     q.add_argument("--result-file", default="")
     q = sub.add_parser("rename"); q.add_argument("--id", required=True)
     q.add_argument("--name", required=True)

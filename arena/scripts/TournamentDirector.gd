@@ -36,7 +36,7 @@ var sudden_death_armed: bool = false
 # episodes, school} or {}.
 var active_job: Dictionary = {}
 # Eval restamp job after a school train: {pid, result_file, brain_id}
-# or {}. Separate slot from training (read-only probe, no progress).
+# or {}. Separate slot from training (read-only probe).
 var score_job: Dictionary = {}
 
 # One-shot async vault op (e.g. generate): {pid, result_file, op} or {}.
@@ -54,6 +54,8 @@ signal job_failed(error: String)
 signal async_done(op: String, result: Dictionary)
 signal train_queue_changed()
 signal score_stamped(brain_id: String, score: float)
+signal score_progress(episode: int, total: int)
+signal score_queue_changed()
 
 
 func _ready() -> void:
@@ -448,6 +450,67 @@ func _process(_delta: float) -> void:
 		_poll_async()
 
 
+# Menu scoring queue: FIFO of {id, name}. Batch eval probes run one
+# at a time in the score slot; in-memory only like the train queue.
+var score_queue: Array = []
+
+
+func enqueue_score(brain_id: String, brain_name: String) -> int:
+	# Appends unless empty/already active/queued; pumps immediately.
+	# Returns 1-based queue position (0 = refused).
+	if brain_id == "":
+		return 0
+	if str(score_job.get("brain_id", "")) == brain_id:
+		return 0
+	for item in score_queue:
+		if str((item as Dictionary).get("id", "")) == brain_id:
+			return 0
+	score_queue.append({"id": brain_id, "name": brain_name})
+	print("[Director] Queued scoring %s (#%d)" % [
+		brain_name, score_queue.size()])
+	score_queue_changed.emit()
+	pump_score_queue()
+	return score_queue.size()
+
+
+func cancel_score_queued(index: int) -> void:
+	if index < 0 or index >= score_queue.size():
+		return
+	print("[Director] Unqueued scoring %s (%d left)" % [
+		str((score_queue[index] as Dictionary).get("name", "?")),
+		score_queue.size() - 1])
+	score_queue.remove_at(index)
+	score_queue_changed.emit()
+
+
+func clear_score_queue() -> void:
+	if score_queue.is_empty():
+		return
+	score_queue.clear()
+	score_queue_changed.emit()
+
+
+func pump_score_queue() -> bool:
+	# Starts the queue head when the score slot is free. A failed
+	# launch keeps the head (transient spawn trouble must not eat it).
+	return _pump_score_queue()
+
+
+func _pump_score_queue() -> bool:
+	if not score_job.is_empty() or score_queue.is_empty():
+		return false
+	var head: Dictionary = score_queue[0]
+	if not _launch_score(str(head.get("id", ""))):
+		print("[Director] Queued scoring deferred for %s." % [
+			str(head.get("name", "?"))])
+		return false
+	print("[Director] Auto-starting scoring %s (%d left waiting)" % [
+		str(head.get("name", "?")), score_queue.size() - 1])
+	score_queue.pop_front()
+	score_queue_changed.emit()
+	return true
+
+
 func _launch_score(brain_id: String) -> bool:
 	# Eval-only probe after a school train (~2 min, weights untouched).
 	# One at a time; a probe failure only logs (the train already banked).
@@ -456,14 +519,20 @@ func _launch_score(brain_id: String) -> bool:
 	var result_file := job_dir.path_join("score_%s_result.json" % brain_id)
 	if FileAccess.file_exists(result_file):
 		DirAccess.remove_absolute(result_file)
+	var progress_path := job_dir.path_join("score_%s.json" % brain_id)
+	var f := FileAccess.open(progress_path, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify({"episode": 0, "total": 6, "pct": 0.0}))
+		f.close()
 	var pid := OS.create_process(python_exe,
 		_cli_argv(["score", "--id", brain_id, "--episodes", "6",
-			"--seed", "7", "--result-file", result_file]), false)
+			"--seed", "7", "--progress", progress_path,
+			"--result-file", result_file]), false)
 	if pid <= 0:
 		print("[Director] Eval probe failed to spawn for %s." % brain_id)
 		return false
 	score_job = {"pid": pid, "result_file": result_file,
-		"brain_id": brain_id}
+		"progress_path": progress_path, "brain_id": brain_id}
 	print("[Director] Eval probe started for %s." % brain_id)
 	return true
 
@@ -471,6 +540,17 @@ func _launch_score(brain_id: String) -> bool:
 func _poll_score() -> void:
 	var rf := str(score_job.get("result_file", ""))
 	var bid := str(score_job.get("brain_id", ""))
+	var pf := str(score_job.get("progress_path", ""))
+	if pf != "":
+		var pfr := FileAccess.open(pf, FileAccess.READ)
+		if pfr != null:
+			var ptext := pfr.get_as_text().strip_edges()
+			pfr.close()
+			if ptext.begins_with("{") and ptext.ends_with("}"):
+				var pparsed = JSON.parse_string(ptext)
+				if pparsed is Dictionary:
+					score_progress.emit(int(pparsed.get("episode", 0)),
+						int(pparsed.get("total", 0)))
 	var f := FileAccess.open(rf, FileAccess.READ)
 	if f != null:
 		var text := f.get_as_text().strip_edges()
@@ -487,12 +567,14 @@ func _poll_score() -> void:
 					print("[Director] Eval probe failed for %s: %s" % [
 						bid, str(parsed.get("error", "?"))])
 				vault_changed.emit()
+				pump_score_queue()
 				return
 			return  # Partial write; retry next frame.
 	var pid := int(score_job.get("pid", 0))
 	if pid > 0 and not OS.is_process_running(pid):
 		print("[Director] Eval probe died silently for %s (see brains/jobs log)." % bid)
 		score_job = {}
+		pump_score_queue()
 
 
 # ── Tournament setup ────────────────────────────────────────────────

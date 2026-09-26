@@ -44,6 +44,11 @@ var job_bar: ProgressBar
 var job_label: Label
 var queue_list: ItemList
 var queue_label: Label
+var score_bar: ProgressBar
+var score_label: Label
+var score_list: ItemList
+var score_queue_label: Label
+var _score_base: String = ""
 # True while a reference-stock generate is in flight: its completion
 # detours into the training queue instead of the normal generate flow.
 var _ref_bridging := false
@@ -86,6 +91,8 @@ func _ready() -> void:
 	TournamentDirector.score_stamped.connect(_on_score_stamped)
 	TournamentDirector.async_done.connect(_on_async_done)
 	TournamentDirector.train_queue_changed.connect(_refresh_train_queue)
+	TournamentDirector.score_queue_changed.connect(_refresh_score_queue)
+	TournamentDirector.score_progress.connect(_on_score_progress)
 	if not TournamentDirector.python_ready:
 		log_label.text = "Python not found: %s" % TournamentDirector.python_probe_error
 	set_busy("Loading vault...")
@@ -396,6 +403,50 @@ func _build_gen_column() -> VBoxContainer:
 	qclr.text = "CLEAR QUEUE"
 	qclr.pressed.connect(_on_queue_clear)
 	qrow.add_child(qclr)
+	# Batch eval scoring: queue brains for 6-ep probes (weights
+	# untouched, scores stamped). Runs FIFO in the score slot while
+	# training uses its own worker; cancellable like the train queue.
+	var srow := HBoxContainer.new()
+	srow.add_theme_constant_override("separation", 6)
+	c.add_child(srow)
+	var scb := Button.new()
+	scb.text = "SCORE SELECTED"
+	scb.tooltip_text = "Queue the selected brain for a 6-episode eval scoring probe."
+	scb.pressed.connect(_on_score_selected)
+	srow.add_child(scb)
+	var sab := Button.new()
+	sab.text = "SCORE ALL"
+	sab.tooltip_text = "Queue every vault brain for eval scoring (long - watch the queue, CLEAR stops new probes)."
+	sab.pressed.connect(_on_score_all)
+	srow.add_child(sab)
+	score_bar = ProgressBar.new()
+	score_bar.min_value = 0
+	score_bar.max_value = 100
+	score_bar.custom_minimum_size = Vector2(0, 18)
+	score_bar.show_percentage = true
+	c.add_child(score_bar)
+	score_label = Label.new()
+	score_label.add_theme_font_size_override("font_size", 13)
+	c.add_child(score_label)
+	score_queue_label = Label.new()
+	score_queue_label.text = "SCORING QUEUE (0)"
+	score_queue_label.add_theme_font_size_override("font_size", 13)
+	c.add_child(score_queue_label)
+	score_list = ItemList.new()
+	score_list.custom_minimum_size = Vector2(0, 84)
+	score_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	c.add_child(score_list)
+	var sqrow := HBoxContainer.new()
+	sqrow.add_theme_constant_override("separation", 6)
+	c.add_child(sqrow)
+	var sqrm := Button.new()
+	sqrm.text = "REMOVE SELECTED"
+	sqrm.pressed.connect(_on_score_queue_remove)
+	sqrow.add_child(sqrm)
+	var sqclr := Button.new()
+	sqclr.text = "CLEAR QUEUE"
+	sqclr.pressed.connect(_on_score_queue_clear)
+	sqrow.add_child(sqclr)
 	return c
 
 
@@ -1178,8 +1229,79 @@ func _on_job_failed(error: String) -> void:
 
 
 func _on_score_stamped(brain_id: String, score: float) -> void:
-	log_label.text = "Probe banked +%.1f points for %s." % [score, brain_id]
+	var left := TournamentDirector.score_queue.size()
+	_score_base = ""
+	if is_instance_valid(score_label):
+		score_label.text = "Idle" if left == 0 else "Waiting..."
+	log_label.text = "Probe banked +%.1f points for %s%s." % [score, brain_id,
+		"" if left == 0 else " (%d queued)" % left]
 	refresh_vault()
+
+
+func _on_score_selected() -> void:
+	if selected_brain.is_empty():
+		log_label.text = "Select a brain first."
+		return
+	var pos := TournamentDirector.enqueue_score(
+		str(selected_brain.get("id", "")),
+		str(selected_brain.get("name", "?")))
+	if pos <= 0:
+		log_label.text = "Already scoring or queued."
+	else:
+		log_label.text = "Scoring queued #%d." % pos
+
+
+func _on_score_all() -> void:
+	var added := 0
+	for b in brains:
+		var bd := b as Dictionary
+		if TournamentDirector.enqueue_score(str(bd.get("id", "")),
+				str(bd.get("name", "?"))) > 0:
+			added += 1
+	log_label.text = "Queued %d brains for scoring." % added
+
+
+func _on_score_queue_remove() -> void:
+	if not is_instance_valid(score_list):
+		return
+	var sel := score_list.get_selected_items()
+	if sel.is_empty():
+		return
+	TournamentDirector.cancel_score_queued(int(sel[0]))
+
+
+func _on_score_queue_clear() -> void:
+	TournamentDirector.clear_score_queue()
+
+
+func _refresh_score_queue() -> void:
+	if not is_instance_valid(score_list):
+		return
+	score_list.clear()
+	var q: Array = TournamentDirector.score_queue
+	score_queue_label.text = "SCORING QUEUE (%d)" % q.size()
+	for i in range(q.size()):
+		var item: Dictionary = q[i]
+		score_list.add_item("%d. %s - eval probe" % [i + 1,
+			str(item.get("name", "?"))])
+	if is_instance_valid(score_label) and not _score_base.is_empty():
+		score_label.text = _score_base + _score_suffix()
+
+
+func _score_suffix() -> String:
+	var n := TournamentDirector.score_queue.size()
+	return "" if n == 0 else " (+%d queued)" % n
+
+
+func _on_score_progress(episode: int, total: int) -> void:
+	if total > 0:
+		if is_instance_valid(score_bar):
+			score_bar.value = 100.0 * episode / total
+		_score_base = "Scoring... episode %d / %d" % [episode, total]
+		if is_instance_valid(score_label):
+			score_label.text = _score_base + _score_suffix()
+		if episode >= total:
+			_score_base = ""
 
 
 func _on_delete() -> void:
