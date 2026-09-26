@@ -175,23 +175,28 @@ func _ready() -> void:
 	_build_visual_model()
 	front_spike_area.area_entered.connect(_on_spike_hit_area)
 
-# Beauty-pass material refs: chitin (thorax + eyes) and wing membranes
-# are per-fly ShaderMaterials; the manager pushes team colors + hit
-# flashes here instead of poking StandardMaterial3D (see set_team_color
-# / flash_hit). Shared scan meshes are untouched, so both rivals keep
-# their own uniforms.
-var body_mat: ShaderMaterial
+# Beauty-pass material refs: eyes + wing membranes are per-fly
+# ShaderMaterials; the thorax is a plain team-colored StandardMaterial.
+# The manager pushes team colors + hit flashes here (see
+# set_team_color / flash_hit). Shared scan meshes are untouched, so
+# both rivals keep their own materials.
 var eye_mat: ShaderMaterial
 var membrane_mat: ShaderMaterial
+var body_std_mat: StandardMaterial3D
 var spear_glow: MeshInstance3D
 var spear_glow_mat: StandardMaterial3D
 var flash_energy := 0.0
 
 func set_team_color(color: Color) -> void:
-	if body_mat == null:
-		return
-	body_mat.set_shader_parameter("team_tint",
-		Vector3(color.r, color.g, color.b))
+	# Plain team coloration on the thorax (flat StandardMaterial, no
+	# shader): what you pick is what you get, no sheen, no fresnel.
+	var body_mesh = $VisualModel/BodyMesh as MeshInstance3D
+	if is_instance_valid(body_mesh):
+		body_std_mat = StandardMaterial3D.new()
+		body_std_mat.albedo_color = color
+		body_std_mat.metallic = 0.4
+		body_std_mat.roughness = 0.6
+		body_mesh.material_override = body_std_mat
 	if spear_glow_mat != null:
 		spear_glow_mat.albedo_color = Color(color.r, color.g, color.b, 0.0)
 	if membrane_mat != null:
@@ -506,8 +511,13 @@ func _physics_process(delta: float) -> void:
 	# Hit-flash decay (visual only, never touches sim state).
 	if flash_energy > 0.0:
 		flash_energy = maxf(0.0, flash_energy - delta * 2.5)
-		if body_mat != null:
-			body_mat.set_shader_parameter("flash_energy", flash_energy)
+		if body_std_mat != null:
+			if flash_energy <= 0.0:
+				body_std_mat.emission_enabled = false
+			else:
+				body_std_mat.emission_enabled = true
+				body_std_mat.emission = Color(1.0, 0.96, 0.88)
+				body_std_mat.emission_energy_multiplier = flash_energy * 3.0
 		if eye_mat != null:
 			eye_mat.set_shader_parameter("flash_energy", flash_energy * 0.7)
 	if landing_mode > 0:
@@ -997,11 +1007,9 @@ func _build_visual_model() -> void:
 	cuticle_mat.vertex_color_use_as_albedo = true
 	_scan_part(vm, "TorsoCuticle", "cuticle", cuticle_mat)
 	_scan_part(vm, "TorsoBristles", "dark", _vmat(Color(0.11, 0.08, 0.06), 0.60, 0.0))
-	# Beetle-shell thorax + glossy crimson eyes (team tint arrives later
-	# via set_team_color; default matches the old neutral tan).
-	body_mat = ShaderMaterial.new()
-	body_mat.shader = preload("res://scripts/chitin.gdshader")
-	_scan_part(vm, "BodyMesh", "thorax", body_mat)
+	# Plain tan thorax (team color arrives later via set_team_color)
+	# plus glossy crimson eyes.
+	_scan_part(vm, "BodyMesh", "thorax", _vmat(Color(0.55, 0.45, 0.30), 0.55, 0.10))
 	eye_mat = ShaderMaterial.new()
 	eye_mat.shader = preload("res://scripts/chitin.gdshader")
 	eye_mat.set_shader_parameter("team_tint", Vector3(0.62, 0.12, 0.10))
