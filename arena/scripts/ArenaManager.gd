@@ -269,6 +269,19 @@ var _tourney_close_ack: bool = false
 @onready var pip_beta_feat: Label = $HUD/PiPBetaFeat
 @onready var pip_alpha_label: Label = $HUD/PiPAlphaLabel
 @onready var pip_beta_label: Label = $HUD/PiPBetaLabel
+@onready var pip_alpha_view: SubViewport = $HUD/PiPAlpha/PiPAlphaView
+@onready var pip_beta_view: SubViewport = $HUD/PiPBeta/PiPBetaView
+@onready var pip_alpha_box: Control = $HUD/PiPAlpha
+@onready var pip_beta_box: Control = $HUD/PiPBeta
+
+# Laptop performance switches (menu PERFORMANCE row, user://perf.cfg):
+# eye-view PiPs render throttled (every 3rd tick) or hidden outright;
+# glow + sun shadows toggleable. All default true (current look).
+var perf_pip := true
+var perf_glow := true
+var perf_shadows := true
+var _pip_tick := 0
+var _pip_hidden := false
 
 # Display name for a slot: the assigned brain name in tournament/quick
 # battles, plain ALPHA/BETA in free battle (no vault identities there).
@@ -406,8 +419,18 @@ func _apply_beauty_pass() -> void:
 		var gmat := ShaderMaterial.new()
 		gmat.shader = preload("res://scripts/glade_ground.gdshader")
 		ground_mi.material_override = gmat
+	var director := _director()
+	if director != null and director.has_method("perf_get"):
+		perf_pip = bool(director.call("perf_get", "pip"))
+		perf_glow = bool(director.call("perf_get", "glow"))
+		perf_shadows = bool(director.call("perf_get", "shadows"))
 	var wenv := get_node_or_null("WorldEnvironment") as WorldEnvironment
 	var env: Environment = wenv.environment if wenv != null else null
+	if env != null:
+		env.glow_enabled = perf_glow
+	var sun := get_node_or_null("DirectionalLight3D") as DirectionalLight3D
+	if sun != null:
+		sun.shadow_enabled = perf_shadows
 	if env != null and env.sky != null:
 		var smat := ShaderMaterial.new()
 		smat.shader = preload("res://scripts/stylized_sky.gdshader")
@@ -1314,8 +1337,7 @@ func _physics_process(delta: float) -> void:
 		arena_camera.global_position = arena_camera.global_position.lerp(target_cam_pos, delta * 3.0)
 		arena_camera.look_at(midpoint + Vector3(0, 1.5, 0), Vector3.UP)
 
-	_update_pip_view(pip_alpha_cam, fly_alpha, sens_a, pip_alpha_feat)
-	_update_pip_view(pip_beta_cam, fly_beta, sens_b, pip_beta_feat)
+	_update_pip_throttled(sens_a, sens_b)
 
 	if current_round_time <= 0.0:
 		# Stalemate verdict: time expired AND neither fly lost a point of
@@ -1333,6 +1355,39 @@ func _physics_process(delta: float) -> void:
 		else:
 			_end_reason = "time"
 			_end_round()
+
+func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
+	# Eye views re-render the whole forest per viewport: throttle to
+	# every 3rd physics tick, or hide outright when disabled.
+	_pip_tick += 1
+	if not perf_pip:
+		if not _pip_hidden:
+			_pip_hidden = true
+			for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
+					pip_beta_label, pip_alpha_feat, pip_beta_feat]:
+				if is_instance_valid(n):
+					(n as Control).visible = false
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+		return
+	if _pip_hidden:
+		_pip_hidden = false
+		for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
+				pip_beta_label, pip_alpha_feat, pip_beta_feat]:
+			if is_instance_valid(n):
+				(n as Control).visible = true
+	if _pip_tick % 3 == 0:
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
+		_update_pip_view(pip_alpha_cam, fly_alpha, sens_a, pip_alpha_feat)
+		_update_pip_view(pip_beta_cam, fly_beta, sens_b, pip_beta_feat)
+	else:
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+
 
 func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, feat: Label) -> void:
 	# Park the PiP camera on the fly's head, looking where it looks.

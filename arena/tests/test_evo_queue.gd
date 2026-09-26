@@ -64,11 +64,34 @@ func test_wild_mode_rotation() -> void:
 	a.queue_free()
 
 
+func test_pip_throttle() -> void:
+	var a = _new_arena()
+	a.perf_pip = false
+	a._update_pip_throttled({}, {})
+	_check(a._pip_hidden, "pip hidden flag set when disabled")
+	a.perf_pip = true
+	a._pip_tick = 0
+	a._update_pip_throttled({}, {})
+	_check(not a._pip_hidden, "pip restored when enabled")
+	a.queue_free()
+
+
+func test_perf_defaults() -> void:
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	_check(D.perf_get("pip"), "pip defaults on")
+	_check(D.perf_get("glow"), "glow defaults on")
+	_check(D.perf_get("shadows"), "shadows defaults on")
+	_check(not D.perf_get("nope", false), "unknown key returns default")
+	D.queue_free()
+
+
 func _initialize() -> void:
 	test_unlaunched_never_blocks()
 	test_launched_without_verdict_blocks()
 	test_dead_worker_blocks_nothing()
 	test_wild_mode_rotation()
+	test_pip_throttle()
+	test_perf_defaults()
 	if failures == 0:
 		print("ALL EVO-QUEUE TESTS PASSED")
 	else:

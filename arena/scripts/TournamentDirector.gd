@@ -28,6 +28,34 @@ var brainview_layer: String = "bars"
 var brainview_detail: int = 1
 var brainview_replay: bool = false
 
+# Performance settings (menu -> arena bus, persisted user://perf.cfg):
+# pip = eye-view PiPs on/off, glow = bloom chain, shadows = sun shadow
+# pass. Arena reads them at boot; all default true (current look).
+const PERF_PATH := "user://perf.cfg"
+const PERF_KEYS := ["pip", "glow", "shadows"]
+var _perf_cache := {}
+
+
+func perf_get(key: String, default: bool = true) -> bool:
+	if _perf_cache.is_empty():
+		var cfg := ConfigFile.new()
+		if cfg.load(PERF_PATH) == OK:
+			for k in PERF_KEYS:
+				_perf_cache[k] = bool(cfg.get_value("video", k, true))
+	if _perf_cache.has(key):
+		return bool(_perf_cache[key])
+	return default
+
+
+func perf_set(key: String, value: bool) -> void:
+	if _perf_cache.is_empty():
+		perf_get(key)
+	_perf_cache[key] = bool(value)
+	var cfg := ConfigFile.new()
+	cfg.load(PERF_PATH)
+	cfg.set_value("video", key, bool(value))
+	cfg.save(PERF_PATH)
+
 # Tournament state (empty dict = inactive).
 var tourney: Dictionary = {}
 var sudden_death_armed: bool = false

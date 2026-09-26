@@ -18,6 +18,9 @@ var bv_enable: CheckButton
 var bv_layer: OptionButton
 var bv_detail: OptionButton
 var bv_replay: CheckButton
+var perf_pip: CheckButton
+var perf_glow: CheckButton
+var perf_shadows: CheckButton
 var gen_yaw_bias: SpinBox
 var gen_yaw_random: CheckButton
 var gen_genome_check: CheckButton
@@ -167,6 +170,7 @@ func _build_layout() -> void:
 	cols.add_child(_build_gen_column())
 	cols.add_child(_build_tourney_column())
 	vbox.add_child(_build_brainview_row())
+	vbox.add_child(_build_perf_row())
 
 	var bottom := HBoxContainer.new()
 	bottom.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -233,6 +237,43 @@ func _push_brainview_settings(_arg = null) -> void:
 	TournamentDirector.brainview_layer = bv_layer.get_item_text(bv_layer.selected)
 	TournamentDirector.brainview_detail = bv_detail.selected
 	TournamentDirector.brainview_replay = bv_replay.button_pressed
+
+
+func _build_perf_row() -> HBoxContainer:
+	# Laptop performance switches (persisted user://perf.cfg, applied
+	# at arena boot): eye-view PiPs, bloom chain, sun shadows.
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 10)
+	var h := Label.new()
+	h.text = "PERFORMANCE"
+	h.add_theme_font_size_override("font_size", 15)
+	row.add_child(h)
+	perf_pip = CheckButton.new()
+	perf_pip.text = "eye views"
+	perf_pip.tooltip_text = "ON = fly eye-view PiPs render (throttled). OFF = hides them for max fps."
+	perf_pip.button_pressed = TournamentDirector.perf_get("pip")
+	perf_pip.toggled.connect(_push_perf_settings)
+	row.add_child(perf_pip)
+	perf_glow = CheckButton.new()
+	perf_glow.text = "glow"
+	perf_glow.tooltip_text = "ON = bloom post-processing. OFF = faster, flatter lighting."
+	perf_glow.button_pressed = TournamentDirector.perf_get("glow")
+	perf_glow.toggled.connect(_push_perf_settings)
+	row.add_child(perf_glow)
+	perf_shadows = CheckButton.new()
+	perf_shadows.text = "shadows"
+	perf_shadows.tooltip_text = "ON = sun shadow pass. OFF = faster, no tree shadows."
+	perf_shadows.button_pressed = TournamentDirector.perf_get("shadows")
+	perf_shadows.toggled.connect(_push_perf_settings)
+	row.add_child(perf_shadows)
+	return row
+
+
+func _push_perf_settings(_arg = null) -> void:
+	TournamentDirector.perf_set("pip", perf_pip.button_pressed)
+	TournamentDirector.perf_set("glow", perf_glow.button_pressed)
+	TournamentDirector.perf_set("shadows", perf_shadows.button_pressed)
 
 
 func _col(title_text: String) -> VBoxContainer:
