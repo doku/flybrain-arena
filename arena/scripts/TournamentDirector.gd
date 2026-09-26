@@ -645,12 +645,39 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	# No wiring gate: the server runs each fighter on its native wiring
 	# (base or experimental overlay), so any vault brains may share a
 	# bracket. Vault files keep their native arity end-to-end.
-	# Canonical single-elim seeding: place the strongest first into the
-	# standard power-of-two seed order, so the top seeds take the byes,
-	# the weakest meet earliest, and round 0 holds exactly size/2 slots
-	# (real matches, BYE cards for the resting seeds, VACANT cards for
-	# empty subtrees when the roster is under half full). Random draw
-	# shuffles the entrants instead (byes fall luck-of-the-draw).
+	var seeded := seed_first_round(players, size, random_draw)
+	players = seeded["players"]
+	var matches: Array = seeded["matches"]
+	var seeding := str(seeded["seeding"])
+	var tid := "T%08X" % int(Time.get_unix_time_from_system())
+	tourney = {
+		"id": tid, "status": "running", "size": size, "best_of": best_of,
+		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
+		"round_time": round_time, "quick": quick, "seeding": seeding,
+		"random_draw": random_draw,
+		"consolation": consolation and not quick,
+		"losers_start_round": -1, "last_place_id": "",
+		"created": Time.get_datetime_string_from_system(),
+		"players": players, "byes": [],
+		"rounds": [matches], "current_round": 0, "current_match": 0,
+		"champion_id": "",
+	}
+	sudden_death_armed = false
+	save_state()
+	return {"ok": true, "tournament_id": tid}
+
+
+func seed_first_round(player_dicts: Array, size: int, random_draw: bool) -> Dictionary:
+	# Canonical single-elim seeding shared by build_bracket (vault brains)
+	# and preview_bracket (synthetic offspring welcome): place the
+	# strongest first into the standard power-of-two seed order, so the
+	# top seeds take the byes, the weakest meet earliest, and round 0
+	# holds exactly size/2 slots (real matches, BYE cards for resting
+	# seeds, VACANT cards for empty subtrees when under half full).
+	# Random draw shuffles instead (byes fall luck-of-the-draw).
+	# Returns {players, matches, seeding}. Player dicts need id/name
+	# (record optional - missing ELO sorts as 1200).
+	var players: Array = player_dicts.duplicate()
 	var seeding := "strength"
 	if random_draw:
 		seeding = "random"
@@ -686,22 +713,20 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 			m["winner_id"] = str(m.get("a_id", ""))
 		elif str(m.get("a_id", "")) == "" and str(m.get("b_id", "")) != "":
 			m["winner_id"] = str(m.get("b_id", ""))
-	var tid := "T%08X" % int(Time.get_unix_time_from_system())
-	tourney = {
-		"id": tid, "status": "running", "size": size, "best_of": best_of,
-		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
-		"round_time": round_time, "quick": quick, "seeding": seeding,
-		"random_draw": random_draw,
-		"consolation": consolation and not quick,
-		"losers_start_round": -1, "last_place_id": "",
-		"created": Time.get_datetime_string_from_system(),
-		"players": players, "byes": [],
-		"rounds": [matches], "current_round": 0, "current_match": 0,
-		"champion_id": "",
-	}
-	sudden_death_armed = false
-	save_state()
-	return {"ok": true, "tournament_id": tid}
+	return {"players": players, "matches": matches, "seeding": seeding}
+
+
+func preview_bracket(player_dicts: Array, size: int, random_draw: bool) -> Dictionary:
+	# Display-only next-generation preview (never saved, never played):
+	# round 0 seeded exactly like the real thing; the renderer pads the
+	# rest as TBD. Unbred offspring ride synthetic {id,name} cards that
+	# refresh to real names on adoption.
+	if player_dicts.size() < 2 or player_dicts.size() > size:
+		return {}
+	var seeded := seed_first_round(player_dicts, size, random_draw)
+	return {"players": seeded["players"], "rounds": [seeded["matches"]],
+		"size": size, "current_round": 0, "current_match": 0,
+		"status": "preview", "seeding": str(seeded["seeding"])}
 
 
 func _new_match(a, b) -> Dictionary:

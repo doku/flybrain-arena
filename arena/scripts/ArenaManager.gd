@@ -191,6 +191,34 @@ var bracket_overlay: Control
 var arena_bracket: BracketView
 var bracket_scroll: ScrollContainer
 var bracket_title: Label
+# Next-generation waiting room (evo handoff only): preview bracket +
+# rotating fighter gallery + training strip, sharing the overlay above.
+var gallery_box: VBoxContainer
+var gallery_title: Label
+var gallery_elo: Label
+var gallery_rows: Label
+var strip_box: HBoxContainer
+var strip_clone_label: Label
+var strip_clone_bar: ProgressBar
+var strip_wild_label: Label
+var strip_wild_bar: ProgressBar
+var nextgen_visible := false
+var nextgen_preview := {}
+var nextgen_gallery: Array = []
+var nextgen_gallery_idx := 0
+var nextgen_gallery_tick := 0.0
+var nextgen_strip_tick := 0.0
+var nextgen_brains := {}
+var nextgen_survivors: Array = []
+var nextgen_gone: Array = []
+var nextgen_size := 8
+var nextgen_gen := 1
+var nextgen_champ_id := ""
+var nextgen_champ_name := ""
+var nextgen_clone_name := ""
+var bracket_close_btn: Button
+const NEXTGEN_GALLERY_EVERY := 7.0
+const NEXTGEN_STRIP_EVERY := 1.0
 var bracket_button: Button
 
 # Sequencing watchdog: every tournament server round-trip arms a deadline.
@@ -537,19 +565,72 @@ func _build_bracket_overlay() -> void:
 	bracket_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	bracket_title.add_theme_font_size_override("font_size", 18)
 	vb.add_child(bracket_title)
+	# Bracket row: gallery column (next-gen waiting room only, hidden
+	# otherwise so mid-tournament views render exactly as before).
+	var brow := HBoxContainer.new()
+	brow.add_theme_constant_override("separation", 8)
+	brow.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	brow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.add_child(brow)
+	gallery_box = VBoxContainer.new()
+	gallery_box.custom_minimum_size = Vector2(300, 0)
+	gallery_box.add_theme_constant_override("separation", 2)
+	gallery_box.visible = false
+	brow.add_child(gallery_box)
+	gallery_title = Label.new()
+	gallery_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	gallery_title.add_theme_font_size_override("font_size", 20)
+	gallery_box.add_child(gallery_title)
+	gallery_elo = Label.new()
+	gallery_elo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	gallery_elo.add_theme_font_size_override("font_size", 28)
+	gallery_box.add_child(gallery_elo)
+	gallery_rows = Label.new()
+	gallery_rows.add_theme_font_size_override("font_size", 14)
+	gallery_rows.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	gallery_box.add_child(gallery_rows)
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-	vb.add_child(scroll)
+	brow.add_child(scroll)
 	bracket_scroll = scroll
 	arena_bracket = BracketView.new()
 	arena_bracket.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	arena_bracket.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.add_child(arena_bracket)
+	# Training strip (next-gen waiting room only): clone/wild progress
+	# stays visible over the bracket for the whole wait.
+	strip_box = HBoxContainer.new()
+	strip_box.add_theme_constant_override("separation", 16)
+	strip_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	strip_box.visible = false
+	vb.add_child(strip_box)
+	for slot in ["clone", "wild"]:
+		var cell := VBoxContainer.new()
+		cell.add_theme_constant_override("separation", 2)
+		cell.custom_minimum_size = Vector2(300, 0)
+		strip_box.add_child(cell)
+		var lab := Label.new()
+		lab.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lab.add_theme_font_size_override("font_size", 14)
+		cell.add_child(lab)
+		var bar := ProgressBar.new()
+		bar.min_value = 0.0
+		bar.max_value = 100.0
+		bar.custom_minimum_size = Vector2(300, 20)
+		bar.show_percentage = true
+		cell.add_child(bar)
+		if slot == "clone":
+			strip_clone_label = lab
+			strip_clone_bar = bar
+		else:
+			strip_wild_label = lab
+			strip_wild_bar = bar
 	var close_btn := Button.new()
 	close_btn.text = "CLOSE"
 	close_btn.pressed.connect(_hide_arena_bracket)
+	bracket_close_btn = close_btn
 	var hbox := HBoxContainer.new()
 	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
 	hbox.add_child(close_btn)
@@ -2564,6 +2645,16 @@ func _process(delta: float) -> void:
 				print("[Arena] Screenshot -> %s (err=%s)" % [_shot_path, str(err)])
 				_shot_done = true
 	_evo_watcher_tick(delta)
+	# Next-gen waiting room ticks (gallery rotation + training strip).
+	if nextgen_visible:
+		nextgen_gallery_tick += delta
+		if nextgen_gallery_tick >= NEXTGEN_GALLERY_EVERY:
+			nextgen_gallery_tick = 0.0
+			_gallery_advance()
+		nextgen_strip_tick += delta
+		if nextgen_strip_tick >= NEXTGEN_STRIP_EVERY:
+			nextgen_strip_tick = 0.0
+			_update_nextgen_strip()
 	# Evo spinner animation while the phase panel is up.
 	if is_instance_valid(evo_panel) and evo_panel.visible:
 		evo_spin_tick += delta
@@ -3174,6 +3265,11 @@ func _build_evo_panel() -> void:
 
 
 func _show_evo_phase(title: String, status: String) -> void:
+	# The next-gen waiting room owns the screen while visible: phase
+	# popups would hide underneath the bracket overlay, so their
+	# progress lives in the strip instead (status_label keeps updating).
+	if nextgen_visible:
+		return
 	if is_instance_valid(evo_title):
 		evo_title.text = title
 	_update_evo_phase(status, -1.0)
@@ -3182,6 +3278,8 @@ func _show_evo_phase(title: String, status: String) -> void:
 
 
 func _update_evo_phase(status: String, pct: float) -> void:
+	if nextgen_visible:
+		return
 	if is_instance_valid(evo_status):
 		evo_status.text = status
 	if is_instance_valid(evo_bar) and pct >= 0.0:
@@ -3730,9 +3828,29 @@ func _run_evo_generation() -> void:
 			_evo_abort("archive failed: %s" % str(ares.get("error", "?")))
 			return
 		print("[Arena] EVO gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
-	# --- Adopt background breeds + await stragglers ---
+	# --- Next-gen waiting room: preview bracket + gallery + strip ---
+	# Survivor context is frozen here; offspring cards refresh live as
+	# breeds adopt (synthetic "training" names until then).
 	var target_gen := gen + 1
+	nextgen_gen = target_gen
+	nextgen_size = int(director.tourney.get("size", 8))
+	nextgen_gone = [last_id, second_id]
+	nextgen_survivors = []
+	for p in director.tourney.get("players", []):
+		var pid := str((p as Dictionary).get("id", ""))
+		if pid != "" and not (pid in nextgen_gone):
+			nextgen_survivors.append(pid)
+	nextgen_champ_id = champ_id
+	nextgen_champ_name = champ_name
+	nextgen_clone_name = director.kin_name(champ_name, target_gen)
+	nextgen_brains = {}
+	for b in director.list_brains():
+		var bd := b as Dictionary
+		nextgen_brains[str(bd.get("id", ""))] = bd
+	_show_nextgen_overlay("NEXT GENERATION %d" % target_gen)
+	# --- Adopt background breeds + await stragglers ---
 	_evo_adopt_finished()
+	_refresh_nextgen_preview()
 	var id1 := _evo_done_id("clone")
 	var id2 := _evo_done_id("wild")
 	# Queue missing specs (watcher will launch them when the slot is free)
@@ -3761,6 +3879,7 @@ func _run_evo_generation() -> void:
 		if id1 == "" and _evo_active():
 			_evo_abort("clone breeding failed - %s" % _evo_spawn_why())
 			return
+		_refresh_nextgen_preview()
 	if id2 == "":
 		id2 = _evo_done_id("wild")
 	if id2 == "" and _evo_has_kind("wild"):
@@ -3771,6 +3890,7 @@ func _run_evo_generation() -> void:
 		if id2 == "" and _evo_active():
 			_evo_abort("random breeding failed - %s" % _evo_spawn_why())
 			return
+		_refresh_nextgen_preview()
 	# STOP/quit during the handoff must freeze the loop, never emit a
 	# short bracket: the 15-roster cascade came from an empty id
 	# appended after a stop, then reactivated at rebuild below.
@@ -3808,6 +3928,7 @@ func _run_evo_generation() -> void:
 			return
 		roster.append(tid)
 		topups += 1
+		_refresh_nextgen_preview()
 	if roster.size() < size:
 		_evo_abort("roster still short after top-ups - refusing a TBA bracket")
 		return
@@ -3842,6 +3963,7 @@ func _run_evo_generation() -> void:
 	if is_instance_valid(status_label):
 		status_label.text = "EVO gen %d ready (%d fighters)." % [gen + 1, roster.size()]
 	await get_tree().create_timer(2.0).timeout
+	_hide_nextgen()
 	_hide_evo_phase()
 	_request_current_battle_load()
 
@@ -3892,6 +4014,278 @@ func _evo_spawn_why() -> String:
 	if evo_last_spawn_error != "":
 		return evo_last_spawn_error
 	return "check brains/jobs log"
+
+
+# ── Next-generation waiting room ────────────────────────────────
+# Preview bracket + rotating fighter gallery + training strip shown
+# during the handoff wait. Display-only throughout: the real bracket
+# is built later by the existing rebuild path (never-TBA guarantee
+# untouched), and the overlay closes on first-battle load.
+
+
+func _nextgen_wild_label(target_gen: int) -> String:
+	return "wild G%d (training)" % target_gen
+
+
+func _nextgen_offspring_slots() -> Array:
+	# [{id, name, elo}] for clone/wild/topups from live done state;
+	# synthetic training cards for the unbred (refreshed on adoption).
+	var out: Array = []
+	var cid := _evo_done_id("clone")
+	if cid != "":
+		var rec: Dictionary = nextgen_brains.get(cid, {})
+		out.append({"id": cid,
+			"name": str(rec.get("name", _evo_done_name("clone"))),
+			"elo": float((rec.get("record", {}) as Dictionary).get("elo", 1200.0))})
+	else:
+		var champ_elo := 1200.0
+		var director := _director()
+		if director != null:
+			for p in director.tourney.get("players", []):
+				var pd := p as Dictionary
+				if str(pd.get("id", "")) == nextgen_champ_id:
+					champ_elo = float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))
+		out.append({"id": "", "name": nextgen_clone_name, "elo": champ_elo})
+	var wid := _evo_done_id("wild")
+	if wid != "":
+		var wrec: Dictionary = nextgen_brains.get(wid, {})
+		out.append({"id": wid,
+			"name": str(wrec.get("name", _evo_done_name("wild"))),
+			"elo": float((wrec.get("record", {}) as Dictionary).get("elo", 1200.0))})
+	else:
+		out.append({"id": "", "name": _nextgen_wild_label(nextgen_gen),
+			"elo": 1200.0})
+	for kind in _evo_done().keys():
+		var ks := str(kind)
+		if ks.begins_with("topup"):
+			var tid := _evo_done_id(ks)
+			if tid != "":
+				var trec: Dictionary = nextgen_brains.get(tid, {})
+				out.append({"id": tid,
+					"name": str(trec.get("name", _evo_done_name(ks))),
+					"elo": float((trec.get("record", {}) as Dictionary).get("elo", 1200.0))})
+	return out
+
+
+func _build_nextgen_preview() -> Dictionary:
+	var director := _director()
+	if director == null or nextgen_survivors.is_empty():
+		return {}
+	var names := {}
+	for p in director.tourney.get("players", []):
+		var pd := p as Dictionary
+		names[str(pd.get("id", ""))] = pd
+	var entries: Array = []
+	for pid in nextgen_survivors:
+		var spid := str(pid)
+		if spid in nextgen_gone:
+			continue
+		var rec: Dictionary = nextgen_brains.get(spid, {})
+		if rec.is_empty() and names.has(spid):
+			var npd: Dictionary = names[spid]
+			entries.append({"id": spid, "name": str(npd.get("name", spid)),
+				"record": npd.get("record", {})})
+		elif not rec.is_empty():
+			entries.append({"id": spid, "name": str(rec.get("name", spid)),
+				"record": rec.get("record", {})})
+		# Vault-missing survivors drop out (rebuild trims/aborts the same).
+	for off in _nextgen_offspring_slots():
+		var od := off as Dictionary
+		entries.append({"id": str(od.get("id", "")),
+			"name": str(od.get("name", "?")),
+			"record": {"elo": float(od.get("elo", 1200.0))}})
+	while entries.size() > nextgen_size:
+		entries.pop_back()
+	if entries.size() < 2:
+		return {}
+	return director.preview_bracket(entries, nextgen_size,
+		bool(director.tourney.get("random_draw", false)))
+
+
+func _show_nextgen_overlay(title_text: String) -> void:
+	nextgen_visible = true
+	nextgen_gallery_tick = 0.0
+	nextgen_strip_tick = NEXTGEN_STRIP_EVERY
+	if is_instance_valid(gallery_box):
+		gallery_box.visible = true
+	if is_instance_valid(strip_box):
+		strip_box.visible = true
+	if is_instance_valid(bracket_close_btn):
+		bracket_close_btn.visible = false
+	_refresh_nextgen_preview()
+	if is_instance_valid(bracket_title):
+		bracket_title.text = title_text
+	if is_instance_valid(bracket_overlay):
+		bracket_overlay.visible = true
+	_hide_evo_phase()
+
+
+func _hide_nextgen() -> void:
+	nextgen_visible = false
+	if is_instance_valid(gallery_box):
+		gallery_box.visible = false
+	if is_instance_valid(strip_box):
+		strip_box.visible = false
+	if is_instance_valid(bracket_close_btn):
+		bracket_close_btn.visible = true
+	if is_instance_valid(bracket_overlay):
+		bracket_overlay.visible = false
+
+
+func _refresh_nextgen_preview() -> void:
+	# Re-fetch vault records (adoptions land new files), rebuild the
+	# preview, gallery and strip. Rare by design: handoff milestones
+	# only, never the per-frame path (list_brains shells out).
+	if not nextgen_visible:
+		return
+	var director := _director()
+	if director != null:
+		var fresh := {}
+		for b in director.list_brains():
+			var bd := b as Dictionary
+			fresh[str(bd.get("id", ""))] = bd
+		if not fresh.is_empty():
+			nextgen_brains = fresh
+	nextgen_preview = _build_nextgen_preview()
+	if director == null or not is_instance_valid(arena_bracket):
+		return
+	if nextgen_preview.is_empty():
+		return
+	arena_bracket.render_bracket(nextgen_preview, 0, 0)
+	if is_instance_valid(bracket_scroll):
+		bracket_scroll.scroll_horizontal = 0
+		bracket_scroll.scroll_vertical = 0
+	_build_gallery_entries(nextgen_preview.get("players", []))
+	_update_nextgen_strip()
+
+
+func _gallery_card(pid: String, pname: String) -> Dictionary:
+	var rec: Dictionary = nextgen_brains.get(pid, {}) if pid != "" else {}
+	if rec.is_empty():
+		# Training card: ep progress from the matching pending spec.
+		var detail := "queued"
+		for spec in _evo_pending():
+			var s := spec as Dictionary
+			var sk := str(s.get("kind", ""))
+			var m := (str(s.get("name", "")) != "" and str(s.get("name", "")) == pname) \
+				or (sk == "wild" and pname.begins_with("wild G"))
+			if not m and not (sk.begins_with("topup") and pname == sk):
+				continue
+			if bool(s.get("launched", false)):
+				var prog := _evo_poll_file(str(s.get("progress", "")))
+				if prog.is_empty():
+					detail = "warming up"
+				else:
+					detail = "ep %d/%d" % [int(prog.get("episode", 0)), EVO_EPISODES]
+			else:
+				detail = "queued"
+			detail += " [%s]" % sk if sk != "" else detail
+			break
+		return {"title": pname, "elo": "--",
+			"rows": "training...\n%s" % detail}
+	var r: Dictionary = rec.get("record", {})
+	var gp: Dictionary = rec.get("generator_params", {})
+	var t: Dictionary = rec.get("training", {})
+	var wiring := str(gp.get("genome_id", ""))
+	if wiring == "":
+		var exp = gp.get("experiment", null)
+		if exp is Array:
+			var parts := PackedStringArray()
+			for e in (exp as Array):
+				parts.append(str(e))
+			wiring = "mix " + "+".join(parts) if parts.size() > 0 else "base"
+		elif exp != null and str(exp) != "":
+			wiring = str(exp)
+		else:
+			wiring = "base"
+	else:
+		wiring = "genome " + wiring
+	var lin: Dictionary = rec.get("lineage", {})
+	var rows := "Battles %d (W%d L%d D%d)\nMatches %d (W%d L%d) | Titles %d\nEpisodes %d | %s\n%s" % [
+		int(r.get("battles", 0)), int(r.get("wins", 0)),
+		int(r.get("losses", 0)), int(r.get("draws", 0)),
+		int(r.get("matches", 0)), int(r.get("matches_won", 0)),
+		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
+		int(t.get("episodes", 0)), wiring,
+		str(lin.get("source", "?"))]
+	return {"title": pname, "elo": "%d" % int(r.get("elo", 1200.0)),
+		"rows": rows}
+
+
+func _build_gallery_entries(players: Array) -> void:
+	nextgen_gallery.clear()
+	for p in players:
+		var pd := p as Dictionary
+		nextgen_gallery.append(_gallery_card(str(pd.get("id", "")),
+			str(pd.get("name", "?"))))
+	nextgen_gallery_idx = 0
+	if not nextgen_gallery.is_empty():
+		_render_gallery_card(nextgen_gallery[0])
+
+
+func _render_gallery_card(entry: Dictionary) -> void:
+	if is_instance_valid(gallery_title):
+		gallery_title.text = str(entry.get("title", "?"))
+	if is_instance_valid(gallery_elo):
+		gallery_elo.text = "ELO " + str(entry.get("elo", "--"))
+	if is_instance_valid(gallery_rows):
+		gallery_rows.text = str(entry.get("rows", ""))
+
+
+func _gallery_advance() -> void:
+	if nextgen_gallery.is_empty():
+		return
+	nextgen_gallery_idx = (nextgen_gallery_idx + 1) % nextgen_gallery.size()
+	_render_gallery_card(nextgen_gallery[nextgen_gallery_idx])
+	if is_instance_valid(gallery_box):
+		var tw := create_tween()
+		gallery_box.modulate.a = 0.25
+		tw.tween_property(gallery_box, "modulate:a", 1.0, 0.4)
+
+
+func _offspring_progress(kind: String) -> Array:
+	# [label, pct]: 100 when done, live ep percent while training,
+	# 0 queued/warming, -1 when the kind is entirely absent.
+	var label := ""
+	if _evo_done().has(kind):
+		return [_evo_done_name(kind), 100.0]
+	for spec in _evo_pending():
+		var s := spec as Dictionary
+		if str(s.get("kind", "")) != kind:
+			continue
+		label = str(s.get("name", ""))
+		if label == "":
+			var director := _director()
+			var gen := int(nextgen_gen)
+			if director != null:
+				gen = int((director.tourney.get("evo", {}) as Dictionary).get("generation", 1)) + 1
+			label = "wild G%d" % gen
+		if not bool(s.get("launched", false)):
+			return [label + " queued", 0.0]
+		var prog := _evo_poll_file(str(s.get("progress", "")))
+		if prog.is_empty():
+			return [label + " warming up", 0.0]
+		return [label, 100.0 * float(prog.get("episode", 0)) / float(EVO_EPISODES)]
+	return ["", -1.0]
+
+
+func _update_nextgen_strip() -> void:
+	if not nextgen_visible:
+		return
+	for slot in [["clone", strip_clone_label, strip_clone_bar],
+			["wild", strip_wild_label, strip_wild_bar]]:
+		var key := str(slot[0])
+		var res: Array = _offspring_progress(key)
+		var lab: Label = slot[1]
+		var bar: ProgressBar = slot[2]
+		if not is_instance_valid(lab) or not is_instance_valid(bar):
+			continue
+		if float(res[1]) < 0.0:
+			lab.text = "%s: --" % key
+			bar.value = 0.0
+		else:
+			lab.text = "%s: %s" % [key, str(res[0])]
+			bar.value = clampf(float(res[1]), 0.0, 100.0)
 
 
 func _evo_await_queued(kind: String) -> String:
@@ -3978,6 +4372,7 @@ func _evo_abort(reason: String) -> void:
 		var evo: Dictionary = director.tourney["evo"]
 		evo["active"] = false
 		director.save_state()
+	_hide_nextgen()
 	_hide_evo_phase()
 	if is_instance_valid(status_label):
 		status_label.text = "EVOLUTION STOPPED: %s" % reason
