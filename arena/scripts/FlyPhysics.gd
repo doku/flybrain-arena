@@ -14,7 +14,17 @@ var last_damage_amount := 0.0
 var last_damage_t := 0.0
 
 
+# Combat gate: damage, tears and KOs only count inside a live round.
+# Between rounds (battle-load, landing ceremony, review) the flies keep
+# simulating where the last round left them - tangled in a clinch or
+# sliding into bark - and ungated hits bled into the next round's bars.
+# The manager opens/closes this around _reset_round/_end_round.
+var combat_enabled := false
+
+
 func take_damage(amount: float, source: String) -> void:
+	if not combat_enabled:
+		return
 	if is_disabled:
 		return
 	health -= amount
@@ -206,6 +216,10 @@ func set_team_color(color: Color) -> void:
 
 func flash_hit(strength: float = 1.0) -> void:
 	flash_energy = maxf(flash_energy, strength)
+
+
+func set_combat_enabled(on: bool) -> void:
+	combat_enabled = on
 
 func apply_brain_controls(ctrl: Dictionary) -> void:
 	if is_disabled:
@@ -704,6 +718,10 @@ func _handle_obstacle_impacts(impact_speed: float, delta: float) -> void:
 	# Tree trunk collisions cost chitin: fast hits tear wings, hard hits cost
 	# health, zero health augers the fly in (knockout, rival credited).
 	# Cooldown stops a single slide from shredding the fly frame by frame.
+	# Outside live rounds (intermission clinches, ceremony slides) impacts
+	# are ignored entirely - no damage, no prints, no cooldown burn.
+	if not combat_enabled:
+		return
 	obstacle_hit_cooldown = maxf(0.0, obstacle_hit_cooldown - delta)
 	if obstacle_hit_cooldown > 0.0:
 		return
@@ -765,7 +783,7 @@ func _facing_victim(victim: FlyPhysics) -> bool:
 	return -local.z > 0.3
 
 func _on_spike_hit_area(area: Area3D) -> void:
-	if is_disabled:
+	if is_disabled or not combat_enabled:
 		return
 	
 	var victim = area.get_parent()
@@ -871,6 +889,8 @@ func _spike_wound(victim: FlyPhysics) -> void:
 		print(victim.fly_id, " bled out from spike wounds!")
 
 func tear_wing(side: String) -> void:
+	if not combat_enabled:
+		return
 	if not left_wing_intact and not right_wing_intact:
 		return
 	if side == "left":
@@ -892,6 +912,8 @@ func tear_wing(side: String) -> void:
 		knocked_out.emit()
 
 func inflict_lethal_strike() -> void:
+	if not combat_enabled:
+		return
 	health = 0.0
 	is_disabled = true
 	knocked_out.emit()

@@ -27,7 +27,8 @@ func test_builds() -> void:
 	_check(arena.get_node_or_null("VignetteLayer") != null, "vignette layer built")
 	_check(arena.hit_burst.amount == 14 and arena.ko_burst.amount == 42,
 		"burst sizes 14/42")
-	_check(arena.fly_alpha.body_mat != null, "alpha chitin bound")
+	_check(arena.fly_alpha.body_std_mat != null, "alpha team tint bound")
+	_check(arena.fly_alpha.eye_mat != null, "alpha eye shader bound")
 	_check(arena.fly_beta.membrane_mat != null, "beta wing shader bound")
 
 
@@ -53,6 +54,24 @@ func test_shock_lifecycle() -> void:
 		"shock uniform 0 at rest")
 
 
+func test_combat_gate() -> void:
+	# Intermission clinches must not bleed: with combat closed,
+	# damage/tears/KOs are all no-ops; reopened, damage applies.
+	var fa = arena.fly_alpha
+	arena._set_combat(false)
+	var h0: float = fa.health
+	fa.take_damage(25.0, "test")
+	_check(fa.health == h0, "take_damage gated outside rounds")
+	fa.tear_wing("left")
+	_check(fa.left_wing_intact, "tear gated outside rounds")
+	fa.inflict_lethal_strike()
+	_check(not fa.is_disabled, "KO gated outside rounds")
+	arena._set_combat(true)
+	fa.take_damage(10.0, "test")
+	_check(fa.health == h0 - 10.0, "damage applies in rounds")
+	fa.health = h0
+
+
 func test_ko_burst_path() -> void:
 	# Same two lines the KO handler runs (burst + shock seed).
 	arena._fire_burst(arena.ko_burst, arena.fly_alpha.global_position)
@@ -74,6 +93,7 @@ func _process(_delta: float) -> bool:
 	test_builds()
 	test_hit_feedback_path()
 	test_shock_lifecycle()
+	test_combat_gate()
 	test_ko_burst_path()
 	if failures == 0:
 		print("ALL COMBAT-FX TESTS PASSED")

@@ -652,6 +652,7 @@ func _request_current_battle_load() -> void:
 	# charges" first-battle bug). A persistent loading callout proves the
 	# game is working, not frozen.
 	is_round_active = false
+	_set_combat(false)
 	_show_loading("LOADING %s" % tourney_match_label,
 		"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name])
 	if is_instance_valid(status_label):
@@ -1188,6 +1189,7 @@ func _reset_round() -> void:
 	# and yaw +90 faces -X (toward alpha). Previously swapped (back-to-back).
 	fly_alpha.reset_fly(Vector3(-14.0, 7.0, 0.0), deg_to_rad(-90.0))
 	fly_beta.reset_fly(Vector3(14.0, 7.0, 0.0), deg_to_rad(90.0))
+	_set_combat(true)
 
 	if is_instance_valid(status_label):
 		status_label.text = "AERIAL JOUST IN PROGRESS"
@@ -2409,6 +2411,7 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 func _handle_draw() -> void:
 	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
 	is_round_active = false
+	_set_combat(false)
 	# Both walk away: land upright for the rematch.
 	_begin_landing("")
 	if tournament_active:
@@ -2838,8 +2841,18 @@ func _check_speed_violations() -> void:
 			status_label.text = msg
 
 
+func _set_combat(on: bool) -> void:
+	# Opens/closes the flies' damage gate alongside the round flag.
+	# Every is_round_active=false site below must call _set_combat(false)
+	# or intermission clinches bleed into the next round's health bars.
+	for fly in [fly_alpha, fly_beta]:
+		if is_instance_valid(fly) and fly.has_method("set_combat_enabled"):
+			fly.call("set_combat_enabled", on)
+
+
 func _end_round() -> void:
 	is_round_active = false
+	_set_combat(false)
 	_check_speed_violations()
 	print("[Arena] Round concluded! Sending battle stats to evolution engine...")
 	if tournament_active:
@@ -4047,6 +4060,7 @@ func _on_restart_pressed() -> void:
 	if not is_round_active:
 		return
 	is_round_active = false
+	_set_combat(false)
 	if is_instance_valid(status_label):
 		status_label.text = "ROUND RESTARTED - banking battle rewards..."
 	print("[Arena] Restart requested! Sending battle stats for dopamine banking...")
