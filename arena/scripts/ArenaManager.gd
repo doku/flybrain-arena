@@ -4095,7 +4095,22 @@ func _build_nextgen_preview() -> Dictionary:
 			"name": str(od.get("name", "?")),
 			"record": {"elo": float(od.get("elo", 1200.0))}})
 	while entries.size() > nextgen_size:
-		entries.pop_back()
+		# Degenerate overshoot (second-last missing, trim territory):
+		# drop the lowest-ELO non-champion, mirroring the rebuild trim
+		# instead of blindly popping offspring off the end.
+		var drop := -1
+		var drop_elo := INF
+		for i in range(entries.size()):
+			var ed := entries[i] as Dictionary
+			if str(ed.get("id", "")) == nextgen_champ_id:
+				continue
+			var e := float((ed.get("record", {}) as Dictionary).get("elo", 1200.0))
+			if e < drop_elo:
+				drop_elo = e
+				drop = i
+		if drop < 0:
+			break
+		entries.remove_at(drop)
 	if entries.size() < 2:
 		return {}
 	return director.preview_bracket(entries, nextgen_size,
@@ -4151,7 +4166,7 @@ func _refresh_nextgen_preview() -> void:
 		return
 	if nextgen_preview.is_empty():
 		return
-	arena_bracket.render_bracket(nextgen_preview, 0, 0)
+	arena_bracket.render_bracket(nextgen_preview, -1, -1)
 	if is_instance_valid(bracket_scroll):
 		bracket_scroll.scroll_horizontal = 0
 		bracket_scroll.scroll_vertical = 0
