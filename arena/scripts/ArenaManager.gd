@@ -2003,7 +2003,7 @@ func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void
 	_flash_attacker(attacker_id, 0.22)
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):
-		_fire_burst(hit_burst, victim.global_position)
+		_fire_burst(hit_bursts.get(victim_id, null), victim.global_position)
 	# Don't clobber the KO/win message if the wing-loss already ended the round.
 	if is_instance_valid(status_label) and is_round_active:
 		if part == "spike_clash":
@@ -2030,16 +2030,19 @@ func _flash_rect(rect: ColorRect, color: Color, strength: float) -> void:
 	tw.tween_property(rect, "color:a", 0.0, 0.4)
 
 # Combat readability FX: ground-projected health rings (in-world health
-# bars with seizure/KO states + KO shockwave) and shared ember-burst
-# nodes for hits and KOs. Visual only; sim state untouched.
+# bars with seizure/KO states + KO shockwave) and per-fly ember bursts
+# for hits and KOs. Each fly bleeds its own team color (orange/blue),
+# so mid-clash hits read instantly. Visual only; sim state untouched.
+const TEAM_ALPHA := Color(1.0, 0.55, 0.30)
+const TEAM_BETA := Color(0.4, 0.75, 1.0)
 var ring_alpha: MeshInstance3D
 var ring_beta: MeshInstance3D
 var ring_mat_alpha: ShaderMaterial
 var ring_mat_beta: ShaderMaterial
 var ring_shock_alpha := 0.0
 var ring_shock_beta := 0.0
-var hit_burst: GPUParticles3D
-var ko_burst: GPUParticles3D
+var hit_bursts := {"alpha": null, "beta": null}
+var ko_bursts := {"alpha": null, "beta": null}
 
 
 func _ring_material(team: Color) -> ShaderMaterial:
@@ -2050,8 +2053,8 @@ func _ring_material(team: Color) -> ShaderMaterial:
 
 
 func _build_combat_fx() -> void:
-	ring_mat_alpha = _ring_material(Color(1.0, 0.55, 0.30))
-	ring_mat_beta = _ring_material(Color(0.4, 0.75, 1.0))
+	ring_mat_alpha = _ring_material(TEAM_ALPHA)
+	ring_mat_beta = _ring_material(TEAM_BETA)
 	for slot in [["alpha", ring_mat_alpha], ["beta", ring_mat_beta]]:
 		var quad := QuadMesh.new()
 		quad.size = Vector2(4.4, 4.4)
@@ -2065,8 +2068,10 @@ func _build_combat_fx() -> void:
 			ring_alpha = mi
 		else:
 			ring_beta = mi
-	hit_burst = _make_burst(14, 0.07, Color(1.0, 0.85, 0.6))
-	ko_burst = _make_burst(42, 0.10, Color(1.0, 0.55, 0.3))
+	hit_bursts["alpha"] = _make_burst(14, 0.07, TEAM_ALPHA)
+	hit_bursts["beta"] = _make_burst(14, 0.07, TEAM_BETA)
+	ko_bursts["alpha"] = _make_burst(42, 0.10, TEAM_ALPHA.lightened(0.2))
+	ko_bursts["beta"] = _make_burst(42, 0.10, TEAM_BETA.lightened(0.2))
 
 
 func _make_burst(amount: int, size: float, color: Color) -> GPUParticles3D:
@@ -2766,7 +2771,7 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 	_flash_victim(victim_id, 0.75)
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):
-		_fire_burst(ko_burst, victim.global_position)
+		_fire_burst(ko_bursts.get(victim_id, null), victim.global_position)
 		if victim_id == "alpha":
 			ring_shock_alpha = 0.01
 		else:

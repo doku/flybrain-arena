@@ -22,11 +22,17 @@ func test_builds() -> void:
 	_check(is_instance_valid(arena.ring_alpha), "alpha ring node built")
 	_check(is_instance_valid(arena.ring_beta), "beta ring node built")
 	_check(arena.ring_mat_alpha.shader != null, "alpha ring shader bound")
-	_check(is_instance_valid(arena.hit_burst), "hit burst node built")
-	_check(is_instance_valid(arena.ko_burst), "KO burst node built")
+	_check(is_instance_valid(arena.hit_bursts["alpha"]), "alpha hit burst built")
+	_check(is_instance_valid(arena.hit_bursts["beta"]), "beta hit burst built")
+	_check(is_instance_valid(arena.ko_bursts["alpha"]), "alpha KO burst built")
+	_check(is_instance_valid(arena.ko_bursts["beta"]), "beta KO burst built")
 	_check(arena.get_node_or_null("VignetteLayer") != null, "vignette layer built")
-	_check(arena.hit_burst.amount == 14 and arena.ko_burst.amount == 42,
+	_check(arena.hit_bursts["alpha"].amount == 14 and arena.ko_bursts["alpha"].amount == 42,
 		"burst sizes 14/42")
+	var acol: Color = arena.hit_bursts["alpha"].draw_pass_1.material.albedo_color
+	var bcol: Color = arena.hit_bursts["beta"].draw_pass_1.material.albedo_color
+	_check(acol.is_equal_approx(Color(1.0, 0.55, 0.30)), "alpha bleeds orange")
+	_check(bcol.is_equal_approx(Color(0.4, 0.75, 1.0)), "beta bleeds blue")
 	_check(arena.fly_alpha.body_std_mat != null, "alpha team tint bound")
 	_check(arena.fly_alpha.eye_mat != null, "alpha eye shader bound")
 	_check(arena.fly_beta.membrane_mat != null, "beta wing shader bound")
@@ -34,7 +40,8 @@ func test_builds() -> void:
 
 func test_hit_feedback_path() -> void:
 	arena._hit_feedback("alpha", "beta", "thorax")
-	_check(arena.hit_burst.emitting, "hit burst emitting after strike")
+	_check(arena.hit_bursts["beta"].emitting, "victim team burst emitting after strike")
+	_check(not arena.hit_bursts["alpha"].emitting, "attacker burst stays dark")
 	_check(arena.fly_beta.flash_energy == 1.0, "victim flash energy 1.0")
 	_check(arena.stats_alpha["damage_dealt"] == 0.0,
 		"no sim stat touched by FX path")
@@ -74,9 +81,9 @@ func test_combat_gate() -> void:
 
 func test_ko_burst_path() -> void:
 	# Same two lines the KO handler runs (burst + shock seed).
-	arena._fire_burst(arena.ko_burst, arena.fly_alpha.global_position)
+	arena._fire_burst(arena.ko_bursts["alpha"], arena.fly_alpha.global_position)
 	arena.ring_shock_alpha = 0.01
-	_check(arena.ko_burst.emitting, "KO burst emitting")
+	_check(arena.ko_bursts["alpha"].emitting, "KO burst emitting")
 	_check(arena.ring_shock_alpha > 0.0, "KO shock seeded")
 
 
