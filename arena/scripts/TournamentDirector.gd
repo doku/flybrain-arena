@@ -761,7 +761,7 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	players = seeded["players"]
 	var matches: Array = seeded["matches"]
 	var seeding := str(seeded["seeding"])
-	var tid := "T%08X" % int(Time.get_unix_time_from_system())
+	var tid := _next_tournament_id()
 	tourney = {
 		"id": tid, "status": "running", "size": size, "best_of": best_of,
 		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
@@ -777,6 +777,21 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	sudden_death_armed = false
 	save_state()
 	return {"ok": true, "tournament_id": tid}
+
+
+func _next_tournament_id() -> String:
+	# Hex-second ids collide when two brackets start in the same second
+	# (quick battle + tournament, back-to-back evo gens): identical ids
+	# share a state file AND the server's battle dedup key, so the
+	# second event's battles get answered from the first's verdicts and
+	# are never banked. Suffix on collision; normal case keeps T+8hex.
+	var base := int(Time.get_unix_time_from_system())
+	var tid := "T%08X" % base
+	var n := 0
+	while FileAccess.file_exists(tournament_dir.path_join(tid + ".json")):
+		n += 1
+		tid = "T%08X-%d" % [base, n]
+	return tid
 
 
 func seed_first_round(player_dicts: Array, size: int, random_draw: bool) -> Dictionary:

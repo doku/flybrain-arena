@@ -727,7 +727,7 @@ func _on_bracket_toggle() -> void:
 	if bracket_overlay != null and bracket_overlay.visible:
 		_hide_arena_bracket()
 	elif tournament_active:
-		_show_arena_bracket("%s  %s vs %s" % [tourney_match_label, tourney_a_name, tourney_b_name])
+		_show_arena_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name])
 
 func _on_quit_to_menu() -> void:
 	var director := _director()
@@ -752,7 +752,7 @@ func _request_current_battle_load() -> void:
 	var p: Dictionary = director.get_load_params()
 	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
 		if is_instance_valid(status_label):
-			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % tourney_match_label
+			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % expand_match_label(tourney_match_label)
 		return
 	print("[Arena] Requesting tournament load: %s (%s vs %s)" % [
 		str(p.get("match", "?")), str(p.get("a_name", "?")), str(p.get("b_name", "?"))])
@@ -768,7 +768,7 @@ func _request_current_battle_load() -> void:
 	# game is working, not frozen.
 	is_round_active = false
 	_set_combat(false)
-	_show_loading("LOADING %s" % tourney_match_label,
+	_show_loading("LOADING %s" % expand_match_label(tourney_match_label),
 		"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name])
 	if is_instance_valid(status_label):
 		status_label.text = "LOADING %s vs %s ..." % [tourney_a_name, tourney_b_name]
@@ -818,10 +818,10 @@ func _on_server_error(error: String) -> void:
 		print("[Arena] Battle report errored (%s); retrying same id=" % error,
 			_seq_battle_id)
 		_show_loading("BATTLE REPORT ERRORED - RETRYING",
-			"Server error: %s. Re-sending the SAME report id %s " % [error, _seq_battle_id]
+			"Server error: %s. Re-sending the SAME report id %s " % [error, expand_battle_id(_seq_battle_id)]
 			+ "(the server answers repeats from its stored verdict, no double count)...")
 		if is_instance_valid(status_label):
-			status_label.text = "BATTLE ERROR - RETRYING %s ..." % _seq_battle_id
+			status_label.text = "BATTLE ERROR - RETRYING %s ..." % expand_battle_id(_seq_battle_id)
 		brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 			bool(q.get("draw", false)), _seq_battle_id,
 			str(q.get("tournament_id", "")), str(q.get("match", "")),
@@ -844,7 +844,7 @@ func _update_tourney_status(prefix: String) -> void:
 		if not m.is_empty():
 			score = "  [%d - %d]" % [int(m.get("wins_a", 0)), int(m.get("wins_b", 0))]
 	if is_instance_valid(status_label):
-		status_label.text = "%s %s: %s vs %s%s" % [tourney_match_label, prefix,
+		status_label.text = "%s %s: %s vs %s%s" % [expand_match_label(tourney_match_label), prefix,
 			tourney_a_name, tourney_b_name, score]
 	if is_instance_valid(gen_label) and director != null:
 		if director.is_quick():
@@ -1316,10 +1316,10 @@ func _check_seq_watchdog() -> void:
 			print("[Arena] Retrying battle report id=", _seq_battle_id,
 				" (same id, idempotent)")
 			_show_loading("STALLED - RETRYING BATTLE REPORT",
-				"No confirmation for battle %s yet. Re-sending the SAME report id " % _seq_battle_id
+				"No confirmation for battle %s yet. Re-sending the SAME report id " % expand_battle_id(_seq_battle_id)
 				+ "(the server answers repeats from its stored verdict, no double count)...")
 			if is_instance_valid(status_label):
-				status_label.text = "STALLED - RETRYING BATTLE %s ..." % _seq_battle_id
+				status_label.text = "STALLED - RETRYING BATTLE %s ..." % expand_battle_id(_seq_battle_id)
 			brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 				bool(q.get("draw", false)), _seq_battle_id,
 				str(q.get("tournament_id", "")), str(q.get("match", "")),
@@ -1329,7 +1329,7 @@ func _check_seq_watchdog() -> void:
 		_tourney_awaiting_battle = false
 		_clear_seq()
 		_show_loading("SERVER SILENT - BATTLE NOT CONFIRMED",
-			"Battle %s was sent twice but the server never confirmed. " % tourney_match_label
+			"Battle %s was sent twice but the server never confirmed. " % expand_match_label(tourney_match_label)
 			+ "Nothing further will be re-sent. See server_log.txt, then QUIT TO MENU + RESUME.")
 		if is_instance_valid(status_label):
 			status_label.text = "SERVER SILENT - see server_log.txt - QUIT TO MENU + RESUME"
@@ -2443,6 +2443,31 @@ func _build_winner_overlay() -> void:
 	countdown_label.add_theme_constant_override("outline_size", 5)
 	vbox.add_child(countdown_label)
 
+static func expand_match_label(code: String) -> String:
+	# "R1M1" -> "Round 1, Match 1". Anything else (FREE, "", junk)
+	# passes through untouched. Display only: wire ids, server keys,
+	# logs and retry matching keep the compact form.
+	var rx := RegEx.new()
+	rx.compile("^R(\\d+)M(\\d+)$")
+	var m := rx.search(code.strip_edges())
+	if m == null:
+		return code
+	return "Round %s, Match %s" % [m.get_string(1), m.get_string(2)]
+
+
+static func expand_battle_id(code: String) -> String:
+	# "R1M1-B1" -> "Round 1, Match 1, Battle 1". Display only.
+	var rx := RegEx.new()
+	rx.compile("^(.*)-B(\\d+)$")
+	var m := rx.search(code.strip_edges())
+	if m == null:
+		return expand_match_label(code)
+	var inner := expand_match_label(m.get_string(1))
+	if inner == "":
+		return "Battle %s" % m.get_string(2)
+	return "%s, Battle %s" % [inner, m.get_string(2)]
+
+
 func _current_battle_id() -> String:
 	# Correlation-only id, echoed by the server for log matching.
 	return "%s-B%d" % [tourney_match_label, _battle_count() + 1]
@@ -2638,12 +2663,12 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	var head := _verdict_headline()
 	_show_loading(str(head.get("text", "")),
 		"%s\n%s - battle %s sent, waiting for server..." % [
-		str(head.get("sub", "")), tourney_match_label, _seq_battle_id],
+		str(head.get("sub", "")), expand_match_label(tourney_match_label), expand_battle_id(_seq_battle_id)],
 		head.get("color", Color(0.85, 0.85, 0.9)))
 	if is_instance_valid(status_label):
 		status_label.text = "%s - %s (%s REPORTING)" % [
 			str(head.get("text", "")), str(head.get("sub", "")),
-			tourney_match_label]
+			expand_match_label(tourney_match_label)]
 
 func _handle_draw() -> void:
 	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
@@ -3147,10 +3172,10 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	if battle_winner == "draw":
 		var draw_title := _draw_title()
 		if is_instance_valid(status_label):
-			status_label.text = "%s %s - REPLAYING" % [tourney_match_label, draw_title]
+			status_label.text = "%s %s - REPLAYING" % [expand_match_label(tourney_match_label), draw_title]
 		_begin_landing("")
 		_show_callout(draw_title, Color(0.78, 0.78, 0.82),
-			"%s STALEMATE - REPLAY" % tourney_match_label, "REMATCH", false)
+			"%s STALEMATE - REPLAY" % expand_match_label(tourney_match_label), "REMATCH", false)
 		await get_tree().create_timer(5.0).timeout
 		var draw_adv: Dictionary = director.on_battle_result("draw",
 			_flight_summary(flight_alpha, fly_alpha),
@@ -3178,7 +3203,7 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		var match_winner := str(res.get("match_winner", battle_winner))
 		_on_match_over(match_winner, score)
 	else:
-		var sub := "%s  BATTLE %d" % [tourney_match_label, _battle_count() + 1]
+		var sub := "%s  BATTLE %d" % [expand_match_label(tourney_match_label), _battle_count() + 1]
 		var vshort := _verdict_short()
 		if vshort != "":
 			sub += "  |  " + vshort
@@ -3205,7 +3230,7 @@ func _on_match_over(match_winner: String, score: String) -> void:
 		adv = director.advance_after_match()
 	# The bracket overlay carries the result: gold connectors show the
 	# path, the loser is grayed out, next lineup is visible.
-	_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, tourney_match_label, score])
+	_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), score])
 	await get_tree().create_timer(6.0).timeout
 	_hide_arena_bracket()
 	_handle_advance_result(adv)
