@@ -1524,18 +1524,20 @@ func build_group_bracket(group_dicts: Array, group_letter: String, event_id: Str
 	return {"ok": true, "tournament_id": tid}
 
 
-func group_standings() -> Array:
+func group_standings(t: Dictionary = {}) -> Array:
 	# [{id, name, wins, kos, matches, elo}] sorted wins desc, KO scored
-	# desc, snapshot ELO desc. Undecided matches don't count.
+	# desc, snapshot ELO desc. Undecided matches don't count. Defaults
+	# to the loaded tourney; pass any bracket dict for overviews.
+	var src: Dictionary = t if not t.is_empty() else tourney
 	var table := {}
-	for p in tourney.get("players", []):
+	for p in src.get("players", []):
 		var pd := p as Dictionary
 		var pid := str(pd.get("id", ""))
 		if pid != "":
 			table[pid] = {"id": pid, "name": str(pd.get("name", "?")),
 				"wins": 0, "kos": 0, "matches": 0,
 				"elo": float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))}
-	for rnd in (tourney.get("rounds", []) as Array):
+	for rnd in (src.get("rounds", []) as Array):
 		for mm in (rnd as Array):
 			var m := mm as Dictionary
 			var wid := str(m.get("winner_id", ""))
@@ -1558,6 +1560,18 @@ func group_standings() -> Array:
 			return int(x["kos"]) > int(y["kos"])
 		return float(x["elo"]) > float(y["elo"]))
 	return out
+
+
+func event_note_bracket(event_id: String, group_letter: String, bracket_id: String) -> void:
+	# Stamp the file id at BUILD time (completion records standings
+	# later): the overview can already match the live file mid-group.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return
+	var groups: Dictionary = ev.get("groups", {})
+	if groups.has(group_letter):
+		(groups[group_letter] as Dictionary)["bracket_id"] = bracket_id
+		event_save(ev)
 
 
 func event_record_group(event_id: String, group_letter: String) -> Dictionary:
@@ -1724,6 +1738,60 @@ func event_draw_pool(event_id: String, n: int, live_override: Dictionary = {}) -
 	if not event_save(ev):
 		return {"ok": false, "error": "cannot save event"}
 	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}
+
+
+func event_overview_data(event_id: String) -> Dictionary:
+	# 2x2 overview assembly: per group {letter, players, rounds,
+	# standings, is_current, is_done, bracket_id}. Sibling files load
+	# read-only; the loaded tourney (when it belongs to this event)
+	# supplies the live table. Display-only, never written back.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {}
+	var live_id := str(tourney.get("id", ""))
+	var live_event := str(tourney.get("event_id", ""))
+	var out: Array = []
+	for g in (ev.get("group_order", []) as Array):
+		var letter := str(g)
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+		var bid := str(gd.get("bracket_id", ""))
+		var is_current := bid != "" and bid == live_id and live_event == event_id
+		var cell := {"letter": letter, "players": [], "rounds": [],
+			"standings": [], "is_current": is_current,
+			"is_done": bool(gd.get("done", false)), "bracket_id": bid,
+			"cur_round": -1, "cur_match": -1}
+		if is_current:
+			cell["players"] = tourney.get("players", [])
+			cell["rounds"] = tourney.get("rounds", [])
+			cell["standings"] = group_standings()
+			cell["cur_round"] = int(tourney.get("current_round", 0))
+			cell["cur_match"] = int(tourney.get("current_match", 0))
+		elif bid != "":
+			var f := FileAccess.open(tournament_dir.path_join(bid + ".json"), FileAccess.READ)
+			if f != null:
+				var t = JSON.parse_string(f.get_as_text())
+				f.close()
+				if t is Dictionary:
+					cell["players"] = (t as Dictionary).get("players", [])
+					cell["rounds"] = (t as Dictionary).get("rounds", [])
+					cell["standings"] = group_standings(t)
+		if (cell["players"] as Array).is_empty():
+			# Upcoming group (no file yet): resolve manifest ids to
+			# cards for the preview table.
+			var by_id := {}
+			for b in list_brains():
+				by_id[str((b as Dictionary).get("id", ""))] = b
+			var cards: Array = []
+			var gd2: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+			for pid in (gd2.get("players", []) as Array):
+				if by_id.has(str(pid)):
+					cards.append(by_id[str(pid)])
+			cell["players"] = cards
+		if (cell["standings"] as Array).is_empty():
+			cell["standings"] = group_standings({"players": cell["players"], "rounds": []})
+		out.append(cell)
+	return {"groups": out,
+		"current": str(tourney.get("group", "")) if live_event == event_id and str(tourney.get("format", "")) == "groups" else ""}
 
 
 func event_set_phase(event_id: String, phase: String) -> void:

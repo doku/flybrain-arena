@@ -822,6 +822,13 @@ func _render_bracket() -> void:
 		_bracket_losers = _live_losers_running()
 	if int(TournamentDirector.tourney.get("losers_start_round", -1)) < 0:
 		_bracket_losers = false
+	if str(TournamentDirector.tourney.get("event_id", "")) != "" \
+			and str(TournamentDirector.tourney.get("format", "bracket")) == "groups":
+		var ov: Dictionary = TournamentDirector.event_overview_data(
+			str(TournamentDirector.tourney.get("event_id", "")))
+		bracket_view.render_event_groups(ov, str(ov.get("current", "")))
+		_sync_bracket_buttons()
+		return
 	bracket_view.render_bracket(TournamentDirector.tourney,
 		int(TournamentDirector.tourney.get("current_round", 0)),
 		int(TournamentDirector.tourney.get("current_match", 0)),
@@ -1486,6 +1493,8 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 		"mutate_traits": int(settings.get("mutate_traits", 1)),
 		"pending": [], "done": {}}
 	TournamentDirector.save_state()
+	TournamentDirector.event_note_bracket(eid, "A",
+		str(TournamentDirector.tourney.get("id", "")))
 	TournamentDirector.event_set_phase(eid, "groups_A")
 	bracket_status.text = "EVENT %s gen 1 ready - GROUP A (%s)." % [eid, str(gres.get("tournament_id", ""))]
 	_render_bracket()

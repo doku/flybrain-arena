@@ -164,6 +164,91 @@ func test_event_chain() -> void:
 	_check((draw.get("drawn", []) as Array) == ["f01", "f02"], "draw takes top ELO")
 
 
+func _panels(bracket) -> Array:
+	# The 4 quadrant panels in order A, B, C, D.
+	var grid: VBoxContainer = bracket.get_child(0)
+	_check(grid.get_child_count() == 2, "overview has 2 rows")
+	var out: Array = []
+	for r in range(2):
+		var row: HBoxContainer = grid.get_child(r)
+		_check(row.get_child_count() == 2, "overview row has 2 panels")
+		for k in range(2):
+			out.append(row.get_child(k))
+	return out
+
+
+func _panel_border(panel: PanelContainer) -> Color:
+	var sb := panel.get_theme_stylebox("panel") as StyleBoxFlat
+	return sb.border_color
+
+
+func _panel_texts(panel: PanelContainer) -> Array:
+	var out: Array = []
+	var vb: VBoxContainer = panel.get_child(0)
+	for ch in vb.get_children():
+		if ch is Label:
+			out.append((ch as Label).text)
+	return out
+
+
+func test_overview_render() -> void:
+	var brains := _brains(16, 2000)
+	var ids: Array = []
+	for b in brains:
+		ids.append(str(b["id"]))
+	var beg: Dictionary = D.call("event_begin", ids,
+		{"best_of": 1, "lr_scale": 0.5, "round_time": 40.0}, 5, brains)
+	var eid := str(beg.get("event_id", ""))
+	# Group B live after one pairing; A/C/D upcoming (no files).
+	var groups: Dictionary = beg.get("groups", {})
+	var bp: Array = []
+	for pid in ((groups.get("B", {}) as Dictionary).get("players", []) as Array):
+		for b in brains:
+			if str((b as Dictionary).get("id", "")) == str(pid):
+				bp.append(b)
+	D.call("build_group_bracket", bp, "B", eid, 1, 0.5, 40.0)
+	D.call("event_note_bracket", eid, "B", str(D.tourney.get("id", "")))
+	D.call("on_battle_result", "alpha", {}, {}, {}, 2, 0)
+	D.call("advance_after_match")
+	var data: Dictionary = D.call("event_overview_data", eid)
+	_check((data.get("groups", []) as Array).size() == 4, "overview has 4 groups")
+	_check(str(data.get("current", "")) == "B", "current group resolved")
+	var B = load("res://scripts/TournamentBracket.gd").new()
+	B.call("render_event_groups", data, "B")
+	var panels := _panels(B)
+	_check(panels.size() == 4, "four quadrant panels")
+	var heads: Array = []
+	for p in panels:
+		for t in _panel_texts(p):
+			if str(t).begins_with("GROUP"):
+				heads.append(str(t))
+	_check(heads == ["GROUP A", "GROUP B  •  LIVE", "GROUP C", "GROUP D"],
+		"headers placed A|B over C|D with live mark")
+	var gold := 0
+	for p in panels:
+		if _panel_border(p) == Color(1.0, 0.82, 0.3, 1.0):
+			gold += 1
+	_check(gold == 1, "exactly the current group is gold-bordered")
+	_check(_panel_border(panels[1]) == Color(1.0, 0.82, 0.3, 1.0),
+		"group B (top-right) is the live one")
+	# Live pairing (R0M2 of group B) is gold-framed inside its panel.
+	var live_rows := 0
+	var bv: VBoxContainer = (panels[1] as PanelContainer).get_child(0)
+	for ch in bv.get_children():
+		if ch is PanelContainer and _panel_border(ch) == Color(1.0, 0.82, 0.3, 1.0):
+			live_rows += 1
+	_check(live_rows == 1, "exactly one live pairing framed")
+	# Played group shows standings stars; upcoming groups render empty.
+	var btexts := _panel_texts(panels[1])
+	var stars := 0
+	for t in btexts:
+		if str(t).begins_with("★"):
+			stars += 1
+	_check(stars == 2, "top-2 starred in live table")
+	_check(_panel_texts(panels[0]).size() == 1, "upcoming group shows header only")
+	B.free()
+
+
 func _initialize() -> void:
 	_setup()
 	test_snake_draft()
@@ -171,6 +256,7 @@ func _initialize() -> void:
 	test_ko_tiebreak()
 	test_final_fixed_order()
 	test_event_chain()
+	test_overview_render()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

@@ -272,6 +272,129 @@ func _paint_card(card: PanelContainer, border: Color, bw: int) -> void:
 	sb.set_border_width_all(bw)
 
 
+func render_event_groups(data: Dictionary, current: String = "") -> void:
+	# 2x2 event overview: A|B over C|D. Each quadrant shows its group
+	# header, standings rows (W-L, KO, top-2 starred) and pairing rows
+	# with battle scores. The live pairing is gold-framed, the current
+	# group gold-bordered; finished groups dim. Display-only.
+	for c in get_children():
+		remove_child(c)
+		c.queue_free()
+	segments.clear()
+	_spot_cards.clear()
+	spotlight_key = ""
+	_apply_metrics(4, 4)
+	var groups: Array = data.get("groups", [])
+	if groups.size() != 4:
+		var ph := Label.new()
+		ph.text = "No event."
+		ph.position = Vector2(SIDE_PAD, SIDE_PAD)
+		add_child(ph)
+		custom_minimum_size = Vector2(200, 60)
+		size = custom_minimum_size
+		queue_redraw()
+		return
+	var grid := VBoxContainer.new()
+	grid.add_theme_constant_override("separation", 8)
+	grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	add_child(grid)
+	for r in range(2):
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 8)
+		row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		grid.add_child(row)
+		for k in range(2):
+			row.add_child(_make_group_panel(groups[r * 2 + k], current))
+	custom_minimum_size = Vector2(760, 560)
+	size = custom_minimum_size
+	queue_redraw()
+
+
+func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
+	var letter := str(cell.get("letter", "?"))
+	var is_current := letter == current
+	var is_done := bool(cell.get("is_done", false))
+	var border := Color(0.3, 0.3, 0.36)
+	var bw := 1
+	if is_current:
+		border = COL_LIVE
+		bw = 3
+	var card := _card_panel(border, bw)
+	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	card.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", CARD_SEP)
+	card.add_child(vb)
+	var head := Label.new()
+	var htxt := "GROUP %s" % letter
+	if is_current:
+		htxt += "  •  LIVE"
+	elif is_done:
+		htxt += "  •  FINAL"
+	head.text = htxt
+	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	head.add_theme_font_size_override("font_size", FS_CARD_HEAD + 2)
+	head.add_theme_color_override("font_color",
+		COL_LIVE if is_current else (Color(0.55, 0.55, 0.6) if is_done else Color(0.75, 0.75, 0.8)))
+	vb.add_child(head)
+	var i := 0
+	for srow in (cell.get("standings", []) as Array):
+		i += 1
+		var rd := srow as Dictionary
+		var sl := Label.new()
+		sl.text = "%s%d. %s  %dW-%d  KO%d" % [
+			"★" if i <= 2 else "  ", i, str(rd.get("name", "?")),
+			int(rd.get("wins", 0)),
+			int(rd.get("matches", 0)) - int(rd.get("wins", 0)),
+			int(rd.get("kos", 0))]
+		sl.add_theme_font_size_override("font_size", FS_ROW)
+		sl.clip_text = true
+		sl.add_theme_color_override("font_color",
+			Color(0.5, 0.5, 0.55) if (is_done and i > 2) else Color(0.92, 0.92, 0.94))
+		vb.add_child(sl)
+	var rounds: Array = cell.get("rounds", [])
+	var cr := int(cell.get("cur_round", -1))
+	var cm := int(cell.get("cur_match", -1))
+	for r in range(rounds.size()):
+		for mi in range((rounds[r] as Array).size()):
+			vb.add_child(_make_pair_row((rounds[r] as Array)[mi],
+				is_current and r == cr and mi == cm))
+	return card
+
+
+func _make_pair_row(m: Dictionary, live: bool) -> PanelContainer:
+	var pc := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.08, 0.08, 0.11, 0.88)
+	sb.border_color = COL_LIVE if live else Color(0.25, 0.25, 0.3)
+	sb.set_border_width_all(2 if live else 1)
+	sb.set_corner_radius_all(4)
+	sb.content_margin_left = 6.0
+	sb.content_margin_right = 6.0
+	sb.content_margin_top = 1.0
+	sb.content_margin_bottom = 1.0
+	pc.add_theme_stylebox_override("panel", sb)
+	var l := Label.new()
+	var txt := "%s %d-%d %s" % [str(m.get("a_name", "TBD")),
+		int(m.get("wins_a", 0)), int(m.get("wins_b", 0)),
+		str(m.get("b_name", "TBD"))]
+	if live:
+		txt += "  •  LIVE"
+	l.text = txt
+	l.add_theme_font_size_override("font_size", FS_ROW)
+	l.clip_text = true
+	var col := Color(0.92, 0.92, 0.94)
+	if live:
+		col = COL_LIVE
+	elif str(m.get("winner_id", "")) == "":
+		col = COL_TBD
+	l.add_theme_color_override("font_color", col)
+	pc.add_child(l)
+	return pc
+
+
 func _draw() -> void:
 	for s in segments:
 		var col: Color = COL_LIVE if bool(s.get("live", false)) else COL_LINE

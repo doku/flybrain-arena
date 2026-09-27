@@ -714,9 +714,15 @@ func _show_arena_bracket(title_text: String) -> void:
 	if director == null or arena_bracket == null:
 		return
 	bracket_title.text = title_text
-	arena_bracket.render_bracket(director.tourney,
-		int(director.tourney.get("current_round", 0)),
-		int(director.tourney.get("current_match", 0)))
+	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
+		# Event view: all four groups in one 2x2 overview (the single
+		# file would render as a fake single-elim).
+		var ov: Dictionary = director.event_overview_data(_event_id())
+		arena_bracket.render_event_groups(ov, str(ov.get("current", "")))
+	else:
+		arena_bracket.render_bracket(director.tourney,
+			int(director.tourney.get("current_round", 0)),
+			int(director.tourney.get("current_match", 0)))
 	_refresh_standings()
 	# The renderer picks compact metrics for big brackets so most fit
 	# outright; whatever still overflows keeps native scrolling here.
@@ -3444,6 +3450,11 @@ func _refresh_standings() -> void:
 	var director := _director()
 	if director == null or not is_instance_valid(standings_label):
 		return
+	if _event_active():
+		# The 2x2 overview carries per-group tables; the strip label
+		# would just duplicate them.
+		standings_label.visible = false
+		return
 	if str(director.tourney.get("format", "bracket")) == "groups":
 		standings_label.text = _standings_text()
 		standings_label.visible = true
@@ -3539,6 +3550,8 @@ func _event_build_group(ev: Dictionary, letter: String) -> bool:
 		return false
 	director.tourney["evo"] = carry
 	director.save_state()
+	director.event_note_bracket(str(ev.get("id", "")), letter,
+		str(director.tourney.get("id", "")))
 	director.event_set_phase(str(ev.get("id", "")), "groups_" + letter)
 	return true
 
@@ -3617,7 +3630,11 @@ func _event_intermission(title: String, sub: String) -> bool:
 		return false
 	_event_skip = false
 	bracket_title.text = title
-	arena_bracket.render_bracket(director.tourney, 0, 0)
+	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
+		var ov: Dictionary = director.event_overview_data(_event_id())
+		arena_bracket.render_event_groups(ov, str(ov.get("current", "")))
+	else:
+		arena_bracket.render_bracket(director.tourney, 0, 0)
 	_refresh_standings()
 	intermission_label.text = sub
 	intermission_row.visible = true
