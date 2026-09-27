@@ -1420,6 +1420,40 @@ class TestBrainVault(unittest.TestCase):
         self.assertTrue(np.allclose(w2, 1.0))
         self.assertTrue(str(rec["lineage"]["source"]).startswith("imported:"))
 
+    def test_concurrent_index_writes(self):
+        # Regression: parallel breed workers once shared one fixed
+        # vault_index.json.tmp and Windows refused the rename
+        # (WinError 5/32), failing a fully-trained breed. Hammer the
+        # index from 8 threads: no errors, valid JSON, no tmp litter,
+        # and the legacy fixed tmp name never reappears.
+        import json
+        import threading
+        rec = vault_pkg.new_record("Race", {})
+        vault_pkg.save_brain(rec, np.zeros(8, dtype=np.float32))
+        with open(vault_pkg.VAULT_INDEX) as f:
+            brains = json.load(f)["brains"]
+        errors = []
+        gate = threading.Barrier(8)
+        def worker():
+            try:
+                gate.wait(timeout=10)
+                for _ in range(5):
+                    vault_pkg._write_index(brains)
+            except Exception as e:  # noqa: BLE001 - collected, asserted below
+                errors.append(e)
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(errors, [])
+        with open(vault_pkg.VAULT_INDEX) as f:
+            json.load(f)
+        litter = [f for f in os.listdir(vault_pkg.VAULT_DIR)
+                  if f.endswith(".tmp")]
+        self.assertEqual(litter, [])
+
     def test_progress_file_contract(self):
         # Progress/result files must always be complete JSON objects (the
         # Godot poller skips anything that doesn't start with { / end with }).

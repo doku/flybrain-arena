@@ -228,13 +228,45 @@ def _read_index():
     return None
 
 
+def _atomic_write_json(path, payload, attempts=8):
+    """Atomically writes a JSON payload (unique temp + rename).
+
+    Unique temp: concurrent writers must never share one fixed tmp
+    name - two breed workers once collided on vault_index.json.tmp
+    and Windows refused the rename with WinError 5/32, failing an
+    otherwise fully-trained breed. Retry: a transient lock on the
+    destination (reader/AV) fails the rename; brief backoff rides
+    it out instead of failing the caller."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json",
+                               dir=os.path.dirname(path) or ".")
+    os.close(fd)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(attempts):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _write_index(brains):
     brains = sorted(brains,
                     key=lambda r: (r.get("name", ""), r.get("id", "")))
-    tmp = VAULT_INDEX + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"updated_utc": _utcnow(), "brains": brains}, f, indent=2)
-    os.replace(tmp, VAULT_INDEX)
+    _atomic_write_json(VAULT_INDEX,
+                       {"updated_utc": _utcnow(), "brains": brains})
 
 
 def update_index_entry(record):
@@ -404,19 +436,9 @@ def _read_archive_log():
 
 
 def _write_archive_log(entries):
-    os.makedirs(ARCHIVE_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=ARCHIVE_DIR)
-    os.close(fd)
-    try:
-        with open(tmp, "w") as f:
-            json.dump(entries, f, indent=2)
-        os.replace(tmp, ARCHIVE_LOG)
-    finally:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+    # Same shared-file hazard as the vault index (evo archiving races
+    # menu restores/deletes): unique temp + rename with backoff.
+    _atomic_write_json(ARCHIVE_LOG, entries)
 
 
 def archive_brain(path_or_id, reason=""):
