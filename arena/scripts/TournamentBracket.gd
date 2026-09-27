@@ -553,6 +553,8 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 		htxt += "  •  VACANT"
 	elif bool(m.get("skipped", false)):
 		htxt += "  •  SKIP"
+	elif bool(m.get("decided_by_draw", false)):
+		htxt += "  •  DRAW-BREAK"
 	elif loser_adv:
 		htxt += "  •  LOSER ADV"
 	head.text = htxt

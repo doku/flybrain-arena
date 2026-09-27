@@ -322,9 +322,34 @@ func test_prebuilt_overview() -> void:
 	B.free()
 
 
+func test_draw_break_stamp() -> void:
+	# Three draws resolve by start-of-match ELO even when battle wins
+	# disagree (1-3): the match is stamped and the card tagged, so the
+	# green winner never looks wrong.
+	var ps := _brains(4, 1500)
+	D.call("build_group_bracket", ps, "A", "E0", 3, 0.5, 40.0)
+	var adv := {}
+	for i in range(3):
+		adv = D.call("on_battle_result", "draw", {}, {}, {})
+		if i < 2:
+			_check(str(adv.get("action", "")) == "replay", "early draws replay")
+	_check(str(adv.get("action", "")) == "match_over", "third draw ends match")
+	_check(str(adv.get("match_winner", "")) == "alpha", "higher ELO takes it")
+	_check(bool(adv.get("resolved_by_draw", false)), "resolved_by_draw flagged")
+	var m: Dictionary = ((D.tourney.get("rounds", []) as Array)[0] as Array)[0]
+	_check(bool(m.get("decided_by_draw", false)), "match stamped decided_by_draw")
+	_check(str(m.get("winner_id", "")) == "f01", "winner is higher-ELO alpha")
+	var B = load("res://scripts/TournamentBracket.gd").new()
+	var card: PanelContainer = B.call("_make_match_card", m, 0, 0, false, false)
+	var head := (card.get_child(0) as VBoxContainer).get_child(0) as Label
+	_check(head.text.contains("DRAW-BREAK"), "card tagged DRAW-BREAK")
+	B.free()
+
+
 func _initialize() -> void:
 	_setup()
 	test_snake_draft()
+	test_draw_break_stamp()
 	test_schedule_and_ko()
 	test_ko_tiebreak()
 	test_final_fixed_order()

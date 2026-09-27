@@ -1054,6 +1054,10 @@ func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dicti
 			var eb := _player_elo(str(m.get("b_id", "")))
 			var dslot := "alpha" if ea >= eb else "beta"
 			m["winner_id"] = str(m.get("a_id" if dslot == "alpha" else "b_id", ""))
+			# Display honesty: the card shows battle score (e.g. 1-3),
+			# so the ELO tiebreak must be visible or the green winner
+			# looks wrong. The renderer tags these DRAW-BREAK.
+			m["decided_by_draw"] = true
 			save_state()
 			return {"action": "match_over", "match_winner": dslot,
 				"score_a": int(m.get("wins_a", 0)),
