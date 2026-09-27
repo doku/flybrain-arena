@@ -6,7 +6,8 @@ import numpy as np
 
 from connectome_loader import load_or_build_csr, load_or_extract_populations
 from lif_brain import FlyBrain
-from sensory_motor import SensoryEncoder, MotorDecoder, normalize_mapping
+from sensory_motor import (SensoryEncoder, MotorDecoder, normalize_mapping,
+                            drive_speed, RAM_EXTRA, SPEED_CAP)
 from dopamine_learning import DopamineReinforcement
 from experimental_wiring import (experiment_arrays, experiment_suffix,
                                    build_genome_arrays, genome_suffix)
@@ -115,6 +116,8 @@ class KinematicFly:
         self.lunge_t = 0.0
         self.lunge_boost = 0.0
         self.lunge_count = 0
+        # base_speed stays for mover-target scoring normalization;
+        # the AGENT fly itself has no base cruise (hover at zero drive).
         self.base_speed = 3.0
         self.max_speed = 12.0
         self.turn_rate = 8.0 # matches FlyPhysics: hover-capable snap turns
@@ -156,7 +159,7 @@ class KinematicFly:
         return np.array([np.sin(self.heading), 0.0, -np.cos(self.heading)], dtype=np.float32)
 
     def step(self, thrust, yaw_torque, pitch_cmd=0.0, dt=0.05,
-             arena_radius=55.0, roll_cmd=0.0):
+             arena_radius=55.0, roll_cmd=0.0, ram_drive=0.0):
         prev_heading, prev_pitch, prev_roll = \
             self.heading, self.pitch, self.roll
         if self.anchored:
@@ -181,8 +184,15 @@ class KinematicFly:
         self.heading -= self.roll * 1.5 * dt
         self.heading = (self.heading + np.pi) % (2.0 * np.pi) - np.pi
 
-        # Forward speed along the 3D nose vector
-        speed = self.base_speed + (self.max_speed - self.base_speed) * np.clip(thrust, 0.0, 1.0)
+        # Activation-driven cruise (no base speed): motor activation
+        # maps to speed on the shared log curve (hover at zero drive),
+        # plus the ram charge headroom. Mirrors FlyPhysics target
+        # speed - keep the two in sync. Lunge transients ride on top
+        # (decaying boost below); the hard cap binds sustained abuse.
+        cruise = min(drive_speed(thrust)
+                     + RAM_EXTRA * float(np.clip(ram_drive, 0.0, 1.0)),
+                     SPEED_CAP)
+        speed = float(cruise)
         self.last_speed = float(speed)
         self.pos += self.forward_vec() * (speed * dt)
         # Hard altitude limits (mirror FlyPhysics CEILING/FLOOR)
@@ -286,12 +296,13 @@ def apply_arena_controls(fly, ctrl, senses, dist, dt=0.05):
         pitch_eff = -1.0
     else:
         pitch_eff = float(ctrl.get("pitch_torque", 0.0))
-    if ctrl.get("ram_burst", False):
-        thrust_eff *= 1.5  # mirrors the arena's 1.5x ram speed
+    ram_drive = float(ctrl.get("ram_drive", 0.0))
+    if ram_drive <= 0.0 and bool(ctrl.get("ram_burst", False)):
+        ram_drive = 1.0  # legacy callers pass the gate without a rate
     _ = float(ctrl.get("approach_bias", 0.0))
     fly.step(thrust=thrust_eff,
              yaw_torque=float(ctrl.get("yaw_torque", 0.0)),
-             pitch_cmd=pitch_eff, dt=dt,
+             pitch_cmd=pitch_eff, dt=dt, ram_drive=ram_drive,
              roll_cmd=float(ctrl.get("roll_torque", 0.0)))
     return fly.update_lunge(ctrl.get("spear_thrust", 0.0), senses, dist, dt)
 

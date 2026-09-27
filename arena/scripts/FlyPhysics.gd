@@ -34,14 +34,18 @@ func take_damage(amount: float, source: String) -> void:
 @export var health: float = 100.0
 
 # Flight aerodynamics constants (fruit-fly agile: hover-capable, snap turns).
-# Tuned for watchable jousts: cruise ~5 m/s, full thrust 12 m/s.
+# Activation-driven flight (no base cruise): motor activation maps to
+# speed on a log curve - easy meters to ~4 m/s, saturating toward 12.
+# DRIVE_LOG_K is fitted so drive_speed(0.15) ~= 4.0. Mirrors the Python
+# drive_speed() in sensory_motor.py - keep the two in sync.
 # Thrust gain is calibrated so cruise equilibrium EQUALS target speed:
 # per-tick add = target*gain*dt vs drag multiply drag_coeff^(60dt);
 # v* = target*gain/(60*(1-drag_coeff)) = target*1.8/1.8 = target.
 # (The old gain 5.0 converged to 2.78x target: full thrust flew 33 m/s
 # and ram 46 m/s while max_speed claimed 12 - the G2-wild zoom bug.)
-@export var base_speed: float = 3.0
 @export var max_speed: float = 12.0
+const DRIVE_LOG_K: float = 6.0
+const RAM_EXTRA: float = 6.0
 @export var turn_rate: float = 8.0
 @export var pitch_rate: float = 2.5
 @export var roll_rate: float = 3.0
@@ -102,7 +106,15 @@ var current_yaw_torque: float = 0.0
 var current_pitch_torque: float = 0.0
 var current_roll_torque: float = 0.0
 var is_ram_burst: bool = false
+var ram_drive: float = 0.0
 var is_emergency_evade: bool = false
+
+
+func drive_speed(activation: float) -> float:
+	# Shared log curve (mirrors Python drive_speed): hover at zero,
+	# ~4 m/s at low-moderate drive, saturating at max_speed.
+	var a := clampf(activation, 0.0, 1.0)
+	return max_speed * log(1.0 + DRIVE_LOG_K * a) / log(1.0 + DRIVE_LOG_K)
 # Command-hold age: the brain answers every few hundred ms (dual-LIF
 # step budget), so each torque command would otherwise hold at FULL
 # value across many physics frames (~1 rad per yaw command) while flying
@@ -229,6 +241,9 @@ func apply_brain_controls(ctrl: Dictionary) -> void:
 	current_pitch_torque = ctrl.get("pitch_torque", 0.0)
 	current_roll_torque = ctrl.get("roll_torque", 0.0)
 	is_ram_burst = ctrl.get("ram_burst", false)
+	ram_drive = clampf(float(ctrl.get("ram_drive", 0.0)), 0.0, 1.0)
+	if ram_drive <= 0.0 and is_ram_burst:
+		ram_drive = 1.0
 	is_emergency_evade = ctrl.get("emergency_evade", false)
 	spear_thrust_cmd = clampf(float(ctrl.get("spear_thrust", 0.0)), 0.0, 1.0)
 	cmd_age = 0.0
@@ -564,9 +579,10 @@ func _physics_process(delta: float) -> void:
 	var pitch_cmd := current_pitch_torque * hold
 	var roll_cmd := current_roll_torque * hold
 
-	# Flight speed and thrust
-	var speed_multiplier = 1.5 if is_ram_burst else 1.0
-	var target_speed = base_speed + (max_speed - base_speed) * current_thrust * speed_multiplier
+	# Flight speed from motor activation (no base cruise: zero drive
+	# hovers) on the shared log curve, plus the ram charge headroom
+	# scaled by DNpe017 rate (never a programmed multiplier).
+	var target_speed = drive_speed(current_thrust) + RAM_EXTRA * ram_drive
 	var forward_vec = -global_transform.basis.z
 
 	# Yaw rotation (snapshot basis first: the seizure watch measures the

@@ -84,6 +84,29 @@ FLOW_CRUISE = 0.35
 # counts / FLOW_FULL_SCALE estimates the flow magnitude back.
 FLOW_FULL_SCALE = 120.0
 
+# Activation-driven flight (no base cruise): motor-pool activation maps
+# to speed on a log curve - easy meters to ~4 m/s, saturating toward
+# 12. DRIVE_LOG_K is fitted so drive_speed(0.15) ~= 4.0; both physics
+# engines must implement this same curve (mirror principle - keep the
+# GDScript twin in FlyPhysics.gd in sync).
+DRIVE_VMAX = 12.0
+DRIVE_LOG_K = 6.0
+# Ram charge headroom above cruise (full ram ~= 18 m/s, as before).
+RAM_EXTRA = 6.0
+# DNpe017 spikes for a full ram charge (threshold 2 starts it).
+RAM_FULL_SCALE = 6.0
+# Hard cap mirror (FlyPhysics SPEED_CAP_MULT * max_speed): cruise speed
+# never exceeds this in the trainer either.
+SPEED_CAP = 19.2
+
+
+def drive_speed(activation):
+    """Speed (m/s) for motor activation in [0, 1]: log saturation from
+    hover (0) to DRIVE_VMAX. v(0.15) ~= 4, v(1) == 12."""
+    a = max(0.0, min(1.0, float(activation)))
+    return DRIVE_VMAX * float(np.log1p(DRIVE_LOG_K * a)) / float(
+        np.log1p(DRIVE_LOG_K))
+
 # Reflex authority defaults (heritable evolvable control traits; the
 # legacy operating point, bit-identical when untouched).
 BLEND_DEFAULTS = {
@@ -116,6 +139,7 @@ CONTROL_CHANNELS = {
     "approach_bias": {"pools": ["mbon_app", "mbon_av"],
                       "reflex": [], "gate": []},
     "ram_burst": {"pools": ["motor_ram_dnpe017"], "reflex": [], "gate": []},
+    "ram_drive": {"pools": ["motor_ram_dnpe017"], "reflex": [], "gate": []},
     "emergency_evade": {"pools": ["motor_giant_fiber"],
                         "reflex": ["reflex_evade", "reflex_evade_tree"],
                         "gate": ["visibility"]},
@@ -642,6 +666,7 @@ class MotorDecoder:
                 "roll_torque": 0.0,     # Wings-level hold (no flow signal)
                 "approach_bias": 0.0,   # No learned value without spikes
                 "ram_burst": False,
+                "ram_drive": 0.0,
                 "emergency_evade": False,
                 "spear_thrust": 0.0
             }
@@ -661,6 +686,7 @@ class MotorDecoder:
                 "roll_torque": 0.0,
                 "approach_bias": 0.0,
                 "ram_burst": False,
+                "ram_drive": 0.0,
                 "emergency_evade": bool(self.reflex_evade(sensory_hint)
                                         or self.reflex_evade_tree(sensory_hint)),
                 "spear_thrust": 0.0
@@ -741,9 +767,13 @@ class MotorDecoder:
         else:
             yaw_torque = brain_yaw
 
-        # 3. High-Speed Ramming Charge (DNpe017)
+        # 3. High-Speed Ramming Charge (DNpe017). ram_burst stays
+        # the boolean gate (stats/compat); ram_drive is the
+        # activation-scaled charge in [0, 1] that physics adds as
+        # RAM_EXTRA on top of the log-curve cruise speed.
         ram_spikes = sum(counts.get(s, 0) for s in self.dnpe017_ids)
         ram_burst = ram_spikes >= 2
+        ram_drive = float(min(ram_spikes / RAM_FULL_SCALE, 1.0))
 
         # 3b. Spear thrust (MNxm mouth motor readout). Fires the couched
         # lance forward when the mouth circuit votes strongly AND the
@@ -873,6 +903,7 @@ class MotorDecoder:
             "roll_torque": float(roll_torque),
             "approach_bias": float(approach_bias),
             "ram_burst": bool(ram_burst),
+            "ram_drive": float(ram_drive),
             "emergency_evade": bool(emergency_evade),
             "spear_thrust": float(spear_thrust)
         }

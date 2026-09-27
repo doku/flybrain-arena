@@ -3682,8 +3682,8 @@ class TestMappingMatrix(unittest.TestCase):
     (legacy ignores split keys, mapped schemes compose). Includes the
     mirror-direction readouts the old suite only tested one-sided."""
     CTRL_KEYS = {"thrust", "yaw_torque", "pitch_torque", "roll_torque",
-                 "approach_bias", "ram_burst", "emergency_evade",
-                 "spear_thrust"}
+                 "approach_bias", "ram_burst", "ram_drive",
+                 "emergency_evade", "spear_thrust"}
 
     @classmethod
     def setUpClass(cls):
@@ -3849,6 +3849,63 @@ class TestMappingMatrix(unittest.TestCase):
         self.assertFalse(dec.decode(gf_pool[:1])["ram_burst"])
         self.assertTrue(dec.decode(gf_pool[:2])["ram_burst"])
 
+    def test_drive_curve_shape(self):
+        # Log saturation: hover at zero, ~4 m/s at low-moderate drive,
+        # asymptote exactly 12, diminishing returns throughout.
+        from sensory_motor import drive_speed, DRIVE_VMAX
+        self.assertEqual(drive_speed(0.0), 0.0)
+        self.assertEqual(drive_speed(1.0), DRIVE_VMAX)
+        self.assertAlmostEqual(drive_speed(0.15), 4.0, delta=0.5)
+        pts = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
+        vals = [drive_speed(a) for a in pts]
+        for v, prev in zip(vals[1:], vals):
+            self.assertGreater(v, prev)
+        gains = [(vals[i + 1] - vals[i]) / (pts[i + 1] - pts[i])
+                 for i in range(len(pts) - 1)]
+        for g, last_gain in zip(gains[1:], gains):
+            self.assertLess(g, last_gain)
+        # Out-of-range inputs clamp, never NaN.
+        self.assertEqual(drive_speed(-3.0), 0.0)
+        self.assertEqual(drive_speed(99.0), DRIVE_VMAX)
+
+    def test_ram_drive_scaling(self):
+        # Charge scales with DNpe017 volley size; the boolean gate
+        # (stats/compat) is unchanged.
+        dec = MotorDecoder(self.pops)
+        pool = list(self.pops["motor_ram_dnpe017"]["all"])
+        c0 = dec.decode([])
+        self.assertEqual(c0["ram_drive"], 0.0)
+        self.assertFalse(c0["ram_burst"])
+        c2 = dec.decode(pool[:2])
+        self.assertTrue(c2["ram_burst"])
+        self.assertGreater(c2["ram_drive"], 0.0)
+        self.assertLess(c2["ram_drive"], 1.0)
+        full = dec.decode(pool * 3)
+        self.assertEqual(full["ram_drive"], 1.0)
+
+    def test_activation_hover_and_ram(self):
+        # No drive hovers in place; full drive cruises 12; ram adds
+        # headroom up to the hard cap, never beyond.
+        from train_homing import KinematicFly
+        from sensory_motor import SPEED_CAP
+        hover = KinematicFly()
+        p0 = hover.pos.copy()
+        hover.step(0.0, 0.0)
+        self.assertEqual(hover.last_speed, 0.0)
+        self.assertTrue((hover.pos == p0).all())
+        cruise = KinematicFly()
+        cruise.step(1.0, 0.0)
+        self.assertAlmostEqual(cruise.last_speed, 12.0)
+        ram = KinematicFly()
+        ram.step(1.0, 0.0, ram_drive=1.0)
+        self.assertAlmostEqual(ram.last_speed, 18.0)
+        self.assertLessEqual(ram.last_speed, SPEED_CAP)
+        # Partial ram scales between cruise and full charge.
+        half = KinematicFly()
+        half.step(1.0, 0.0, ram_drive=0.5)
+        self.assertGreater(half.last_speed, cruise.last_speed)
+        self.assertLess(half.last_speed, ram.last_speed)
+
     def test_mixed_regime_battle_pair(self):
         # exp-vs-exp and legacy-vs-mapped pairs integrate side by side
         # with native arity and full control sets (extends the base/exp
@@ -3926,8 +3983,8 @@ class TestTrainerArenaContract(unittest.TestCase):
         # arena control application (no silently dropped channels).
         from train_homing import KinematicFly, apply_arena_controls
         for key in ("thrust", "yaw_torque", "pitch_torque", "roll_torque",
-                    "approach_bias", "ram_burst", "emergency_evade",
-                    "spear_thrust"):
+                    "approach_bias", "ram_burst", "ram_drive",
+                    "emergency_evade", "spear_thrust"):
             self.assertIn(key, TestMappingMatrix.CTRL_KEYS)
         ctrl = {"thrust": 0.5, "yaw_torque": 0.2, "pitch_torque": 0.1,
                 "roll_torque": 0.0, "approach_bias": 0.1,
