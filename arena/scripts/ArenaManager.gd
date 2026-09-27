@@ -2792,9 +2792,6 @@ func _evo_watcher_tick(delta: float) -> void:
 			evo_status_line.visible = false
 		return
 	_evo_adopt_finished()
-	if _event_active():
-		_event_drain_done_to_pool()
-		_event_maintain_pool()
 	var director := _director()
 	if director != null and not evo_waiting and director.pending_async.is_empty():
 		for spec in _evo_pending():
@@ -2807,6 +2804,9 @@ func _evo_watcher_tick(delta: float) -> void:
 	if evo_status_tick < EVO_STATUS_EVERY:
 		return
 	evo_status_tick = 0.0
+	if _event_active():
+		_event_drain_done_to_pool()
+		_event_maintain_pool()
 	_update_evo_status_line()
 
 
@@ -3500,16 +3500,19 @@ func _event_maintain_pool() -> void:
 
 
 func _event_drain_done_to_pool() -> void:
-	# Banked offspring belong on the bench, not in a bracket.
+	# Banked offspring belong on the bench, not in a bracket. Runs on
+	# every watcher tick, so it stays silent unless the bench actually
+	# gains a brain (otherwise the log drowns in repeats).
 	if not _event_active():
 		return
 	var director := _director()
 	if director == null:
 		return
+	var bench: Array = director.event_load(_event_id()).get("pool", [])
 	var ids: Array = []
 	for kind in ["clone", "wild"]:
 		var bid := _evo_done_id(kind)
-		if bid != "":
+		if bid != "" and not (bid in bench):
 			ids.append(bid)
 	if ids.is_empty():
 		return
