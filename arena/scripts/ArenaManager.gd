@@ -3581,10 +3581,10 @@ func _event_preview_sub(upcoming: String) -> String:
 	var director := _director()
 	if director == null:
 		return ""
-	var ev := _event_manifest()
+	var ev: Dictionary = _event_manifest()
 	var lines := PackedStringArray()
 	if upcoming == "final":
-		var adv := director.event_advancers(str(ev.get("id", "")))
+		var adv: Dictionary = director.event_advancers(str(ev.get("id", "")))
 		var qf: Array = adv.get("advancers", []) if bool(adv.get("ok", false)) else []
 		var names := {}
 		for b in director.list_brains():
