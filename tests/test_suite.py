@@ -476,6 +476,116 @@ class TestSensoryMotor(unittest.TestCase):
                           {"score_weights": {"dodge": 5.0, "gate": 1.0}}),
             6.0)
 
+    def test_scenario_pinning(self):
+        # Curriculum pins restrict the scheduler draw; unknown pins are
+        # ignored and deterministic seeds stay deterministic.
+        import random
+        from train_homing import pick_school_scenario
+        for _ in range(30):
+            b, e = pick_school_scenario(
+                random.Random(3), 0.1, {"pin_behaviors": ["duel"]})
+            self.assertEqual(b, "duel")
+        for _ in range(30):
+            b, e = pick_school_scenario(
+                random.Random(3), 0.9,
+                {"pin_behaviors": ["DUEL"],
+                 "pin_envs": ["forest", "bogus"]})
+            self.assertEqual(b, "duel")
+            self.assertEqual(e, "forest")
+        # Unknown-only pins fall back to the full table.
+        seen = set()
+        for i in range(40):
+            b, _e = pick_school_scenario(
+                random.Random(i), 0.1, {"pin_behaviors": ["bogus"]})
+            seen.add(b)
+        self.assertGreater(len(seen), 1)
+
+    def test_scenario_mults(self):
+        # Default tables are 1.0 (legacy scoring); curriculum overrides
+        # scale the non-takedown base; takedowns keep fixed supremacy.
+        from train_homing import _school_score, _scenario_mult
+        base = {"initial_dist": 20.0, "success": True,
+                "scenario": "DUEL+OPEN"}
+        # Fitted defaults (duel 1.00 x open 1.04) scale the reach base.
+        self.assertAlmostEqual(_school_score(dict(base), {}), 6.24)
+        self.assertEqual(_scenario_mult({"scenario": "BOGUS+X"}, {}), 1.0)
+        self.assertEqual(_scenario_mult({}, {}), 1.0)
+        cur = {"scenario_mult": {"behaviors": {"duel": 2.0},
+                                 "envs": {"open": 0.5}}}
+        self.assertEqual(_scenario_mult({"scenario": "DUEL+OPEN"}, cur), 1.0)
+        self.assertEqual(_school_score(dict(base), cur), 6.0)
+        cur2 = {"scenario_mult": {"behaviors": {"duel": 0.5}}}
+        self.assertAlmostEqual(_school_score(dict(base), cur2), 3.12)
+        # Takedown supremacy untouched by mults.
+        self.assertEqual(
+            _school_score(dict(base, takedown=True), cur2), 10.0)
+
+    def test_scenario_marginals_and_stamp(self):
+        # by_scenario combos split into behavior+env marginal avgs;
+        # stamps accumulate across probes (enrich, never overwrite).
+        from train_homing import scenario_marginals
+        import train_job
+        import brain_package as vault
+        by = {"DUEL+OPEN": {"episodes": 4, "successes": 2, "takedowns": 0,
+                            "score": 16.0},
+              "DUEL+FOREST": {"episodes": 2, "successes": 0, "takedowns": 0,
+                              "score": 2.0}}
+        m = scenario_marginals(by)
+        self.assertAlmostEqual(m["DUEL"], 3.0)
+        self.assertAlmostEqual(m["OPEN"], 4.0)
+        self.assertAlmostEqual(m["FOREST"], 1.0)
+        self.assertEqual(scenario_marginals({}), {})
+        r = vault.new_record("ScenTest")
+        train_job.stamp_scenario_scores(r, by)
+        train_job.stamp_scenario_scores(r, by)
+        table = r["training"]["scenario_scores"]
+        self.assertEqual(table["DUEL"]["episodes"], 12)
+        self.assertAlmostEqual(table["DUEL"]["score"], 36.0)
+
+    def test_merge_summaries_cells(self):
+        # Multi-stage merges sum per-scenario cells (both stages
+        # schooled, so both count) instead of keeping the last.
+        import train_job
+        merged = train_job.merge_summaries([
+            {"episodes": 2, "successes": 1, "score": 8.0,
+             "by_scenario": {"DUEL+OPEN": {"episodes": 2, "successes": 1,
+                                           "takedowns": 0, "score": 8.0}}},
+            {"episodes": 3, "successes": 1, "score": 6.0,
+             "by_scenario": {"DUEL+OPEN": {"episodes": 1, "successes": 0,
+                                           "takedowns": 0, "score": 2.0},
+                             "CAMP+OPEN": {"episodes": 2, "successes": 1,
+                                            "takedowns": 0, "score": 4.0}}}])
+        self.assertEqual(merged["episodes"], 5)
+        self.assertAlmostEqual(merged["score"], 14.0)
+        cell = merged["by_scenario"]["DUEL+OPEN"]
+        self.assertEqual(cell["episodes"], 3)
+        self.assertAlmostEqual(cell["score"], 10.0)
+
+    def test_score_correlations_report(self):
+        # Records-only audit: per-family r vs ELO plus suggested mults.
+        import vault_cli
+        recs = []
+        for i in range(6):
+            elo = 1200.0 + i * 50.0
+            recs.append({"id": "b%d" % i, "name": "B%d" % i,
+                         "record": {"elo": elo, "battles": 10},
+                         "training": {"episodes": 50, "score": 100.0,
+                                      "avg_score": 2.0,
+                                      "scenario_scores": {
+                                          "DUEL": {"score": 4.0 * (i + 1),
+                                                   "episodes": 10},
+                                          "CAMP": {"score": 30.0,
+                                                   "episodes": 10}}}})
+        rows, overall, n = vault_cli.score_correlation_rows(recs, 5, 4)
+        self.assertEqual(n, 6)
+        rows = {r["family"]: r for r in rows}
+        # DUEL rises with ELO -> r ~ +1, mult > 1; CAMP flat -> r ~ 0.
+        self.assertGreater(rows["DUEL"]["pearson_vs_elo"], 0.9)
+        self.assertGreater(rows["DUEL"]["suggested_mult"], 1.0)
+        self.assertAlmostEqual(rows["CAMP"]["pearson_vs_elo"], 0.0, places=6)
+        self.assertEqual(rows["CAMP"]["suggested_mult"], 1.0)
+        self.assertEqual(rows["DUEL"]["n"], 6)
+
     def test_score_stamping(self):
         # Score banks on the record, accumulates across sessions, avg
         # spans cumulative episodes; new records default 0. Production

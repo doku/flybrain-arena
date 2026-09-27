@@ -160,13 +160,35 @@ def train_staged(record, weights, stages, progress_cb=None, save=True):
     return record, weights, summaries
 
 
+def _merge_cells(into, table):
+    """Sums per-family by_scenario/by_archetype cells across stages
+    ({episodes, successes, takedowns, score} each)."""
+    if not isinstance(table, dict):
+        return
+    for fam, cell in table.items():
+        if not isinstance(cell, dict):
+            continue
+        acc = into.setdefault(fam, {"episodes": 0, "successes": 0,
+                                    "takedowns": 0, "score": 0.0})
+        for k in ("episodes", "successes", "takedowns"):
+            try:
+                acc[k] = int(acc.get(k, 0)) + int(cell.get(k, 0))
+            except (TypeError, ValueError):
+                pass
+        try:
+            acc["score"] = float(acc.get("score", 0.0)) + float(
+                cell.get("score", 0.0))
+        except (TypeError, ValueError):
+            pass
+
+
 def merge_summaries(summaries):
     """Combined multi-stage verdict summary: summed episodes/successes
     (plus any takedown/strike counters and pre-training scores stages
-    report) and the per-stage list. Unknown keys pass through from the
-    last stage that has them."""
+    report), merged per-scenario cells across stages (both stages
+    schooled, so both count), and the per-stage list."""
     out = {"stages": list(summaries), "episodes": 0, "successes": 0,
-           "score": 0.0}
+           "score": 0.0, "by_scenario": {}, "by_archetype": {}}
     for s in summaries:
         if not isinstance(s, dict):
             continue
@@ -176,15 +198,50 @@ def merge_summaries(summaries):
         for k in ("takedowns", "strikes", "crashes"):
             if k in s:
                 out[k] = int(out.get(k, 0)) + int(s.get(k, 0))
+        _merge_cells(out["by_scenario"], s.get("by_scenario"))
+        _merge_cells(out["by_archetype"], s.get("by_archetype"))
     out["avg_score"] = out["score"] / max(out["episodes"], 1)
     return out
+
+
+def stamp_scenario_scores(record, by_scenario):
+    """Accumulates per-family scenario points onto the record
+    (training["scenario_scores"][family] = {score, episodes}), so
+    later probes enrich rather than overwrite. Returns the record."""
+    if not isinstance(by_scenario, dict):
+        return record
+    training = record.setdefault("training", {})
+    table = training.setdefault("scenario_scores", {})
+    for combo, cell in by_scenario.items():
+        if not isinstance(cell, dict):
+            continue
+        try:
+            eps = int(cell.get("episodes", 0))
+            sc = float(cell.get("score", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if eps <= 0:
+            continue
+        for part in str(combo).upper().split("+"):
+            part = part.strip()
+            if not part:
+                continue
+            acc = table.setdefault(part, {"score": 0.0, "episodes": 0})
+            try:
+                acc["score"] = float(acc.get("score", 0.0)) + sc
+                acc["episodes"] = int(acc.get("episodes", 0)) + eps
+            except (TypeError, ValueError):
+                pass
+    return record
 
 
 def stamp_train_score(record, summary):
     """Banks the pre-training score on the record: score accumulates
     across training sessions (like episodes), avg_score is recomputed
-    over cumulative episodes. Pre-score records (no score key) tolerate
-    missing summaries (score unchanged). Returns the record."""
+    over cumulative episodes, and per-scenario cells accumulate into
+    training["scenario_scores"] when the summary carries them.
+    Pre-score records (no score key) tolerate missing summaries (score
+    unchanged). Returns the record."""
     if not isinstance(summary, dict):
         return record
     training = record.setdefault("training", {})
@@ -192,6 +249,7 @@ def stamp_train_score(record, summary):
     training["score"] = float(training.get("score", 0.0)) + gained
     episodes = int(training.get("episodes", 0))
     training["avg_score"] = (float(training["score"]) / max(episodes, 1))
+    stamp_scenario_scores(record, summary.get("by_scenario"))
     return record
 
 

@@ -601,6 +601,41 @@ SCHOOL_SCORE_WEIGHTS = {
     "gaze": 4.0,        # stalk lock fraction when not reaching
     "gate": 2.0,        # slalom gate threaded (stacks, capped at takedown)
 }
+# Scenario predictiveness multipliers, fitted against ELO (see the
+# score-correlations CLI report): behavior × env scales the
+# non-takedown base so school points track combat rating instead of
+# rewarding ELO-neutral navigation. Defaults 1.0 = legacy scoring;
+# curriculum "scenario_mult" {"behaviors": {}, "envs": {}} overrides.
+# Fitted 2026-09-27 against ELO (score-correlations, n=23
+# battle-tested brains, seed-7 probes): camp/open/slalom predict,
+# dodge strongly anti-predicts (fighters ram through dodge passes
+# instead of threading them cleanly), forest mildly anti-predicts,
+# duel is table stakes (r~0). Refit as the meta evolves; changing
+# these re-baselines future scores (banked history is untouched).
+SCENARIO_BEHAVIOR_MULT = {
+    "camp": 1.40, "mover": 1.16, "duel": 1.00, "dodge": 0.38,
+    "stalk": 1.05,
+}
+SCENARIO_ENV_MULT = {
+    "open": 1.04, "slalom": 1.23, "forest": 0.77,
+}
+
+
+def _scenario_mult(entry, curriculum):
+    """Behavior × env multiplier for this episode's scenario family
+    ("DUEL+OPEN" style keys, case-insensitive; unknown families 1.0)."""
+    override = (curriculum or {}).get("scenario_mult", {}) or {}
+    beh_tab = dict(SCENARIO_BEHAVIOR_MULT)
+    beh_tab.update(override.get("behaviors", {}) or {})
+    env_tab = dict(SCENARIO_ENV_MULT)
+    env_tab.update(override.get("envs", {}) or {})
+    parts = str(entry.get("scenario", "") or "").lower().split("+")
+    beh = beh_tab.get(parts[0], 1.0) if parts and parts[0] else 1.0
+    env = env_tab.get(parts[1], 1.0) if len(parts) > 1 else 1.0
+    try:
+        return max(0.0, float(beh) * float(env))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def _school_score(entry, curriculum):
@@ -631,6 +666,9 @@ def _school_score(entry, curriculum):
         frac = float(np.clip(float(entry.get("closed", 0.0)) / initial,
                              0.0, 1.0))
         base = frac * float(w["partial_max"])
+    # Scenario predictiveness: scale the base toward combat rating
+    # (takedowns keep fixed supremacy above; crashes already exited).
+    base = base * _scenario_mult(entry, curriculum)
     if bool(entry.get("gate_paid", False)):
         # Threading bonus stacks, capped at takedown supremacy (explicit
         # weight overrides still punch through uncapped).
@@ -644,6 +682,32 @@ def _school_stage(progress, curriculum):
         if progress <= float(stage.get("until", 1.0)):
             return stage
     return (curriculum.get("stages", None) or SCHOOL_STAGES)[-1]
+
+
+def scenario_marginals(by_scenario):
+    """Per-family {family: avg/ep} from a summary's by_scenario table:
+    each "BEHAVIOR+ENV" combo contributes its points to both its
+    behavior and its env marginal (episodes-weighted). Keys uppercase
+    ("DUEL", "FOREST")."""
+    acc = {}
+    for combo, cell in (by_scenario or {}).items():
+        if not isinstance(cell, dict):
+            continue
+        try:
+            eps = int(cell.get("episodes", 0))
+            sc = float(cell.get("score", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if eps <= 0:
+            continue
+        for part in str(combo).upper().split("+"):
+            part = part.strip()
+            if not part:
+                continue
+            a = acc.setdefault(part, {"score": 0.0, "episodes": 0})
+            a["score"] += sc
+            a["episodes"] += eps
+    return {fam: (v["score"] / v["episodes"]) for fam, v in acc.items()}
 
 
 def _school_draw(rng, weights, keys):
@@ -680,10 +744,23 @@ def stalk_gaze_pay(behavior, visible, az_abs, dist):
 
 
 def pick_school_scenario(rng, progress, curriculum):
-    """(behavior, env) for this episode from the stage weight tables."""
+    """(behavior, env) for this episode from the stage weight tables.
+    Curriculum "pin_behaviors"/"pin_envs" lists restrict the draw to
+    those families (per-scenario probes); unknown names are ignored,
+    and a pin that matches nothing falls back to the full table."""
     stage = _school_stage(progress, curriculum)
-    return (_school_draw(rng, stage.get("behaviors", {}), list(SCHOOL_BEHAVIORS)),
-            _school_draw(rng, stage.get("envs", {}), list(SCHOOL_ENVS)))
+    behaviors = list(SCHOOL_BEHAVIORS)
+    envs = list(SCHOOL_ENVS)
+    pinned_b = [b for b in ((curriculum or {}).get("pin_behaviors", []) or [])
+                if str(b).lower() in behaviors]
+    if pinned_b:
+        behaviors = [b for b in behaviors if b in [str(p).lower() for p in pinned_b]]
+    pinned_e = [e for e in ((curriculum or {}).get("pin_envs", []) or [])
+                if str(e).lower() in envs]
+    if pinned_e:
+        envs = [e for e in envs if e in [str(p).lower() for p in pinned_e]]
+    return (_school_draw(rng, stage.get("behaviors", {}), behaviors),
+            _school_draw(rng, stage.get("envs", {}), envs))
 
 
 def _mover_archetype(rng, progress, curriculum, behavior="mover"):

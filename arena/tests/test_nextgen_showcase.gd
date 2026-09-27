@@ -104,8 +104,8 @@ func test_gallery_real_card() -> void:
 	var rows := str(card.get("rows", ""))
 	_check(rows.contains("Titles 1") and rows.contains("Matches 4 (W3 L1)"),
 		"fight record stats present")
-	_check(rows.contains("Episodes 150") and rows.contains("Score 412.3"),
-		"schooling stats present")
+	_check(rows.contains("Episodes 150") and rows.contains("Avg"),
+		"schooling stats lead with per-episode average")
 	_check(rows.contains("genome gf66baac62c") and rows.contains("3 rules"),
 		"wiring makeup present")
 	_check(rows.contains("evasion 0.46") and rows.contains("lr 0.01"),

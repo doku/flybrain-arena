@@ -224,6 +224,20 @@ def cmd_score(a):
     seed = int(float(getattr(a, "seed", 7) or 7))
     prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
         if getattr(a, "progress", "") else None
+    curriculum = {}
+    pins = str(getattr(a, "pin_behaviors", "") or "")
+    if pins.strip():
+        curriculum["pin_behaviors"] = [p.strip() for p in pins.split(",")]
+    pins = str(getattr(a, "pin_envs", "") or "")
+    if pins.strip():
+        curriculum["pin_envs"] = [p.strip() for p in pins.split(",")]
+    from sensory_motor import BLEND_DEFAULTS
+    blends = {}
+    for _bk, _bd in BLEND_DEFAULTS.items():
+        try:
+            blends[_bk] = max(0.0, min(1.0, float(gp.get(_bk, _bd))))
+        except (TypeError, ValueError):
+            blends[_bk] = _bd
     try:
         _save, _w, summary = run_training(
             num_episodes=eps, variant="custom", seed=seed,
@@ -231,8 +245,8 @@ def cmd_score(a):
             experiment=gp.get("experiment"), mapping=gp.get("mapping"),
             yaw_bias=gp.get("yaw_bias"), genome=gp.get("genome"),
             legacy=("mapping" not in gp), init_weights=weights,
-            curriculum={}, return_brain=True, eval_only=True,
-            progress_cb=prog)
+            curriculum=curriculum, return_brain=True, eval_only=True,
+            blends=blends, progress_cb=prog)
     except Exception as e:
         return err(str(e))
     if getattr(a, "progress", ""):
@@ -253,7 +267,9 @@ def cmd_score(a):
             _np.asarray(weights, dtype=_np.float32)))
     except Exception:
         same_weights = False
-    stamp_train_score(cur_rec, {"score": gained})
+    stamp_train_score(cur_rec, {"score": gained,
+                                "by_scenario": summary.get("by_scenario",
+                                                           {})})
     tr = cur_rec.setdefault("training", {})
     tr["episodes"] = int(tr.get("episodes", 0)) + eps
     tr["avg_score"] = (float(tr.get("score", 0.0)) / max(tr["episodes"], 1))
@@ -266,6 +282,80 @@ def cmd_score(a):
         return err(str(e))
     return out({"ok": True, "eval_score": gained,
                 "summary": summary}, getattr(a, "result_file", None))
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = (sum((x - mx) ** 2 for x in xs)
+           * sum((y - my) ** 2 for y in ys)) ** 0.5
+    return num / den if den > 0.0 else 0.0
+
+
+def score_correlation_rows(records, min_battles=5, min_eps=4):
+    """Pure audit math: per-scenario-family avg score vs ELO plus
+    suggested multipliers (1 + r, clamped [0.2, 2.0]). Returns
+    (rows, overall_r, n_brains)."""
+    import brain_package as vault
+    brains = [rec for rec in records
+              if int((rec.get("record", {}) or {}).get("battles", 0))
+              >= min_battles]
+    fams = {}
+    for rec in brains:
+        table = ((rec.get("training", {}) or {}).get("scenario_scores",
+                                                      {}) or {})
+        for fam, cell in table.items():
+            if not isinstance(cell, dict):
+                continue
+            try:
+                eps = int(cell.get("episodes", 0))
+                sc = float(cell.get("score", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if eps >= min_eps:
+                fams.setdefault(fam, []).append(
+                    (float((rec.get("record", {}) or {}).get(
+                        "elo", vault.ELO_DEFAULT)), sc / eps))
+    rows = []
+    for fam in sorted(fams):
+        pairs = fams[fam]
+        r = _pearson([e for e, _s in pairs], [s for _e, s in pairs])
+        mult = round(max(0.2, min(2.0, 1.0 + r)), 2)
+        rows.append({"family": fam, "n": len(pairs),
+                     "pearson_vs_elo": round(r, 3),
+                     "suggested_mult": mult})
+    overall = _pearson(
+        [float((b.get("record", {}) or {}).get("elo", vault.ELO_DEFAULT))
+         for b in brains],
+        [float((b.get("training", {}) or {}).get("avg_score", 0.0))
+         for b in brains])
+    return rows, overall, len(brains)
+
+
+def cmd_score_correlations(a):
+    """Records-only audit: per-scenario-family avg score vs ELO across
+    the vault (battle-tested brains only), plus suggested scenario
+    multipliers (1 + r, clamped to [0.2, 2.0]). No probes run."""
+    import brain_package as vault
+    min_battles = int(getattr(a, "min_battles", 5) or 0)
+    min_eps = int(getattr(a, "min_episodes", 4) or 0)
+    rows, overall, n = score_correlation_rows(
+        vault.scan_vault(silent=True), min_battles, min_eps)
+    text = "score-correlations (min %d battles, min %d eps/family):\n" % (
+        min_battles, min_eps)
+    for row in rows:
+        text += ("  %(family)-8s n=%(n)3d r=%(pearson_vs_elo)+.3f "
+                 "mult=%(suggested_mult).2f\n") % row
+    text += "overall avg_score vs elo r=%+.3f over %d brains" % (
+        overall, n)
+    print(text, flush=True)
+    return out({"ok": True, "rows": rows, "overall_r": round(overall, 3),
+                "n_brains": n},
+               getattr(a, "result_file", None))
 
 
 def cmd_delete(a):
@@ -472,9 +562,19 @@ def main():
     q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")
     q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
     q = sub.add_parser("delete"); q.add_argument("--id", required=True)
+    q = sub.add_parser("score-correlations")
+    q.add_argument("--min-battles", type=int, default=5)
+    q.add_argument("--min-episodes", type=int, default=4)
+    q.add_argument("--result-file", default="")
     q = sub.add_parser("score"); q.add_argument("--id", required=True)
     q.add_argument("--episodes", type=int, default=6)
     q.add_argument("--seed", default=7)
+    q.add_argument("--pin-behaviors", default="",
+                   help="comma list pinning school behaviors "
+                   "(camp,mover,duel,dodge,stalk) for per-scenario probes")
+    q.add_argument("--pin-envs", default="",
+                   help="comma list pinning school envs "
+                   "(open,slalom,forest) for per-scenario probes")
     q.add_argument("--progress", default="")
     q.add_argument("--result-file", default="")
     q = sub.add_parser("rename"); q.add_argument("--id", required=True)
@@ -517,6 +617,7 @@ def main():
     a = p.parse_args()
     fn = {"list": cmd_list, "info": cmd_info, "generate": cmd_generate,
            "train": cmd_train, "delete": cmd_delete, "score": cmd_score,
+           "score-correlations": cmd_score_correlations,
            "rename": cmd_rename,
            "export": cmd_export, "import": cmd_import, "archive": cmd_archive,
            "restore": cmd_restore, "archive-list": cmd_archive_list,
