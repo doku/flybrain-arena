@@ -1432,8 +1432,13 @@ func _on_start_evolution() -> void:
 	if ids.size() != size:
 		bracket_status.text = "Evolution needs a full %d-brain roster (picked %d) - Ctrl+click to fill it." % [size, ids.size()]
 		return
-	# Evo always runs the losers bracket: bottom-two elimination must
-	# come through combat, never the ranking fallback.
+	# Size 16 runs group-stage events (4 round-robin groups + final);
+	# smaller sizes keep the single-elim + losers loop, where the
+	# bottom-two elimination must come through combat, never the
+	# ranking fallback.
+	if size == 16:
+		_start_event_evolution(ids, bestof)
+		return
 	var res: Dictionary = TournamentDirector.build_bracket(ids, size, bestof, tourney_lr.value, tourney_round_time.value, false, [], tourney_random.button_pressed, true)
 	if not res.get("ok", false):
 		bracket_status.text = "Cannot start: %s" % str(res.get("error", "?"))
@@ -1444,6 +1449,45 @@ func _on_start_evolution() -> void:
 			and evo_mutate_traits.button_pressed else 0}
 	TournamentDirector.save_state()
 	bracket_status.text = "EVOLUTION gen 1 ready (%s)." % str(res.get("tournament_id", ""))
+	_render_bracket()
+	await get_tree().create_timer(0.5).timeout
+	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
+
+
+func _start_event_evolution(ids: Array, bestof: int) -> void:
+	# Group-stage evolution: snake-draft event manifest, group A file,
+	# then the arena chains A-D + final with queue intermissions.
+	var settings := {"best_of": bestof, "lr_scale": tourney_lr.value,
+		"round_time": tourney_round_time.value, "random_draw": false,
+		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
+			and evo_mutate_traits.button_pressed else 0,
+		"episodes": 50, "min_matches": 3}
+	var beg: Dictionary = TournamentDirector.event_begin(ids, settings, 1)
+	if not bool(beg.get("ok", false)):
+		bracket_status.text = "Cannot start: %s" % str(beg.get("error", "?"))
+		return
+	var eid := str(beg.get("event_id", ""))
+	var by_id := {}
+	for b in TournamentDirector.list_brains():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var dicts: Array = []
+	for pid in (((beg.get("groups", {}) as Dictionary).get("A", {}) as Dictionary).get("players", []) as Array):
+		if not by_id.has(str(pid)):
+			bracket_status.text = "Cannot start: %s missing from vault" % str(pid)
+			return
+		dicts.append(by_id[str(pid)])
+	var gres: Dictionary = TournamentDirector.build_group_bracket(dicts, "A", eid,
+		bestof, tourney_lr.value, tourney_round_time.value)
+	if not bool(gres.get("ok", false)):
+		bracket_status.text = "Cannot start: %s" % str(gres.get("error", "?"))
+		return
+	TournamentDirector.tourney["evo"] = {"active": true, "generation": 1,
+		"episodes": 50,
+		"mutate_traits": int(settings.get("mutate_traits", 1)),
+		"pending": [], "done": {}}
+	TournamentDirector.save_state()
+	TournamentDirector.event_set_phase(eid, "groups_A")
+	bracket_status.text = "EVENT %s gen 1 ready - GROUP A (%s)." % [eid, str(gres.get("tournament_id", ""))]
 	_render_bracket()
 	await get_tree().create_timer(0.5).timeout
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
@@ -1480,14 +1524,15 @@ func _on_resume() -> void:
 	if TournamentDirector.tournament_active():
 		get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
 		return
-	# File resume: latest running state under tournaments/.
+	# File resume: latest running state under tournaments/ (event
+	# manifests E*.json are chain ledgers, never brackets - skip them).
 	var dir := DirAccess.open(TournamentDirector.tournament_dir)
 	if dir == null:
 		return
 	var latest := ""
 	var latest_mtime := 0
 	for f in dir.get_files():
-		if f.ends_with(".json"):
+		if f.ends_with(".json") and not f.begins_with("E"):
 			var p: String = TournamentDirector.tournament_dir.path_join(f)
 			if FileAccess.get_modified_time(p) > latest_mtime:
 				latest_mtime = FileAccess.get_modified_time(p)

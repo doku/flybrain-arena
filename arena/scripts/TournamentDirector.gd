@@ -741,7 +741,7 @@ func _battle_rate(r: Dictionary) -> float:
 	return float(r.get("wins", 0)) / max(d, 1) if d > 0 else WIN_RATE_FALLBACK
 
 
-func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false, consolation: bool = false) -> Dictionary:
+func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false, consolation: bool = false, fixed_order: bool = false) -> Dictionary:
 	var all_brains: Array = list_brains() if brains_override.is_empty() else brains_override
 	var by_id := {}
 	for b in all_brains:
@@ -757,7 +757,7 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	# No wiring gate: the server runs each fighter on its native wiring
 	# (base or experimental overlay), so any vault brains may share a
 	# bracket. Vault files keep their native arity end-to-end.
-	var seeded := seed_first_round(players, size, random_draw)
+	var seeded := seed_first_round(players, size, random_draw, fixed_order)
 	players = seeded["players"]
 	var matches: Array = seeded["matches"]
 	var seeding := str(seeded["seeding"])
@@ -794,7 +794,7 @@ func _next_tournament_id() -> String:
 	return tid
 
 
-func seed_first_round(player_dicts: Array, size: int, random_draw: bool) -> Dictionary:
+func seed_first_round(player_dicts: Array, size: int, random_draw: bool, fixed_order: bool = false) -> Dictionary:
 	# Canonical single-elim seeding shared by build_bracket (vault brains)
 	# and preview_bracket (synthetic offspring welcome): place the
 	# strongest first into the standard power-of-two seed order, so the
@@ -802,9 +802,17 @@ func seed_first_round(player_dicts: Array, size: int, random_draw: bool) -> Dict
 	# holds exactly size/2 slots (real matches, BYE cards for resting
 	# seeds, VACANT cards for empty subtrees when under half full).
 	# Random draw shuffles instead (byes fall luck-of-the-draw).
+	# Fixed order (event finals) pairs consecutive entries untouched.
 	# Returns {players, matches, seeding}. Player dicts need id/name
 	# (record optional - missing ELO sorts as 1200).
 	var players: Array = player_dicts.duplicate()
+	if fixed_order:
+		var fmatches: Array = []
+		var i := 0
+		while i + 1 < players.size():
+			fmatches.append(_new_match(players[i], players[i + 1]))
+			i += 2
+		return {"players": players, "matches": fmatches, "seeding": "fixed"}
 	var seeding := "strength"
 	if random_draw:
 		seeding = "random"
@@ -865,6 +873,7 @@ func _new_match(a, b) -> Dictionary:
 		"bye": (b == null and a != null), "vacant": (a == null and b == null),
 		"wins_a": 0, "wins_b": 0, "draws": 0,
 		"winner_id": "", "battles": 0,
+		"ko_a": 0, "ko_b": 0,
 	}
 
 
@@ -1009,16 +1018,21 @@ func get_load_params() -> Dictionary:
 	}
 
 
-func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}) -> Dictionary:
+func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}, kills_a: int = -1, kills_b: int = -1) -> Dictionary:
 	# winner: "alpha" | "beta" | "draw". Per-battle flight telemetry is
 	# banked on the match ("flights" list) so flight-style regressions
 	# have recorded evidence; the pool-rate stream rides along when the
 	# menu record toggle is on (gated arena-side; ~50 KB per battle).
-	# Returns sequencing action for arena.
+	# kills_a/b bank takedowns per side for group standings (negative =
+	# unreported, e.g. legacy callers). Returns sequencing action.
 	var m := current_match()
 	if m.is_empty():
 		return {"action": "idle"}
 	m["battles"] = int(m.get("battles", 0)) + 1
+	if kills_a >= 0:
+		m["ko_a"] = int(m.get("ko_a", 0)) + kills_a
+	if kills_b >= 0:
+		m["ko_b"] = int(m.get("ko_b", 0)) + kills_b
 	if not flight_a.is_empty() or not flight_b.is_empty():
 		if not m.has("flights"):
 			m["flights"] = []
@@ -1084,6 +1098,21 @@ func advance_after_match() -> Dictionary:
 		if int(tourney["current_match"]) < r.size():
 			save_state()
 			return {"action": "next_match"}
+	# Group format: the round-robin schedule is precomputed, so rounds
+	# just step forward (no winner-progression rebuild). Exhausting the
+	# schedule completes the group; standings decide advancers.
+	if str(tourney.get("format", "bracket")) == "groups":
+		tourney["current_round"] = int(tourney["current_round"]) + 1
+		tourney["current_match"] = 0
+		if int(tourney["current_round"]) >= (tourney["rounds"] as Array).size():
+			tourney["status"] = "complete"
+			save_state()
+			return {"action": "group_complete",
+				"group": str(tourney.get("group", "?")),
+				"event_id": str(tourney.get("event_id", "")),
+				"standings": group_standings()}
+		save_state()
+		return {"action": "next_match"}
 	# Round complete: build next from winners - or from losers inside
 	# the consolation bracket (loser advances, converging down to last
 	# place + second-last for the archives). Empty slots = vacant subtrees.
@@ -1378,3 +1407,338 @@ func load_state_file(path: String) -> bool:
 func quit_to_menu() -> void:
 	arena = null
 	get_tree().change_scene_to_file("res://scenes/MainMenu.tscn")
+
+
+# ── Group-stage events (evolution size-16) ──────────────────────────
+# One event = 4 round-robin group files (A-D) + 1 single-elim final,
+# chained by an event manifest (tournaments/E<id>.json). Bracket files
+# stay ordinary tournaments, so the battle loop, banking, review and
+# resume paths are untouched; only scheduling (fixed RR order, no
+# winner-progression rebuild) and advancement (standings) differ.
+
+
+func event_path(event_id: String) -> String:
+	return tournament_dir.path_join(str(event_id) + ".json")
+
+
+func event_load(event_id: String) -> Dictionary:
+	var f := FileAccess.open(event_path(event_id), FileAccess.READ)
+	if f == null:
+		return {}
+	var parsed = JSON.parse_string(f.get_as_text())
+	f.close()
+	return parsed if parsed is Dictionary else {}
+
+
+func event_save(ev: Dictionary) -> bool:
+	var f := FileAccess.open(event_path(str(ev.get("id", ""))), FileAccess.WRITE)
+	if f == null:
+		return false
+	f.store_string(JSON.stringify(ev, "\t"))
+	f.close()
+	return true
+
+
+func _snake_sort(player_dicts: Array) -> Array:
+	# ELO desc, deterministic (strength, then name): the snake draft
+	# input, so groups balance star power evenly.
+	var out: Array = player_dicts.duplicate()
+	out.sort_custom(func(a, b):
+		var sa := _strength(a)
+		var sb := _strength(b)
+		if sa[0] != sb[0]:
+			return sa[0] > sb[0]
+		if sa[1] != sb[1]:
+			return sa[1] > sb[1]
+		if sa[2] != sb[2]:
+			return sa[2] > sb[2]
+		return str(sa[3]) < str(sb[3]))
+	return out
+
+
+func event_begin(player_ids: Array, settings: Dictionary, generation: int, brains_override: Array = []) -> Dictionary:
+	# Snake-drafts exactly 16 brains into groups A-D (ranks
+	# 1,8,9,16 / 2,7,10,15 / 3,6,11,14 / 4,5,12,13) and writes the
+	# event manifest. Returns {ok, event_id, groups}.
+	var all_brains: Array = brains_override if not brains_override.is_empty() else list_brains()
+	var by_id := {}
+	for b in all_brains:
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var players: Array = []
+	for pid in player_ids:
+		if by_id.has(str(pid)):
+			players.append(by_id[str(pid)])
+	if players.size() != 16:
+		return {"ok": false, "error": "group events need exactly 16 brains"}
+	players = _snake_sort(players)
+	var snake := [[0, 7, 8, 15], [1, 6, 9, 14], [2, 5, 10, 13], [3, 4, 11, 12]]
+	var letters := ["A", "B", "C", "D"]
+	var eid := "E" + _next_tournament_id().trim_prefix("T")
+	var en := 0
+	while FileAccess.file_exists(event_path(eid)):
+		en += 1
+		eid = "E" + _next_tournament_id().trim_prefix("T") + "-%d" % en
+	var groups := {}
+	for gi in range(4):
+		var gp: Array = []
+		for idx in snake[gi]:
+			gp.append(str(((players[idx]) as Dictionary).get("id", "")))
+		groups[letters[gi]] = {"players": gp, "bracket_id": "",
+			"standings": [], "done": false}
+	var ev := {"id": eid, "status": "running", "generation": generation,
+		"settings": settings, "groups": groups,
+		"group_order": letters, "final_id": "", "champion_id": "",
+		"pool": [], "phase": "groups_A",
+		"created": Time.get_datetime_string_from_system()}
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot write event file"}
+	return {"ok": true, "event_id": eid, "groups": groups}
+
+
+func build_group_bracket(group_dicts: Array, group_letter: String, event_id: String, best_of: int, lr_scale: float, round_time: float = 40.0) -> Dictionary:
+	# One 4-fighter round-robin file: canonical circle-method schedule
+	# (every pairing meets exactly once: 03/12, 02/31, 01/23).
+	if group_dicts.size() != 4:
+		return {"ok": false, "error": "groups need 4 brains"}
+	var sched := [[0, 3], [1, 2], [0, 2], [3, 1], [0, 1], [2, 3]]
+	var rounds: Array = []
+	for r in range(3):
+		var row: Array = []
+		for k in range(2):
+			var pair: Array = sched[r * 2 + k]
+			row.append(_new_match(group_dicts[pair[0]], group_dicts[pair[1]]))
+		rounds.append(row)
+	var tid := _next_tournament_id()
+	tourney = {"id": tid, "status": "running", "format": "groups",
+		"group": group_letter, "event_id": event_id, "phase": "groups_" + group_letter,
+		"size": 4, "best_of": best_of, "wins_needed": best_of / 2 + 1,
+		"lr_scale": lr_scale, "round_time": round_time, "quick": false,
+		"seeding": "snake", "random_draw": false, "consolation": false,
+		"losers_start_round": -1, "last_place_id": "",
+		"created": Time.get_datetime_string_from_system(),
+		"players": group_dicts, "byes": [],
+		"rounds": rounds, "current_round": 0, "current_match": 0,
+		"champion_id": ""}
+	sudden_death_armed = false
+	save_state()
+	return {"ok": true, "tournament_id": tid}
+
+
+func group_standings() -> Array:
+	# [{id, name, wins, kos, matches, elo}] sorted wins desc, KO scored
+	# desc, snapshot ELO desc. Undecided matches don't count.
+	var table := {}
+	for p in tourney.get("players", []):
+		var pd := p as Dictionary
+		var pid := str(pd.get("id", ""))
+		if pid != "":
+			table[pid] = {"id": pid, "name": str(pd.get("name", "?")),
+				"wins": 0, "kos": 0, "matches": 0,
+				"elo": float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))}
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			var m := mm as Dictionary
+			var wid := str(m.get("winner_id", ""))
+			if wid == "":
+				continue
+			for slot in ["a", "b"]:
+				var sid := str(m.get(slot + "_id", ""))
+				if table.has(sid):
+					var row: Dictionary = table[sid]
+					row["matches"] = int(row.get("matches", 0)) + 1
+					row["kos"] = int(row.get("kos", 0)) + int(m.get("ko_" + slot, 0))
+			if table.has(wid):
+				var wrow: Dictionary = table[wid]
+				wrow["wins"] = int(wrow.get("wins", 0)) + 1
+	var out: Array = table.values()
+	out.sort_custom(func(x, y):
+		if int(x["wins"]) != int(y["wins"]):
+			return int(x["wins"]) > int(y["wins"])
+		if int(x["kos"]) != int(y["kos"]):
+			return int(x["kos"]) > int(y["kos"])
+		return float(x["elo"]) > float(y["elo"]))
+	return out
+
+
+func event_record_group(event_id: String, group_letter: String) -> Dictionary:
+	# Call with the completed group file loaded: banks its standings
+	# into the manifest and stamps the bracket id.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var groups: Dictionary = ev.get("groups", {})
+	if not groups.has(group_letter):
+		return {"ok": false, "error": "no such group"}
+	var st := group_standings()
+	var g: Dictionary = groups[group_letter]
+	g["standings"] = st
+	g["done"] = true
+	g["bracket_id"] = str(tourney.get("id", ""))
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "standings": st}
+
+
+func build_final_bracket(advancer_ids: Array, event_id: String, best_of: int, lr_scale: float, round_time: float = 40.0, brains_override: Array = []) -> Dictionary:
+	# 8 advancers in fixed QF order (A1vB2, C1vD2, B1vA2, D1vC2):
+	# consecutive pairing, no re-seeding. Standard single elim, no
+	# consolation (elimination runs on the ELO rule instead).
+	if advancer_ids.size() != 8:
+		return {"ok": false, "error": "finals need 8 advancers"}
+	var res := build_bracket(advancer_ids, 8, best_of, lr_scale,
+		round_time, false, brains_override, false, false, true)
+	if not bool(res.get("ok", false)):
+		return res
+	tourney["event_id"] = event_id
+	tourney["phase"] = "final"
+	save_state()
+	return res
+
+
+func event_advancers(event_id: String) -> Dictionary:
+	# Top 2 per group in QF order from recorded standings.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var order: Array = []
+	for g in ["A", "C", "B", "D"]:
+		var st: Array = ((ev.get("groups", {}) as Dictionary).get(g, {}) as Dictionary).get("standings", [])
+		if st.size() < 2:
+			return {"ok": false, "error": "group %s unfinished" % g}
+		order.append(str((st[0] as Dictionary).get("id", "")))
+		order.append(str((st[1] as Dictionary).get("id", "")))
+	# order is A1,A2,C1,C2,B1,B2,D1,D2 -> interleave to
+	# A1vB2, C1vD2, B1vA2, D1vC2.
+	var qf := [order[0], order[5], order[2], order[7],
+		order[4], order[1], order[6], order[3]]
+	return {"ok": true, "advancers": qf}
+
+
+func event_eliminate_candidates(event_id: String, min_matches: int = 3, live_override: Dictionary = {}) -> Dictionary:
+	# Worst-first elimination order: played >= min_matches across the
+	# event files, lowest live ELO first. Pure (no archiving) so the
+	# rule is unit-testable; event_eliminate archives the bottom two.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var bids: Array = []
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		if str(gd.get("bracket_id", "")) != "":
+			bids.append(str(gd.get("bracket_id", "")))
+	if str(ev.get("final_id", "")) != "":
+		bids.append(str(ev.get("final_id", "")))
+	var played := {}
+	for bid in bids:
+		var f := FileAccess.open(tournament_dir.path_join(bid + ".json"), FileAccess.READ)
+		if f == null:
+			continue
+		var t = JSON.parse_string(f.get_as_text())
+		f.close()
+		if not (t is Dictionary):
+			continue
+		for rnd in ((t as Dictionary).get("rounds", []) as Array):
+			for mm in (rnd as Array):
+				var m := mm as Dictionary
+				if str(m.get("winner_id", "")) == "":
+					continue
+				for slot in ["a", "b"]:
+					var sid := str(m.get(slot + "_id", ""))
+					if sid != "":
+						played[sid] = int(played.get(sid, 0)) + 1
+	var live := live_override
+	if live.is_empty():
+		for b in list_brains():
+			var bd := b as Dictionary
+			live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
+	var cands: Array = []
+	for pid in played.keys():
+		if int(played[pid]) >= min_matches and live.has(pid):
+			cands.append(pid)
+	cands.sort_custom(func(x, y): return float(live[x]) < float(live[y]))
+	return {"ok": true, "candidates": cands}
+
+
+func event_eliminate(event_id: String, min_matches: int = 3) -> Dictionary:
+	# Archives the bottom two candidates with the reason stamped.
+	var cands := event_eliminate_candidates(event_id, min_matches)
+	if not bool(cands.get("ok", false)):
+		return cands
+	var order: Array = cands.get("candidates", [])
+	if order.size() < 2:
+		return {"ok": false, "error": "fewer than 2 eligible brains"}
+	var live := {}
+	for b in list_brains():
+		var bd := b as Dictionary
+		live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
+	var out: Array = [order[0], order[1]]
+	for pid in out:
+		var ar := evo_archive(pid, "event %s elimination (ELO %.0f)" % [event_id, float(live.get(pid, 1200.0))])
+		if not bool(ar.get("ok", false)):
+			return {"ok": false, "error": str(ar.get("error", "?"))}
+	return {"ok": true, "eliminated": out}
+
+
+func _event_live_elo(live_override: Dictionary = {}) -> Dictionary:
+	var live := live_override
+	if live.is_empty():
+		for b in list_brains():
+			var bd := b as Dictionary
+			live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
+	return live
+
+
+func event_pool_add(event_id: String, ids: Array, live_override: Dictionary = {}) -> Dictionary:
+	# Bench bred offspring (cap 4, lowest live ELO trimmed first).
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var pool: Array = ev.get("pool", [])
+	for pid in ids:
+		var s := str(pid)
+		if s != "" and not (s in pool):
+			pool.append(s)
+	while pool.size() > 4:
+		var live := _event_live_elo(live_override)
+		pool.sort_custom(func(x, y): return float(live.get(x, 0.0)) < float(live.get(y, 0.0)))
+		pool.remove_at(0)
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "pool": pool}
+
+
+func event_draw_pool(event_id: String, n: int, live_override: Dictionary = {}) -> Dictionary:
+	# Top-n live ELO from the bench; drawn ids leave the pool.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var pool: Array = ev.get("pool", [])
+	var live := _event_live_elo(live_override)
+	pool = pool.filter(func(pid): return live.has(str(pid)))
+	pool.sort_custom(func(x, y): return float(live[x]) > float(live[y]))
+	if pool.size() < n:
+		return {"ok": false, "error": "pool short (%d/%d)" % [pool.size(), n]}
+	var drawn: Array = pool.slice(0, n)
+	ev["pool"] = pool.slice(n)
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}
+
+
+func event_set_phase(event_id: String, phase: String) -> void:
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return
+	ev["phase"] = phase
+	event_save(ev)
+
+
+func event_finish(event_id: String, champion_id: String) -> void:
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return
+	ev["status"] = "complete"
+	ev["phase"] = "done"
+	ev["champion_id"] = champion_id
+	event_save(ev)

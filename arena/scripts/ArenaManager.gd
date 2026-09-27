@@ -218,6 +218,16 @@ var nextgen_champ_name := ""
 var nextgen_clone_name := ""
 var bracket_close_btn: Button
 var bracket_close_row: HBoxContainer
+# Group-stage event widgets (evo size-16): standings table + the
+# intermission countdown row, sharing the bracket overlay above.
+var standings_label: Label
+var intermission_row: HBoxContainer
+var intermission_label: Label
+var _event_skip := false
+const EVENT_INTERMISSION_SECS := 60.0
+const EVENT_MIN_MATCHES := 3
+const EVENT_POOL_TARGET := 2
+const EVENT_POOL_CAP := 4
 # In-flight awaited breed: _evo_await_queued DETACHES its spec from
 # pending, so every progress readout (strip, gallery, status line)
 # must consult this fallback or flatline for the whole (long) await.
@@ -468,9 +478,14 @@ func _enter_tournament_mode() -> void:
 	_build_menu_bar(true)
 	# Pipeline kick-off: queue a wild breed for the next generation
 	# immediately, so it trains in the background while gen 1 plays.
+	# Events stock the pool bench instead (clones need the champion,
+	# so only wilds pipeline mid-event).
 	if _evo_active():
-		var evo: Dictionary = director.tourney.get("evo", {})
-		_evo_queue_wild(int(evo.get("generation", 1)) + 1)
+		if _event_active():
+			_event_maintain_pool()
+		else:
+			var evo: Dictionary = director.tourney.get("evo", {})
+			_evo_queue_wild(int(evo.get("generation", 1)) + 1)
 	_request_current_battle_load()
 
 
@@ -599,6 +614,30 @@ func _build_bracket_overlay() -> void:
 	bracket_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	bracket_title.add_theme_font_size_override("font_size", 18)
 	vb.add_child(bracket_title)
+	# Group standings (event group brackets only, hidden otherwise).
+	standings_label = Label.new()
+	standings_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	standings_label.add_theme_font_size_override("font_size", 14)
+	standings_label.visible = false
+	vb.add_child(standings_label)
+	# Intermission row (event transitions only): countdown + skip/stop.
+	intermission_row = HBoxContainer.new()
+	intermission_row.add_theme_constant_override("separation", 16)
+	intermission_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	intermission_row.visible = false
+	vb.add_child(intermission_row)
+	intermission_label = Label.new()
+	intermission_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	intermission_label.add_theme_font_size_override("font_size", 16)
+	intermission_row.add_child(intermission_label)
+	var skip_btn := Button.new()
+	skip_btn.text = "SKIP WAIT"
+	skip_btn.pressed.connect(_on_intermission_skip)
+	intermission_row.add_child(skip_btn)
+	var stop_btn := Button.new()
+	stop_btn.text = "STOP EVENT"
+	stop_btn.pressed.connect(_on_intermission_stop)
+	intermission_row.add_child(stop_btn)
 	# Training strip FIRST (next-gen waiting room only): progress must
 	# stay visible even when a tall bracket fills the scroll area below.
 	strip_box = HBoxContainer.new()
@@ -678,6 +717,7 @@ func _show_arena_bracket(title_text: String) -> void:
 	arena_bracket.render_bracket(director.tourney,
 		int(director.tourney.get("current_round", 0)),
 		int(director.tourney.get("current_match", 0)))
+	_refresh_standings()
 	# The renderer picks compact metrics for big brackets so most fit
 	# outright; whatever still overflows keeps native scrolling here.
 	if is_instance_valid(bracket_scroll):
@@ -2693,7 +2733,7 @@ func _handle_draw() -> void:
 		"TIME UP - NOBODY BLED - REMATCH",
 		"REMATCH")
 
-# ?�?� Dynamic tree fade ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�?�?Dynamic tree fade ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
 # Every combat-area tree gets its own StandardMaterial3D (so alpha can
 # be set per-tree). Each frame the camera->fly ray is tested against
 # each tree's XZ position; occluding trees go translucent instantly,
@@ -2746,6 +2786,9 @@ func _evo_watcher_tick(delta: float) -> void:
 			evo_status_line.visible = false
 		return
 	_evo_adopt_finished()
+	if _event_active():
+		_event_drain_done_to_pool()
+		_event_maintain_pool()
 	var director := _director()
 	if director != null and not evo_waiting and director.pending_async.is_empty():
 		for spec in _evo_pending():
@@ -2894,7 +2937,7 @@ func _process(delta: float) -> void:
 		for cm in entry["canopy_mats"]:
 			(cm as StandardMaterial3D).albedo_color.a = lerpf((cm as StandardMaterial3D).albedo_color.a, target, k)
 
-# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
 
 func _update_ctrl_label() -> void:
 	if not is_instance_valid(ctrl_label):
@@ -3180,7 +3223,9 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		var draw_adv: Dictionary = director.on_battle_result("draw",
 			_flight_summary(flight_alpha, fly_alpha),
 			_flight_summary(flight_beta, fly_beta),
-			_bv_stream_packet())
+			_bv_stream_packet(),
+			int((stats_alpha as Dictionary).get("kills", 0)),
+			int((stats_beta as Dictionary).get("kills", 0)))
 		# Third draw resolves the match outright (higher ELO advances)
 		# instead of replaying forever.
 		if str(draw_adv.get("action", "")) == "match_over":
@@ -3194,7 +3239,9 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	var res: Dictionary = director.on_battle_result(battle_winner,
 		_flight_summary(flight_alpha, fly_alpha),
 		_flight_summary(flight_beta, fly_beta),
-		_bv_stream_packet())
+		_bv_stream_packet(),
+		int((stats_alpha as Dictionary).get("kills", 0)),
+		int((stats_beta as Dictionary).get("kills", 0)))
 	var action := str(res.get("action", "next_battle"))
 	print("[Arena] Battle result: winner=", battle_winner, " action=", action,
 		" verdict=", str(_last_verdict.get("line", "")))
@@ -3248,6 +3295,9 @@ func _handle_advance_result(res: Dictionary) -> void:
 	if director == null:
 		return
 	var action := str(res.get("action", "next_match"))
+	if action == "group_complete":
+		await _event_group_done(res)
+		return
 	if action == "tournament_end":
 		var champ_id := str(res.get("champion_id", ""))
 		if director.is_quick():
@@ -3266,7 +3316,10 @@ func _handle_advance_result(res: Dictionary) -> void:
 		# Evolution mode: skip the review-wait and breed the next
 		# generation instead (champion display happens inside).
 		if _evo_active():
-			_run_evo_generation()
+			if _event_active():
+				await _run_event_handoff()
+			else:
+				_run_evo_generation()
 			return
 		var last_line := ""
 		var last_id := str(res.get("last_place_id", ""))
@@ -3323,6 +3376,406 @@ func _evo_active() -> bool:
 	if director == null:
 		return false
 	return bool(director.tourney.get("evo", {}).get("active", false))
+
+
+# ?�?� Group-stage events (evolution size-16) ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# One event = group files A-D + final, chained by the event manifest.
+# Brackets are fixed at event start; bred offspring stock the manifest
+# pool bench and never enter a live bracket directly.
+
+
+func _event_id() -> String:
+	var director := _director()
+	if director == null:
+		return ""
+	return str(director.tourney.get("event_id", ""))
+
+
+func _event_active() -> bool:
+	return _evo_active() and _event_id() != ""
+
+
+func _event_manifest() -> Dictionary:
+	var director := _director()
+	if director == null:
+		return {}
+	return director.event_load(_event_id())
+
+
+func _event_evo_carry() -> Dictionary:
+	# Pipeline continuity across brackets of one event: pending specs
+	# keep training (absolute result paths), done entries keep their
+	# dedup. Fresh dicts only at event boundaries (see handoff).
+	var director := _director()
+	if director == null:
+		return {"active": true, "generation": 1, "episodes": EVO_EPISODES,
+			"mutate_traits": 1, "pending": [], "done": {}}
+	return (director.tourney.get("evo", {}) as Dictionary).duplicate(true)
+
+
+func _on_intermission_skip() -> void:
+	_event_skip = true
+
+
+func _on_intermission_stop() -> void:
+	_on_evo_stop()
+
+
+func _standings_text() -> String:
+	var director := _director()
+	if director == null:
+		return ""
+	var group := str(director.tourney.get("group", "?"))
+	var lines := PackedStringArray()
+	lines.append("GROUP %s — top 2 advance" % group)
+	var i := 0
+	for row in director.group_standings():
+		i += 1
+		var mark := "★" if i <= 2 else " "
+		lines.append("%s%d. %s  %dW-%d  KO%d" % [mark, i,
+			str((row as Dictionary).get("name", "?")),
+			int((row as Dictionary).get("wins", 0)),
+			int((row as Dictionary).get("matches", 0)) - int((row as Dictionary).get("wins", 0)),
+			int((row as Dictionary).get("kos", 0))])
+	return "\n".join(lines)
+
+
+func _refresh_standings() -> void:
+	var director := _director()
+	if director == null or not is_instance_valid(standings_label):
+		return
+	if str(director.tourney.get("format", "bracket")) == "groups":
+		standings_label.text = _standings_text()
+		standings_label.visible = true
+	else:
+		standings_label.visible = false
+
+
+func _pool_text(ev: Dictionary) -> String:
+	var director := _director()
+	var names := PackedStringArray()
+	if director != null:
+		var by_id := {}
+		for b in director.list_brains():
+			by_id[str((b as Dictionary).get("id", ""))] = str((b as Dictionary).get("name", "?"))
+		for pid in (ev.get("pool", []) as Array):
+			names.append(str(by_id.get(str(pid), str(pid))))
+	return "POOL: " + (", ".join(names) if names.size() > 0 else "empty")
+
+
+func _event_maintain_pool() -> void:
+	# Breed-ahead: keep wilds training toward the bench while the
+	# event plays (clones need the champion, so they queue post-final).
+	if not _event_active():
+		return
+	var director := _director()
+	if director == null:
+		return
+	var ev: Dictionary = director.event_load(_event_id())
+	if ev.is_empty():
+		return
+	var evo: Dictionary = director.tourney.get("evo", {})
+	var gen := int(evo.get("generation", 1))
+	var busy := (ev.get("pool", []) as Array).size()
+	for spec in _evo_pending():
+		var sk := str((spec as Dictionary).get("kind", ""))
+		if sk == "wild" or sk == "clone":
+			busy += 1
+	for kind in (evo.get("done", {}) as Dictionary).keys():
+		if str(kind) == "wild" or str(kind) == "clone":
+			busy += 1
+	if busy < EVENT_POOL_TARGET and not _evo_has_kind("wild"):
+		_evo_queue_wild(gen + 1)
+
+
+func _event_drain_done_to_pool() -> void:
+	# Banked offspring belong on the bench, not in a bracket.
+	if not _event_active():
+		return
+	var director := _director()
+	if director == null:
+		return
+	var ids: Array = []
+	for kind in ["clone", "wild"]:
+		var bid := _evo_done_id(kind)
+		if bid != "":
+			ids.append(bid)
+	if ids.is_empty():
+		return
+	var res: Dictionary = director.event_pool_add(_event_id(), ids)
+	if bool(res.get("ok", false)):
+		print("[Arena] Event pool stocked: ", str(res.get("pool", [])))
+
+
+func _event_next_phase(ev: Dictionary) -> String:
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		if not bool(gd.get("done", false)):
+			return str(g)
+	return "final"
+
+
+func _event_build_group(ev: Dictionary, letter: String) -> bool:
+	var director := _director()
+	if director == null:
+		return false
+	var carry := _event_evo_carry()
+	var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+	var by_id := {}
+	for b in director.list_brains():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var dicts: Array = []
+	for pid in (g.get("players", []) as Array):
+		if not by_id.has(str(pid)):
+			_evo_abort("event short: %s missing from vault" % str(pid))
+			return false
+		dicts.append(by_id[str(pid)])
+	var st: Dictionary = ev.get("settings", {})
+	var res: Dictionary = director.build_group_bracket(dicts, letter,
+		str(ev.get("id", "")), int(st.get("best_of", 7)),
+		float(st.get("lr_scale", 0.5)), float(st.get("round_time", 40.0)))
+	if not bool(res.get("ok", false)):
+		_evo_abort("next group failed: " + str(res.get("error", "?")))
+		return false
+	director.tourney["evo"] = carry
+	director.save_state()
+	director.event_set_phase(str(ev.get("id", "")), "groups_" + letter)
+	return true
+
+
+func _event_build_final(ev: Dictionary) -> bool:
+	var director := _director()
+	if director == null:
+		return false
+	var eid := str(ev.get("id", ""))
+	var adv: Dictionary = director.event_advancers(eid)
+	if not bool(adv.get("ok", false)):
+		_evo_abort("finalists undecided: " + str(adv.get("error", "?")))
+		return false
+	var by_id := {}
+	for b in director.list_brains():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	for pid in (adv.get("advancers", []) as Array):
+		if not by_id.has(str(pid)):
+			_evo_abort("event short: finalist %s missing" % str(pid))
+			return false
+	var carry := _event_evo_carry()
+	var st: Dictionary = ev.get("settings", {})
+	var res: Dictionary = director.build_final_bracket(adv.get("advancers", []), eid,
+		int(st.get("best_of", 7)), float(st.get("lr_scale", 0.5)),
+		float(st.get("round_time", 40.0)))
+	if not bool(res.get("ok", false)):
+		_evo_abort("final failed: " + str(res.get("error", "?")))
+		return false
+	director.tourney["evo"] = carry
+	director.save_state()
+	var ev2: Dictionary = director.event_load(eid)
+	ev2["final_id"] = str(director.tourney.get("id", ""))
+	director.event_save(ev2)
+	director.event_set_phase(eid, "final")
+	return true
+
+
+func _event_preview_sub(upcoming: String) -> String:
+	# One glance at what's next: group card or final QF pairs + bench.
+	var director := _director()
+	if director == null:
+		return ""
+	var ev := _event_manifest()
+	var lines := PackedStringArray()
+	if upcoming == "final":
+		var adv := director.event_advancers(str(ev.get("id", "")))
+		var qf: Array = adv.get("advancers", []) if bool(adv.get("ok", false)) else []
+		var names := {}
+		for b in director.list_brains():
+			names[str((b as Dictionary).get("id", ""))] = str((b as Dictionary).get("name", "?"))
+		var i := 0
+		while i + 1 < qf.size():
+			lines.append("QF: %s v %s" % [str(names.get(str(qf[i]), "?")),
+				str(names.get(str(qf[i + 1]), "?"))])
+			i += 2
+	else:
+		var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(upcoming, {})
+		var by_id := {}
+		for b in director.list_brains():
+			var bd := b as Dictionary
+			by_id[str(bd.get("id", ""))] = "%s (%d)" % [str(bd.get("name", "?")),
+				int((bd.get("record", {}) as Dictionary).get("elo", 1200.0))]
+		for pid in (g.get("players", []) as Array):
+			lines.append(str(by_id.get(str(pid), str(pid))))
+	lines.append(_pool_text(ev))
+	return "\n".join(lines)
+
+
+func _event_intermission(title: String, sub: String) -> bool:
+	# Bracket preview + standings + 60 s countdown between event
+	# brackets. SKIP starts now; STOP aborts the event (quit to menu
+	# follows in the caller). Returns true when the next bracket may
+	# start (the file is already built, so quit/resume always lands).
+	var director := _director()
+	if director == null:
+		return false
+	_event_skip = false
+	bracket_title.text = title
+	arena_bracket.render_bracket(director.tourney, 0, 0)
+	_refresh_standings()
+	intermission_label.text = sub
+	intermission_row.visible = true
+	if is_instance_valid(bracket_close_row):
+		bracket_close_row.visible = false
+	if is_instance_valid(bracket_scroll):
+		bracket_scroll.scroll_horizontal = 0
+		bracket_scroll.scroll_vertical = 0
+	bracket_overlay.visible = true
+	var left := EVENT_INTERMISSION_SECS
+	while left > 0.0 and not _event_skip:
+		if not _event_active():
+			break
+		intermission_label.text = "%s\nNext bracket in %d s — SKIP to start now" % [sub, int(ceil(left))]
+		await get_tree().create_timer(1.0).timeout
+		left -= 1.0
+	intermission_row.visible = false
+	if is_instance_valid(bracket_close_row):
+		bracket_close_row.visible = true
+	if not _event_active():
+		return false
+	bracket_overlay.visible = false
+	return true
+
+
+func _event_group_done(res: Dictionary) -> void:
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	var group := str(res.get("group", "?"))
+	var rec: Dictionary = director.event_record_group(eid, group)
+	if not bool(rec.get("ok", false)):
+		_evo_abort("event record failed: " + str(rec.get("error", "?")))
+		return
+	_save_bracket_record(true)
+	_show_callout("GROUP %s COMPLETE" % group, Color(0.6, 0.85, 1.0),
+		"STANDINGS BANKED", "", false)
+	var ev: Dictionary = director.event_load(eid)
+	var nxt := _event_next_phase(ev)
+	if nxt == "":
+		_evo_abort("event chain broken after group " + group)
+		return
+	var built := _event_build_final(ev) if nxt == "final" else _event_build_group(ev, nxt)
+	if not built:
+		return
+	var title := "EVENT %s · %s" % [eid, "FINAL" if nxt == "final" else "GROUP " + nxt]
+	if not await _event_intermission(title, _event_preview_sub(nxt)):
+		director.quit_to_menu()
+		return
+	_request_current_battle_load()
+
+
+func _event_await_pool() -> bool:
+	# Block the handoff until the bench holds two (adoptions land via
+	# the watcher; missing kinds are awaited through the shared slot).
+	var director := _director()
+	if director == null:
+		return false
+	_event_drain_done_to_pool()
+	_show_evo_phase("STOCKING POOL", "Waiting on pool breeds...")
+	for kind in ["wild", "clone"]:
+		if not _evo_active():
+			_hide_evo_phase()
+			return false
+		_event_drain_done_to_pool()
+		var ev: Dictionary = director.event_load(_event_id())
+		if (ev.get("pool", []) as Array).size() >= EVENT_POOL_TARGET:
+			break
+		if _evo_has_kind(kind):
+			var got := await _evo_await_queued(kind)
+			_event_drain_done_to_pool()
+			if got == "" and _evo_active():
+				_hide_evo_phase()
+				_evo_abort(kind + " breeding failed - " + _evo_spawn_why())
+				return false
+	_hide_evo_phase()
+	var ev2: Dictionary = director.event_load(_event_id())
+	if (ev2.get("pool", []) as Array).size() < EVENT_POOL_TARGET:
+		_evo_abort("pool short - refusing a short-bench event")
+		return false
+	return true
+
+
+func _run_event_handoff() -> void:
+	# Final's tournament_end: the title request already went out above.
+	# Bank the record, eliminate two, stock the bench, chain next event.
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	var champ_id := str(director.tourney.get("champion_id", ""))
+	_save_bracket_record(true)
+	_show_callout("EVENT %s CHAMPION: %s" % [eid, director.champion_name()],
+		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false)
+	_event_drain_done_to_pool()
+	var elim: Dictionary = director.event_eliminate(eid, EVENT_MIN_MATCHES)
+	if not bool(elim.get("ok", false)):
+		_evo_abort("elimination failed: " + str(elim.get("error", "?")))
+		return
+	var gone: Array = elim.get("eliminated", [])
+	print("[Arena] Event %s eliminated %s" % [eid, str(gone)])
+	director.event_finish(eid, champ_id)
+	var ev: Dictionary = director.event_load(eid)
+	var gen := int(ev.get("generation", 1))
+	if not _evo_has_kind("clone"):
+		_evo_queue_clone(gen + 1, champ_id, director.champion_name(),
+			_evo_clone_parent2(gen + 1, champ_id))
+	if not _evo_has_kind("wild"):
+		_evo_queue_wild(gen + 1)
+	if not await _event_await_pool():
+		return
+	_event_start_next(ev, gone)
+
+
+func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
+	var director := _director()
+	if director == null:
+		return
+	var eid := str(ev_old.get("id", ""))
+	var gen := int(ev_old.get("generation", 1)) + 1
+	var st: Dictionary = ev_old.get("settings", {})
+	var survivors: Array = []
+	for g in (ev_old.get("group_order", []) as Array):
+		var gd: Dictionary = (ev_old.get("groups", {}) as Dictionary).get(str(g), {})
+		for pid in (gd.get("players", []) as Array):
+			if not (str(pid) in gone) and not (str(pid) in survivors):
+				survivors.append(str(pid))
+	if survivors.size() != 14:
+		_evo_abort("event survivors %d != 14" % survivors.size())
+		return
+	var draw: Dictionary = director.event_draw_pool(eid, EVENT_POOL_TARGET)
+	if not bool(draw.get("ok", false)):
+		_evo_abort("pool draw failed: " + str(draw.get("error", "?")))
+		return
+	var roster: Array = survivors + (draw.get("drawn", []) as Array)
+	var beg: Dictionary = director.event_begin(roster, st, gen)
+	if not bool(beg.get("ok", false)):
+		_evo_abort("next event failed: " + str(beg.get("error", "?")))
+		return
+	var new_eid := str(beg.get("event_id", ""))
+	# Bench remainder rides into the new event; the queue starts clean
+	# (everything was awaited above, so no orphan verdicts follow).
+	director.event_pool_add(new_eid,
+		(director.event_load(eid).get("pool", []) as Array))
+	var ev_new: Dictionary = director.event_load(new_eid)
+	if not _event_build_group(ev_new, "A"):
+		return
+	director.tourney["evo"] = {"active": true, "generation": gen,
+		"episodes": EVO_EPISODES,
+		"mutate_traits": int(st.get("mutate_traits", 1)),
+		"pending": [], "done": {}}
+	director.save_state()
+	if not await _event_intermission("EVENT %s · GROUP A (GEN %d)" % [new_eid, gen],
+			_event_preview_sub("A")):
+		director.quit_to_menu()
+		return
+	_request_current_battle_load()
 
 
 const EVO_EPISODES := 50
