@@ -46,7 +46,9 @@ const SPOT_PREFIX := "offspring:"
 ## View modes: 0 = auto (focus-swap while live losers run, main
 ## bracket only at review - the appended losers rounds jumble the
 ## single-elim layout), 1 = main bracket only, 2 = losers bracket
-## only (forced focus rendering, works at review time too).
+## only (forced focus rendering, works at review time too), 3 = group
+## fixture (round-robin rounds as plain columns: no TBD synthesis, no
+## connectors, no champion node, plain ROUND headers).
 func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1, view: int = 0) -> void:
 	for c in get_children():
 		remove_child(c)
@@ -98,10 +100,14 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 		queue_redraw()
 		return
 	_lf_view = losers_from
+	var group_mode := view == 3
 	# TBA templates (display-only, never written back): synthesize future
 	# main rounds from tournament size, and future losers rounds by
 	# halving, so the whole bracket is visible before matches resolve.
-	if focus:
+	# Group fixtures are complete schedules: nothing is synthesized.
+	if group_mode:
+		pass
+	elif focus:
 		while (shown[shown.size() - 1] as Array).size() > 1:
 			var _prev2: Array = shown[shown.size() - 1]
 			shown.append(_tbd_round(maxi(1, int(ceil(float(_prev2.size()) / 2.0)))))
@@ -122,8 +128,8 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 				shown.append(_tbd_round(maxi(1, int(ceil(float(_prev3.size()) / 2.0)))))
 	rounds = shown
 	var n_rounds: int = rounds.size()
-	var cols: int = n_rounds + 1  # + champion/last-place column
-	_apply_metrics(cols, (rounds[0] as Array).size())
+	var cols: int = n_rounds if group_mode else n_rounds + 1
+	_apply_metrics(cols, (rounds[0] as Array).size(), group_mode)
 	# Column x positions.
 	var xs: Array = []
 	for i in range(cols):
@@ -131,13 +137,15 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Round header labels. Focus mode's final column is LAST PLACE.
 	for i in range(n_rounds):
 		add_child(_make_header(str(xs[i]), _round_name(i, n_rounds, tourney)))
-	add_child(_make_header(str(xs[n_rounds]), "LAST PLACE" if focus else "CHAMPION"))
-	# Card tops per round for feeder-centering.
+	if not group_mode:
+		add_child(_make_header(str(xs[n_rounds]), "LAST PLACE" if focus else "CHAMPION"))
+	# Card tops per round for feeder-centering (group fixtures stack
+	# every round straight: columns are fixtures, not progression).
 	var tops: Array = []
 	for r in range(n_rounds):
 		var rtops: Array = []
 		var rms: Array = rounds[r]
-		if r == 0:
+		if r == 0 or group_mode:
 			for mi in range(rms.size()):
 				rtops.append(TOP_PAD + mi * (CARD_H + ROW_GAP))
 		else:
@@ -165,7 +173,10 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 				_register_spot(m, "b", card)
 	# Connectors from feeders into each later-round match. Edges
 	# landing in losers rounds draw muted red (distinct consolation).
+	# Group fixtures imply no progression, so they draw none.
 	for r in range(1, n_rounds):
+		if group_mode:
+			break
 		var rms3: Array = rounds[r]
 		var prev2: Array = tops[r - 1]
 		var loser_edge := losers_from >= 0 and r >= losers_from
@@ -185,8 +196,10 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Champion node centered on the main final; with consolation, a
 	# LAST PLACE node hangs off the losers final in red. Focus mode
 	# skips the champion (main bracket hidden) and the final column
-	# carries LAST PLACE alone.
-	if focus:
+	# carries LAST PLACE alone. Group fixtures crown nobody.
+	if group_mode:
+		pass
+	elif focus:
 		var f_tops: Array = tops[n_rounds - 1]
 		var f_mid: float = float(f_tops[f_tops.size() - 1]) + CARD_H * 0.5
 		var flast := _make_last_place_card(_last_place_name(tourney), tourney)
@@ -223,7 +236,8 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Size for scroll containers.
 	var n0: Array = rounds[0]
 	var height: float = TOP_PAD + n0.size() * (CARD_H + ROW_GAP) + SIDE_PAD
-	custom_minimum_size = Vector2(float(xs[n_rounds]) + CARD_W + SIDE_PAD, height)
+	var last_x: float = float(xs[n_rounds - 1]) if group_mode else float(xs[n_rounds])
+	custom_minimum_size = Vector2(last_x + CARD_W + SIDE_PAD, height)
 	size = custom_minimum_size
 	queue_redraw()
 
@@ -354,45 +368,20 @@ func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
 		sl.add_theme_color_override("font_color",
 			Color(0.5, 0.5, 0.55) if (is_done and i > 2) else Color(0.92, 0.92, 0.94))
 		vb.add_child(sl)
-	var rounds: Array = cell.get("rounds", [])
-	var cr := int(cell.get("cur_round", -1))
-	var cm := int(cell.get("cur_match", -1))
-	for r in range(rounds.size()):
-		for mi in range((rounds[r] as Array).size()):
-			vb.add_child(_make_pair_row((rounds[r] as Array)[mi],
-				is_current and r == cr and mi == cm))
+	# Fixture cards: the group's own rounds in group view mode (real
+	# versus cards with live/result coloring, no finals, no champion).
+	var mini := {"rounds": cell.get("rounds", []),
+		"players": cell.get("players", []), "size": 4, "format": "groups",
+		"status": "running", "quick": false}
+	# Self-instantiation (class_name is unresolvable inside its own
+	# script at compile time): load the script resource instead.
+	var sub = load("res://scripts/TournamentBracket.gd").new()
+	sub.render_bracket(mini, int(cell.get("cur_round", -1)),
+		int(cell.get("cur_match", -1)), 3)
+	sub.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sub.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vb.add_child(sub)
 	return card
-
-
-func _make_pair_row(m: Dictionary, live: bool) -> PanelContainer:
-	var pc := PanelContainer.new()
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.08, 0.08, 0.11, 0.88)
-	sb.border_color = COL_LIVE if live else Color(0.25, 0.25, 0.3)
-	sb.set_border_width_all(2 if live else 1)
-	sb.set_corner_radius_all(4)
-	sb.content_margin_left = 6.0
-	sb.content_margin_right = 6.0
-	sb.content_margin_top = 1.0
-	sb.content_margin_bottom = 1.0
-	pc.add_theme_stylebox_override("panel", sb)
-	var l := Label.new()
-	var txt := "%s %d-%d %s" % [str(m.get("a_name", "TBD")),
-		int(m.get("wins_a", 0)), int(m.get("wins_b", 0)),
-		str(m.get("b_name", "TBD"))]
-	if live:
-		txt += "  •  LIVE"
-	l.text = txt
-	l.add_theme_font_size_override("font_size", FS_ROW)
-	l.clip_text = true
-	var col := Color(0.92, 0.92, 0.94)
-	if live:
-		col = COL_LIVE
-	elif str(m.get("winner_id", "")) == "":
-		col = COL_TBD
-	l.add_theme_color_override("font_color", col)
-	pc.add_child(l)
-	return pc
 
 
 func _draw() -> void:
@@ -404,6 +393,8 @@ func _draw() -> void:
 
 
 func _round_name(r: int, n_rounds: int, tourney: Dictionary) -> String:
+	if str(tourney.get("format", "")) == "groups":
+		return "ROUND %d" % (r + 1)
 	var losers_from := _lf_view
 	if losers_from >= 0 and r >= losers_from:
 		if r == n_rounds - 1:
@@ -490,13 +481,15 @@ func _card_panel(border: Color, border_w: int) -> PanelContainer:
 	return pc
 
 
-func _apply_metrics(cols: int, rows0: int) -> void:
+func _apply_metrics(cols: int, rows0: int, group_mode: bool = false) -> void:
 	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond.
+	# Group fixtures render 3 columns inside event-overview quadrants,
+	# so they take the compact set to fit 2-up.
 	# Compact CARD_H must clear the card content (~56px: 3+3 margins +
 	# header + separation + two 18px rows) or text spills into the
 	# neighbor card. Compact pitch is 70px/card, so a size-8 first
 	# round (4 cards) fits in 324px without scrolling.
-	if cols > 3 or rows0 > 3:
+	if cols > 3 or rows0 > 3 or group_mode:
 		CARD_W = 108.0
 		CARD_H = 64.0
 		GAP_X = 16.0

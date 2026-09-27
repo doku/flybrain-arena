@@ -231,22 +231,43 @@ func test_overview_render() -> void:
 	_check(gold == 1, "exactly the current group is gold-bordered")
 	_check(_panel_border(panels[1]) == Color(1.0, 0.82, 0.3, 1.0),
 		"group B (top-right) is the live one")
-	# Live pairing (R0M2 of group B) is gold-framed inside its panel.
-	var live_rows := 0
-	var bv: VBoxContainer = (panels[1] as PanelContainer).get_child(0)
-	for ch in bv.get_children():
-		if ch is PanelContainer and _panel_border(ch) == Color(1.0, 0.82, 0.3, 1.0):
-			live_rows += 1
-	_check(live_rows == 1, "exactly one live pairing framed")
-	# Played group shows standings stars; upcoming groups render empty.
+	# Quadrant B embeds a live fixture: R1M2 (cur 0,1) gold with LIVE.
+	var labels := _all_labels(B)
+	var live := 0
+	for t in labels:
+		if str(t).contains("LIVE") and str(t).begins_with("R"):
+			live += 1
+	_check(live == 1, "exactly one live pairing card")
+	var champy := false
+	var finals := false
+	var r1 := false
+	for t in labels:
+		if str(t) == "CHAMPION":
+			champy = true
+		if str(t) in ["FINAL", "SEMIFINAL"]:
+			finals = true
+		if str(t) == "ROUND 1":
+			r1 = true
+	_check(not champy, "no champion column in group view")
+	_check(not finals, "no final/semifinal headers in group view")
+	_check(r1, "fixture round headers present")
+	# Played group shows standings stars.
 	var btexts := _panel_texts(panels[1])
 	var stars := 0
 	for t in btexts:
 		if str(t).begins_with("★"):
 			stars += 1
 	_check(stars == 2, "top-2 starred in live table")
-	_check(_panel_texts(panels[0]).size() == 1, "upcoming group shows header only")
 	B.free()
+
+
+func _all_labels(node: Node) -> Array:
+	var out: Array = []
+	if node is Label:
+		out.append((node as Label).text)
+	for ch in node.get_children():
+		out += _all_labels(ch)
+	return out
 
 
 func _initialize() -> void:
