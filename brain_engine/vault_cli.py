@@ -296,14 +296,19 @@ def _pearson(xs, ys):
     return num / den if den > 0.0 else 0.0
 
 
-def score_correlation_rows(records, min_battles=5, min_eps=4):
+def score_correlation_rows(records, min_battles=5, min_eps=4,
+                            min_matches=0):
     """Pure audit math: per-scenario-family avg score vs ELO plus
-    suggested multipliers (1 + r, clamped [0.2, 2.0]). Returns
+    suggested multipliers (1 + r, clamped [0.2, 2.0]). Matches are
+    the stabilized rating (battles include consolation noise), so
+    min_matches selects proven veterans. Returns
     (rows, overall_r, n_brains)."""
     import brain_package as vault
     brains = [rec for rec in records
               if int((rec.get("record", {}) or {}).get("battles", 0))
-              >= min_battles]
+              >= min_battles
+              and int((rec.get("record", {}) or {}).get("matches", 0))
+              >= min_matches]
     fams = {}
     for rec in brains:
         table = ((rec.get("training", {}) or {}).get("scenario_scores",
@@ -343,10 +348,11 @@ def cmd_score_correlations(a):
     import brain_package as vault
     min_battles = int(getattr(a, "min_battles", 5) or 0)
     min_eps = int(getattr(a, "min_episodes", 4) or 0)
+    min_matches = int(getattr(a, "min_matches", 0) or 0)
     rows, overall, n = score_correlation_rows(
-        vault.scan_vault(silent=True), min_battles, min_eps)
-    text = "score-correlations (min %d battles, min %d eps/family):\n" % (
-        min_battles, min_eps)
+        vault.scan_vault(silent=True), min_battles, min_eps, min_matches)
+    text = ("score-correlations (min %d battles, min %d matches, "
+            "min %d eps/family):\n") % (min_battles, min_matches, min_eps)
     for row in rows:
         text += ("  %(family)-8s n=%(n)3d r=%(pearson_vs_elo)+.3f "
                  "mult=%(suggested_mult).2f\n") % row
@@ -564,6 +570,7 @@ def main():
     q = sub.add_parser("delete"); q.add_argument("--id", required=True)
     q = sub.add_parser("score-correlations")
     q.add_argument("--min-battles", type=int, default=5)
+    q.add_argument("--min-matches", type=int, default=0)
     q.add_argument("--min-episodes", type=int, default=4)
     q.add_argument("--result-file", default="")
     q = sub.add_parser("score"); q.add_argument("--id", required=True)
