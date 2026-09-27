@@ -35,6 +35,12 @@ const COL_LOSER_DIM := Color(0.75, 0.3, 0.28, 0.85)
 var segments: Array = []
 # View-relative losers start for _round_name (0 in losers-focus mode).
 var _lf_view := -1
+# Gallery spotlight (waiting-room preview): bracket key (fighter id or
+# "offspring:<kind>" placeholder) -> its round-0 card. Orthogonal to the
+# live/decided borders; cleared on every re-render.
+var spotlight_key := ""
+var _spot_cards := {}
+const SPOT_PREFIX := "offspring:"
 
 
 ## View modes: 0 = auto (focus-swap while live losers run, main
@@ -46,6 +52,8 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 		remove_child(c)
 		c.queue_free()
 	segments.clear()
+	_spot_cards.clear()
+	spotlight_key = ""
 	var rounds: Array = tourney.get("rounds", [])
 	var losers_from := int(tourney.get("losers_start_round", -1))
 	if rounds.is_empty() or (view == 2 and (losers_from < 0 or losers_from >= rounds.size())):
@@ -152,6 +160,9 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 			var card := _make_match_card(m, r, mi, live, loser_adv)
 			card.position = Vector2(float(xs[r]), float(tops[r][mi]))
 			add_child(card)
+			if r == 0:
+				_register_spot(m, "a", card)
+				_register_spot(m, "b", card)
 	# Connectors from feeders into each later-round match. Edges
 	# landing in losers rounds draw muted red (distinct consolation).
 	for r in range(1, n_rounds):
@@ -215,6 +226,50 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	custom_minimum_size = Vector2(float(xs[n_rounds]) + CARD_W + SIDE_PAD, height)
 	size = custom_minimum_size
 	queue_redraw()
+
+
+func _register_spot(m: Dictionary, slot: String, card: PanelContainer) -> void:
+	# Round-0 slots register under fighter id or placeholder key so the
+	# gallery can spotlight them later. TBD/vacant slots have no key.
+	var key := str(m.get("a_id" if slot == "a" else "b_id", ""))
+	var nm := str(m.get("a_name" if slot == "a" else "b_name", ""))
+	if key == "" or nm == "" or nm == "TBD":
+		return
+	_spot_cards[key] = card
+
+
+func set_spotlight(key: String) -> void:
+	# Gold-frames one round-0 card (the gallery's showcased fighter);
+	# no-op for unknown keys. Re-callers re-render first, which clears.
+	if key == spotlight_key:
+		return
+	clear_spotlight()
+	if key == "" or not _spot_cards.has(key):
+		return
+	spotlight_key = key
+	_paint_card(_spot_cards[key], COL_LIVE, 3)
+
+
+func clear_spotlight() -> void:
+	if spotlight_key != "" and _spot_cards.has(spotlight_key):
+		var card: PanelContainer = _spot_cards[spotlight_key]
+		var base: Color = card.get_meta("base_border")
+		_paint_card(card, base, int(card.get_meta("base_bw")))
+	spotlight_key = ""
+
+
+func spotlight_applied() -> String:
+	return spotlight_key
+
+
+func _paint_card(card: PanelContainer, border: Color, bw: int) -> void:
+	# Mutates the card's own StyleBoxFlat (each card gets a fresh one
+	# in _card_panel, so neighbors are untouched).
+	var sb := card.get_theme_stylebox("panel") as StyleBoxFlat
+	if sb == null:
+		return
+	sb.border_color = border
+	sb.set_border_width_all(bw)
 
 
 func _draw() -> void:
@@ -367,6 +422,8 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 	elif decided:
 		border = Color(0.35, 0.55, 0.38)
 	var card := _card_panel(border, bw)
+	card.set_meta("base_border", border)
+	card.set_meta("base_bw", bw)
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", CARD_SEP)
 	card.add_child(vb)
@@ -398,7 +455,14 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 	row.add_theme_constant_override("separation", 6)
 	var nm := Label.new()
 	var vacant: bool = bool(m.get("vacant", false))
-	nm.text = "-" if vacant else (pname if pname != "" else "TBD")
+	# Unbred offspring ride synthetic "offspring:<kind>" ids (preview
+	# only): dim TRAINING rows that can never read as banked fighters.
+	var training: bool = str(m.get("a_id" if slot == "a" else "b_id", "")) \
+		.begins_with(SPOT_PREFIX)
+	var label := "-" if vacant else (pname if pname != "" else "TBD")
+	if training and not vacant:
+		label += " · TRAINING"
+	nm.text = label
 	nm.clip_text = true
 	nm.custom_minimum_size = Vector2(CARD_W - 60.0, ROW_H)
 	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -406,6 +470,8 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 	var col := Color(0.92, 0.92, 0.94)
 	if vacant:
 		col = Color(0.28, 0.28, 0.32)
+	elif training:
+		col = Color(0.78, 0.72, 0.55)
 	elif pname == "" or pname == "TBD":
 		col = COL_TBD
 	elif decided:
@@ -417,7 +483,7 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 	nm.add_theme_color_override("font_color", col)
 	row.add_child(nm)
 	var sc := Label.new()
-	sc.text = str(score)
+	sc.text = "…" if training else str(score)
 	sc.add_theme_font_size_override("font_size", FS_ROW)
 	sc.add_theme_color_override("font_color", col)
 	row.add_child(sc)

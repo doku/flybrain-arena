@@ -4208,15 +4208,18 @@ func _nextgen_wild_label(target_gen: int) -> String:
 
 
 func _nextgen_offspring_slots() -> Array:
-	# [{id, name, elo}] for clone/wild/topups from live done state;
-	# synthetic training cards for the unbred (refreshed on adoption).
+	# [{key, id, kind, name, elo, placeholder}] for clone/wild/topups
+	# from live done state; the unbred ride stable "offspring:<kind>"
+	# placeholder keys (never bare "" twice) so the bracket, gallery
+	# and strip all address the same training card until adoption.
 	var out: Array = []
 	var cid := _evo_done_id("clone")
 	if cid != "":
 		var rec: Dictionary = nextgen_brains.get(cid, {})
-		out.append({"id": cid,
+		out.append({"key": cid, "id": cid, "kind": "clone",
 			"name": str(rec.get("name", _evo_done_name("clone"))),
-			"elo": float((rec.get("record", {}) as Dictionary).get("elo", 1200.0))})
+			"elo": float((rec.get("record", {}) as Dictionary).get("elo", 1200.0)),
+			"placeholder": false})
 	else:
 		var champ_elo := 1200.0
 		var director := _director()
@@ -4225,25 +4228,30 @@ func _nextgen_offspring_slots() -> Array:
 				var pd := p as Dictionary
 				if str(pd.get("id", "")) == nextgen_champ_id:
 					champ_elo = float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))
-		out.append({"id": "", "name": nextgen_clone_name, "elo": champ_elo})
+		out.append({"key": "offspring:clone", "id": "offspring:clone",
+			"kind": "clone", "name": nextgen_clone_name, "elo": champ_elo,
+			"placeholder": true})
 	var wid := _evo_done_id("wild")
 	if wid != "":
 		var wrec: Dictionary = nextgen_brains.get(wid, {})
-		out.append({"id": wid,
+		out.append({"key": wid, "id": wid, "kind": "wild",
 			"name": str(wrec.get("name", _evo_done_name("wild"))),
-			"elo": float((wrec.get("record", {}) as Dictionary).get("elo", 1200.0))})
+			"elo": float((wrec.get("record", {}) as Dictionary).get("elo", 1200.0)),
+			"placeholder": false})
 	else:
-		out.append({"id": "", "name": _nextgen_wild_label(nextgen_gen),
-			"elo": 1200.0})
+		out.append({"key": "offspring:wild", "id": "offspring:wild",
+			"kind": "wild", "name": _nextgen_wild_label(nextgen_gen),
+			"elo": 1200.0, "placeholder": true})
 	for kind in _evo_done().keys():
 		var ks := str(kind)
 		if ks.begins_with("topup"):
 			var tid := _evo_done_id(ks)
 			if tid != "":
 				var trec: Dictionary = nextgen_brains.get(tid, {})
-				out.append({"id": tid,
+				out.append({"key": tid, "id": tid, "kind": ks,
 					"name": str(trec.get("name", _evo_done_name(ks))),
-					"elo": float((trec.get("record", {}) as Dictionary).get("elo", 1200.0))})
+					"elo": float((trec.get("record", {}) as Dictionary).get("elo", 1200.0)),
+					"placeholder": false})
 	return out
 
 
@@ -4319,6 +4327,8 @@ func _show_nextgen_overlay(title_text: String) -> void:
 
 func _hide_nextgen() -> void:
 	nextgen_visible = false
+	if is_instance_valid(arena_bracket):
+		arena_bracket.clear_spotlight()
 	if is_instance_valid(gallery_box):
 		gallery_box.visible = false
 	if is_instance_valid(strip_box):
@@ -4358,21 +4368,41 @@ func _refresh_nextgen_preview() -> void:
 	_update_nextgen_strip()
 
 
+func _offspring_kind_title(kind: String, pname: String) -> String:
+	# Placeholder cards announce themselves as the incoming breed, so
+	# the queue reads "new breed / new wild is here" at a glance.
+	if kind == "clone":
+		return "NEW BREED — %s" % pname
+	if kind == "wild":
+		return "NEW WILD — %s" % pname
+	if kind.begins_with("topup"):
+		return "TOP-UP — %s" % pname
+	return pname
+
+
 func _gallery_card(pid: String, pname: String) -> Dictionary:
 	var rec: Dictionary = nextgen_brains.get(pid, {}) if pid != "" else {}
 	if rec.is_empty():
 		# Training card: ep progress from the matching pending spec
 		# (or the awaited-detached one, same blind spot as the strip).
+		# Placeholders arrive under "offspring:<kind>" keys, so kind
+		# matching is exact; name matching stays as legacy fallback.
+		var want := ""
+		if pid.begins_with("offspring:"):
+			want = pid.trim_prefix("offspring:")
 		var detail := "queued"
+		var found_kind := want
 		for spec in _evo_pending() + [evo_await_spec]:
 			var s := spec as Dictionary
 			if s.is_empty():
 				continue
 			var sk := str(s.get("kind", ""))
-			var m := (str(s.get("name", "")) != "" and str(s.get("name", "")) == pname) \
+			var m := (want != "" and sk == want) \
+				or (str(s.get("name", "")) != "" and str(s.get("name", "")) == pname) \
 				or (sk == "wild" and pname.begins_with("wild G"))
 			if not m and not (sk.begins_with("topup") and pname == sk):
 				continue
+			found_kind = sk
 			if bool(s.get("launched", false)):
 				var prog := _evo_poll_file(str(s.get("progress", "")))
 				if prog.is_empty():
@@ -4383,8 +4413,8 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 				detail = "queued"
 			detail += " [%s]" % sk if sk != "" else detail
 			break
-		return {"title": pname, "elo": "--",
-			"rows": "training...\n%s" % detail}
+		return {"key": pid, "title": _offspring_kind_title(found_kind, pname),
+			"elo": "--", "rows": "training...\n%s" % detail}
 	var r: Dictionary = rec.get("record", {})
 	var gp: Dictionary = rec.get("generator_params", {})
 	var t: Dictionary = rec.get("training", {})
@@ -4402,16 +4432,96 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 			wiring = "base"
 	else:
 		wiring = "genome " + wiring
-	var lin: Dictionary = rec.get("lineage", {})
-	var rows := "Battles %d (W%d L%d D%d)\nMatches %d (W%d L%d) | Titles %d\nEpisodes %d | %s\n%s" % [
+	wiring += " · " + str(gp.get("explore_mode", "legacy"))
+	var mp = gp.get("mapping", null)
+	if mp is Array:
+		wiring += " · %d rules" % (mp as Array).size()
+	var traits := "evasion %s · dist_gain %s · lr %s" % [
+		_fmt_stat(gp.get("evasion", 0.0)), _fmt_stat(gp.get("dist_gain", 0.0)),
+		_fmt_stat(gp.get("learning_rate", 0.0))]
+	var yb = gp.get("yaw_bias", null)
+	if yb != null:
+		traits += " · yaw %s" % _fmt_bias(yb)
+	var teps := int(t.get("episodes", 0))
+	var tscore := float(t.get("score", 0.0))
+	var fights := "Battles %d (W%d L%d D%d) · Matches %d (W%d L%d) · Titles %d" % [
 		int(r.get("battles", 0)), int(r.get("wins", 0)),
 		int(r.get("losses", 0)), int(r.get("draws", 0)),
 		int(r.get("matches", 0)), int(r.get("matches_won", 0)),
-		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
-		int(t.get("episodes", 0)), wiring,
-		str(lin.get("source", "?"))]
-	return {"title": pname, "elo": "%d" % int(r.get("elo", 1200.0)),
-		"rows": rows}
+		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0))]
+	var schooled := "Episodes %d · Score %.1f" % [teps, tscore]
+	if teps > 0:
+		schooled += " (avg %.2f)" % (tscore / float(teps))
+	var rows := "%s\n%s\n%s\n%s\n%s" % [fights, schooled, wiring,
+		traits, _inheritance_line(rec)]
+	return {"key": pid, "title": pname,
+		"elo": "%d" % int(r.get("elo", 1200.0)), "rows": rows}
+
+
+func _fmt_stat(v) -> String:
+	return "%.2f" % float(v)
+
+
+func _fmt_bias(yb) -> String:
+	if yb is Array:
+		var parts := PackedStringArray()
+		for b in (yb as Array):
+			parts.append("%.2f" % float(b))
+		return "[" + ", ".join(parts) + "]"
+	return str(yb)
+
+
+func _nextgen_parent_name(pid: String) -> String:
+	# Resolve a lineage parent id to its vault name; archived/gone
+	# parents fall back to the id itself (never blank, never "?").
+	var rec: Dictionary = nextgen_brains.get(pid, {})
+	if not rec.is_empty():
+		return str(rec.get("name", pid))
+	var director := _director()
+	if director != null:
+		for p in director.tourney.get("players", []):
+			var pd := p as Dictionary
+			if str(pd.get("id", "")) == pid:
+				return str(pd.get("name", pid))
+	return pid
+
+
+func _inheritance_line(rec: Dictionary) -> String:
+	# "clone of X · traits: evasion 0.40→0.53" / "crossover A × B" /
+	# "wild (evo-random · novelty)" / "reference stock" / "generated".
+	var lin: Dictionary = rec.get("lineage", {})
+	var src := str(lin.get("source", "?"))
+	var line := src
+	if src.begins_with("clone:"):
+		line = "clone"
+	elif src.begins_with("crossover:"):
+		line = "crossover"
+	elif src == "evo-random":
+		line = "wild"
+	elif src == "reference":
+		line = "reference stock"
+	elif src == "generated":
+		line = "generated"
+	var parents: Array = lin.get("parent_ids", [])
+	if not parents.is_empty():
+		var names := PackedStringArray()
+		for pp in parents:
+			names.append(_nextgen_parent_name(str(pp)))
+		line += " of " + " × ".join(names)
+	var mode := str(lin.get("explore_mode", ""))
+	if mode != "" and line in ["wild", "crossover", "clone"]:
+		line += " · " + mode
+	var tm = lin.get("trait_mutations", {})
+	if tm is Dictionary and not (tm as Dictionary).is_empty():
+		var bits := PackedStringArray()
+		for k in (tm as Dictionary).keys():
+			var pair = (tm as Dictionary)[k]
+			if pair is Array and (pair as Array).size() >= 2:
+				bits.append("%s %s→%s" % [str(k),
+					_fmt_stat((pair as Array)[0]), _fmt_stat((pair as Array)[1])])
+		if bits.size() > 0:
+			line += " · traits: " + ", ".join(bits)
+	return line
 
 
 func _build_gallery_entries(players: Array) -> void:
@@ -4432,6 +4542,14 @@ func _render_gallery_card(entry: Dictionary) -> void:
 		gallery_elo.text = "ELO " + str(entry.get("elo", "--"))
 	if is_instance_valid(gallery_rows):
 		gallery_rows.text = str(entry.get("rows", ""))
+	# The showcased fighter's bracket slot spotlights in sync (cleared
+	# when the card carries no key).
+	if is_instance_valid(arena_bracket):
+		var k := str(entry.get("key", ""))
+		if k != "":
+			arena_bracket.set_spotlight(k)
+		else:
+			arena_bracket.clear_spotlight()
 
 
 func _gallery_advance() -> void:
@@ -4484,11 +4602,16 @@ func _update_nextgen_strip() -> void:
 		var bar: ProgressBar = slot[2]
 		if not is_instance_valid(lab) or not is_instance_valid(bar):
 			continue
+		var tag := key
+		if key == "clone":
+			tag = "new breed"
+		elif key == "wild":
+			tag = "new wild"
 		if float(res[1]) < 0.0:
-			lab.text = "%s: --" % key
+			lab.text = "%s: --" % tag
 			bar.value = 0.0
 		else:
-			lab.text = "%s: %s" % [key, str(res[0])]
+			lab.text = "%s: %s" % [tag, str(res[0])]
 			bar.value = clampf(float(res[1]), 0.0, 100.0)
 
 
