@@ -41,6 +41,13 @@ DEFAULT_GENERATOR_PARAMS = {
     "mapping": None,
     "yaw_bias": None,
     "explore_mode": "legacy",
+    # Reflex authority (heritable control traits; defaults reproduce the
+    # legacy operating point — see sensory_motor.BLEND_DEFAULTS).
+    "yaw_blend": 0.3,
+    "evade_backup": 1.0,
+    "flow_authority": 1.0,
+    "search_blend": 0.5,
+    "pitch_blend": 1.0,
 }
 
 

@@ -923,7 +923,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                  learning_rate=0.008, dist_gain=0.15, align_bonus=(0.5, 0.2, -0.3),
                  experiment=None, init_weights=None, progress_cb=None,
                  return_brain=False, mapping=None, yaw_bias=None, legacy=False,
-                 genome=None, curriculum=None, eval_only=False):
+                 genome=None, curriculum=None, eval_only=False, blends=None):
     global TREES
     cfg = VARIANTS.get(variant, {})
     label = cfg.get("label", variant)
@@ -987,7 +987,7 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     # fused loom channel, legacy decoder operating point, no gain pinning.
     encoder = SensoryEncoder(pops, mapping=mapping, legacy=legacy)
     decoder = MotorDecoder(pops, mapping=mapping, legacy=legacy,
-                           yaw_bias=yaw_bias)
+                           yaw_bias=yaw_bias, blends=blends)
     schemes = () if legacy else mapping
     dopamine_rl = DopamineReinforcement(pops, learning_rate=learning_rate,
                                         dist_gain=dist_gain, align_bonus=align_bonus,

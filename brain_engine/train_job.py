@@ -76,6 +76,12 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
     resolved_bias = _stored("yaw_bias", None)
     if params.get("yaw_bias", None) is not None:
         record.setdefault("generator_params", {})["yaw_bias"] = params["yaw_bias"]
+    # Reflex authority rides the record (breeder-stamped for evo brains,
+    # legacy defaults otherwise); training and battles then agree.
+    from sensory_motor import BLEND_DEFAULTS
+    resolved_blends = {}
+    for _bk, _bd in BLEND_DEFAULTS.items():
+        resolved_blends[_bk] = _stored(_bk, _bd)
     from train_homing import CHECKPOINTS_DIR
     os.makedirs(os.path.join(CHECKPOINTS_DIR, "tmp"), exist_ok=True)
     tmp_name = os.path.join("tmp", f"train_{record['id']}.npz")
@@ -96,6 +102,7 @@ def train_brain(record, weights, episodes, params=None, progress_cb=None,
         curriculum=_stored("curriculum", None),
         mapping=resolved_mapping,
         yaw_bias=resolved_bias,
+        blends=resolved_blends,
         legacy=legacy,
         init_weights=weights,
         progress_cb=progress_cb,

@@ -175,9 +175,162 @@ def inherit_elo(parent_elo):
         float(parent_elo) - vault.ELO_DEFAULT) * vault.ELO_INHERIT
 
 
-def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
+# Reflex-blend traits (see sensory_motor.BLEND_DEFAULTS): how much of
+# each control channel the reflexes own. Inherited ± a delta (fresh
+# ranges for wilds) on a dedicated seed stream, stamped into
+# trait_mutations alongside the hyperparameter traits, so evolution
+# can migrate control from reflex to neurons and ELO proves it.
+BLEND_KEYS = ("yaw_blend", "evade_backup", "flow_authority",
+              "search_blend", "pitch_blend")
+BLEND_DELTAS = {"yaw_blend": 0.15, "evade_backup": 0.3,
+                "flow_authority": 0.2, "search_blend": 0.15,
+                "pitch_blend": 0.2}
+BLEND_STREAM = 0xB1ED
+
+
+def fresh_blends(seed):
+    """Fresh reflex authority for parent-less brains (wilds). Ranges
+    stay near the flyable regime: brain-led yaw is allowed, pitch
+    keeps at least half reflex (altitude is safety-critical)."""
+    import random as _random
+    r = _random.Random(int(seed) ^ BLEND_STREAM)
+    return {
+        "yaw_blend": round(r.uniform(0.0, 0.6), 2),
+        "evade_backup": float(r.random() < 0.5),
+        "flow_authority": round(r.uniform(0.0, 1.0), 2),
+        "search_blend": round(r.uniform(0.2, 0.8), 2),
+        "pitch_blend": round(r.uniform(0.5, 1.0), 2),
+    }
+
+
+def inherit_blends(parent_gp, seed):
+    """Child blends = parent blends ± a bounded delta per knob.
+    Returns (blends, mutated) with mutated = {key: [old, new]}."""
+    import random as _random
+    from sensory_motor import BLEND_DEFAULTS
+    r = _random.Random(int(seed) ^ BLEND_STREAM)
+    base = dict(BLEND_DEFAULTS)
+    for k in BLEND_KEYS:
+        try:
+            base[k] = max(0.0, min(1.0, float((parent_gp or {}).get(
+                k, base[k]))))
+        except (TypeError, ValueError):
+            pass
+    blends, mutated = {}, {}
+    for k in BLEND_KEYS:
+        old = base[k]
+        new = round(max(0.0, min(1.0, old + r.uniform(
+            -BLEND_DELTAS[k], BLEND_DELTAS[k]))), 2)
+        blends[k] = new
+        if new != old:
+            mutated[k] = [old, new]
+    return blends, mutated
+
+
+# Heritable training recipe: how LONG/HARD a brain is schooled is a
+# rearing trait, inherited ± a random delta (never a fresh draw), so
+# lineages explore training regimes and ELO selects what works. Stored
+# on lineage["training"] (a biography entry, not a brain trait) with
+# per-key [old, new] stamps in lineage["training_mutations"].
+# Wilds (no parents) draw fresh from the same ranges.
+TRAINING_RANGES = {
+    "episodes_total": (20, 80),
+    "stage_split": (0.25, 0.75),
+    "noise": (0.0, 0.15),
+    "max_changes": (0, 3),
+}
+TRAINING_DELTAS = {
+    "episodes_total": 10.0,
+    "stage_split": 0.1,
+    "noise": 0.02,
+    "max_changes": 1.0,
+}
+RECIPE_DEFAULTS = {
+    "episodes_total": 50,
+    "stage_split": 0.5,
+    "noise": 0.05,
+    "max_changes": 1,
+}
+RECIPE_STREAM = 0x7E21
+
+
+def _clamp_recipe(key, value):
+    lo, hi = TRAINING_RANGES[key]
+    v = max(lo, min(hi, float(value)))
+    if key == "episodes_total":
+        return int(round(v / 5.0) * 5)
+    if key == "max_changes":
+        return int(round(v))
+    if key == "stage_split":
+        return round(v, 2)
+    return round(v, 3)
+
+
+def fresh_recipe(seed):
+    """Fresh training recipe for parent-less brains (wilds): uniform
+    draws from TRAINING_RANGES on a dedicated seed stream."""
+    import random as _random
+    r = _random.Random(int(seed) ^ RECIPE_STREAM)
+    recipe = {}
+    for key in ("episodes_total", "stage_split", "noise", "max_changes"):
+        lo, hi = TRAINING_RANGES[key]
+        recipe[key] = _clamp_recipe(key, r.uniform(lo, hi))
+    return recipe
+
+
+def inherit_recipe(parent_recipe, seed):
+    """Child recipe = parent recipe ± a bounded random delta per knob
+    (dedicated seed stream; deterministic per seed). Returns
+    (recipe, mutated) with mutated = {key: [old, new]} for nonzero
+    deltas, mirroring the trait_mutations stamp."""
+    import random as _random
+    r = _random.Random(int(seed) ^ RECIPE_STREAM)
+    base = dict(RECIPE_DEFAULTS)
+    for k, v in (parent_recipe or {}).items():
+        if k in base:
+            try:
+                base[k] = _clamp_recipe(k, v)
+            except (TypeError, ValueError):
+                pass
+    recipe, mutated = {}, {}
+    for key in ("episodes_total", "stage_split", "noise", "max_changes"):
+        old = base[key]
+        new = _clamp_recipe(key, old + r.uniform(
+            -TRAINING_DELTAS[key], TRAINING_DELTAS[key]))
+        recipe[key] = new
+        if new != old:
+            mutated[key] = [old, new]
+    return recipe, mutated
+
+
+def _resolve_recipe(parent_recipe, seed, episodes, episodes2, noise,
+                    max_changes):
+    """Merges explicit caller overrides over the inherited recipe.
+    Returns (recipe, mutated, ep1, ep2, noise, max_changes): stage
+    episode counts derive from total × split unless explicitly given
+    (explicit episodes without episodes2 keeps the legacy single-stage
+    path)."""
+    recipe, mutated = inherit_recipe(parent_recipe, seed)
+    if episodes is not None:
+        recipe["episodes_total"] = max(1, int(episodes))
+    if noise is not None:
+        recipe["noise"] = max(0.0, float(noise))
+    if max_changes is not None:
+        recipe["max_changes"] = max(0, int(max_changes))
+    total = int(recipe["episodes_total"])
+    if episodes is None and episodes2 is None:
+        ep1 = max(5, int(round(total * float(recipe["stage_split"]) / 5.0) * 5))
+        ep1 = min(ep1, total - 5) if total > 10 else total
+        ep2 = total - ep1
+    else:
+        ep1 = total if episodes is None else max(1, int(episodes))
+        ep2 = episodes2
+    return recipe, mutated, ep1, ep2, recipe["noise"], recipe["max_changes"]
+
+
+def breed_clone(parent_id, name, seed, episodes=None, noise=None,
                 mapping=None, progress_cb=None, mutate_structure=True,
-                max_changes=1, episodes2=None, params2=None,
+                max_changes=None, episodes2=None, params2=None,
                 mutate_traits=1):
     """Clone a winner: weight copy + Gaussian noise, fresh seed, full
     training. mapping=None inherits the parent's stack. Genome parents
@@ -189,10 +342,15 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     mutate_traits re-rolls that many hyperparameter traits at random
     (learning_rate/dist_gain/evasion, plus yaw_bias when carried; 0
     disables) with the change stamped into the lineage.
+    Training recipe (episodes/noise/max_changes) inherits ± a delta
+    from the parent's lineage["training"] unless explicitly passed;
+    derived stage counts feed _staged_or_single, and the recipe lands
+    in lineage["training"] with lineage["training_mutations"].
     episodes2/params2 run a second stage (flight school) back-to-back
-    via train_staged (unset stage-2 keys inherit stage 1); omitted
-    means single-stage. Returns (record, weights, summary) like
-    train_job (multi-stage summary when staged)."""
+    via train_staged (unset stage-2 keys inherit stage 1); explicit
+    episodes without episodes2 keeps the single-stage path. Returns
+    (record, weights, summary) like train_job (multi-stage summary
+    when staged)."""
     from train_job import train_brain
     from experimental_wiring import (mutate_genome, remap_for_genome,
                                      derive_mapping, attach_genome)
@@ -200,6 +358,9 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
                                    load_or_build_csr)
     rec, weights = vault.load_brain(parent_id)
     gp = dict(rec.get("generator_params", {}) or {})
+    parent_recipe = ((rec.get("lineage", {}) or {}).get("training", {}) or {})
+    recipe, recipe_mut, ep1, ep2, noise, max_changes = _resolve_recipe(
+        parent_recipe, seed, episodes, episodes2, noise, max_changes)
     genome = gp.get("genome", None)
     child_mapping = gp.get("mapping") if mapping is None else mapping
     start_weights = np.ascontiguousarray(
@@ -229,12 +390,18 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
     mutated = {}
     if int(mutate_traits or 0) > 0:
         mutated = mutate_kin_traits(params, int(seed), int(mutate_traits))
+    blend_vals, blend_mut = inherit_blends(gp, int(seed))
+    params.update(blend_vals)
+    mutated.update(blend_mut)
     if genome is not None:
         attach_genome(params, genome)
     child = vault.new_record(name, params)
+    recipe["inherited_from"] = rec.get("id", "")
     child["lineage"] = {"parent_ids": [rec.get("id", "")],
                         "source": f"clone:{rec.get('id', '')}",
-                        "trait_mutations": mutated}
+                        "trait_mutations": mutated,
+                        "training": dict(recipe),
+                        "training_mutations": recipe_mut}
     # ELO inheritance with regression to the mean: the child starts
     # strong but below the parent (wilds take the new_record default).
     parent_elo = float((rec.get("record", {}) or {}).get(
@@ -246,12 +413,12 @@ def breed_clone(parent_id, name, seed, episodes=50, noise=0.05,
         * (1.0 + rng.normal(0.0, float(noise), size=len(start_weights))).astype(np.float32))
     cname = rec.get('name', '?')
     return _staged_or_single(
-        child, noisy, episodes, params, f"evo clone of {cname} (pre-train)",
-        episodes2, params2, f"evo clone of {cname} (flight school)",
+        child, noisy, ep1, params, f"evo clone of {cname} (pre-train)",
+        ep2, params2, f"evo clone of {cname} (flight school)",
         progress_cb)
 
 
-def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
+def breed_random(name, seed, episodes=None, progress_cb=None, generation=1,
                  episodes2=None, params2=None, mode="graft"):
     """Fresh random brain: wiring genome plus random yaw_bias + rates.
     mode="legacy" keeps the exact historical behavior (1-4 fully random
@@ -263,8 +430,11 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
     names. Deterministic in seed end to end (dedicated np stream for
     the genome); rate draws use the legacy random stream (positions
     shifted vs pre-genome code - seeds are not a stable API across
-    breeder versions). episodes2/params2 run a flight-school second
-    stage back-to-back (see breed_clone); omitted is single-stage."""
+    breeder versions). Training recipe draws fresh from TRAINING_RANGES
+    (no parents to inherit from) unless episodes are explicit;
+    stamped in lineage["training"]. episodes2/params2 run a
+    flight-school second stage back-to-back (see breed_clone);
+    explicit episodes without episodes2 keeps the single-stage path."""
     import random as _random
     import numpy as _np
     from sensory_motor import draw_yaw_bias
@@ -310,14 +480,28 @@ def breed_random(name, seed, episodes=50, progress_cb=None, generation=1,
         "explore_mode": mode,
     }
     attach_genome(params, genome)
+    params.update(fresh_blends(int(seed)))
     from train_job import fresh_weights
+    recipe = fresh_recipe(seed)
+    if episodes is not None:
+        recipe["episodes_total"] = max(5, int(episodes))
+    total = int(recipe["episodes_total"])
+    if episodes is None and episodes2 is None:
+        ep1 = max(5, int(round(total * 0.5 / 5.0) * 5))
+        ep1 = min(ep1, total - 5) if total > 10 else total
+        ep2 = total - ep1
+    else:
+        ep1 = total if episodes is None else max(5, int(episodes))
+        ep2 = episodes2
     record = vault.new_record(name, params)
     weights = fresh_weights(params.get("experiment"), params.get("genome"))
     record, weights, summary = _staged_or_single(
-        record, weights, episodes, params, "evo wild pre-train",
-        episodes2, params2, "evo wild flight school", progress_cb)
+        record, weights, ep1, params, "evo wild pre-train",
+        ep2, params2, "evo wild flight school", progress_cb)
+    recipe["inherited_from"] = None
     record["lineage"] = {"parent_ids": [], "source": "evo-random",
-                         "explore_mode": mode, "provenance": provenance}
+                         "explore_mode": mode, "provenance": provenance,
+                         "training": dict(recipe), "training_mutations": {}}
     vault.save_brain(record, weights)
     return record, weights, summary
 
@@ -394,8 +578,8 @@ def _crossover_parent_genome(gp):
                      "(base/legacy/multi-mix)")
 
 
-def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=50,
-                    noise=0.05, progress_cb=None, mutate_traits=1,
+def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=None,
+                    noise=None, progress_cb=None, mutate_traits=1,
                     episodes2=None, params2=None):
     """Sexual reproduction: rule-level uniform crossover of two parents'
     genomes plus one structural mutation step, weights remapped from
@@ -403,6 +587,8 @@ def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=50,
     ELO regresses from the parents' mean. Genome-less base/legacy
     parents (or multi-mixes) raise ValueError - breed_clone instead.
     Mapping derives from the child genome; traits mutate like a clone.
+    Training recipe inherits ± a delta from the parents' MEAN recipe
+    unless explicitly passed (lineage["training"], stamped).
     Returns (record, weights, summary) like breed_clone."""
     import numpy as _np
     from experimental_wiring import (
@@ -414,6 +600,18 @@ def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=50,
     rec_b, weights_b = vault.load_brain(parent_b_id)
     gp_a = dict(rec_a.get("generator_params", {}) or {})
     gp_b = dict(rec_b.get("generator_params", {}) or {})
+    ra = ((rec_a.get("lineage", {}) or {}).get("training", {}) or {})
+    rb = ((rec_b.get("lineage", {}) or {}).get("training", {}) or {})
+    mean_recipe = {}
+    for k in RECIPE_DEFAULTS:
+        va = ra.get(k, RECIPE_DEFAULTS[k])
+        vb = rb.get(k, RECIPE_DEFAULTS[k])
+        try:
+            mean_recipe[k] = _clamp_recipe(k, (float(va) + float(vb)) / 2.0)
+        except (TypeError, ValueError):
+            mean_recipe[k] = RECIPE_DEFAULTS[k]
+    recipe, recipe_mut, ep1, ep2, noise, _mc = _resolve_recipe(
+        mean_recipe, seed, episodes, episodes2, noise, None)
     genome_a = _crossover_parent_genome(gp_a)
     genome_b = _crossover_parent_genome(gp_b)
     pops = load_or_extract_populations()
@@ -440,13 +638,27 @@ def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=50,
     mutated = {}
     if int(mutate_traits or 0) > 0:
         mutated = mutate_kin_traits(params, int(seed), int(mutate_traits))
+    from sensory_motor import BLEND_DEFAULTS as _bd
+    mean_blends = {}
+    for k in BLEND_KEYS:
+        try:
+            va = float(gp_a.get(k, _bd[k]))
+            vb = float(gp_b.get(k, _bd[k]))
+            mean_blends[k] = max(0.0, min(1.0, (va + vb) / 2.0))
+        except (TypeError, ValueError):
+            pass
+    blend_vals, blend_mut = inherit_blends(mean_blends, int(seed))
+    params.update(blend_vals)
+    mutated.update(blend_mut)
     attach_genome(params, genome)
     child = vault.new_record(name, params)
+    recipe["inherited_from"] = [rec_a.get("id", ""), rec_b.get("id", "")]
     child["lineage"] = {
         "parent_ids": [rec_a.get("id", ""), rec_b.get("id", "")],
         "source": f"crossover:{rec_a.get('id', '')}x{rec_b.get('id', '')}",
         "trait_mutations": mutated, "explore_mode": "crossover",
-        "provenance": provenance}
+        "provenance": provenance, "training": dict(recipe),
+        "training_mutations": recipe_mut}
     elo_a = float((rec_a.get("record", {}) or {}).get(
         "elo", vault.ELO_DEFAULT))
     elo_b = float((rec_b.get("record", {}) or {}).get(
@@ -458,6 +670,6 @@ def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=50,
                             size=len(start_weights))).astype(_np.float32))
     cname = "%s x %s" % (rec_a.get("name", "?"), rec_b.get("name", "?"))
     return _staged_or_single(
-        child, noisy, episodes, params, f"evo crossover of {cname} (pre-train)",
-        episodes2, params2, f"evo crossover of {cname} (flight school)",
+        child, noisy, ep1, params, f"evo crossover of {cname} (pre-train)",
+        ep2, params2, f"evo crossover of {cname} (flight school)",
         progress_cb)

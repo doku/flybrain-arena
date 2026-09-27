@@ -87,9 +87,11 @@ func _fixture_rec() -> Dictionary:
 		"generator_params": {"evasion": 0.46, "dist_gain": 0.15,
 			"learning_rate": 0.008, "yaw_bias": [0.5, -0.2],
 			"explore_mode": "novelty", "genome_id": "gf66baac62c",
-			"mapping": [1, 2, 3]},
+			"mapping": [1, 2, 3], "yaw_blend": 0.45, "pitch_blend": 0.8},
 		"lineage": {"parent_ids": ["par67890"], "source": "clone:par67890",
-			"trait_mutations": {"evasion": [0.4, 0.46]}}}
+			"trait_mutations": {"evasion": [0.4, 0.46]},
+			"training": {"episodes_total": 55, "stage_split": 0.42,
+				"noise": 0.034, "max_changes": 0}}}
 
 
 func test_gallery_real_card() -> void:
@@ -111,6 +113,9 @@ func test_gallery_real_card() -> void:
 	_check(rows.contains("clone of Mottled_G4"),
 		"inheritance names the parent")
 	_check(rows.contains("evasion 0.40→0.46"), "trait mutations shown")
+	_check(rows.contains("reared 55ep"), "training recipe shown")
+	_check(rows.contains("ctl") and rows.contains("yaw 0.45"),
+		"evolved reflex authority shown")
 	A.free()
 
 

@@ -396,12 +396,20 @@ def _bind_codecs(rec, pops, codec_cache):
             f"brain '{rec.get('name')}' declares bad yaw_bias "
             f"'{(rec.get('generator_params', {}) or {}).get('yaw_bias', None)}'")
     legacy = is_legacy_record(rec)
-    key = (m, legacy, yb)
+    from sensory_motor import BLEND_DEFAULTS
+    gp = rec.get("generator_params", {}) or {}
+    blends = {}
+    for _bk, _bd in BLEND_DEFAULTS.items():
+        try:
+            blends[_bk] = max(0.0, min(1.0, float(gp.get(_bk, _bd))))
+        except (TypeError, ValueError):
+            blends[_bk] = _bd
+    key = (m, legacy, yb, tuple(sorted(blends.items())))
     if key not in codec_cache:
         codec_cache[key] = (SensoryEncoder(pops, mapping=m, legacy=legacy),
                             MotorDecoder(pops, mapping=m, legacy=legacy,
-                                         yaw_bias=yb))
-        print(f"[Server] Cached {m} sensorimotor codecs (legacy={legacy}, yaw_bias={yb})")
+                                         yaw_bias=yb, blends=blends))
+        print(f"[Server] Cached {m} sensorimotor codecs (legacy={legacy}, yaw_bias={yb}, blends={blends})")
     return codec_cache[key]
 
 

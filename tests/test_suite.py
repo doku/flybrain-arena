@@ -169,6 +169,120 @@ class TestSensoryMotor(unittest.TestCase):
         self.assertGreater(t1, t0)
         self.assertLessEqual(t1, 1.0)
 
+    def test_control_channel_audit(self):
+        # Every decoded output is registered in CONTROL_CHANNELS with
+        # at least one driving neuron pool: reflex-only control can
+        # never slip in silently again.
+        from sensory_motor import CONTROL_CHANNELS
+        out = self.decoder.decode([], sensory_hint={
+            "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5,
+            "visual_target_visible": True, "visual_target_azimuth": 0.0,
+            "visual_target_elevation": 0.0, "altitude": 7.0,
+            "visual_looming_rate": 0.0, "visual_tree_looming": 0.0,
+            "visual_flow_ventral": 0.3, "visual_flow_lateral": 0.0,
+            "visual_flow_expansion": 0.0, "scent_lost": 0.0})
+        self.assertTrue(len(out) > 0)
+        for key in out:
+            self.assertIn(key, CONTROL_CHANNELS)
+            self.assertGreater(
+                len(CONTROL_CHANNELS[key]["pools"]), 0, key)
+
+    def test_blend_defaults_match_legacy(self):
+        # Untouched blends reproduce the legacy operating point exactly.
+        from sensory_motor import BLEND_DEFAULTS
+        hint = {"pheromone_conc_left": 0.2, "pheromone_conc_right": 0.7,
+                "visual_target_visible": True, "visual_target_azimuth": 10.0,
+                "visual_target_elevation": 5.0, "altitude": 7.0,
+                "visual_looming_rate": 0.8, "visual_tree_looming": 0.0,
+                "scent_lost": 0.0}
+        a = MotorDecoder(self.pops).decode([], sensory_hint=dict(hint))
+        b = MotorDecoder(self.pops,
+                         blends=dict(BLEND_DEFAULTS)).decode(
+                             [], sensory_hint=dict(hint))
+        self.assertEqual(a, b)
+
+    def test_yaw_blend_migrates_vote(self):
+        # yaw_blend=1 flies the brain vote alone (hint reflex gone);
+        # default blends keep the legacy reflex-led turn. Spikes keep
+        # the decode on the main path (empty spikes take the
+        # blend-exempt dead-brain failsafe).
+        hint = {"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.8,
+                "visual_target_visible": False, "scent_lost": 0.0}
+        dn = list(self.pops["descending_all"]["all"])[:24]
+        default = MotorDecoder(self.pops).decode(dn, sensory_hint=dict(hint))
+        neural = MotorDecoder(self.pops,
+                              blends={"yaw_blend": 1.0}).decode(
+                                  dn, sensory_hint=dict(hint))
+        lone = MotorDecoder(self.pops).decode(dn, sensory_hint=None)
+        self.assertGreater(default["yaw_torque"], 0.0)
+        self.assertAlmostEqual(neural["yaw_torque"], lone["yaw_torque"],
+                               places=6)
+
+    def test_evade_backup_toggle(self):
+        # Looming rival, silent giant fiber: backup on (legacy) evades,
+        # evade_backup=0 trusts the GF alone and holds. Spikes keep the
+        # decode on the main path (empty spikes take the blend-exempt
+        # dead-brain failsafe).
+        hint = {"visual_target_visible": True, "visual_target_azimuth": 0.0,
+                "visual_rival_looming": 0.9, "visual_tree_looming": 0.0,
+                "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}
+        # Thrust-only spikes: no GF/mouth/ram drive, so evade can only
+        # come from the reflex backup under test.
+        dn = list(self.pops["motor_thrust_dnp09"]["all"])
+        on = MotorDecoder(self.pops).decode(dn, sensory_hint=dict(hint))
+        off = MotorDecoder(self.pops,
+                           blends={"evade_backup": 0.0}).decode(
+                               dn, sensory_hint=dict(hint))
+        self.assertTrue(on["emergency_evade"])
+        self.assertFalse(off["emergency_evade"])
+
+    def test_pitch_neural_vote(self):
+        # Legacy reflex holds the nose level here (elevation 0, alt 7);
+        # pitch_blend=0 with a T4c climb volley pitches up on neurons.
+        hint = {"visual_target_elevation": 0.0, "altitude": 7.0,
+                "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}
+        pops = self.pops
+        climb = list(pops["visual_t4c"]["all"]) + list(pops["visual_t5c"]["all"])
+        self.assertGreater(len(climb), 0)
+        base = MotorDecoder(self.pops).decode(
+            climb, sensory_hint=dict(hint))["pitch_torque"]
+        self.assertAlmostEqual(base, 0.0, places=6)
+        neural = MotorDecoder(self.pops,
+                              blends={"pitch_blend": 0.0}).decode(
+                                  climb, sensory_hint=dict(hint))["pitch_torque"]
+        self.assertGreater(neural, 0.0)
+
+    def test_flow_cruise_reads_spikes(self):
+        # Same ventral hint: silent T4a falls back to the hint trim
+        # (legacy), a full T4a volley reads fast and trims thrust down.
+        hint = {"visual_flow_ventral": 0.0, "visual_flow_lateral": 0.0,
+                "visual_flow_expansion": 0.0,
+                "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}
+        pops = self.pops
+        fast = list(pops["visual_t4a"]["all"]) + list(pops["visual_t5a"]["all"])
+        self.assertGreater(len(fast), 0)
+        dec = MotorDecoder(self.pops, mapping="flow_trans")
+        fallback = dec.decode([], sensory_hint=dict(hint))["thrust"]
+        neural = dec.decode(fast, sensory_hint=dict(hint))["thrust"]
+        self.assertLess(neural, fallback)
+
+    def test_lost_search_orn_vote(self):
+        # Lost with a right cast: silent antennae follow the sweep
+        # (legacy); whispering left ORNs pull the vote back left.
+        hint = {"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.05,
+                "visual_target_visible": False, "scent_lost": 10.0,
+                "scent_cast": 1.0, "scent_surge": 0.0}
+        pops = self.pops
+        left_orn = list(pops["pheromone_da1"]["left"]) \
+            + list(pops["pheromone_va1v"]["left"])
+        self.assertGreater(len(left_orn), 0)
+        dec = MotorDecoder(self.pops)
+        sweep = dec.decode([], sensory_hint=dict(hint))["yaw_torque"]
+        whisper = dec.decode(left_orn,
+                             sensory_hint=dict(hint))["yaw_torque"]
+        self.assertGreater(sweep, 0.0)
+        self.assertLess(whisper, sweep)
+
     def test_scent_reward_and_acuity(self):
         # Rising total conc pays, falling costs; acuity reads ORN
         # efferent strength and rises with correct-turn potentiation.
@@ -4875,8 +4989,17 @@ class TestElo(unittest.TestCase):
                                "yaw_bias")
                    if seen.get(k) != parent["generator_params"][k]]
         self.assertEqual(len(changed), 2)
-        self.assertEqual(set(rec["lineage"]["trait_mutations"].keys()),
-                         set(changed))
+        stamped = rec["lineage"]["trait_mutations"]
+        for k in changed:
+            self.assertIn(k, stamped)
+        # Reflex blends inherit ± a delta alongside (stamped too).
+        for k in evo.BLEND_KEYS:
+            self.assertIn(k, seen)
+            if k in stamped:
+                old, new = stamped[k]
+                self.assertLessEqual(abs(new - old),
+                                     evo.BLEND_DELTAS[k] + 1e-9)
+                self.assertTrue(0.0 <= new <= 1.0)
         # Disabled: hyperparameters copy over exactly (seed always fresh).
         seen.clear()
         with mock.patch("brain_package.load_brain",
@@ -4896,6 +5019,129 @@ class TestElo(unittest.TestCase):
             evo.breed_random("X", seed=1, episodes=1, mode="bogus")
         with self.assertRaises(ValueError):
             evo.breed_random("X", seed=1, episodes=1, mode="crossover")
+
+    def test_training_recipe_inherit(self):
+        import evo_breeder as evo
+        base = {"episodes_total": 50, "stage_split": 0.5, "noise": 0.05,
+                "max_changes": 1}
+        # Child stays within one delta per knob, stamps [old, new].
+        recipe, mut = evo.inherit_recipe(base, seed=600521426)
+        self.assertLessEqual(abs(recipe["episodes_total"] - 50), 10)
+        self.assertLessEqual(abs(recipe["stage_split"] - 0.5), 0.1 + 1e-9)
+        self.assertLessEqual(abs(recipe["noise"] - 0.05), 0.02 + 1e-9)
+        self.assertLessEqual(abs(recipe["max_changes"] - 1), 1)
+        for k, (old, new) in mut.items():
+            self.assertEqual(old, base[k])
+            self.assertEqual(new, recipe[k])
+        # Deterministic per seed; clamps hold at the walls.
+        self.assertEqual(evo.inherit_recipe(base, seed=600521426)[0], recipe)
+        low, _m = evo.inherit_recipe({"episodes_total": 20, "stage_split": 0.25,
+                                       "noise": 0.0, "max_changes": 0},
+                                      seed=7)
+        self.assertGreaterEqual(low["episodes_total"], 20)
+        self.assertGreaterEqual(low["stage_split"], 0.25)
+        self.assertGreaterEqual(low["noise"], 0.0)
+        self.assertGreaterEqual(low["max_changes"], 0)
+        high, _m = evo.inherit_recipe({"episodes_total": 80, "stage_split": 0.75,
+                                        "noise": 0.15, "max_changes": 3},
+                                       seed=7)
+        self.assertLessEqual(high["episodes_total"], 80)
+        self.assertLessEqual(high["stage_split"], 0.75)
+        self.assertLessEqual(high["noise"], 0.15)
+        self.assertLessEqual(high["max_changes"], 3)
+        # Missing recipe = recipe-less parent: vary around the defaults.
+        orphan, _m = evo.inherit_recipe({}, seed=600521426)
+        self.assertLessEqual(abs(orphan["episodes_total"] - 50), 10)
+        # Fresh wild draws land in range.
+        for s in range(10):
+            f = evo.fresh_recipe(s)
+            self.assertTrue(20 <= f["episodes_total"] <= 80)
+            self.assertTrue(0.25 <= f["stage_split"] <= 0.75)
+            self.assertTrue(0.0 <= f["noise"] <= 0.15)
+            self.assertTrue(0 <= f["max_changes"] <= 3)
+
+    def test_blends_inherit_fresh(self):
+        import evo_breeder as evo
+        from sensory_motor import BLEND_DEFAULTS
+        gp = dict(BLEND_DEFAULTS)
+        # Child stays within one delta per knob, stamps [old, new].
+        bl, mut = evo.inherit_blends(gp, seed=99)
+        for k in evo.BLEND_KEYS:
+            self.assertLessEqual(abs(bl[k] - gp[k]),
+                                 evo.BLEND_DELTAS[k] + 1e-9)
+            self.assertTrue(0.0 <= bl[k] <= 1.0)
+        for k, (old, new) in mut.items():
+            self.assertEqual(old, gp[k])
+            self.assertEqual(new, bl[k])
+        self.assertEqual(evo.inherit_blends(gp, seed=99)[0], bl)
+        # Missing parent (legacy brains) = defaults ± delta.
+        bl2, _m = evo.inherit_blends({}, seed=99)
+        for k in evo.BLEND_KEYS:
+            self.assertLessEqual(abs(bl2[k] - BLEND_DEFAULTS[k]),
+                                 evo.BLEND_DELTAS[k] + 1e-9)
+        # Fresh wild draws stay in the flyable regime.
+        f = evo.fresh_blends(7)
+        self.assertTrue(0.0 <= f["yaw_blend"] <= 0.6)
+        self.assertIn(f["evade_backup"], (0.0, 1.0))
+        self.assertTrue(0.0 <= f["flow_authority"] <= 1.0)
+        self.assertTrue(0.2 <= f["search_blend"] <= 0.8)
+        self.assertTrue(0.5 <= f["pitch_blend"] <= 1.0)
+        self.assertEqual(evo.fresh_blends(7), f)
+
+    def test_resolve_recipe_stages(self):
+        import evo_breeder as evo
+        base = {"episodes_total": 50, "stage_split": 0.5, "noise": 0.05,
+                "max_changes": 1}
+        # Derived: stages sum to the inherited total.
+        recipe, _m, ep1, ep2, _nz, _mc = evo._resolve_recipe(
+            base, 600521426, None, None, None, None)
+        self.assertEqual(ep1 + ep2, recipe["episodes_total"])
+        self.assertGreater(ep1, 0)
+        self.assertGreater(ep2, 0)
+        # Explicit episodes without episodes2 keeps single-stage.
+        _r, _m, ep1, ep2, _nz, _mc = evo._resolve_recipe(
+            base, 600521426, 1, None, None, None)
+        self.assertEqual(ep1, 1)
+        self.assertIsNone(ep2)
+
+    def test_breed_clone_inherits_recipe(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3, "learning_rate": 0.008,
+                                       "dist_gain": 0.15, "evasion": 0.2,
+                                       "yaw_bias": 9.0},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "training": {"episodes_total": 50,
+                                           "stage_split": 0.5,
+                                           "noise": 0.05,
+                                           "max_changes": 1}}}
+        seen = {}
+
+        def fake_staged(child, start_weights, ep1, params, _n1, ep2,
+                        _p2, _n2, progress_cb):
+            seen["ep1"] = ep1
+            seen["ep2"] = ep2
+            return child, start_weights, {}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch.object(evo, "_staged_or_single",
+                                  side_effect=fake_staged):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5,
+                                          mutate_structure=False,
+                                          mutate_traits=0)
+        tr = rec["lineage"]["training"]
+        self.assertEqual(seen["ep1"] + seen["ep2"], tr["episodes_total"])
+        self.assertEqual(tr["inherited_from"], "p1")
+        for k in ("episodes_total", "stage_split", "noise", "max_changes"):
+            self.assertIn(k, tr)
+        for k, (old, new) in rec["lineage"]["training_mutations"].items():
+            self.assertEqual(new, tr[k])
 
     def test_crossover_parent_genome(self):
         import evo_breeder as evo

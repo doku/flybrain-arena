@@ -79,6 +79,49 @@ def normalize_mapping(value):
 # Translational-flow cruise target (ventral flow units): the decoder
 # trims thrust to hold this. Cruise 5 m/s at 7 m altitude reads ~0.36.
 FLOW_CRUISE = 0.35
+# Full-scale T4/T5 spike volley: the encoder injects up to 30 cells per
+# pool over the 4 pools of a direction group at magnitude 1.0, so
+# counts / FLOW_FULL_SCALE estimates the flow magnitude back.
+FLOW_FULL_SCALE = 120.0
+
+# Reflex authority defaults (heritable evolvable control traits; the
+# legacy operating point, bit-identical when untouched).
+BLEND_DEFAULTS = {
+    "yaw_blend": 0.3,
+    "evade_backup": 1.0,
+    "flow_authority": 1.0,
+    "search_blend": 0.5,
+    "pitch_blend": 1.0,
+}
+
+# Control-channel audit: every MotorDecoder output and what drives it.
+# "pools" = spiking neuron pools that vote; "reflex" = hardwired
+# sensory-math contributors (no neurons); "gate" = sensory conditions
+# that enable a neural drive without steering it. The audit test
+# asserts every decoded output appears here with at least one pool,
+# so reflex-only control can never slip in silently again.
+CONTROL_CHANNELS = {
+    "thrust": {"pools": ["motor_thrust_dnp09", "descending_all",
+                         "motor_flight_thrust"],
+               "reflex": [], "gate": []},
+    "yaw_torque": {"pools": ["motor_turn_dnp20", "descending_all",
+                             "motor_steer", "visual_lc11"],
+                   "reflex": ["reflex_yaw", "lost_search"],
+                   "gate": []},
+    "pitch_torque": {"pools": ["visual_t4c", "visual_t5c",
+                               "visual_t4d", "visual_t5d"],
+                     "reflex": ["reflex_pitch"], "gate": []},
+    "roll_torque": {"pools": ["flow_vs", "flow_hs", "motor_roll_mnhl"],
+                    "reflex": [], "gate": []},
+    "approach_bias": {"pools": ["mbon_app", "mbon_av"],
+                      "reflex": [], "gate": []},
+    "ram_burst": {"pools": ["motor_ram_dnpe017"], "reflex": [], "gate": []},
+    "emergency_evade": {"pools": ["motor_giant_fiber"],
+                        "reflex": ["reflex_evade", "reflex_evade_tree"],
+                        "gate": ["visibility"]},
+    "spear_thrust": {"pools": ["motor_mouth"], "reflex": [],
+                     "gate": ["aim"]},
+}
 
 
 def _side_pair(populations, key):
@@ -482,10 +525,23 @@ class MotorDecoder:
     validate correct — stays for both regimes.
     """
     def __init__(self, populations, mapping=None, legacy=False,
-                 yaw_bias=None):
+                 yaw_bias=None, blends=None):
         self.schemes = normalize_mapping(mapping)
         self.legacy = bool(legacy)
         self._dn_gain = 0.008 if self.legacy else 0.0005
+        # Reflex authority per channel (heritable evolvable traits;
+        # defaults reproduce the legacy operating point exactly):
+        # yaw_blend = brain share of yaw (legacy 0.3 brain / 0.7 reflex),
+        # evade_backup = reflex evade backup on (>0.5) or pure GF,
+        # flow_authority = cruise/drift/flare trim gain, search_blend =
+        # lost-search cast share, pitch_blend = reflex share of pitch.
+        self._blends = dict(BLEND_DEFAULTS)
+        for k, v in (blends or {}).items():
+            if k in self._blends:
+                try:
+                    self._blends[k] = max(0.0, min(1.0, float(v)))
+                except (TypeError, ValueError):
+                    pass
         # Per-brain intrinsic DN lateralization correction (default 9.0:
         # measured dnR-dnL on symmetric input). A single constant
         # over-steers brains whose true bias runs lower (constant left
@@ -551,6 +607,26 @@ class MotorDecoder:
         self.mbon_app_ids = set(mbon_app.get("all", []))
         mbon_av = populations.get("mbon_av", {})
         self.mbon_av_ids = set(mbon_av.get("all", []))
+        # Translational-flow direction groups for the neural cruise/
+        # flare/pitch votes (flow_trans encoder drives these; silent
+        # pools read 0 = no vote, so unwired brains fly as before).
+        self.t4a_ids = set()
+        self.t4c_ids = set()
+        self.t4d_ids = set()
+        for _key, _dest in (("visual_t4a", "t4a_ids"),
+                            ("visual_t5a", "t4a_ids"),
+                            ("visual_t4c", "t4c_ids"),
+                            ("visual_t5c", "t4c_ids"),
+                            ("visual_t4d", "t4d_ids"),
+                            ("visual_t5d", "t4d_ids")):
+            getattr(self, _dest).update(
+                populations.get(_key, {}).get("all", []))
+        # ORN pools for the neural lost-search vote (encoder-driven;
+        # silent = fall back to the arena cast sweep, as before).
+        da1 = populations.get("pheromone_da1", {})
+        va1v = populations.get("pheromone_va1v", {})
+        self.orn_left = set(da1.get("left", [])) | set(va1v.get("left", []))
+        self.orn_right = set(da1.get("right", [])) | set(va1v.get("right", []))
 
     def decode(self, fired_spikes, sensory_hint=None, _counts_out=None):
         # _counts_out: optional caller-owned dict to fill instead of a
@@ -572,7 +648,10 @@ class MotorDecoder:
             if sensory_hint is None:
                 return base
             # No brain spikes: fall back to pure reflex so the fly still homess.
-            # Surge applies here too: a homing fly spends extra thrust closing.
+            # Dead-brain failsafe, blend-exempt by design: with no neural
+            # activity there is no brain vote to arbitrate, so reflex owns
+            # every channel (see CONTROL_CHANNELS). Surge applies here too:
+            # a homing fly spends extra thrust closing.
             fb_surge = float(np.clip(sensory_hint.get("scent_surge", 0.0), 0.0, 1.0))
             return {
                 "thrust": float(np.clip(0.2 + fb_surge * 0.25, 0.0, 1.0)),
@@ -648,12 +727,17 @@ class MotorDecoder:
             brain_yaw = float(np.clip(brain_yaw + yaw_lc, -1.0, 1.0))
         if sensory_hint is not None:
             # Parallel olfactory/visual reflex (antenna tropotaxis + visual
-            # fixation), blended 30/70 with brain readout. Reflex dominates
-            # the TURN SIGN (brain alone has a rightward bias that training
-            # only partly removes); brain sets thrust/bursts/variation.
+            # fixation), blended with brain readout. Legacy 30/70: reflex
+            # dominates the TURN SIGN (brain alone has a rightward bias
+            # that training only partly removes); brain sets
+            # thrust/bursts/variation. yaw_blend is heritable, so
+            # evolution can migrate the turn vote onto neurons.
+            w = float(self._blends["yaw_blend"])
             reflex = self.reflex_yaw(sensory_hint)
-            yaw_torque = float(np.clip(0.3 * brain_yaw + 0.7 * reflex, -1.0, 1.0))
-            yaw_torque = self._lost_search_yaw(sensory_hint, yaw_torque)
+            yaw_torque = float(np.clip(
+                w * brain_yaw + (1.0 - w) * reflex, -1.0, 1.0))
+            yaw_torque = self._lost_search_yaw(
+                sensory_hint, yaw_torque, self._search_dir(counts))
         else:
             yaw_torque = brain_yaw
 
@@ -690,7 +774,11 @@ class MotorDecoder:
             vis = bool(sensory_hint.get("visual_target_visible", False))
             az = abs(float(sensory_hint.get("visual_target_azimuth", 0.0)))
             emergency_evade = bool(vis and az < 50.0)
-        if sensory_hint is not None:
+        # Reflex backup is heritable (legacy on): evade_backup above
+        # 0.5 keeps the loom reflexes behind the GF drive; at or below,
+        # the fly trusts its giant fiber alone.
+        if sensory_hint is not None \
+                and float(self._blends["evade_backup"]) > 0.5:
             emergency_evade = emergency_evade or bool(self.reflex_evade(sensory_hint)) \
                 or bool(self.reflex_evade_tree(sensory_hint))
 
@@ -745,18 +833,34 @@ class MotorDecoder:
         # drove T4/T5).
         if "flow_trans" in self.schemes and not self.legacy \
                 and sensory_hint is not None:
-            ventral = float(np.clip(sensory_hint.get(
-                "visual_flow_ventral", 0.0), 0.0, 1.0))
+            # Cruise + flare read the T4/T5 spike volleys (the encoder
+            # drives them from these same flow magnitudes); silent pools
+            # fall back to the hint magnitudes, as before. Drift keeps
+            # the signed hint key: the T4b pools have no handedness, so
+            # spikes alone cannot tell left slip from right slip.
+            # flow_authority scales the whole trim block (legacy 1.0).
+            auth = float(self._blends["flow_authority"])
+            a_counts = sum(counts.get(s, 0) for s in self.t4a_ids)
+            d_counts = sum(counts.get(s, 0) for s in self.t4d_ids)
+            if a_counts > 0:
+                ventral = min(a_counts / FLOW_FULL_SCALE, 1.0)
+            else:
+                ventral = float(np.clip(sensory_hint.get(
+                    "visual_flow_ventral", 0.0), 0.0, 1.0))
             lateral = float(np.clip(sensory_hint.get(
                 "visual_flow_lateral", 0.0), -1.0, 1.0))
-            expansion = float(np.clip(sensory_hint.get(
-                "visual_flow_expansion", 0.0), 0.0, 1.0))
+            if d_counts > 0:
+                expansion = min(d_counts / FLOW_FULL_SCALE, 1.0)
+            else:
+                expansion = float(np.clip(sensory_hint.get(
+                    "visual_flow_expansion", 0.0), 0.0, 1.0))
             thrust = float(np.clip(
-                thrust + np.clip((FLOW_CRUISE - ventral) * 0.5, -0.15, 0.15),
+                thrust + np.clip((FLOW_CRUISE - ventral) * 0.5,
+                                 -0.15, 0.15) * auth,
                 0.0, 1.0))
             if abs(lateral) < 0.95:
                 yaw_torque = float(np.clip(
-                    yaw_torque + np.clip(lateral * 0.2, -0.15, 0.15),
+                    yaw_torque + np.clip(lateral * 0.2, -0.15, 0.15) * auth,
                     -1.0, 1.0))
             thrust = float(np.clip(thrust * (1.0 - 0.4 * expansion),
                                    0.0, 1.0))
@@ -764,7 +868,8 @@ class MotorDecoder:
         return {
             "thrust": float(thrust),
             "yaw_torque": float(yaw_torque),
-            "pitch_torque": float(self.reflex_pitch(sensory_hint)) if sensory_hint is not None else 0.0,
+            "pitch_torque": self._pitch_torque(counts, sensory_hint) \
+                if sensory_hint is not None else 0.0,
             "roll_torque": float(roll_torque),
             "approach_bias": float(approach_bias),
             "ram_burst": bool(ram_burst),
@@ -772,20 +877,35 @@ class MotorDecoder:
             "spear_thrust": float(spear_thrust)
         }
 
-    @staticmethod
-    def _lost_search_yaw(sensory_hint, yaw_torque):
+    def _search_dir(self, counts):
+        """Neural lost-search vote: ORN L/R contrast while the antennae
+        still whisper (faint traces below the lost threshold), else None
+        (caller falls back to the arena cast sweep, as before)."""
+        l = sum(counts.get(s, 0) for s in self.orn_left)
+        r = sum(counts.get(s, 0) for s in self.orn_right)
+        if l + r <= 0:
+            return None
+        return float(np.clip((r - l) / (r + l + 1e-6) * 1.5, -1.0, 1.0))
+
+    def _lost_search_yaw(self, sensory_hint, yaw_torque, cast_dir=None):
         """Floor-relative lost-scent search: usable scent gone 3+ s with
         nothing visible -> blend toward the slow cast sweep instead of
-        coasting straight. Keys default to found, so legacy/partial
-        dicts behave exactly as before."""
+        coasting straight. cast_dir carries the neural ORN vote when the
+        antennae still whisper; None keeps the legacy arena sweep.
+        search_blend is heritable (legacy 0.5/0.5). Keys default to
+        found, so legacy/partial dicts behave exactly as before."""
         if sensory_hint is None:
             return yaw_torque
         if float(sensory_hint.get("scent_lost", 0.0)) <= 3.0:
             return yaw_torque
         if bool(sensory_hint.get("visual_target_visible", False)):
             return yaw_torque
-        cast = float(np.clip(sensory_hint.get("scent_cast", 0.0), -1.0, 1.0))
-        return float(np.clip(0.5 * yaw_torque + 0.5 * cast * 0.8, -1.0, 1.0))
+        if cast_dir is None:
+            cast_dir = float(np.clip(
+                sensory_hint.get("scent_cast", 0.0), -1.0, 1.0))
+        s = float(self._blends["search_blend"])
+        return float(np.clip((1.0 - s) * yaw_torque + s * cast_dir * 0.8,
+                             -1.0, 1.0))
 
     @staticmethod
     def reflex_yaw(sensory_dict):
@@ -822,6 +942,21 @@ class MotorDecoder:
         loom = float(np.clip(sensory_dict.get(
             "visual_tree_looming", sensory_dict.get("visual_looming_rate", 0.0)), 0.0, 1.0))
         return bool(loom > 0.4)
+
+    def _pitch_torque(self, counts, sensory_hint):
+        """Nose control: T4c (climb) vs T4d (descent) spike vote blended
+        with the reflex tracker. pitch_blend is the reflex share
+        (legacy 1.0 = pure reflex, bit-identical); silent flow pools
+        read 0, so unwired brains fly exactly as before. No new pools
+        were needed: the annotation table carries no labeled pitch
+        (dorsal/ventral) descending neurons, so climb/descent flow is
+        the honest neural pitch signal available."""
+        reflex = float(self.reflex_pitch(sensory_hint))
+        c = sum(counts.get(s, 0) for s in self.t4c_ids)
+        d = sum(counts.get(s, 0) for s in self.t4d_ids)
+        neural = float(np.tanh((c - d) / 30.0))
+        w = float(self._blends["pitch_blend"])
+        return float(np.clip(w * reflex + (1.0 - w) * neural, -1.0, 1.0))
 
     @staticmethod
     def reflex_pitch(sensory_dict):

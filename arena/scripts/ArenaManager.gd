@@ -2789,7 +2789,7 @@ func _update_evo_status_line() -> void:
 				parts.append("%s warming up" % label)
 			else:
 				parts.append("%s ep %d/%d" % [label,
-					int(prog.get("episode", 0)), EVO_EPISODES])
+					int(prog.get("episode", 0)), int(_prog_total(prog))])
 		else:
 			parts.append("%s queued" % label)
 	for kind in (evo.get("done", {}) as Dictionary).keys():
@@ -3326,13 +3326,18 @@ func _evo_active() -> bool:
 
 
 const EVO_EPISODES := 50
+# Legacy regime default: every breed's training recipe (episode total,
+# stage split, weight noise, structural changes) now inherits ± a delta
+# from its parent (wilds draw fresh), so EVO_EPISODES is only the
+# display fallback. MAX_EVO_EPISODES mirrors TRAINING_RANGES upstairs.
+const MAX_EVO_EPISODES := 80
 # Await/slot-wait ceiling: two-stage breeds (25+25 eps) run ~40+ min on
 # this hardware (single-stage wild already took 22 min). The old fixed
 # 20-min timeout aborted generations mid-training while the worker was
 # still legitimately burning CPU - the log showed only the banner
-# (buffered) and the verdict never landed. Episodes-proportional: 50
-# eps x 80 s + loader headroom = 66 min.
-const EVO_AWAIT_TIMEOUT := EVO_EPISODES * 80.0
+# (buffered) and the verdict never landed. Episodes-proportional to the
+# recipe cap: 80 eps x 80 s + loader headroom.
+const EVO_AWAIT_TIMEOUT := MAX_EVO_EPISODES * 80.0
 # Two-step evo breeding: half the episodes pre-train, half Advanced
 # Flight School (default school curriculum; school code selects stages).
 # NOTE: this JSON must NEVER ride argv (--params2): Godot strips embedded
@@ -3340,7 +3345,6 @@ const EVO_AWAIT_TIMEOUT := EVO_EPISODES * 80.0
 # the old empty --name bug. _evo_params2_file writes it to disk and the
 # spawns pass --params2-file instead (same pattern as generate_brain_async).
 const EVO_SCHOOL_PARAMS := '{"curriculum": {}}'
-const EVO_NOISE := 0.05
 
 
 func _evo_params2_file(result_file: String) -> String:
@@ -3491,6 +3495,12 @@ func _evo_poll_file(path: String) -> Dictionary:
 	return {}
 
 
+func _prog_total(prog: Dictionary) -> float:
+	# Per-breed episode total from its progress file (recipes vary the
+	# regime per child); legacy EVO_EPISODES as the fallback.
+	return maxf(float(prog.get("total", EVO_EPISODES)), 1.0)
+
+
 func _evo_breed(strategy: String, brain_name: String, parent_id: String,
 		seed: int, progress_path: String, result_file: String,
 		target_gen: int = 1) -> String:
@@ -3520,10 +3530,11 @@ func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
 	var log_path := result_file.get_base_dir().path_join(
 		result_file.get_file().get_basename() + ".log")
 	var display := brain_name if brain_name != "" else ("wild G%d" % target_gen)
+	# No --episodes/--episodes2/--noise: the breeder deals each child a
+	# recipe inherited ± a delta from its parent (fresh for wilds).
 	var args := ["breed", "--strategy", strategy,
-		"--episodes", str(EVO_EPISODES / 2), "--seed", str(seed),
-		"--episodes2", str(EVO_EPISODES / 2),
-		"--noise", str(EVO_NOISE), "--progress", progress_path,
+		"--seed", str(seed),
+		"--progress", progress_path,
 		"--gen", str(target_gen),
 		"--log-file", log_path]
 	var p2 := _evo_params2_file(result_file)
@@ -3534,7 +3545,7 @@ func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
 	if parent_id != "":
 		args += ["--parent", parent_id]
 	_show_evo_phase("BREEDING " + display,
-		"Spawning worker (attempt %d)... ep 0/%d" % [attempt, EVO_EPISODES])
+		"Spawning worker (attempt %d)... dealing training recipe" % attempt)
 	var res: Dictionary = director.run_cli_async(
 		"evo_breed", args, result_file)
 	if not bool(res.get("ok", false)):
@@ -3574,15 +3585,15 @@ func _evo_await_result(display: String, progress_path: String,
 			var last := _evo_poll_file(progress_path)
 			_show_evo_phase("BREEDING " + display,
 				"Worker died at ep %d/%d - failing fast." % [
-				int(last.get("episode", 0)), EVO_EPISODES])
+					int(last.get("episode", 0)), int(_prog_total(last))])
 			evo_waiting = false
 			break
 		var prog := _evo_poll_file(progress_path)
 		if not prog.is_empty():
 			var pct := 100.0 * float(prog.get("episode", 0)) / maxf(float(prog.get("total", EVO_EPISODES)), 1.0)
 			_show_evo_phase("BREEDING " + display,
-				"Training ep %d/%d ..." % [int(prog.get("episode", 0)), EVO_EPISODES])
-			_update_evo_phase("Training ep %d/%d ..." % [int(prog.get("episode", 0)), EVO_EPISODES], pct)
+				"Training ep %d/%d ..." % [int(prog.get("episode", 0)), int(_prog_total(prog))])
+			_update_evo_phase("Training ep %d/%d ..." % [int(prog.get("episode", 0)), int(_prog_total(prog))], pct)
 		# Verdicts are accepted from our own result file only. The shared
 		# async signal can carry another pipelined job's verdict while we
 		# wait, so a signal value with no corroborating file of our own is
@@ -3841,10 +3852,11 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	var strategy := "random"
 	if kind == "clone":
 		strategy = "crossover" if parent2 != "" else "clone"
+	# No --episodes/--episodes2/--noise: the breeder deals each child a
+	# recipe inherited ± a delta from its parent (fresh for wilds).
 	var args := ["breed", "--strategy", strategy,
-		"--episodes", str(EVO_EPISODES / 2), "--seed", str(int(spec.get("seed", 0))),
-		"--episodes2", str(EVO_EPISODES / 2),
-		"--noise", str(EVO_NOISE), "--progress", str(spec.get("progress", "")),
+		"--seed", str(int(spec.get("seed", 0))),
+		"--progress", str(spec.get("progress", "")),
 		"--gen", str(int(spec.get("gen", 1))),
 		"--explore-mode", str(spec.get("mode", "")) if str(spec.get("mode", "")) != "" else "graft",
 		"--log-file", log_path]
@@ -3930,7 +3942,7 @@ func _evo_adopt_finished() -> Dictionary:
 					var log_path := rf.get_base_dir().path_join(
 						rf.get_file().get_basename() + ".log")
 					print("[Arena] EVO background worker died at ep %d/%d (%s) - dropping; see %s" % [
-						int(last.get("episode", 0)), EVO_EPISODES,
+						int(last.get("episode", 0)), int(_prog_total(last)),
 						str(sd.get("kind", "?")), log_path])
 					if director != null and str(director.pending_async.get("result_file", "")) == rf:
 						director.pending_async = {}
@@ -4172,7 +4184,7 @@ func _evo_offspring_summary(target_gen: int) -> String:
 					lines.append("%s - warming up" % label)
 				else:
 					lines.append("%s - training ep %d/%d" % [label,
-						int(prog.get("episode", 0)), EVO_EPISODES])
+						int(prog.get("episode", 0)), int(_prog_total(prog))])
 			else:
 				lines.append("%s - queued" % label)
 		if not found:
@@ -4408,7 +4420,7 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 				if prog.is_empty():
 					detail = "warming up"
 				else:
-					detail = "ep %d/%d" % [int(prog.get("episode", 0)), EVO_EPISODES]
+					detail = "ep %d/%d" % [int(prog.get("episode", 0)), int(_prog_total(prog))]
 			else:
 				detail = "queued"
 			detail += " [%s]" % sk if sk != "" else detail
@@ -4442,6 +4454,20 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 	var yb = gp.get("yaw_bias", null)
 	if yb != null:
 		traits += " · yaw %s" % _fmt_bias(yb)
+	# Evolved reflex authority: only deviations from the legacy
+	# operating point (mirrors sensory_motor.BLEND_DEFAULTS).
+	var bldefs := {"yaw_blend": 0.3, "evade_backup": 1.0,
+		"flow_authority": 1.0, "search_blend": 0.5, "pitch_blend": 1.0}
+	var blnames := {"yaw_blend": "yaw", "evade_backup": "evbk",
+		"flow_authority": "flow", "search_blend": "srch",
+		"pitch_blend": "ptch"}
+	var blparts := PackedStringArray()
+	for bk in bldefs.keys():
+		var bv := float(gp.get(bk, bldefs[bk]))
+		if absf(bv - float(bldefs[bk])) > 0.001:
+			blparts.append("%s %.2f" % [str(blnames[bk]), bv])
+	if blparts.size() > 0:
+		traits += " · ctl " + " ".join(blparts)
 	var teps := int(t.get("episodes", 0))
 	var tscore := float(t.get("score", 0.0))
 	var fights := "Battles %d (W%d L%d D%d) · Matches %d (W%d L%d) · Titles %d" % [
@@ -4454,8 +4480,22 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 		schooled += " (avg %.2f)" % (tscore / float(teps))
 	var rows := "%s\n%s\n%s\n%s\n%s" % [fights, schooled, wiring,
 		traits, _inheritance_line(rec)]
+	var rear := _rearing_line(rec)
+	if rear != "":
+		rows += "\n" + rear
 	return {"key": pid, "title": pname,
 		"elo": "%d" % int(r.get("elo", 1200.0)), "rows": rows}
+
+
+func _rearing_line(rec: Dictionary) -> String:
+	# Heritable training recipe: how long/hard this brain was
+	# schooled (episodes inherit ± a delta, wilds draw fresh).
+	var tr: Dictionary = (rec.get("lineage", {}) as Dictionary).get("training", {})
+	if tr.is_empty():
+		return ""
+	return "reared %dep · split %.2f · noise %.3f · struct %d" % [
+		int(tr.get("episodes_total", 0)), float(tr.get("stage_split", 0.5)),
+		float(tr.get("noise", 0.0)), int(tr.get("max_changes", 0))]
 
 
 func _fmt_stat(v) -> String:
@@ -4587,7 +4627,7 @@ func _offspring_progress(kind: String) -> Array:
 		var prog := _evo_poll_file(str(s.get("progress", "")))
 		if prog.is_empty():
 			return [label + " warming up", 0.0]
-		return [label, 100.0 * float(prog.get("episode", 0)) / float(EVO_EPISODES)]
+		return [label, 100.0 * float(prog.get("episode", 0)) / _prog_total(prog)]
 	return ["", -1.0]
 
 
@@ -4662,7 +4702,7 @@ func _evo_await_queued(kind: String) -> String:
 					var bprog := _evo_poll_file(str(blk.get("progress", "")))
 					var bep := "warming up"
 					if not bprog.is_empty():
-						bep = "ep %d/%d" % [int(bprog.get("episode", 0)), EVO_EPISODES]
+						bep = "ep %d/%d" % [int(bprog.get("episode", 0)), int(_prog_total(bprog))]
 					_show_evo_phase("BREEDING " + display0,
 						"Queued behind %s (%s)..." % [blabel, bep])
 				await get_tree().create_timer(2.0).timeout

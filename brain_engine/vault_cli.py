@@ -406,29 +406,34 @@ def cmd_breed(a):
               f"episodes={a.episodes} seed={a.seed}", flush=True)
         prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
             if getattr(a, "progress", "") else None
-        ep2 = int(getattr(a, "episodes2", 0) or 0)
-        params2 = _parse_params2(a) if ep2 > 0 else None
+        eps = int(getattr(a, "episodes", 0) or 0) or None
+        ep2 = int(getattr(a, "episodes2", 0) or 0) or None
+        noise = getattr(a, "noise", None)
+        noise = None if noise is None else float(noise)
+        maxc = getattr(a, "max_changes", None)
+        maxc = None if maxc is None else int(maxc)
+        params2 = _parse_params2(a) if (ep2 or 0) > 0 or eps is None else None
         if isinstance(params2, dict) and params2.get("__error"):
             return err(params2["__error"])
         if a.strategy == "clone":
             rec, _w, summary = evo_breeder.breed_clone(
-                a.parent, a.name, int(a.seed), int(a.episodes),
-                noise=float(getattr(a, "noise", 0.05) or 0.05),
-                progress_cb=prog, episodes2=ep2 or None, params2=params2,
+                a.parent, a.name, int(a.seed), eps,
+                noise=noise, max_changes=maxc,
+                progress_cb=prog, episodes2=ep2, params2=params2,
                 mutate_traits=int(float(
                     getattr(a, "mutate_traits", 1) or 0)))
         elif a.strategy == "random":
             rec, _w, summary = evo_breeder.breed_random(
-                a.name, int(a.seed), int(a.episodes), progress_cb=prog,
+                a.name, int(a.seed), eps, progress_cb=prog,
                 generation=int(getattr(a, "gen", 1) or 1),
-                episodes2=ep2 or None, params2=params2,
+                episodes2=ep2, params2=params2,
                 mode=str(getattr(a, "explore_mode", "graft") or "graft"))
         elif a.strategy == "crossover":
             rec, _w, summary = evo_breeder.breed_crossover(
                 a.parent, str(getattr(a, "parent2", "") or ""), a.name,
-                int(a.seed), int(a.episodes),
-                noise=float(getattr(a, "noise", 0.05) or 0.05),
-                progress_cb=prog, episodes2=ep2 or None, params2=params2,
+                int(a.seed), eps,
+                noise=noise,
+                progress_cb=prog, episodes2=ep2, params2=params2,
                 mutate_traits=int(float(
                     getattr(a, "mutate_traits", 1) or 0)))
         elif a.strategy == "reference":
@@ -495,11 +500,15 @@ def main():
     # (Godot OS.create_process on Windows), leaving a bare `--name`
     # followed by the next option. nargs="?" maps that to "" too.
     q.add_argument("--name", nargs="?", default="", const="");
-    q.add_argument("--episodes", type=int, required=True)
+    # Training recipe overrides: all optional (0/None = inherit ± delta
+    # from the parent, or fresh draws for wilds). Explicit values keep
+    # the legacy fixed-regime behavior for manual breeds.
+    q.add_argument("--episodes", type=int, default=0)
     q.add_argument("--parent", default=""); q.add_argument("--seed", type=int, required=True)
     q.add_argument("--episodes2", type=int, default=0)
     q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")
-    q.add_argument("--noise", type=float, default=0.05)
+    q.add_argument("--noise", type=float, default=None)
+    q.add_argument("--max-changes", type=int, default=None)
     q.add_argument("--mutate-traits", default=1)
     q.add_argument("--explore-mode", default="graft")
     q.add_argument("--parent2", default="")
