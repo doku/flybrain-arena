@@ -270,6 +270,58 @@ func _all_labels(node: Node) -> Array:
 	return out
 
 
+func test_prebuilt_overview() -> void:
+	# All four fixtures built up front: every quadrant renders versus
+	# cards, never the "No tournament." placeholder.
+	var brains := _brains(16, 2000)
+	var ids: Array = []
+	for b in brains:
+		ids.append(str(b["id"]))
+	var beg: Dictionary = D.call("event_begin", ids,
+		{"best_of": 1, "lr_scale": 0.5, "round_time": 40.0}, 9, brains)
+	var eid := str(beg.get("event_id", ""))
+	var groups: Dictionary = beg.get("groups", {})
+	for g in ["A", "B", "C", "D"]:
+		var gp: Array = []
+		for pid in (((groups.get(g, {}) as Dictionary).get("players", [])) as Array):
+			for b in brains:
+				if str((b as Dictionary).get("id", "")) == str(pid):
+					gp.append(b)
+		D.call("build_group_bracket", gp, g, eid, 1, 0.5, 40.0)
+		D.call("event_note_bracket", eid, g, str(D.tourney.get("id", "")))
+	# Back to group A, play one pairing.
+	var aid := str((((D.call("event_load", eid) as Dictionary).get("groups", {}) as Dictionary).get("A", {}) as Dictionary).get("bracket_id", ""))
+	_check(D.call("load_state_file", D.tournament_dir.path_join(aid + ".json")),
+		"group A reloads")
+	D.call("on_battle_result", "alpha", {}, {}, {}, 1, 0)
+	D.call("advance_after_match")
+	var data: Dictionary = D.call("event_overview_data", eid)
+	var cells: Array = data.get("groups", [])
+	_check(cells.size() == 4, "four overview cells")
+	for cell in cells:
+		_check(((cell as Dictionary).get("rounds", []) as Array).size() == 3,
+			"every quadrant has its fixture")
+	_check(str(data.get("current", "")) == "A", "current is group A")
+	var B = load("res://scripts/TournamentBracket.gd").new()
+	B.call("render_event_groups", data, "A")
+	var labels := _all_labels(B)
+	var no_tourney := 0
+	var heads := 0
+	var cards := 0
+	for t in labels:
+		var s := str(t)
+		if s == "No tournament.":
+			no_tourney += 1
+		if s == "ROUND 1" or s == "ROUND 2" or s == "ROUND 3":
+			heads += 1
+		if s.begins_with("R") and s.contains("M"):
+			cards += 1
+	_check(no_tourney == 0, "no empty quadrants")
+	_check(heads == 12, "twelve fixture round headers")
+	_check(cards == 24, "twenty-four versus cards")
+	B.free()
+
+
 func _initialize() -> void:
 	_setup()
 	test_snake_draft()
@@ -278,6 +330,7 @@ func _initialize() -> void:
 	test_final_fixed_order()
 	test_event_chain()
 	test_overview_render()
+	test_prebuilt_overview()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

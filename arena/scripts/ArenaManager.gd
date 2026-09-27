@@ -2739,7 +2739,7 @@ func _handle_draw() -> void:
 		"TIME UP - NOBODY BLED - REMATCH",
 		"REMATCH")
 
-# ?�?�?Dynamic tree fade ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
+# ?�?� Dynamic tree fade ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 # Every combat-area tree gets its own StandardMaterial3D (so alpha can
 # be set per-tree). Each frame the camera->fly ray is tested against
 # each tree's XZ position; occluding trees go translucent instantly,
@@ -2943,7 +2943,7 @@ func _process(delta: float) -> void:
 		for cm in entry["canopy_mats"]:
 			(cm as StandardMaterial3D).albedo_color.a = lerpf((cm as StandardMaterial3D).albedo_color.a, target, k)
 
-# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 
 func _update_ctrl_label() -> void:
 	if not is_instance_valid(ctrl_label):
@@ -3384,7 +3384,7 @@ func _evo_active() -> bool:
 	return bool(director.tourney.get("evo", {}).get("active", false))
 
 
-# ?�?� Group-stage events (evolution size-16) ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ── Group-stage events (evolution size-16) ──────────────────────────
 # One event = group files A-D + final, chained by the event manifest.
 # Brackets are fixed at event start; bred offspring stock the manifest
 # pool bench and never enter a live bracket directly.
@@ -3556,6 +3556,48 @@ func _event_build_group(ev: Dictionary, letter: String) -> bool:
 	return true
 
 
+func _event_build_all_groups(ev: Dictionary) -> bool:
+	# Fixtures for the whole event up front: every quadrant renders
+	# real versus cards from the first minute (no "No tournament"
+	# panels). The chain only switches between prebuilt files after.
+	for letter in (ev.get("group_order", []) as Array):
+		if not _event_build_group(ev, str(letter)):
+			return false
+	return true
+
+
+func _event_switch_group(ev: Dictionary, letter: String) -> bool:
+	# Enter a prebuilt group file: ghost-check the roster, load it,
+	# carry the pipeline evo over. Falls back to building when no
+	# file was recorded (older events).
+	var director := _director()
+	if director == null:
+		return false
+	var eid := str(ev.get("id", ""))
+	var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+	var by_id: Dictionary = {}
+	for b in director.list_brains():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	for pid in (g.get("players", []) as Array):
+		if not by_id.has(str(pid)):
+			_evo_abort("event short: %s missing from vault" % str(pid))
+			return false
+	var carry: Dictionary = _event_evo_carry()
+	var bid := str(g.get("bracket_id", ""))
+	if bid == "":
+		return _event_build_group(ev, letter)
+	if not director.load_state_file(director.tournament_dir.path_join(bid + ".json")):
+		_evo_abort("event file missing: " + bid)
+		return false
+	if not director.tournament_active():
+		_evo_abort("event file not running: " + bid)
+		return false
+	director.tourney["evo"] = carry
+	director.save_state()
+	director.event_set_phase(eid, "groups_" + letter)
+	return true
+
+
 func _event_build_final(ev: Dictionary) -> bool:
 	var director := _director()
 	if director == null:
@@ -3678,7 +3720,7 @@ func _event_group_done(res: Dictionary) -> void:
 	if nxt == "":
 		_evo_abort("event chain broken after group " + group)
 		return
-	var built := _event_build_final(ev) if nxt == "final" else _event_build_group(ev, nxt)
+	var built := _event_build_final(ev) if nxt == "final" else _event_switch_group(ev, nxt)
 	if not built:
 		return
 	var title := "EVENT %s · %s" % [eid, "FINAL" if nxt == "final" else "GROUP " + nxt]

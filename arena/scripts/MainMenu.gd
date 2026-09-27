@@ -1488,13 +1488,38 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 	if not bool(gres.get("ok", false)):
 		bracket_status.text = "Cannot start: %s" % str(gres.get("error", "?"))
 		return
-	TournamentDirector.tourney["evo"] = {"active": true, "generation": 1,
-		"episodes": 50,
+	var evo1 := {"active": true, "generation": 1, "episodes": 50,
 		"mutate_traits": int(settings.get("mutate_traits", 1)),
 		"pending": [], "done": {}}
+	TournamentDirector.tourney["evo"] = evo1
 	TournamentDirector.save_state()
 	TournamentDirector.event_note_bracket(eid, "A",
 		str(TournamentDirector.tourney.get("id", "")))
+	# Pre-build every group fixture now: all four quadrants render
+	# real versus cards from the first minute (no "No tournament").
+	for letter in ["B", "C", "D"]:
+		var gdicts: Array = []
+		for pid in ((((beg.get("groups", {}) as Dictionary).get(letter, {}) as Dictionary).get("players", [])) as Array):
+			if not by_id.has(str(pid)):
+				bracket_status.text = "Cannot start: %s missing from vault" % str(pid)
+				return
+			gdicts.append(by_id[str(pid)])
+		var br: Dictionary = TournamentDirector.build_group_bracket(gdicts, letter, eid,
+			bestof, tourney_lr.value, tourney_round_time.value)
+		if not bool(br.get("ok", false)):
+			bracket_status.text = "Cannot start: %s" % str(br.get("error", "?"))
+			return
+		TournamentDirector.tourney["evo"] = (evo1 as Dictionary).duplicate(true)
+		TournamentDirector.save_state()
+		TournamentDirector.event_note_bracket(eid, letter,
+			str(TournamentDirector.tourney.get("id", "")))
+	# Back to group A for tip-off (it already carries the evo dict).
+	var ev0: Dictionary = TournamentDirector.event_load(eid)
+	var aid := str(((ev0.get("groups", {}) as Dictionary).get("A", {}) as Dictionary).get("bracket_id", ""))
+	if not TournamentDirector.load_state_file(
+			TournamentDirector.tournament_dir.path_join(aid + ".json")):
+		bracket_status.text = "Cannot start: group A file missing"
+		return
 	TournamentDirector.event_set_phase(eid, "groups_A")
 	bracket_status.text = "EVENT %s gen 1 ready - GROUP A (%s)." % [eid, str(gres.get("tournament_id", ""))]
 	_render_bracket()
