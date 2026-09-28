@@ -5293,6 +5293,47 @@ class TestElo(unittest.TestCase):
         self.assertTrue(0.5 <= f["pitch_blend"] <= 1.0)
         self.assertEqual(evo.fresh_blends(7), f)
 
+    def test_breed_clone_zero_structural_changes(self):
+        # Regression (live gen-5 abort): an inherited max_changes = 0
+        # is a legal recipe meaning "structurally identical clone" -
+        # it must skip mutate_genome (which requires >= 1), not crash.
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        from experimental_wiring import reference_genome
+        genome = reference_genome()
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3, "genome": genome,
+                                       "mapping": ["m1"],
+                                       "learning_rate": 0.008,
+                                       "dist_gain": 0.15, "evasion": 0.2,
+                                       "yaw_bias": 9.0},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "training": {"episodes_total": 45,
+                                           "stage_split": 0.5,
+                                           "noise": 0.05,
+                                           "max_changes": 0}}}
+        seen = {}
+
+        def fake_staged(child, start_weights, ep1, params, _n1, ep2,
+                        _p2, _n2, progress_cb):
+            seen.update(params)
+            return child, start_weights, {}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch.object(evo, "_staged_or_single",
+                                  side_effect=fake_staged):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5,
+                                          mutate_structure=True,
+                                          mutate_traits=0)
+        self.assertEqual(rec["generator_params"]["genome"], genome)
+        self.assertEqual(rec["generator_params"]["mapping"], ["m1"])
+        self.assertEqual(rec["lineage"]["training"]["max_changes"], 0)
+
     def test_resolve_recipe_stages(self):
         import evo_breeder as evo
         base = {"episodes_total": 50, "stage_split": 0.5, "noise": 0.05,

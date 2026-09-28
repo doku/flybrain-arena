@@ -365,7 +365,10 @@ def breed_clone(parent_id, name, seed, episodes=None, noise=None,
     child_mapping = gp.get("mapping") if mapping is None else mapping
     start_weights = np.ascontiguousarray(
         np.asarray(weights, dtype=np.float32))
-    if genome is not None and mutate_structure:
+    # max_changes = 0 (a legal inherited recipe) means a structurally
+    # identical clone: skip mutate_genome, which requires >= 1. The
+    # child still varies by weight noise, traits, blends and recipe.
+    if genome is not None and mutate_structure and max_changes >= 1:
         pops = load_or_extract_populations()
         csr = load_or_build_csr()
         mrng = np.random.default_rng(int(seed) ^ 0x5EED)
