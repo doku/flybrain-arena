@@ -510,13 +510,13 @@ func _enter_tournament_mode() -> void:
 		status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	# Unmistakable row split: round time and versus/score can never
 	# read as one line (divider + airy column spacing).
-	var hud_vb := timer_label.get_parent() if is_instance_valid(timer_label) else null
-	if hud_vb != null and not (hud_vb as Node).has_meta("hud_sep_added"):
-		(hud_vb as Node).set_meta("hud_sep_added", true)
-		(hud_vb as VBoxContainer).add_theme_constant_override("separation", 10)
+	var hud_box := get_node_or_null("HUD/Margin/VBox") as VBoxContainer
+	if hud_box != null and is_instance_valid(timer_label) and not hud_box.has_meta("hud_sep_added"):
+		hud_box.set_meta("hud_sep_added", true)
+		hud_box.add_theme_constant_override("separation", 10)
 		var sep := HSeparator.new()
-		(hud_vb as VBoxContainer).add_child(sep)
-		(hud_vb as VBoxContainer).move_child(sep, timer_label.get_index() + 1)
+		hud_box.add_child(sep)
+		hud_box.move_child(sep, timer_label.get_index() + 1)
 	_apply_pip_slot()
 	# Pipeline kick-off: queue a wild breed for the next generation
 	# immediately, so it trains in the background while gen 1 plays.
