@@ -507,6 +507,8 @@ func _enter_tournament_mode() -> void:
 			_event_maintain_pool()
 			if _event_is_fresh():
 				await _event_pre_showcase()
+				if not _event_active():
+					return
 		else:
 			var evo: Dictionary = director.tourney.get("evo", {})
 			_evo_queue_wild(int(evo.get("generation", 1)) + 1)
@@ -3670,6 +3672,12 @@ func _event_drain_done_to_pool() -> void:
 		print("[Arena] Event pool stocked: ", str(res.get("pool", [])))
 
 
+static func _gallery_cache_key(eid: String, target: String) -> String:
+	# Gallery cache keys carry the event id: chained generations reuse
+	# group letters ("B" this event is not "B" last event).
+	return eid + ":" + target
+
+
 func _event_gallery_update(all_fighters: bool = false) -> void:
 	# Bracket-view gallery: every fighter pre-event, else the next
 	# pending group's cards (hidden once nothing is pending, e.g. the
@@ -3684,7 +3692,9 @@ func _event_gallery_update(all_fighters: bool = false) -> void:
 	var ev: Dictionary = director.event_load(eid)
 	if ev.is_empty():
 		return
-	var key := "ALL"
+	# Keyed by event: chained generations reuse group letters, so a
+	# bare letter would serve the previous event's cards forever.
+	var key := _gallery_cache_key(eid, "ALL")
 	var ids: Array = []
 	if all_fighters:
 		for g in (ev.get("group_order", []) as Array):
@@ -3702,7 +3712,7 @@ func _event_gallery_update(all_fighters: bool = false) -> void:
 			if is_instance_valid(gallery_box):
 				gallery_box.visible = false
 			return
-		key = nxt
+		key = _gallery_cache_key(eid, nxt)
 		var gd2: Dictionary = (ev.get("groups", {}) as Dictionary).get(nxt, {})
 		for pid in (gd2.get("players", []) as Array):
 			ids.append(str(pid))

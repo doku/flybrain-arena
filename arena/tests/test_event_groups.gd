@@ -430,6 +430,19 @@ func test_next_group_sequence() -> void:
 	_check(str(D.call("event_next_group", "E404", "A")) == "", "missing event is empty")
 
 
+func test_gallery_cache_key() -> void:
+	# Cache keys namespace by event: same group letter in consecutive
+	# generations must never share a gallery cache entry.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	var k1: String = A.call("_gallery_cache_key", "E1", "B")
+	var k2: String = A.call("_gallery_cache_key", "E2", "B")
+	var k3: String = A.call("_gallery_cache_key", "E1", "ALL")
+	_check(k1 != k2, "group key differs across events")
+	_check(k1 != k3, "ALL key differs from group key")
+	_check(k1 == "E1:B", "key format is event:target")
+	A.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -586,6 +599,7 @@ func _initialize() -> void:
 	test_bracket_close_toggle()
 	test_next_group_sequence()
 	test_slowmo_safety()
+	test_gallery_cache_key()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
