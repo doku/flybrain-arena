@@ -199,8 +199,8 @@ def _resolve(path_or_id):
     cand = os.path.join(VAULT_DIR, str(path_or_id))
     if os.path.isfile(cand):
         return cand
-    # Search by id prefix or filename stem.
-    for rec in scan_vault(silent=True):
+    # Search by id prefix or filename stem (index-first: no zip walk).
+    for rec in read_vault(silent=True):
         if rec["id"].startswith(str(path_or_id)) or rec["filename"] == str(path_or_id):
             return package_path(rec)
     raise FileNotFoundError(f"Brain '{path_or_id}' not found in vault {VAULT_DIR}")
@@ -237,6 +237,23 @@ def scan_vault(silent=False):
     except OSError:
         pass
     return records
+
+
+def read_vault(silent=True, force_scan=False):
+    """Index-first read-only roster: serves parsed index entries without
+    opening every package (~50 zip walks per call). Entries are validated
+    against the filesystem (one stat per entry — ghost entries from
+    direct file deletion are filtered); every vault writer upserts the
+    index, so only external file drops need a rescan. force_scan
+    (list --rescan) rebuilds it."""
+    if not force_scan:
+        brains = _read_index()
+        if brains is not None:
+            live = [b for b in brains
+                    if os.path.isfile(package_path(b.get("filename", "")))]
+            return sorted(live,
+                          key=lambda r: (r.get("name", ""), r.get("id", "")))
+    return scan_vault(silent=silent)
 
 
 def refresh_index():
@@ -342,8 +359,12 @@ def import_legacy_npz(npz_path, name, params=None):
     return rec
 
 
-def snapshot_backup(record):
-    """Copies the current package to a timestamped pre-event backup."""
+def snapshot_backup(record, enabled=True):
+    """Copies the current package to a timestamped pre-event backup.
+    Opt-in for automated workers (queued/top-up trains pass enabled=False):
+    a full 19-100 MB copy per train is disk-safety only."""
+    if not enabled:
+        return None
     src = package_path(record)
     if not os.path.isfile(src):
         return None
@@ -431,7 +452,7 @@ def backfill_elo():
     (1200 + 25 x (battle wins - losses)). Records that already carry
     the key are never touched. Returns the count stamped."""
     stamped = 0
-    for rec in scan_vault(silent=True):
+    for rec in read_vault(silent=True):
         r = rec.get("record", {})
         if "elo" in r:
             continue

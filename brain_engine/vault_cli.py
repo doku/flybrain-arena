@@ -50,8 +50,9 @@ def err(msg):
     return 1
 
 
-def cmd_list(_a):
-    return out({"ok": True, "brains": vault.scan_vault()})
+def cmd_list(a):
+    return out({"ok": True, "brains": vault.read_vault(
+        force_scan=bool(getattr(a, "rescan", False)))})
 
 
 def cmd_info(a):
@@ -110,7 +111,7 @@ def cmd_generate(a):
                 params["mapping"] = stack if stack else None
         if params.get("reference_stock"):
             gid = ew.genome_label(genome) if genome is not None else ""
-            for rec in vault.scan_vault(silent=True):
+            for rec in vault.read_vault(silent=True):
                 gp = rec.get("generator_params", {}) or {}
                 if gid != "" and str(gp.get("genome_id", "")) == gid:
                     return err(
@@ -169,6 +170,19 @@ def _write_progress(path, ep, total):
                                     "pct": round(100.0 * ep / max(total, 1), 1)}))
 
 
+def _batched_progress(path, batch=5):
+    """Training-loop progress callback: every 5th episode + first + final
+    (a ~50 B atomic write per episode was pure writer-syscall churn; the
+    game polls at 4 Hz so 5-episode granularity is invisible)."""
+    if not path:
+        return None
+
+    def _cb(ep, total):
+        if ep == total or ep <= 1 or ep % max(batch, 1) == 0:
+            _write_progress(path, ep, total)
+    return _cb
+
+
 def cmd_train(a):
     params = _parse_params(a)
     if isinstance(params, dict) and params.get("__error"):
@@ -178,7 +192,7 @@ def cmd_train(a):
         rec, weights = vault.load_brain(a.id)
     except Exception as e:
         return out({"ok": False, "error": str(e)}, a.result_file)
-    vault.snapshot_backup(rec)
+    vault.snapshot_backup(rec, enabled=bool(getattr(a, "snapshot", False)))
     from train_job import train_brain, train_staged, merge_summaries
     ep2 = int(getattr(a, "episodes2", 0) or 0)
     try:
@@ -186,8 +200,7 @@ def cmd_train(a):
             params2 = _parse_params2(a)
             if isinstance(params2, dict) and params2.get("__error"):
                 return err(params2["__error"])
-            prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
-                if getattr(a, "progress", "") else None
+            prog = _batched_progress(a.progress) if getattr(a, "progress", "") else None
             rec, _w, summaries = train_staged(
                 rec, weights,
                 [(int(a.episodes), params, f"menu training x{a.episodes}"),
@@ -198,7 +211,7 @@ def cmd_train(a):
         else:
             rec, _w, summary = train_brain(
                 rec, weights, int(a.episodes), params,
-                progress_cb=(lambda ep, total: _write_progress(a.progress, ep, total)),
+                progress_cb=_batched_progress(a.progress),
                 notes=f"menu training x{a.episodes}", save=True)
             total = int(a.episodes)
     except Exception as e:
@@ -216,14 +229,19 @@ def cmd_score(a):
     from train_homing import run_training
     from train_job import stamp_train_score
     try:
-        rec, weights = vault.load_brain(a.id)
+        probe_path = vault._resolve(a.id)
+        rec, weights = vault.load_brain(probe_path)
     except Exception as e:
         return err(str(e))
+    probe_mtime = None
+    try:
+        probe_mtime = os.path.getmtime(probe_path)
+    except OSError:
+        pass
     gp = rec.get("generator_params", {}) or {}
     eps = int(getattr(a, "episodes", 6) or 6)
     seed = int(float(getattr(a, "seed", 7) or 7))
-    prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
-        if getattr(a, "progress", "") else None
+    prog = _batched_progress(a.progress) if getattr(a, "progress", "") else None
     curriculum = {}
     pins = str(getattr(a, "pin_behaviors", "") or "")
     if pins.strip():
@@ -252,13 +270,21 @@ def cmd_score(a):
     if getattr(a, "progress", ""):
         _write_progress(a.progress, eps, eps)
     gained = round(float(summary.get("score", 0.0)), 1)
-    # Merge onto a fresh reload: batch scoring overlaps training now
-    # (separate slots), so a concurrent train may have saved newer
-    # weights/counters since this probe loaded. Stamping onto the
-    # stale copy would silently revert them.
+    # Merge onto a fresh reload ONLY when the package actually changed
+    # mid-probe (mtime guard): batch scoring overlaps training now, and
+    # a raced train may have saved newer weights/counters. Unchanged
+    # (the common case) skips the second ~100 MB load entirely.
+    cur_changed = True
     try:
-        cur_rec, cur_w = vault.load_brain(a.id)
-    except Exception:
+        cur_changed = os.path.getmtime(probe_path) != probe_mtime
+    except (OSError, TypeError):
+        pass
+    if cur_changed:
+        try:
+            cur_rec, cur_w = vault.load_brain(a.id)
+        except Exception:
+            cur_rec, cur_w = rec, weights
+    else:
         cur_rec, cur_w = rec, weights
     try:
         import numpy as _np
@@ -350,7 +376,7 @@ def cmd_score_correlations(a):
     min_eps = int(getattr(a, "min_episodes", 4) or 0)
     min_matches = int(getattr(a, "min_matches", 0) or 0)
     rows, overall, n = score_correlation_rows(
-        vault.scan_vault(silent=True), min_battles, min_eps, min_matches)
+        vault.read_vault(silent=True), min_battles, min_eps, min_matches)
     text = ("score-correlations (min %d battles, min %d matches, "
             "min %d eps/family):\n") % (min_battles, min_matches, min_eps)
     for row in rows:
@@ -500,8 +526,7 @@ def cmd_breed(a):
     try:
         print(f"[breed] strategy={a.strategy} name={a.name} "
               f"episodes={a.episodes} seed={a.seed}", flush=True)
-        prog = (lambda ep, total: _write_progress(a.progress, ep, total)) \
-            if getattr(a, "progress", "") else None
+        prog = _batched_progress(a.progress) if getattr(a, "progress", "") else None
         eps = int(getattr(a, "episodes", 0) or 0) or None
         ep2 = int(getattr(a, "episodes2", 0) or 0) or None
         noise = getattr(a, "noise", None)
@@ -556,13 +581,14 @@ def cmd_breed(a):
 def main():
     p = argparse.ArgumentParser(description="Fly-brain vault CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list")
+    q = sub.add_parser("list"); q.add_argument("--rescan", action="store_true")
     q = sub.add_parser("info"); q.add_argument("--id", required=True)
     q = sub.add_parser("generate"); q.add_argument("--name", required=True)
     q.add_argument("--params", default=""); q.add_argument("--params-file", default="")
     q.add_argument("--result-file", default="")
     q = sub.add_parser("train"); q.add_argument("--id", required=True)
     q.add_argument("--episodes", type=int, required=True)
+    q.add_argument("--snapshot", action="store_true")
     q.add_argument("--params", default=""); q.add_argument("--params-file", default="")
     q.add_argument("--episodes2", type=int, default=0)
     q.add_argument("--params2", default=""); q.add_argument("--params2-file", default="")

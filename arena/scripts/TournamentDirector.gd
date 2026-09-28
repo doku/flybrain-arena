@@ -384,7 +384,8 @@ func import_brain(npz_path: String, brain_name: String) -> Dictionary:
 	return res
 
 
-func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dictionary:
+func start_training(brain_id: String, episodes: int, params: Dictionary,
+		snapshot: bool = true) -> Dictionary:
 	if not python_ready:
 		return {"ok": false, "error": "no working python found (%s)" % python_probe_error}
 	if not active_job.is_empty():
@@ -408,7 +409,8 @@ func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dict
 		DirAccess.remove_absolute(result_file)
 	var args: Array = _cli_argv(["train", "--id", brain_id,
 		"--episodes", str(episodes), "--params-file", params_file,
-		"--progress", progress_path, "--result-file", result_file])
+		"--progress", progress_path, "--result-file", result_file]
+		+ (["--snapshot"] if snapshot else []))
 	var pid := _spawn_worker(args)
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
@@ -524,8 +526,10 @@ func _pump_train_queue() -> bool:
 	if not active_job.is_empty() or train_queue.is_empty():
 		return false
 	var head: Dictionary = train_queue[0]
+	# Queued/top-up trains skip the pre-train snapshot (opt-in backups):
+	# a full 19-100 MB copy per queued episode batch is disk-safety only.
 	var res: Dictionary = start_training(str(head.get("id", "")),
-		int(head.get("episodes", 0)), head.get("params", {}))
+		int(head.get("episodes", 0)), head.get("params", {}), false)
 	if not bool(res.get("ok", false)):
 		print("[Director] Queued training deferred for %s: %s" % [
 			str(head.get("name", "?")), str(res.get("error", "?"))])

@@ -11,7 +11,15 @@ from sensory_motor import (SensoryEncoder, MotorDecoder, normalize_mapping,
                             RAM_COOLDOWN)
 from dopamine_learning import DopamineReinforcement
 from experimental_wiring import (experiment_arrays, experiment_suffix,
-                                   build_genome_arrays, genome_suffix)
+                                   build_genome_arrays, genome_suffix,
+                                   genome_label, normalize_experiment)
+
+# Wiring struct cache (mirrors brain_server._bind_brain): indptr/indices/
+# wbasis per wiring, so multi-stage breeds/trains stop rebuilding the
+# ~25M-edge overlay add per stage. Keyed by wiring identity + CSR object
+# (the loader memo keeps the object alive, so ids are stable and a changed
+# CSR file forces a rebuild). Capped at 4 wirings (~200 MB each).
+_WIRING_STRUCT_CACHE = {}
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
@@ -1102,10 +1110,27 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
     # wiring or genome (if any). Arity changes with injected edges, so
     # checkpoints for this run carry the experiment/genome suffix and are
     # never mixed with base files. Genome wins when both are given.
+    # Wiring struct cache (mirrors brain_server._bind_brain): the ~25M-edge
+    # overlay add rebuilt per stage now serves memory on repeat wirings
+    # (multi-stage breeds/trains), keyed by wiring identity + CSR stamp.
+    global _WIRING_STRUCT_CACHE
     if genome is not None:
-        indptr, indices, wbasis = build_genome_arrays(genome, csr, pops)
+        try:
+            wkey = ("genome:" + genome_label(genome), id(csr))
+        except ValueError:
+            wkey = (None,)
+        if wkey not in _WIRING_STRUCT_CACHE:
+            _WIRING_STRUCT_CACHE[wkey] = build_genome_arrays(genome, csr, pops)
+            while len(_WIRING_STRUCT_CACHE) > 4:
+                _WIRING_STRUCT_CACHE.pop(next(iter(_WIRING_STRUCT_CACHE)))
+        indptr, indices, wbasis = _WIRING_STRUCT_CACHE[wkey]
     else:
-        indptr, indices, wbasis = experiment_arrays(experiment, csr, pops)
+        wkey = (normalize_experiment(experiment), id(csr))
+        if wkey not in _WIRING_STRUCT_CACHE:
+            _WIRING_STRUCT_CACHE[wkey] = experiment_arrays(experiment, csr, pops)
+            while len(_WIRING_STRUCT_CACHE) > 4:
+                _WIRING_STRUCT_CACHE.pop(next(iter(_WIRING_STRUCT_CACHE)))
+        indptr, indices, wbasis = _WIRING_STRUCT_CACHE[wkey]
     start_weights = wbasis.copy() if init_weights is None else np.ascontiguousarray(
         np.asarray(init_weights, dtype=np.float32).copy())
     if len(start_weights) != len(wbasis):

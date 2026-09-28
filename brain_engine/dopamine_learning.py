@@ -6,6 +6,25 @@ import numpy as np
 GROUND_DA = 0.5
 from sensory_motor import FLOW_CRUISE
 
+_BASE_MEANS_MEMO = {}
+
+
+def _base_means_cached(populations, bindptr, bindices, bweights):
+    """Memoized _compute_base_means: a wiring constant (5 floats) that
+    every DopamineReinforcement construction recomputed from scratch —
+    ~100 MB of repeat/mask temps per stage, per server boot. Keyed by
+    object identity with strong refs (keeps the base wiring alive, so
+    ids stay stable and hits stay correct); capped at 2 wirings."""
+    key = (id(populations), id(bindptr), id(bweights))
+    hit = _BASE_MEANS_MEMO.get(key)
+    if hit is not None:
+        return hit[4]
+    means = _compute_base_means_impl(populations, bindptr, bindices, bweights)
+    _BASE_MEANS_MEMO[key] = (populations, bindptr, bindices, bweights, means)
+    while len(_BASE_MEANS_MEMO) > 2:
+        _BASE_MEANS_MEMO.pop(next(iter(_BASE_MEANS_MEMO)))
+    return means
+
 
 class DopamineReinforcement:
     """
@@ -29,7 +48,7 @@ class DopamineReinforcement:
         # pinning (unit tests, diagnose scripts).
         self._base_means = None
         if base is not None:
-            self._base_means = self._compute_base_means(populations, *base)
+            self._base_means = _base_means_cached(populations, *base)
 
         # Sensory pools as lists for fast iteration (gain modulation acts on
         # ALL efferents from these pools, not just monosynaptic sensory->DN
@@ -192,90 +211,96 @@ class DopamineReinforcement:
     def _compute_base_means(self, populations, bindptr, bindices, bweights):
         """Mean |w| per plastic pool on the reference connectome. One factor
         per pool (never per row/side) so every learned ratio survives."""
-        bindptr = np.asarray(bindptr)
-        bindices = np.asarray(bindices)
-        bweights = np.asarray(bweights, dtype=np.float32)
-        sens_ids = (list(populations["pheromone_da1"]["left"])
-                    + list(populations["pheromone_da1"]["right"])
-                    + list(populations["pheromone_va1v"]["left"])
-                    + list(populations["pheromone_va1v"]["right"])
-                    + list(populations["visual_lc10"]["left"])
-                    + list(populations["visual_lc10"]["right"])
-                    + list(populations["visual_lc4"]["left"])
-                    + list(populations["visual_lc4"]["right"])
-                    + list(populations["visual_lplc2"]["left"])
-                    + list(populations["visual_lplc2"]["right"])
-                    + list(populations.get("visual_lc11", {}).get("left", []))
-                    + list(populations.get("visual_lc11", {}).get("right", []))
-                    + list(populations.get("visual_lc15", {}).get("left", []))
-                    + list(populations.get("visual_lc15", {}).get("right", []))
-                    + list(populations.get("visual_lc17", {}).get("left", []))
-                    + list(populations.get("visual_lc17", {}).get("right", []))
-                    + list(populations.get("visual_lc18", {}).get("left", []))
-                    + list(populations.get("visual_lc18", {}).get("right", []))
-                    + list(populations.get("visual_t4a", {}).get("left", []))
-                    + list(populations.get("visual_t4a", {}).get("right", []))
-                    + list(populations.get("visual_t4b", {}).get("left", []))
-                    + list(populations.get("visual_t4b", {}).get("right", []))
-                    + list(populations.get("visual_t4c", {}).get("left", []))
-                    + list(populations.get("visual_t4c", {}).get("right", []))
-                    + list(populations.get("visual_t4d", {}).get("left", []))
-                    + list(populations.get("visual_t4d", {}).get("right", []))
-                    + list(populations.get("visual_t5a", {}).get("left", []))
-                    + list(populations.get("visual_t5a", {}).get("right", []))
-                    + list(populations.get("visual_t5b", {}).get("left", []))
-                    + list(populations.get("visual_t5b", {}).get("right", []))
-                    + list(populations.get("visual_t5c", {}).get("left", []))
-                    + list(populations.get("visual_t5c", {}).get("right", []))
-                    + list(populations.get("visual_t5d", {}).get("left", []))
-                    + list(populations.get("visual_t5d", {}).get("right", [])))
-        jo_ids = list(populations.get("gyro_jo", {}).get("left", [])) \
-            + list(populations.get("gyro_jo", {}).get("right", []))
-        n = len(bindptr) - 1
-        dn_ids = np.concatenate([
-            np.asarray(populations.get("descending_all", {}).get("left", []), dtype=np.int32),
-            np.asarray(populations.get("descending_all", {}).get("right", []), dtype=np.int32)])
-        kc_ids = np.asarray(populations.get("mushroom_body_kc", []), dtype=np.int32)
-        mbon_ids = np.concatenate([
-            np.asarray(populations.get("mbon_app", {}).get("all", []), dtype=np.int32),
-            np.asarray(populations.get("mbon_av", {}).get("all", []), dtype=np.int32)])
-        pos_sens = self._row_positions(bindptr, sens_ids)
-        pos_jo = self._row_positions(bindptr, jo_ids)
-        pos_dn = np.where(np.isin(bindices, dn_ids))[0].astype(np.int32) if len(dn_ids) else np.empty(0, dtype=np.int32)
-        brows = np.repeat(np.arange(n, dtype=np.int32), np.diff(bindptr).astype(np.int64))
-        is_kc = np.zeros(n, dtype=bool)
-        if len(kc_ids):
-            is_kc[kc_ids[kc_ids < n]] = True
-        is_mbon = np.zeros(n, dtype=bool)
-        if len(mbon_ids):
-            is_mbon[mbon_ids[mbon_ids < n]] = True
-        pos_kcm = np.where(is_kc[brows] & is_mbon[bindices])[0].astype(np.int32)
-        del brows
-        # Bulk = everything outside the pinned pools. Tracked separately
-        # because the global mean masks composition: hot pools plus
-        # crushed bulk cancel out (measured: 22x pools with 0.04x bulk
-        # reads as a healthy global). Bulk collapse is always drift -
-        # nothing in the engine learns by suppressing all non-pool
-        # synapses - so bulk gets bands but no suppression floor.
-        covered = np.zeros(len(bweights), dtype=bool)
-        for pos in (pos_sens, pos_jo):
-            if len(pos):
-                covered[pos] = True
-        dn_cov = np.isin(bindices, dn_ids) if len(dn_ids) else np.zeros(len(bweights), dtype=bool)
-        covered |= dn_cov
-        if len(pos_kcm):
-            covered[pos_kcm] = True
-        pos_bulk = np.where(~covered)[0].astype(np.int32)
-        del covered
-        means = {}
-        for name, pos in (("sens", pos_sens), ("jo", pos_jo), ("dn_in", pos_dn),
-                          ("kcmbon", pos_kcm), ("bulk", pos_bulk)):
-            if len(pos) == 0:
-                means[name] = 0.0
-            else:
-                means[name] = float(np.abs(bweights[pos]).mean())
-        means["global"] = float(np.abs(bweights).mean())
-        return means
+        return _compute_base_means_impl(populations, bindptr, bindices, bweights)
+
+
+def _compute_base_means_impl(populations, bindptr, bindices, bweights):
+    """Mean |w| per plastic pool on the reference connectome (module-level
+    so _base_means_cached can memoize it across constructions)."""
+    bindptr = np.asarray(bindptr)
+    bindices = np.asarray(bindices)
+    bweights = np.asarray(bweights, dtype=np.float32)
+    sens_ids = (list(populations["pheromone_da1"]["left"])
+                + list(populations["pheromone_da1"]["right"])
+                + list(populations["pheromone_va1v"]["left"])
+                + list(populations["pheromone_va1v"]["right"])
+                + list(populations["visual_lc10"]["left"])
+                + list(populations["visual_lc10"]["right"])
+                + list(populations["visual_lc4"]["left"])
+                + list(populations["visual_lc4"]["right"])
+                + list(populations["visual_lplc2"]["left"])
+                + list(populations["visual_lplc2"]["right"])
+                + list(populations.get("visual_lc11", {}).get("left", []))
+                + list(populations.get("visual_lc11", {}).get("right", []))
+                + list(populations.get("visual_lc15", {}).get("left", []))
+                + list(populations.get("visual_lc15", {}).get("right", []))
+                + list(populations.get("visual_lc17", {}).get("left", []))
+                + list(populations.get("visual_lc17", {}).get("right", []))
+                + list(populations.get("visual_lc18", {}).get("left", []))
+                + list(populations.get("visual_lc18", {}).get("right", []))
+                + list(populations.get("visual_t4a", {}).get("left", []))
+                + list(populations.get("visual_t4a", {}).get("right", []))
+                + list(populations.get("visual_t4b", {}).get("left", []))
+                + list(populations.get("visual_t4b", {}).get("right", []))
+                + list(populations.get("visual_t4c", {}).get("left", []))
+                + list(populations.get("visual_t4c", {}).get("right", []))
+                + list(populations.get("visual_t4d", {}).get("left", []))
+                + list(populations.get("visual_t4d", {}).get("right", []))
+                + list(populations.get("visual_t5a", {}).get("left", []))
+                + list(populations.get("visual_t5a", {}).get("right", []))
+                + list(populations.get("visual_t5b", {}).get("left", []))
+                + list(populations.get("visual_t5b", {}).get("right", []))
+                + list(populations.get("visual_t5c", {}).get("left", []))
+                + list(populations.get("visual_t5c", {}).get("right", []))
+                + list(populations.get("visual_t5d", {}).get("left", []))
+                + list(populations.get("visual_t5d", {}).get("right", [])))
+    jo_ids = list(populations.get("gyro_jo", {}).get("left", [])) \
+        + list(populations.get("gyro_jo", {}).get("right", []))
+    n = len(bindptr) - 1
+    dn_ids = np.concatenate([
+        np.asarray(populations.get("descending_all", {}).get("left", []), dtype=np.int32),
+        np.asarray(populations.get("descending_all", {}).get("right", []), dtype=np.int32)])
+    kc_ids = np.asarray(populations.get("mushroom_body_kc", []), dtype=np.int32)
+    mbon_ids = np.concatenate([
+        np.asarray(populations.get("mbon_app", {}).get("all", []), dtype=np.int32),
+        np.asarray(populations.get("mbon_av", {}).get("all", []), dtype=np.int32)])
+    pos_sens = DopamineReinforcement._row_positions(bindptr, sens_ids)
+    pos_jo = DopamineReinforcement._row_positions(bindptr, jo_ids)
+    pos_dn = np.where(np.isin(bindices, dn_ids))[0].astype(np.int32) if len(dn_ids) else np.empty(0, dtype=np.int32)
+    brows = np.repeat(np.arange(n, dtype=np.int32), np.diff(bindptr).astype(np.int64))
+    is_kc = np.zeros(n, dtype=bool)
+    if len(kc_ids):
+        is_kc[kc_ids[kc_ids < n]] = True
+    is_mbon = np.zeros(n, dtype=bool)
+    if len(mbon_ids):
+        is_mbon[mbon_ids[mbon_ids < n]] = True
+    pos_kcm = np.where(is_kc[brows] & is_mbon[bindices])[0].astype(np.int32)
+    del brows
+    # Bulk = everything outside the pinned pools. Tracked separately
+    # because the global mean masks composition: hot pools plus
+    # crushed bulk cancel out (measured: 22x pools with 0.04x bulk
+    # reads as a healthy global). Bulk collapse is always drift -
+    # nothing in the engine learns by suppressing all non-pool
+    # synapses - so bulk gets bands but no suppression floor.
+    covered = np.zeros(len(bweights), dtype=bool)
+    for pos in (pos_sens, pos_jo):
+        if len(pos):
+            covered[pos] = True
+    dn_cov = np.isin(bindices, dn_ids) if len(dn_ids) else np.zeros(len(bweights), dtype=bool)
+    covered |= dn_cov
+    if len(pos_kcm):
+        covered[pos_kcm] = True
+    pos_bulk = np.where(~covered)[0].astype(np.int32)
+    del covered
+    means = {}
+    for name, pos in (("sens", pos_sens), ("jo", pos_jo), ("dn_in", pos_dn),
+                      ("kcmbon", pos_kcm), ("bulk", pos_bulk)):
+        if len(pos) == 0:
+            means[name] = 0.0
+        else:
+            means[name] = float(np.abs(bweights[pos]).mean())
+    means["global"] = float(np.abs(bweights).mean())
+    return means
 
     def _ensure_pin_positions(self, brain):
         """Flat positions for the pinned pools on this brain's wiring.

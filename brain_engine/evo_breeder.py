@@ -455,7 +455,7 @@ def breed_random(name, seed, episodes=None, progress_cb=None, generation=1,
         # not shift the wiring/rate draws below for a given seed.
         nr = _random.Random(f"wild-name:{int(seed)}")
         taken = {str(rec.get("name", ""))
-                 for rec in vault.scan_vault(silent=True)}
+                 for rec in vault.read_vault(silent=True)}
         name = unique_wild_name(nr, generation, taken)
     grng = _np.random.default_rng(int(seed))
     pops = load_or_extract_populations()
@@ -524,7 +524,7 @@ def breed_reference(name="Reference", seed=7, episodes=50,
     from sensory_motor import YAW_BIAS_DEFAULT
     genome = reference_genome()
     gid = genome_label(genome)
-    for rec in vault.scan_vault(silent=True):
+    for rec in vault.read_vault(silent=True):
         gp = rec.get("generator_params", {}) or {}
         if str(gp.get("genome_id", "")) == gid:
             raise ValueError(

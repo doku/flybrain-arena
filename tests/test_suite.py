@@ -5423,6 +5423,8 @@ class TestElo(unittest.TestCase):
                 mock.patch.object(vault_pkg, "save_brain",
                                   side_effect=lambda r, w: saved.update(
                                       rec=r, weights=w) or "mock-path"), \
+                mock.patch.object(vault_pkg, "read_vault",
+                                  return_value=[]), \
                 mock.patch.object(vault_pkg, "scan_vault",
                                   return_value=[]):
             rec, w, _s = evo.breed_reference(
@@ -5446,8 +5448,10 @@ class TestElo(unittest.TestCase):
         # reference genome refuses a second.
         ghost = {"id": "ghost", "name": "Reference",
                  "generator_params": {"genome_id": gid}}
-        with mock.patch.object(vault_pkg, "scan_vault",
-                               return_value=[ghost]):
+        with mock.patch.object(vault_pkg, "read_vault",
+                               return_value=[ghost]), \
+                mock.patch.object(vault_pkg, "scan_vault",
+                                  return_value=[ghost]):
             with self.assertRaises(ValueError):
                 evo.breed_reference("Reference", seed=7, episodes=1)
 
@@ -5478,6 +5482,8 @@ class TestElo(unittest.TestCase):
             with mock.patch.object(
                     vault_pkg, "save_brain",
                     return_value=os.path.join(tmp, "x.flybrain")), \
+                    mock.patch.object(vault_pkg, "read_vault",
+                                      return_value=[]), \
                     mock.patch.object(vault_pkg, "scan_vault",
                                       return_value=[]):
                 self.assertEqual(vault_cli.cmd_generate(a), 0)
@@ -5495,8 +5501,10 @@ class TestElo(unittest.TestCase):
             a2 = SimpleNamespace(name="Reference",
                                  params=json.dumps(params), params_file="",
                                  result_file="", log_file="")
-            with mock.patch.object(vault_pkg, "scan_vault",
-                                   return_value=[ghost]):
+            with mock.patch.object(vault_pkg, "read_vault",
+                                   return_value=[ghost]), \
+                    mock.patch.object(vault_pkg, "scan_vault",
+                                      return_value=[ghost]):
                 self.assertEqual(vault_cli.cmd_generate(a2), 1)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
