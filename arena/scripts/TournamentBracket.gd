@@ -353,16 +353,31 @@ func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
 	head.add_theme_color_override("font_color",
 		COL_LIVE if is_current else (Color(0.55, 0.55, 0.6) if is_done else Color(0.75, 0.75, 0.8)))
 	vb.add_child(head)
+	# Leader tags (ties share): most wins and most knockouts, only
+	# once somebody actually banked them (a fresh 0-0 table tags no
+	# one). Expanded words, not shorthand: "Wins: 2, Losses: 1".
+	var top_w := -1.0
+	var top_k := -1
+	for srow in (cell.get("standings", []) as Array):
+		var rd := srow as Dictionary
+		top_w = maxf(top_w, float(rd.get("wins", 0)))
+		top_k = maxi(top_k, int(rd.get("kos", 0)))
 	var i := 0
 	for srow in (cell.get("standings", []) as Array):
 		i += 1
 		var rd := srow as Dictionary
-		var sl := Label.new()
 		var sw := float(rd.get("wins", 0))
-		sl.text = "%s%d. %s  %sW-%s  KO%d" % [
+		var sk := int(rd.get("kos", 0))
+		var tags := ""
+		if sw >= top_w and top_w > 0.0:
+			tags += "  •  WINS LEADER"
+		if sk >= top_k and top_k > 0:
+			tags += "  •  KO LEADER"
+		var sl := Label.new()
+		sl.text = "%s%d. %s  —  Wins: %s, Losses: %s, Knockouts: %d%s" % [
 			"★" if i <= 2 else "  ", i, str(rd.get("name", "?")),
 			_fmt_wins(sw), _fmt_wins(float(rd.get("matches", 0)) - sw),
-			int(rd.get("kos", 0))]
+			sk, tags]
 		sl.add_theme_font_size_override("font_size", FS_ROW)
 		sl.clip_text = true
 		sl.add_theme_color_override("font_color",

@@ -351,7 +351,47 @@ func test_overview_render() -> void:
 		if str(t).begins_with("★"):
 			stars += 1
 	_check(stars == 2, "top-2 starred in live table")
+	# Expanded standings: words not shorthand, leader tags present.
+	var wins_word := false
+	var ko_word := false
+	var wins_tag := false
+	var ko_tag := false
+	for t in btexts:
+		var s := str(t)
+		if s.contains("Wins: 1"):
+			wins_word = true
+		if s.contains("Knockouts: 2"):
+			ko_word = true
+		if s.contains("WINS LEADER"):
+			wins_tag = true
+		if s.contains("KO LEADER"):
+			ko_tag = true
+	_check(wins_word, "expanded Wins label")
+	_check(ko_word, "expanded Knockouts label")
+	_check(wins_tag, "wins leader tagged")
+	_check(ko_tag, "KO leader tagged")
 	B.free()
+
+
+func test_bracket_close_toggle() -> void:
+	# The overlay CLOSE row sits under the menu bar (unreachable), so
+	# the menu-bar button doubles as the close control: "Bracket
+	# Close" while open, "BRACKET" while closed.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	A.bracket_button = Button.new()
+	A.bracket_overlay = Control.new()
+	A.bracket_overlay.visible = false
+	A.call("_sync_bracket_button")
+	_check(A.bracket_button.text == "BRACKET", "closed reads BRACKET")
+	A.bracket_overlay.visible = true
+	A.call("_sync_bracket_button")
+	_check(A.bracket_button.text == "Bracket Close", "open reads Bracket Close")
+	A.bracket_overlay.visible = false
+	A.call("_hide_arena_bracket")
+	_check(A.bracket_button.text == "BRACKET", "hide restores BRACKET")
+	A.bracket_button.free()
+	A.bracket_overlay.free()
+	A.free()
 
 
 func _all_labels(node: Node) -> Array:
@@ -507,6 +547,7 @@ func _initialize() -> void:
 	test_prebuilt_overview()
 	test_cutoff_and_weighted_draw()
 	test_topup_pick()
+	test_bracket_close_toggle()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

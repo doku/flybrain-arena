@@ -733,10 +733,22 @@ func _show_arena_bracket(title_text: String) -> void:
 		bracket_scroll.scroll_horizontal = 0
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
+	_sync_bracket_button()
 
 func _hide_arena_bracket() -> void:
 	if bracket_overlay != null:
 		bracket_overlay.visible = false
+	_sync_bracket_button()
+
+
+func _sync_bracket_button() -> void:
+	# The overlay's own CLOSE row sits under the bottom menu bar and
+	# can't be reached, so the menu-bar button doubles as the close
+	# control: it reads "Bracket Close" while the overlay is open.
+	if not is_instance_valid(bracket_button):
+		return
+	var open := is_instance_valid(bracket_overlay) and bracket_overlay.visible
+	bracket_button.text = "Bracket Close" if open else "BRACKET"
 
 
 func _save_bracket_record(with_png: bool) -> void:
@@ -3503,16 +3515,29 @@ func _standings_text() -> String:
 	var group := str(director.tourney.get("group", "?"))
 	var lines := PackedStringArray()
 	lines.append("GROUP %s — top 2 advance" % group)
+	var rows: Array = director.group_standings()
+	var top_w := -1.0
+	var top_k := -1
+	for row in rows:
+		var rd := row as Dictionary
+		top_w = maxf(top_w, float(rd.get("wins", 0)))
+		top_k = maxi(top_k, int(rd.get("kos", 0)))
 	var i := 0
-	for row in director.group_standings():
+	for row in rows:
 		i += 1
-		var w := float((row as Dictionary).get("wins", 0))
-		var played := int((row as Dictionary).get("matches", 0))
+		var rd := row as Dictionary
+		var w := float(rd.get("wins", 0))
+		var played := int(rd.get("matches", 0))
 		var mark := "★" if i <= 2 else " "
-		lines.append("%s%d. %s  %sW-%s  KO%d" % [mark, i,
-			str((row as Dictionary).get("name", "?")),
+		var tags := ""
+		if w >= top_w and top_w > 0.0:
+			tags += "  •  WINS LEADER"
+		if int(rd.get("kos", 0)) >= top_k and top_k > 0:
+			tags += "  •  KO LEADER"
+		lines.append("%s%d. %s  —  Wins: %s, Losses: %s, Knockouts: %d%s" % [mark, i,
+			str(rd.get("name", "?")),
 			director._fmt_wins(w), director._fmt_wins(float(played) - w),
-			int((row as Dictionary).get("kos", 0))])
+			int(rd.get("kos", 0)), tags])
 	return "\n".join(lines)
 
 
@@ -3766,6 +3791,7 @@ func _event_intermission(title: String, sub: String) -> bool:
 		bracket_scroll.scroll_horizontal = 0
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
+	_sync_bracket_button()
 	var left := EVENT_INTERMISSION_SECS
 	while left > 0.0 and not _event_skip:
 		if not _event_active():
@@ -3777,8 +3803,10 @@ func _event_intermission(title: String, sub: String) -> bool:
 	if is_instance_valid(bracket_close_row):
 		bracket_close_row.visible = true
 	if not _event_active():
+		_sync_bracket_button()
 		return false
 	bracket_overlay.visible = false
+	_sync_bracket_button()
 	return true
 
 
@@ -4954,6 +4982,7 @@ func _show_nextgen_overlay(title_text: String) -> void:
 		bracket_title.text = title_text
 	if is_instance_valid(bracket_overlay):
 		bracket_overlay.visible = true
+	_sync_bracket_button()
 	_hide_evo_phase()
 
 
@@ -4971,6 +5000,7 @@ func _hide_nextgen() -> void:
 		bracket_close_row.visible = true
 	if is_instance_valid(bracket_overlay):
 		bracket_overlay.visible = false
+	_sync_bracket_button()
 
 
 func _refresh_nextgen_preview() -> void:
