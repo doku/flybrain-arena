@@ -358,10 +358,10 @@ func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
 		i += 1
 		var rd := srow as Dictionary
 		var sl := Label.new()
-		sl.text = "%s%d. %s  %dW-%d  KO%d" % [
+		var sw := float(rd.get("wins", 0))
+		sl.text = "%s%d. %s  %sW-%s  KO%d" % [
 			"★" if i <= 2 else "  ", i, str(rd.get("name", "?")),
-			int(rd.get("wins", 0)),
-			int(rd.get("matches", 0)) - int(rd.get("wins", 0)),
+			_fmt_wins(sw), _fmt_wins(float(rd.get("matches", 0)) - sw),
 			int(rd.get("kos", 0))]
 		sl.add_theme_font_size_override("font_size", FS_ROW)
 		sl.clip_text = true

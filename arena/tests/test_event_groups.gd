@@ -374,6 +374,9 @@ func test_prior_wins_and_split() -> void:
 	var st: Array = D.call("group_standings")
 	_check(absf(float(st[0]["wins"]) - 0.5) < 0.001 and absf(float(st[1]["wins"]) - 0.5) < 0.001,
 		"both sides hold 0.5 wins")
+	_check(str(D.call("bracket_text")).contains("DRAW SPLIT"), "record prints the split")
+	_check(str(D.call("_fmt_wins", 2.5)) == "2.5", "fractional wins print trimmed")
+	_check(str(D.call("_fmt_wins", 3.0)) == "3", "whole wins print as ints")
 
 
 func _momentum_pair() -> Array:

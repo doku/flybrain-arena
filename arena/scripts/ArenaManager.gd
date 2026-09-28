@@ -3452,11 +3452,12 @@ func _standings_text() -> String:
 	var i := 0
 	for row in director.group_standings():
 		i += 1
+		var w := float((row as Dictionary).get("wins", 0))
+		var played := int((row as Dictionary).get("matches", 0))
 		var mark := "★" if i <= 2 else " "
-		lines.append("%s%d. %s  %dW-%d  KO%d" % [mark, i,
+		lines.append("%s%d. %s  %sW-%s  KO%d" % [mark, i,
 			str((row as Dictionary).get("name", "?")),
-			int((row as Dictionary).get("wins", 0)),
-			int((row as Dictionary).get("matches", 0)) - int((row as Dictionary).get("wins", 0)),
+			director._fmt_wins(w), director._fmt_wins(float(played) - w),
 			int((row as Dictionary).get("kos", 0))])
 	return "\n".join(lines)
 

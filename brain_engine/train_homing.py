@@ -160,9 +160,8 @@ class KinematicFly:
         # alone loses momentum on contact instead).
         self.slow_t = 0.0
         # Ground-scrape detection (mirror FlyPhysics scrape_time): the
-        # floor band while descending/nose-down; the train loop pays a
-        # per-step aversive on this signal, so ground-clipping learns
-        # away. scrapes counts episodes that ended scraped.
+        # floor band; the train loop pays a per-step aversive on this
+        # signal, so ground-clipping learns away.
         self.scrape_time = 0.0
         self.ground_now = 0.0
 
