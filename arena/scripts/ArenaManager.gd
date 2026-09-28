@@ -216,8 +216,7 @@ var nextgen_gen := 1
 var nextgen_champ_id := ""
 var nextgen_champ_name := ""
 var nextgen_clone_name := ""
-var bracket_close_btn: Button
-var bracket_close_row: HBoxContainer
+
 # Group-stage event widgets (evo size-16): standings table + the
 # intermission countdown row, sharing the bracket overlay above.
 var standings_label: Label
@@ -703,14 +702,9 @@ func _build_bracket_overlay() -> void:
 	arena_bracket.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	arena_bracket.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.add_child(arena_bracket)
-	var close_btn := Button.new()
-	close_btn.text = "CLOSE"
-	close_btn.pressed.connect(_hide_arena_bracket)
-	var hbox := HBoxContainer.new()
-	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	hbox.add_child(close_btn)
-	bracket_close_row = hbox
-	vb.add_child(hbox)
+	# No overlay CLOSE row: it sat under the bottom menu bar and could
+	# never receive clicks. The menu-bar "Bracket Close" button (kept
+	# in sync by _sync_bracket_button) is the close control.
 
 func _show_arena_bracket(title_text: String) -> void:
 	var director := _director()
@@ -3785,8 +3779,6 @@ func _event_intermission(title: String, sub: String) -> bool:
 	_refresh_standings()
 	intermission_label.text = sub
 	intermission_row.visible = true
-	if is_instance_valid(bracket_close_row):
-		bracket_close_row.visible = false
 	if is_instance_valid(bracket_scroll):
 		bracket_scroll.scroll_horizontal = 0
 		bracket_scroll.scroll_vertical = 0
@@ -3800,8 +3792,6 @@ func _event_intermission(title: String, sub: String) -> bool:
 		await get_tree().create_timer(1.0).timeout
 		left -= 1.0
 	intermission_row.visible = false
-	if is_instance_valid(bracket_close_row):
-		bracket_close_row.visible = true
 	if not _event_active():
 		_sync_bracket_button()
 		return false
@@ -4973,10 +4963,6 @@ func _show_nextgen_overlay(title_text: String) -> void:
 		gallery_box.visible = true
 	if is_instance_valid(strip_box):
 		strip_box.visible = true
-	if is_instance_valid(bracket_close_btn):
-		bracket_close_btn.visible = false
-	if is_instance_valid(bracket_close_row):
-		bracket_close_row.visible = false
 	_refresh_nextgen_preview()
 	if is_instance_valid(bracket_title):
 		bracket_title.text = title_text
@@ -4994,10 +4980,6 @@ func _hide_nextgen() -> void:
 		gallery_box.visible = false
 	if is_instance_valid(strip_box):
 		strip_box.visible = false
-	if is_instance_valid(bracket_close_btn):
-		bracket_close_btn.visible = true
-	if is_instance_valid(bracket_close_row):
-		bracket_close_row.visible = true
 	if is_instance_valid(bracket_overlay):
 		bracket_overlay.visible = false
 	_sync_bracket_button()
