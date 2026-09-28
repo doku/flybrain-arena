@@ -507,6 +507,19 @@ func test_spawn_hold() -> void:
 	D.free()
 
 
+func test_worker_affinity_mask() -> void:
+	# Workers stay off the game's cores: CPU 0 reserved on small
+	# machines, CPUs 0-1 on roomy ones, nothing reserved when tiny.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	_check(int(D.call("_worker_affinity_mask_for", 1)) == 1, "1 cpu: full mask")
+	_check(int(D.call("_worker_affinity_mask_for", 2)) == 3, "2 cpu: full mask")
+	_check(int(D.call("_worker_affinity_mask_for", 4)) == 14, "4 cpu: reserve cpu0")
+	_check(int(D.call("_worker_affinity_mask_for", 8)) == 252, "8 cpu: reserve cpu0-1")
+	var m8 := int(D.call("_worker_affinity_mask_for", 8))
+	_check(m8 & 3 == 0 and m8 & 4 != 0, "8 cpu: game cores clear, worker cores kept")
+	D.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -669,6 +682,7 @@ func _initialize() -> void:
 	test_pip_slot_cycle()
 	test_roster_cache()
 	test_spawn_hold()
+	test_worker_affinity_mask()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

@@ -185,17 +185,51 @@ func _run_cli(args: Array) -> Dictionary:
 	return _parse_cli_output(out, code)
 
 
+func _worker_affinity_mask_for(n: int) -> int:
+	# Bitmask keeping workers off the game's cores: reserve CPU 0 on
+	# small machines, CPUs 0-1 on roomy ones. Pure (unit-tested).
+	if n <= 2:
+		return (1 << n) - 1  # Nowhere to hide; priority alone must do.
+	var full := -1 if n >= 63 else (1 << n) - 1
+	if n <= 4:
+		return full & ~1
+	return full & ~3
+
+
 func _soften_worker(pid: int) -> void:
 	# Background workers (breeds/trains/probes) run long CPU-heavy jobs
-	# beside the live fight: drop them below normal priority so frame
-	# pacing never contends with them. Fire-and-forget helper process;
-	# any failure (exited pid, non-Windows host) is silently ignored.
+	# beside the live fight: drop them below normal priority AND pin them
+	# off the game's cores, so frame pacing never contends with them.
+	# Fire-and-forget helper process; any failure (exited pid,
+	# non-Windows host) is silently ignored.
 	if pid <= 0 or OS.get_name() != "Windows":
 		return
+	var mask := _worker_affinity_mask_for(maxi(OS.get_processor_count(), 1))
 	OS.create_process("powershell.exe", ["-NoProfile", "-NonInteractive",
 		"-WindowStyle", "Hidden", "-Command",
-		"try { [System.Diagnostics.Process]::GetProcessById(%d).PriorityClass = 'BelowNormal' } catch {}" % pid],
+		"try { $p=[System.Diagnostics.Process]::GetProcessById(%d); $p.PriorityClass='BelowNormal'; $p.ProcessorAffinity=[Int64]%d } catch {}" % [pid, mask]],
 		false)
+
+
+func _spawn_worker(argv: Array) -> int:
+	# Spawn a background Python worker confined to the non-game cores:
+	# single-threaded BLAS (numpy would otherwise fan OpenBLAS/MKL
+	# threads across every core) + below-normal priority + affinity
+	# (see _soften_worker). Env is restored right after spawn; the
+	# child already inherited its copy.
+	var saved := {}
+	for key in ["OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"]:
+		saved[key] = OS.get_environment(key) if OS.has_environment(key) else null
+		OS.set_environment(key, "1")
+	var pid := OS.create_process(python_exe, argv, false)
+	for key in saved.keys():
+		if saved[key] == null:
+			OS.set_environment(key, "")
+		else:
+			OS.set_environment(key, str(saved[key]))
+	if pid > 0:
+		_soften_worker(pid)
+	return pid
 
 
 func run_cli_async(op: String, args: Array, result_file: String,
@@ -211,11 +245,9 @@ func run_cli_async(op: String, args: Array, result_file: String,
 		return {"ok": false, "error": "another operation is already running"}
 	if FileAccess.file_exists(result_file):
 		DirAccess.remove_absolute(result_file)
-	var pid := OS.create_process(python_exe,
-		_cli_argv(args + ["--result-file", result_file]), false)
+	var pid := _spawn_worker(_cli_argv(args + ["--result-file", result_file]))
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
-	_soften_worker(pid)
 	pending_async = {"pid": pid, "result_file": result_file, "op": op,
 		"started": Time.get_ticks_msec(), "timeout_msec": timeout_msec}
 	return {"ok": true, "pid": pid}
@@ -377,10 +409,9 @@ func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dict
 	var args: Array = _cli_argv(["train", "--id", brain_id,
 		"--episodes", str(episodes), "--params-file", params_file,
 		"--progress", progress_path, "--result-file", result_file])
-	var pid := OS.create_process(python_exe, args, false)
+	var pid := _spawn_worker(args)
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
-	_soften_worker(pid)
 	active_job = {"pid": pid, "progress_path": progress_path,
 		"result_file": result_file, "brain_id": brain_id,
 		"episodes": episodes, "school": params.has("curriculum")}
@@ -606,14 +637,12 @@ func _launch_score(brain_id: String) -> bool:
 	if f != null:
 		f.store_string(JSON.stringify({"episode": 0, "total": 6, "pct": 0.0}))
 		f.close()
-	var pid := OS.create_process(python_exe,
-		_cli_argv(["score", "--id", brain_id, "--episodes", "6",
-			"--seed", "7", "--progress", progress_path,
-			"--result-file", result_file]), false)
+	var pid := _spawn_worker(_cli_argv(["score", "--id", brain_id, "--episodes", "6",
+		"--seed", "7", "--progress", progress_path,
+		"--result-file", result_file]))
 	if pid <= 0:
 		print("[Director] Eval probe failed to spawn for %s." % brain_id)
 		return false
-	_soften_worker(pid)
 	score_job = {"pid": pid, "result_file": result_file,
 		"progress_path": progress_path, "brain_id": brain_id}
 	print("[Director] Eval probe started for %s." % brain_id)
