@@ -163,7 +163,7 @@ var wing_flutter_time: float = 0.0
 # further hits. reset_fly clears it.
 var landing_mode: int = 0
 const LAND_POS_Y: float = 0.62
-const LOSER_SINK_RATE: float = 3.0
+const LOSER_SINK_RATE: float = 5.5
 const WINNER_SINK_RATE: float = 1.4
 
 # Spear lunge attack (mouth-motor driven): a short forward impulse plus
@@ -173,6 +173,7 @@ var lunge_cooldown: float = 0.0
 var lunge_t: float = 0.0
 var lunge_count: int = 0
 var spear_root: Node3D = null
+var spear_pierce := false
 const LUNGE_COOLDOWN: float = 1.2
 const LUNGE_TIME: float = 0.35
 const LUNGE_DIST: float = 0.35
@@ -675,9 +676,11 @@ func _physics_process(delta: float) -> void:
 		lunge_cooldown = LUNGE_COOLDOWN
 		lunge_t = LUNGE_TIME
 		lunge_count += 1
-	if lunge_t > 0.0:
-		lunge_t = maxf(0.0, lunge_t - delta)
-		var ext := LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
+	_check_pierce_hold()
+	if lunge_t > 0.0 or spear_pierce:
+		if lunge_t > 0.0:
+			lunge_t = maxf(0.0, lunge_t - delta)
+		var ext := _spear_extension()
 		if is_instance_valid(spear_root):
 			spear_root.position.z = -ext
 		front_spike_area.position = SPIKE_BASE_POS + Vector3(0, 0, -ext)
@@ -826,6 +829,31 @@ func _facing_victim(victim: FlyPhysics) -> bool:
 	var local = global_transform.basis.inverse() * to_v.normalized()
 	return -local.z > 0.3
 
+func _note_pierce_if_lethal(victim: FlyPhysics) -> bool:
+	# Pierce-through arms only on a killing blow: the victim went down
+	# from this strike (tear-forfeit, puncture, bleed-out). Glancing
+	# hits never hold the spear. Returns the held state for tests.
+	if victim.is_disabled:
+		spear_pierce = true
+		return true
+	return false
+
+
+func _check_pierce_hold() -> void:
+	# Release when real time resumes (slow-mo finish over): the retract
+	# branch below re-centers on the next ticks. Self-contained so no
+	# manager coupling can leave it stuck.
+	if spear_pierce and Engine.time_scale >= 1.0:
+		spear_pierce = false
+
+
+func _spear_extension() -> float:
+	# Full reach while pierced; the sine strike-and-return otherwise.
+	if spear_pierce:
+		return LUNGE_DIST
+	return LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
+
+
 func _on_spike_hit_area(area: Area3D) -> void:
 	if is_disabled or not combat_enabled:
 		return
@@ -845,6 +873,7 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		# Momentum knockback: the impalement shoves the victim along the
 		# attacker's momentum; the attacker bleeds a share.
 		_apply_knockback(victim, velocity, minf(rel_vel * 0.35, 6.0))
+		_note_pierce_if_lethal(victim)
 		landed_strike.emit("wing")
 		print(fly_id, " impaled ", victim.fly_id, "'s ", area.name, "! (Rel Speed: ", rel_vel, ")")
 	elif area.name == "ThoraxHurtbox":
@@ -861,6 +890,7 @@ func _on_spike_hit_area(area: Area3D) -> void:
 			victim.last_damage_t = victim.fly_time
 			victim.inflict_lethal_strike()
 			_apply_knockback(victim, velocity, minf(rel_vel * 0.4, 8.0))
+			_note_pierce_if_lethal(victim)
 			landed_strike.emit("thorax")
 			print(fly_id, " landed rear-aspect THORAX PUNCTURE on ", victim.fly_id, "!")
 	elif area.name == "FrontSpikeArea":
@@ -1014,6 +1044,7 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	is_emergency_evade = false
 	spear_thrust_cmd = 0.0
 	lunge_cooldown = 0.0
+	spear_pierce = false
 	lunge_t = 0.0
 	lunge_count = 0
 	cmd_age = 0.0

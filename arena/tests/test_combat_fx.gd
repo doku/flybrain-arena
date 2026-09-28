@@ -87,6 +87,48 @@ func test_ko_burst_path() -> void:
 	_check(arena.ring_shock_alpha > 0.0, "KO shock seeded")
 
 
+func test_pierce_only_on_kill() -> void:
+	# Pierce-through arms only on a killing blow; glancing hits
+	# retract normally. Held spear reads full reach.
+	var atk = arena.fly_alpha
+	var vic = arena.fly_beta
+	vic.is_disabled = false
+	atk.spear_pierce = false
+	_check(not atk._note_pierce_if_lethal(vic), "live victim never pierces")
+	_check(not atk.spear_pierce, "flag stays clear on glance")
+	vic.is_disabled = true
+	_check(atk._note_pierce_if_lethal(vic), "lethal strike pierces")
+	_check(atk.spear_pierce, "flag holds after kill")
+	_check(absf(atk._spear_extension() - atk.LUNGE_DIST) < 0.001,
+		"pierced spear reads full reach")
+	vic.is_disabled = false
+	atk.spear_pierce = false
+
+
+func test_pierce_releases_realtime() -> void:
+	# Held through the slow-mo finish, released the frame real time
+	# resumes (no manager coupling to get stuck).
+	var atk = arena.fly_alpha
+	atk.spear_pierce = true
+	Engine.time_scale = 0.25
+	atk._check_pierce_hold()
+	_check(atk.spear_pierce, "holds through slow-mo")
+	Engine.time_scale = 1.0
+	atk._check_pierce_hold()
+	_check(not atk.spear_pierce, "releases at real time")
+
+
+func test_loser_drops_faster() -> void:
+	# Loser ceremony sinks at LOSER_SINK_RATE (5.5 m/s), not the old
+	# gentle 3.0.
+	var vic = arena.fly_beta
+	vic.landing_mode = 1
+	vic.global_position.y = 10.0
+	vic._landing_step(1.0)
+	_check(absf(vic.global_position.y - 4.5) < 0.05, "loser sinks 5.5 m/s")
+	vic.landing_mode = 0
+
+
 func _initialize() -> void:
 	var scene = load("res://scenes/ArenaGlade.tscn")
 	arena = scene.instantiate()
@@ -102,6 +144,9 @@ func _process(_delta: float) -> bool:
 	test_shock_lifecycle()
 	test_combat_gate()
 	test_ko_burst_path()
+	test_pierce_only_on_kill()
+	test_pierce_releases_realtime()
+	test_loser_drops_faster()
 	if failures == 0:
 		print("ALL COMBAT-FX TESTS PASSED")
 	else:
