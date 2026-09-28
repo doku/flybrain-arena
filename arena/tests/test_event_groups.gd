@@ -454,6 +454,17 @@ func test_soften_worker_noop() -> void:
 	D.free()
 
 
+func test_pip_slot_defaults() -> void:
+	# Stats view is the default slot; the stat card renders record,
+	# traits and live numbers (zeros headless, never a crash).
+	var A = load("res://scripts/ArenaManager.gd").new()
+	_check(str(A.get("pip_slot_mode")) == "STATS", "stats on by default")
+	var txt: String = A.call("_pip_stats_text", "alpha")
+	_check(txt.contains("BTL") and txt.contains("EVA"), "card has record + traits")
+	_check(txt.contains("KO"), "card has fight numbers")
+	A.free()
+
+
 func test_pip_slot_cycle() -> void:
 	# PiP slot rotation: EYES -> BRAIN -> STATS -> EYES; junk resets.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -622,6 +633,7 @@ func _initialize() -> void:
 	test_slowmo_safety()
 	test_gallery_cache_key()
 	test_soften_worker_noop()
+	test_pip_slot_defaults()
 	test_pip_slot_cycle()
 	_cleanup()
 	if failures == 0:

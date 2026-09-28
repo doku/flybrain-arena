@@ -118,6 +118,21 @@ func test_pierce_releases_realtime() -> void:
 	_check(not atk.spear_pierce, "releases at real time")
 
 
+func test_pip_stats_layering() -> void:
+	# Stat cards are created under the bracket overlay (never on top
+	# of the popup) and toggle with the slot mode.
+	arena.pip_slot_mode = "STATS"
+	arena._apply_pip_slot()
+	_check(arena.pip_stats_alpha != null, "stats label created")
+	var hud: Node = arena.get_node("HUD")
+	var kids: Array = hud.get_children()
+	var si: int = kids.find(arena.pip_stats_alpha)
+	var oi: int = kids.find(arena.bracket_overlay)
+	_check(oi == -1 or si < oi, "stats behind bracket overlay")
+	arena.pip_slot_mode = "EYES"
+	arena._apply_pip_slot()
+
+
 func test_pip_slot_visibility() -> void:
 	# STATS hides the viewport boxes (no frozen eye frames behind the
 	# stat cards); EYES/BRAIN keep them. Brain mode forces clouds on.
@@ -162,6 +177,7 @@ func _process(_delta: float) -> bool:
 	test_shock_lifecycle()
 	test_combat_gate()
 	test_ko_burst_path()
+	test_pip_stats_layering()
 	test_pierce_only_on_kill()
 	test_pierce_releases_realtime()
 	test_loser_drops_faster()

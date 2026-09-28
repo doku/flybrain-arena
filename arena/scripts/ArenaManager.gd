@@ -328,7 +328,7 @@ var _pip_hidden := false
 # BRAIN (cams parked on the spinning 3D clouds), STATS (live fly stat
 # cards instead of viewports).
 const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS"]
-var pip_slot_mode := "EYES"
+var pip_slot_mode := "STATS"
 var pip_stats_alpha: Label
 var pip_stats_beta: Label
 
@@ -504,6 +504,11 @@ func _enter_tournament_mode() -> void:
 	director.arena = self
 	_build_bracket_overlay()
 	_build_menu_bar(true)
+	if is_instance_valid(timer_label):
+		timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	if is_instance_valid(status_label):
+		status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_apply_pip_slot()
 	# Pipeline kick-off: queue a wild breed for the next generation
 	# immediately, so it trains in the background while gen 1 plays.
 	# Events stock the pool bench instead (clones need the champion,
@@ -935,7 +940,9 @@ func _update_tourney_status(prefix: String) -> void:
 		if not m.is_empty():
 			score = "  [%d - %d]" % [int(m.get("wins_a", 0)), int(m.get("wins_b", 0))]
 	if is_instance_valid(status_label):
-		status_label.text = "%s %s: %s vs %s%s" % [expand_match_label(tourney_match_label), prefix,
+		# Versus + score on their own centered row, below the round
+		# line (the column labels are centered since arena entry).
+		status_label.text = "%s %s:\n%s vs %s%s" % [expand_match_label(tourney_match_label), prefix,
 			tourney_a_name, tourney_b_name, score]
 	if is_instance_valid(gen_label) and director != null:
 		if director.is_quick():
@@ -1572,21 +1579,28 @@ func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	l.visible = false
 	parent.add_child(l)
+	# Behind the bracket overlay (appended after it): the popup must
+	# cover stat cards, never the reverse.
+	parent.move_child(l, 0)
 	return l
 
 
 func _pip_stats_text(side: String) -> String:
-	# Live fly stat card: name, ELO, speed, thrust, health, KOs, damage.
+	# Live fly stat card: record (ELO, battles, matches, titles),
+	# traits, and live flight numbers. Record/traits ride the bracket
+	# snapshot (no vault shell-outs at 10 Hz).
 	var fly: CharacterBody3D = fly_alpha if side == "alpha" else fly_beta
 	var nm := _slot_name(side)
-	var elo := "--"
+	var rec := {}
+	var gp := {}
 	var director := _director()
 	if director != null:
 		var m: Dictionary = director.current_match()
 		var pid := str(m.get("a_id" if side == "alpha" else "b_id", ""))
 		for p in director.tourney.get("players", []):
 			if str((p as Dictionary).get("id", "")) == pid:
-				elo = str(int(((p as Dictionary).get("record", {}) as Dictionary).get("elo", 1200.0)))
+				rec = (p as Dictionary).get("record", {})
+				gp = (p as Dictionary).get("generator_params", {})
 				break
 	var spd := 0.0
 	var thr := 0.0
@@ -1598,8 +1612,22 @@ func _pip_stats_text(side: String) -> String:
 		var _h = fly.get("health")
 		hp = float(_h) if _h != null else 0.0
 	var st: Dictionary = stats_alpha if side == "alpha" else stats_beta
-	return "%s  (ELO %s)\nSPD %.1f  THR %.2f\nHP %.0f  KO %d  DMG %.0f" % [nm, elo, spd, thr, hp,
-		int(st.get("kills", 0)), float(st.get("damage_dealt", 0.0))]
+	var gid := str(gp.get("genome_id", ""))
+	if gid == "":
+		var exp = gp.get("experiment", null)
+		gid = "mix" if exp is Array else (str(exp) if exp != null and str(exp) != "" else "base")
+	var lines := PackedStringArray()
+	lines.append("%s  (ELO %d)" % [nm, int(rec.get("elo", 1200.0))])
+	lines.append("BTL %d (W%d L%d D%d)  MTCH %d (W%d)  T%d" % [
+		int(rec.get("battles", 0)), int(rec.get("wins", 0)),
+		int(rec.get("losses", 0)), int(rec.get("draws", 0)),
+		int(rec.get("matches", 0)), int(rec.get("matches_won", 0)),
+		int(rec.get("tournaments_won", 0))])
+	lines.append("EVA %.2f  LR %.4f  %s" % [
+		float(gp.get("evasion", 0.0)), float(gp.get("learning_rate", 0.0)), gid])
+	lines.append("SPD %.1f  THR %.2f  HP %.0f  KO %d" % [spd, thr, hp,
+		int(st.get("kills", 0))])
+	return "\n".join(lines)
 
 
 func _park_pip_on_cloud(cam: Camera3D, cloud: Node3D) -> void:
