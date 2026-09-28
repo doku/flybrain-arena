@@ -508,15 +508,6 @@ func _enter_tournament_mode() -> void:
 		timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	if is_instance_valid(status_label):
 		status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	# Unmistakable row split: round time and versus/score can never
-	# read as one line (divider + airy column spacing).
-	var hud_box := get_node_or_null("HUD/Margin/VBox") as VBoxContainer
-	if hud_box != null and is_instance_valid(timer_label) and not hud_box.has_meta("hud_sep_added"):
-		hud_box.set_meta("hud_sep_added", true)
-		hud_box.add_theme_constant_override("separation", 10)
-		var sep := HSeparator.new()
-		hud_box.add_child(sep)
-		hud_box.move_child(sep, timer_label.get_index() + 1)
 	_apply_pip_slot()
 	# Pipeline kick-off: queue a wild breed for the next generation
 	# immediately, so it trains in the background while gen 1 plays.
@@ -1855,18 +1846,19 @@ func _layout_match_hud() -> void:
 	# hide it outright (updates stay guarded no-ops).
 	if is_instance_valid(gen_label):
 		gen_label.visible = false
-	# Round time + wins move to a centered top strip, clear of the
-	# side brain-view panels (reparented scene labels, same nodes).
+	# Round time + wins + control cadence move to a centered top
+	# strip, clear of the side brain-view panels (reparented scene
+	# labels, same nodes) - stacked vertically, one readout per row.
 	var hud: CanvasLayer = $HUD
-	var strip := HBoxContainer.new()
+	var strip := VBoxContainer.new()
 	strip.name = "MatchStrip"
 	strip.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	strip.offset_left = -320.0
 	strip.offset_right = 320.0
-	strip.offset_top = 64.0
-	strip.offset_bottom = 96.0
+	strip.offset_top = 56.0
+	strip.offset_bottom = 170.0
 	strip.alignment = BoxContainer.ALIGNMENT_CENTER
-	strip.add_theme_constant_override("separation", 40)
+	strip.add_theme_constant_override("separation", 4)
 	hud.add_child(strip)
 	for lbl in [timer_label, win_label]:
 		if is_instance_valid(lbl):
