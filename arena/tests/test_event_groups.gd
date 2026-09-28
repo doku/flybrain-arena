@@ -231,6 +231,32 @@ func test_cutoff_and_weighted_draw() -> void:
 	_check((q.get("qualified", []) as Array) == ["vet_a"], "floors gate qualification")
 
 
+func test_topup_pick() -> void:
+	# Least-trained bench brain below target wins the schooling slot;
+	# a graduated bench (or missing event) yields nothing to do.
+	var brains := _brains(16, 2000)
+	var ids: Array = []
+	for b in brains:
+		ids.append(str(b["id"]))
+	var beg: Dictionary = D.call("event_begin", ids,
+		{"best_of": 1, "lr_scale": 0.5, "round_time": 40.0}, 13, brains)
+	var eid := str(beg.get("event_id", ""))
+	var cards := {
+		"f01": {"elo": 1500.0, "train": 80, "matches": 10},
+		"f02": {"elo": 1400.0, "train": 30, "matches": 5},
+		"f03": {"elo": 1300.0, "train": 45, "matches": 5},
+		"f04": {"elo": 1200.0, "train": 60, "matches": 5}}
+	D.call("event_pool_add", eid, ["f01", "f02", "f03", "f04"], cards)
+	var pick: Dictionary = D.call("event_topup_pick", eid, 50, cards)
+	_check(bool(pick.get("ok", false)), "top-up pick resolves")
+	_check(str(pick.get("id", "")) == "f02", "fewest-trained picked")
+	_check(int(pick.get("deficit", 0)) == 20, "deficit to target")
+	var grad: Dictionary = D.call("event_topup_pick", eid, 10, cards)
+	_check(not bool(grad.get("ok", false)), "graduated bench picks nothing")
+	var nope: Dictionary = D.call("event_topup_pick", "E404", 50, cards)
+	_check(not bool(nope.get("ok", false)), "missing event errors")
+
+
 func _panels(bracket) -> Array:
 	# The 4 quadrant panels in order A, B, C, D.
 	var grid: VBoxContainer = bracket.get_child(0)
@@ -480,6 +506,7 @@ func _initialize() -> void:
 	test_overview_render()
 	test_prebuilt_overview()
 	test_cutoff_and_weighted_draw()
+	test_topup_pick()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

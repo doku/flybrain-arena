@@ -1680,7 +1680,7 @@ func event_advancers(event_id: String) -> Dictionary:
 	return {"ok": true, "advancers": qf}
 
 
-func event_eliminate_candidates(event_id: String, min_matches: int = 3, elo_cutoff: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
+func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
 	# Worst-first elimination order: played >= min_matches across the
 	# event files, lowest live ELO first. elo_cutoff > 0 restricts the
 	# axe to brains rated below it (menu demotion line); fewer than 2
@@ -1732,7 +1732,7 @@ func event_eliminate_candidates(event_id: String, min_matches: int = 3, elo_cuto
 	return {"ok": true, "candidates": experienced}
 
 
-func event_eliminate(event_id: String, min_matches: int = 3, elo_cutoff: float = 0.0) -> Dictionary:
+func event_eliminate(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0) -> Dictionary:
 	# Archives the bottom two candidates with the reason stamped.
 	var cands := event_eliminate_candidates(event_id, min_matches, elo_cutoff)
 	if not bool(cands.get("ok", false)):
@@ -1919,6 +1919,30 @@ func event_overview_data(event_id: String) -> Dictionary:
 		out.append(cell)
 	return {"groups": out,
 		"current": str(tourney.get("group", "")) if live_event == event_id and str(tourney.get("format", "")) == "groups" else ""}
+
+
+func event_topup_pick(event_id: String, target: int = 50, live_override: Dictionary = {}) -> Dictionary:
+	# Least-trained bench brain below target: {ok, id, name, episodes,
+	# deficit}. Pure over live cards (override for tests); empty when
+	# the whole bench already graduated.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var cards := _event_live_cards(live_override)
+	var worst := ""
+	var worst_eps := target
+	for pid in (ev.get("pool", []) as Array):
+		var s := str(pid)
+		if not cards.has(s):
+			continue
+		var eps := int((cards[s] as Dictionary).get("train", 0))
+		if eps < worst_eps:
+			worst_eps = eps
+			worst = s
+	if worst == "":
+		return {"ok": false, "error": "bench graduated"}
+	return {"ok": true, "id": worst, "episodes": worst_eps,
+		"deficit": target - worst_eps}
 
 
 func event_set_phase(event_id: String, phase: String) -> void:

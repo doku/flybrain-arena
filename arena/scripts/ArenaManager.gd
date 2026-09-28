@@ -225,8 +225,11 @@ var intermission_row: HBoxContainer
 var intermission_label: Label
 var _event_skip := false
 const EVENT_INTERMISSION_SECS := 60.0
-const EVENT_MIN_MATCHES := 3
+const EVENT_MIN_MATCHES := 10
 const EVENT_POOL_TARGET := 2
+const POOL_TRAIN_TARGET := 50
+const EVENT_TOPUP_EVERY := 30.0
+var _event_topup_cd := 0.0
 const EVENT_POOL_CAP := 4
 # In-flight awaited breed: _evo_await_queued DETACHES its spec from
 # pending, so every progress readout (strip, gallery, status line)
@@ -2813,7 +2816,58 @@ func _evo_watcher_tick(delta: float) -> void:
 	if _event_active():
 		_event_drain_done_to_pool()
 		_event_maintain_pool()
+		_event_topup_tick()
 	_update_evo_status_line()
+
+
+func _event_topup_tick() -> void:
+	# Automatic top-up trainer: when every worker slot is idle, school
+	# the least-trained bench brain toward POOL_TRAIN_TARGET (own
+	# stored wiring/rates + school curriculum, same as a menu school
+	# retrain). Throttled: the vault scan runs at most every 30 s, and
+	# it never steals CPU from breeds, trains, or score probes. The
+	# queue naturally rotates through the bench as each graduate
+	# outgrows the bottom slot.
+	if not _event_active():
+		return
+	_event_topup_cd += EVO_STATUS_EVERY
+	if _event_topup_cd < EVENT_TOPUP_EVERY:
+		return
+	var director := _director()
+	if director == null:
+		return
+	_event_topup_cd = 0.0
+	if not (director.train_queue as Array).is_empty():
+		return
+	if not (director.active_job as Dictionary).is_empty() \
+			or not (director.pending_async as Dictionary).is_empty() \
+			or not (director.score_job as Dictionary).is_empty():
+		return
+	var pick: Dictionary = director.event_topup_pick(_event_id(), POOL_TRAIN_TARGET)
+	if not bool(pick.get("ok", false)):
+		return
+	var worst := str(pick.get("id", ""))
+	var worst_eps := int(pick.get("episodes", 0))
+	var deficit := int(pick.get("deficit", 0))
+	var worst_rec := {}
+	for b in director.list_brains():
+		if str((b as Dictionary).get("id", "")) == worst:
+			worst_rec = b as Dictionary
+			break
+	if (worst_rec as Dictionary).is_empty():
+		return
+	var gp: Dictionary = (worst_rec as Dictionary).get("generator_params", {})
+	var params := {}
+	for k in ["variant", "seed", "learning_rate", "dist_gain", "evasion",
+			"align_bonus", "experiment", "genome", "genome_id",
+			"mapping", "yaw_bias"]:
+		if gp.has(k):
+			params[k] = gp[k]
+	params["curriculum"] = {}
+	director.enqueue_training(worst, str(worst_rec.get("name", "?")), deficit, params)
+	director.pump_train_queue()
+	print("[Arena] Event top-up: schooling %s +%d eps (had %d)" % [
+		str(worst_rec.get("name", "?")), deficit, worst_eps])
 
 
 func _update_evo_status_line() -> void:
