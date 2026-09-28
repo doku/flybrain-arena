@@ -31,7 +31,10 @@ def _load_variant_weights(checkpoints_dir, names, fallback):
 
 def _pool_index(pops):
     """Named-pool id sets for the brain-view stream (built once per boot;
-    stale-cache safe: absent pools read empty)."""
+    stale-cache safe: absent pools read empty). A parallel flat-array
+    dict ("__flat") backs the vectorized per-tick pool counts (spikes
+    are few per tick; np.isin over ~7k-member sets beats that many dict
+    lookups per pool per tick per brain)."""
     idx = {}
     for key in ("pheromone_da1", "pheromone_va1v", "visual_lc10",
                 "visual_lc4", "visual_lplc2", "visual_lc11", "visual_lc15",
@@ -48,6 +51,11 @@ def _pool_index(pops):
     dn = pops.get("descending_all", {})
     idx["dn_left"] = set(dn.get("left", []))
     idx["dn_right"] = set(dn.get("right", []))
+    flat = {}
+    for key, ids in idx.items():
+        flat[key] = np.asarray(sorted(ids), dtype=np.int64) if ids \
+            else np.empty(0, dtype=np.int64)
+    idx["__flat"] = flat
     return idx
 
 
@@ -115,7 +123,17 @@ def _spike_stats(spikes, pops, pool_idx=None, detail=0, _counts=None):
         "mn_thrust": int(sum(counts.get(s, 0) for s in mn_thrust)),
         "vs_flow": int(sum(counts.get(s, 0) for s in vs_flow)),
     }
-    if pool_idx is not None:
+    if pool_idx is not None and isinstance(pool_idx.get("__flat"), dict):
+        # Vectorized per-pool counts (flat arrays built once per boot):
+        # one np.isin pass per pool instead of a ~7k-iteration dict loop.
+        flat = pool_idx["__flat"]
+        pools = {}
+        for key, ids in pool_idx.items():
+            if key in ("dn_left", "dn_right", "__flat"):
+                continue
+            pools[key] = int(np.isin(spikes, flat[key]).sum())
+        out["pools"] = pools
+    elif pool_idx is not None:
         pools = {}
         for key, ids in pool_idx.items():
             if key in ("dn_left", "dn_right"):

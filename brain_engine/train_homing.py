@@ -1276,8 +1276,12 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
             # 3. Simulate 50 ms in biological LIF connectome
             spikes = brain.integrate_50ms(stim)
 
-            # 4. Decode descending motor controls (brain + reflex assist)
-            ctrl = decoder.decode(spikes, sensory_hint=senses)
+            # 4. Decode descending motor controls (brain + reflex assist).
+            # Reusable counts dict (server precedent): decode builds it
+            # once per step instead of twice.
+            _step_counts = {}
+            ctrl = decoder.decode(spikes, sensory_hint=senses,
+                                  _counts_out=_step_counts)
 
             # 5. Compute Dopamine reward (closing distance + gaze alignment
             # + tail chase + scent gradient ascent)

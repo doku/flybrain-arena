@@ -12,6 +12,8 @@ def lif_integrate_sparse(
     active_buffer,
     indptr, indices, data,
     stim_indices,
+    next_buffer,
+    current_spikes,
     steps=100,
     dt=0.5,
     tau_m=20.0,
@@ -54,8 +56,11 @@ def lif_integrate_sparse(
             active_buffer[n_active] = idx
             n_active += 1
 
-    next_buffer = np.empty(max_buf_len, dtype=np.int32)
-    current_spikes = np.empty(max_buf_len, dtype=np.int32)
+    next_count = 0
+    spike_count = 0
+    # Scratch buffers arrive preallocated from the brain instance (see
+    # FlyBrain.__init__): per-call np.empty of 2 x num_neurons was
+    # ~1.3 MB of allocation churn per 50 ms tick.
     spike_record = []
 
     for step in range(steps):
@@ -141,6 +146,10 @@ class FlyBrain:
         self.refractory = np.zeros(num_neurons, dtype=np.int16)
         self.is_active = np.zeros(num_neurons, dtype=np.bool_)
         self.active_buffer = np.zeros(num_neurons, dtype=np.int32)
+        # Scratch buffers for the integration kernel (preallocated once:
+        # per-call np.empty of 2 x num_neurons was churn per 50 ms tick).
+        self.next_buffer = np.zeros(num_neurons, dtype=np.int32)
+        self.current_spikes = np.zeros(num_neurons, dtype=np.int32)
 
     def reset_state(self):
         """Reset membrane states back to rest."""
@@ -156,6 +165,7 @@ class FlyBrain:
             self.active_buffer,
             self.indptr, self.indices, self.weights,
             stim_indices,
+            self.next_buffer, self.current_spikes,
             steps=int(50.0 / self.dt),
             dt=self.dt
         )

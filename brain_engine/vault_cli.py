@@ -233,11 +233,6 @@ def cmd_score(a):
         rec, weights = vault.load_brain(probe_path)
     except Exception as e:
         return err(str(e))
-    probe_mtime = None
-    try:
-        probe_mtime = os.path.getmtime(probe_path)
-    except OSError:
-        pass
     gp = rec.get("generator_params", {}) or {}
     eps = int(getattr(a, "episodes", 6) or 6)
     seed = int(float(getattr(a, "seed", 7) or 7))
@@ -271,20 +266,23 @@ def cmd_score(a):
         _write_progress(a.progress, eps, eps)
     gained = round(float(summary.get("score", 0.0)), 1)
     # Merge onto a fresh reload ONLY when the package actually changed
-    # mid-probe (mtime guard): batch scoring overlaps training now, and
-    # a raced train may have saved newer weights/counters. Unchanged
-    # (the common case) skips the second ~100 MB load entirely.
-    cur_changed = True
+    # since this probe loaded (batch scoring overlaps training now, and
+    # a raced train may have saved newer weights/counters — including
+    # just before the probe). Staleness probe: a record-only ~KB read
+    # compared on key fields (no ~100 MB weight decode); unchanged (the
+    # common case) stamps onto the already-current copy.
+    cur_rec, cur_w = rec, weights
     try:
-        cur_changed = os.path.getmtime(probe_path) != probe_mtime
-    except (OSError, TypeError):
-        pass
-    if cur_changed:
-        try:
+        live = vault.load_brain_record(probe_path)
+        stale = (int(live.get("training", {}).get("episodes", 0))
+                 != int(rec.get("training", {}).get("episodes", 0))
+                 or int(live.get("record", {}).get("battles", 0))
+                 != int(rec.get("record", {}).get("battles", 0))
+                 or int(live.get("record", {}).get("matches", 0))
+                 != int(rec.get("record", {}).get("matches", 0)))
+        if stale:
             cur_rec, cur_w = vault.load_brain(a.id)
-        except Exception:
-            cur_rec, cur_w = rec, weights
-    else:
+    except Exception:
         cur_rec, cur_w = rec, weights
     try:
         import numpy as _np

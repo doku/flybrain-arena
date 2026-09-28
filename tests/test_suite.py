@@ -1524,9 +1524,14 @@ class TestUDPServerIntegration(unittest.TestCase):
 
         # Wide retry window: the server loads a 25M-synapse graph at boot and
         # can be slow when the suite runs other CPU-heavy tests concurrently.
+        # Deadline-based (not attempt-counted): while the port is unbound,
+        # every sendto raises instant ConnectionResetError (ICMP), so a
+        # 30-attempt loop burns out in ~15 s - under heavy machine load the
+        # server can take 30 s+ to bind. Patience is TIME, not tries.
         sock.settimeout(4.0)
         res = None
-        for attempt in range(30):
+        deadline = time.time() + 150.0
+        while time.time() < deadline:
             try:
                 sock.sendto(json.dumps(step_packet).encode("utf-8"), server_addr)
                 data, _ = sock.recvfrom(65535)
@@ -1556,7 +1561,8 @@ class TestUDPServerIntegration(unittest.TestCase):
             "stats_beta": { "kills": 0, "damage_dealt": 0.0, "damage_taken": 80.0, "tracking_time_s": 4.0 }
         }
         round_res = None
-        for attempt in range(30):
+        round_deadline = time.time() + 150.0
+        while time.time() < round_deadline:
             try:
                 sock_round.sendto(json.dumps(round_packet).encode("utf-8"), server_addr)
                 data, _ = sock_round.recvfrom(65535)

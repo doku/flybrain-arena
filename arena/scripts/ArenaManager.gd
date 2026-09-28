@@ -125,7 +125,7 @@ const BV_NET_COLORS := {
 # Replay (L4): per-battle pool-rate stream. One count array per motor
 # reply (~5 Hz), capped; banked into the tournament JSON `flights`
 # entry when the menu record toggle is on, plus an in-memory copy for
-# the post-battle scrubber. ~50 KB per 40 s battle ??toggle-gated.
+# the post-battle scrubber. ~50 KB per 40 s battle — toggle-gated.
 const BV_STREAM_MAX := 600
 var bv_stream_alpha: Array = []
 var bv_stream_beta: Array = []
@@ -2283,7 +2283,7 @@ func _apply_brainview_settings() -> void:
 
 func _apply_bv_layer(layer: String) -> void:
 	# Bars always ride along when enabled. Flow shows on "flow", or on
-	# "raster" until a pool is selected ??then the raster takes its
+	# "raster" until a pool is selected — then the raster takes its
 	# rect (click again to deselect and return to the diagram).
 	_apply_bv_side_layer("alpha", layer)
 	_apply_bv_side_layer("beta", layer)

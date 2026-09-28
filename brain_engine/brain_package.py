@@ -174,6 +174,19 @@ def save_brain_record_only(record):
     return path
 
 
+def load_brain_record(path_or_id):
+    """Record-only read (~KB zip meta, no weight decode, sidecar honored).
+    Cheap staleness probe for score-stamp guards: compares key fields
+    without paying a full ~100 MB load_brain."""
+    path = _resolve(path_or_id)
+    side = _read_sidecar_record(path)
+    if side is not None:
+        return side
+    with zipfile.ZipFile(path, "r") as zf:
+        record = json.loads(zf.read(META_ENTRY).decode("utf-8"))
+    return record
+
+
 def load_brain(path_or_id):
     """Loads (record, weights) by vault id, filename, or absolute path.
     A record sidecar (see save_brain_record_only) overrides the embedded
@@ -241,18 +254,21 @@ def scan_vault(silent=False):
 
 def read_vault(silent=True, force_scan=False):
     """Index-first read-only roster: serves parsed index entries without
-    opening every package (~50 zip walks per call). Entries are validated
-    against the filesystem (one stat per entry — ghost entries from
-    direct file deletion are filtered); every vault writer upserts the
-    index, so only external file drops need a rescan. force_scan
+    opening every package (~50 zip walks per call). Drop-aware: the
+    indexed filename set is compared against the on-disk listing (one
+    listdir — trivial), and a mismatch (external file drop/removal)
+    falls back to a full scan, so direct file manipulation never serves
+    ghosts. Every vault writer upserts the index; force_scan
     (list --rescan) rebuilds it."""
     if not force_scan:
         brains = _read_index()
         if brains is not None:
-            live = [b for b in brains
-                    if os.path.isfile(package_path(b.get("filename", "")))]
-            return sorted(live,
-                          key=lambda r: (r.get("name", ""), r.get("id", "")))
+            indexed = {b.get("filename", "") for b in brains}
+            on_disk = {f for f in os.listdir(VAULT_DIR)
+                       if f.endswith(PACKAGE_EXT)}
+            if on_disk == indexed:
+                return sorted(brains,
+                              key=lambda r: (r.get("name", ""), r.get("id", "")))
     return scan_vault(silent=silent)
 
 
