@@ -491,12 +491,22 @@ func _apply_beauty_pass() -> void:
 			Vector3(fog.r, fog.g, fog.b))
 
 
+var _dir_ref: Node = null
+var _dir_lookup_done := false
+
+
 func _director() -> Node:
 	# Bare-instance safe (headless unit tests): absolute lookup outside
 	# the tree errors in the log, so report null the quiet way.
+	# Memoized: ~40 call sites, several on tick paths; the director is
+	# an autoload (lives for the whole session), so one lookup suffices.
+	if _dir_lookup_done:
+		return _dir_ref
 	if not is_inside_tree():
 		return null
-	return get_node_or_null("/root/TournamentDirector")
+	_dir_ref = get_node_or_null("/root/TournamentDirector")
+	_dir_lookup_done = _dir_ref != null
+	return _dir_ref
 
 func _enter_tournament_mode() -> void:
 	tournament_active = true
@@ -1501,7 +1511,11 @@ func _physics_process(delta: float) -> void:
 		return
 
 	current_round_time -= delta
-	if is_instance_valid(timer_label):
+	# Timer rewritten only on decisecond change (per-tick string builds
+	# and Label re-shapes were churn; 0.1 s granularity is the display).
+	var tenths := int(maxf(current_round_time, 0.0) * 10.0)
+	if is_instance_valid(timer_label) and tenths != _timer_last_tenths:
+		_timer_last_tenths = tenths
 		timer_label.text = "ROUND TIME: %04.1f s" % maxf(current_round_time, 0.0)
 
 	_update_health_hud()
@@ -1828,12 +1842,25 @@ func _make_wing_label(text: String) -> Label:
 func _update_health_hud() -> void:
 	if alpha_health_bar == null:
 		return
-	alpha_health_bar.value = fly_alpha.health
-	beta_health_bar.value = fly_beta.health
-	_update_wing_label(alpha_wing_l, fly_alpha.left_wing_intact)
-	_update_wing_label(alpha_wing_r, fly_alpha.right_wing_intact)
-	_update_wing_label(beta_wing_l, fly_beta.left_wing_intact)
-	_update_wing_label(beta_wing_r, fly_beta.right_wing_intact)
+	# Health bars written every tick (bar re-shape churn); wing labels
+	# only rebuilt on change. Change-gated on rounded health (the bar
+	# itself is continuous; 1-point granularity is the display).
+	var ha := int(fly_alpha.health)
+	var hb := int(fly_beta.health)
+	if ha != _health_last_a or hb != _health_last_b:
+		_health_last_a = ha
+		_health_last_b = hb
+		alpha_health_bar.value = fly_alpha.health
+		beta_health_bar.value = fly_beta.health
+	var wing_now := "%d%d%d%d" % [int(fly_alpha.left_wing_intact),
+		int(fly_alpha.right_wing_intact), int(fly_beta.left_wing_intact),
+		int(fly_beta.right_wing_intact)]
+	if wing_now != _wing_last_state:
+		_wing_last_state = wing_now
+		_update_wing_label(alpha_wing_l, fly_alpha.left_wing_intact)
+		_update_wing_label(alpha_wing_r, fly_alpha.right_wing_intact)
+		_update_wing_label(beta_wing_l, fly_beta.left_wing_intact)
+		_update_wing_label(beta_wing_r, fly_beta.right_wing_intact)
 
 func _update_wing_label(label: Label, intact: bool) -> void:
 	if label == null:
@@ -2701,13 +2728,19 @@ func _build_winner_overlay() -> void:
 	countdown_label.add_theme_constant_override("outline_size", 5)
 	vbox.add_child(countdown_label)
 
+static var _RX_MATCH: RegEx = null
+static var _RX_BATTLE: RegEx = null
+
+
 static func expand_match_label(code: String) -> String:
 	# "R1M1" -> "Round 1, Match 1". Anything else (FREE, "", junk)
 	# passes through untouched. Display only: wire ids, server keys,
-	# logs and retry matching keep the compact form.
-	var rx := RegEx.new()
-	rx.compile("^R(\\d+)M(\\d+)$")
-	var m := rx.search(code.strip_edges())
+	# logs and retry matching keep the compact form. RegEx compiled
+	# once (called per status update / report / retry).
+	if _RX_MATCH == null:
+		_RX_MATCH = RegEx.new()
+		_RX_MATCH.compile("^R(\\d+)M(\\d+)$")
+	var m := _RX_MATCH.search(code.strip_edges())
 	if m == null:
 		return code
 	return "Round %s, Match %s" % [m.get_string(1), m.get_string(2)]
@@ -2715,9 +2748,10 @@ static func expand_match_label(code: String) -> String:
 
 static func expand_battle_id(code: String) -> String:
 	# "R1M1-B1" -> "Round 1, Match 1, Battle 1". Display only.
-	var rx := RegEx.new()
-	rx.compile("^(.*)-B(\\d+)$")
-	var m := rx.search(code.strip_edges())
+	if _RX_BATTLE == null:
+		_RX_BATTLE = RegEx.new()
+		_RX_BATTLE.compile("^(.*)-B(\\d+)$")
+	var m := _RX_BATTLE.search(code.strip_edges())
 	if m == null:
 		return expand_match_label(code)
 	var inner := expand_match_label(m.get_string(1))
@@ -3129,6 +3163,11 @@ func _update_evo_status_line() -> void:
 var _shot_path := ""
 var _shot_frames := 0
 var _shot_done := false
+var _shot_scanned := false
+var _timer_last_tenths := -1
+var _health_last_a := -1
+var _health_last_b := -1
+var _wing_last_state := ""
 
 
 const HITCH_SECS := 0.15
@@ -3155,9 +3194,11 @@ func _process(delta: float) -> void:
 	_log_hitch(delta)
 	_update_combat_fx(delta)
 	# Dev screenshot hook: `--shot=C:/path/out.png` saves one viewport
-	# frame ~1 s after boot. Untouched in normal runs.
+	# frame ~1 s after boot. Untouched in normal runs. Cmdline scanned
+	# once (per-frame user-args scans were churn).
 	if not _shot_done:
-		if _shot_path == "":
+		if _shot_path == "" and not _shot_scanned:
+			_shot_scanned = true
 			for a in OS.get_cmdline_user_args():
 				if str(a).begins_with("--shot="):
 					_shot_path = str(a).get_slice("=", 1)
@@ -3236,6 +3277,11 @@ func _process(delta: float) -> void:
 				target = TREE_FADE_ALPHA
 				break
 		var k: float = clampf(TREE_FADE_SMOOTH * delta, 0.0, 1.0)
+		# Skip the material writes at rest (per-frame lerpf writes on
+		# ~40 materials were churn when nothing moves).
+		if absf((entry["trunk_mats"][0] as StandardMaterial3D).albedo_color.a - target) < 0.003 \
+				and absf((entry["canopy_mats"][0] as StandardMaterial3D).albedo_color.a - target) < 0.003:
+			continue
 		for tm in entry["trunk_mats"]:
 			(tm as StandardMaterial3D).albedo_color.a = lerpf((tm as StandardMaterial3D).albedo_color.a, target, k)
 		for cm in entry["canopy_mats"]:
@@ -3832,7 +3878,7 @@ func _event_maintain_pool() -> void:
 	if director == null:
 		return
 	var eid := _event_id()
-	var ev: Dictionary = director.event_load(eid)
+	var ev: Dictionary = director.event_load_cached(eid)
 	if ev.is_empty():
 		return
 	var evo: Dictionary = director.tourney.get("evo", {})
@@ -3861,7 +3907,7 @@ func _event_drain_done_to_pool() -> void:
 	var director := _director()
 	if director == null:
 		return
-	var bench: Array = director.event_load(_event_id()).get("pool", [])
+	var bench: Array = director.event_load_cached(_event_id()).get("pool", [])
 	var ids: Array = []
 	for kind in ["clone", "wild"]:
 		var bid := _evo_done_id(kind)
@@ -3977,7 +4023,7 @@ func _event_build_group(ev: Dictionary, letter: String) -> bool:
 	var carry := _event_evo_carry()
 	var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
 	var by_id := {}
-	for b in director.list_brains():
+	for b in director.list_brains_cached():
 		by_id[str((b as Dictionary).get("id", ""))] = b
 	var dicts: Array = []
 	for pid in (g.get("players", []) as Array):
@@ -4020,7 +4066,7 @@ func _event_switch_group(ev: Dictionary, letter: String) -> bool:
 	var eid := str(ev.get("id", ""))
 	var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
 	var by_id: Dictionary = {}
-	for b in director.list_brains():
+	for b in director.list_brains_cached():
 		by_id[str((b as Dictionary).get("id", ""))] = b
 	for pid in (g.get("players", []) as Array):
 		if not by_id.has(str(pid)):
@@ -4052,7 +4098,7 @@ func _event_build_final(ev: Dictionary) -> bool:
 		_evo_abort("finalists undecided: " + str(adv.get("error", "?")))
 		return false
 	var by_id := {}
-	for b in director.list_brains():
+	for b in director.list_brains_cached():
 		by_id[str((b as Dictionary).get("id", ""))] = b
 	for pid in (adv.get("advancers", []) as Array):
 		if not by_id.has(str(pid)):
@@ -4378,6 +4424,7 @@ var evo_last_spawn_error := ""
 # name "" + --gen and reads the christened name back from the result.
 var evo_status_line: Label
 var evo_status_tick := 0.0
+var _adopt_last_sweep := 0.0
 const EVO_STATUS_EVERY := 5.0
 
 
@@ -4918,10 +4965,16 @@ func _evo_verdict_seed(verdict: Dictionary) -> int:
 	return int(gp.get("seed", -1))
 
 
-func _evo_adopt_finished() -> Dictionary:
+func _evo_adopt_finished(force: bool = false) -> Dictionary:
 	# Sweeps queued specs for completed result files: banks {kind: id},
 	# drops failed specs (re-bred at tournament end), cleans litter.
-	# Returns ids adopted this sweep.
+	# Returns ids adopted this sweep. Throttled (per-frame result-file
+	# re-opens were churn); rescue paths pass force=true so a just-
+	# landed verdict is never missed and a finished breed never aborted.
+	var now := Time.get_ticks_msec() / 1000.0
+	if not force and now - _adopt_last_sweep < 1.0:
+		return {}
+	_adopt_last_sweep = now
 	var got := {}
 	var pending := _evo_pending()
 	var done := _evo_done()
@@ -5067,7 +5120,7 @@ func _run_evo_generation() -> void:
 		if id1 == "":
 			# Last-chance rescue: a verdict adopted by a concurrent
 			# sweep between the await's last tick and this line.
-			_evo_adopt_finished()
+			_evo_adopt_finished(true)
 			id1 = _evo_done_id("clone")
 		if id1 == "" and _evo_active():
 			_evo_abort("clone breeding failed - %s" % _evo_spawn_why())
@@ -5078,7 +5131,7 @@ func _run_evo_generation() -> void:
 	if id2 == "" and _evo_has_kind("wild"):
 		id2 = await _evo_await_queued("wild")
 		if id2 == "":
-			_evo_adopt_finished()
+			_evo_adopt_finished(true)
 			id2 = _evo_done_id("wild")
 		if id2 == "" and _evo_active():
 			_evo_abort("random breeding failed - %s" % _evo_spawn_why())

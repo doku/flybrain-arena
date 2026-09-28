@@ -141,8 +141,15 @@ func python_status() -> Dictionary:
 		"extra": python_extra_args, "probe": python_probe_error}
 
 
+var _project_root_cache := ""
+
+
 func project_root() -> String:
-	return ProjectSettings.globalize_path("res://../")
+	# Memoized: path globalization is a per-click cost on export/import/
+	# breed; the res:// root never changes within a session.
+	if _project_root_cache == "":
+		_project_root_cache = ProjectSettings.globalize_path("res://../")
+	return _project_root_cache
 
 
 # ── Vault operations (via vault_cli.py) ─────────────────────────────
@@ -284,6 +291,19 @@ func _poll_async() -> void:
 const BRAINS_CACHE_TTL_MSEC := 60000
 var brains_cache: Array = []
 var brains_cache_msec: int = 0
+# Event-manifest cache (mtime-gated): the 5 s watcher tick re-parsed the
+# manifest 3x per tick mid-battle. Writers write through; handoff code
+# keeps the forcing (uncached) path.
+var event_cache: Dictionary = {}
+var event_cache_mtime: int = 0
+# Progress emit-once tracking (job + score slots): signals fire only on
+# (episode, total) change, never per poll tick.
+var _last_job_ep := -1
+var _last_job_total := -1
+var _last_job_text := ""
+var _last_score_ep := -1
+var _last_score_total := -1
+var _last_score_text := ""
 
 
 func invalidate_brains_cache() -> void:
@@ -417,6 +437,7 @@ func start_training(brain_id: String, episodes: int, params: Dictionary,
 	active_job = {"pid": pid, "progress_path": progress_path,
 		"result_file": result_file, "brain_id": brain_id,
 		"episodes": episodes, "school": params.has("curriculum")}
+	_last_job_text = ""
 	return {"ok": true, "pid": pid}
 
 
@@ -431,10 +452,19 @@ func poll_job() -> Dictionary:
 		var text := f.get_as_text().strip_edges()
 		f.close()
 		if text.begins_with("{") and text.ends_with("}"):
-			var parsed = JSON.parse_string(text)
-			if parsed is Dictionary:
-				res = parsed
-	job_progress.emit(int(res.get("episode", 0)), int(res.get("total", 0)))
+			# Skip the parse when the text is unchanged (the poller
+			# re-reads between episode writes).
+			if text != _last_job_text:
+				_last_job_text = text
+				var parsed = JSON.parse_string(text)
+				if parsed is Dictionary:
+					res = parsed
+	var ep_now := int(res.get("episode", 0))
+	var total_now := int(res.get("total", 0))
+	if ep_now != _last_job_ep or total_now != _last_job_total:
+		_last_job_ep = ep_now
+		_last_job_total = total_now
+		job_progress.emit(ep_now, total_now)
 	if float(res.get("pct", 0.0)) >= 100.0:
 		print("[Director] Job done: %s (%d/%d)" % [
 			str(active_job.get("brain_id", "?")),
@@ -556,7 +586,18 @@ func _read_job_result_error(result_file: String) -> String:
 	return "training process exited before episode 1 (see brains/jobs log)"
 
 
-func _process(_delta: float) -> void:
+const POLL_EVERY_SEC := 0.25
+var _poll_accum := 0.0
+
+
+func _process(delta: float) -> void:
+	# Job-slot polling throttled to ~4 Hz: per-frame file opens + JSON
+	# parses were pure syscall churn; a 0.25 s delay is invisible on a
+	# progress bar and pushes completion detection by at most one tick.
+	_poll_accum += delta
+	if _poll_accum < POLL_EVERY_SEC:
+		return
+	_poll_accum = 0.0
 	if not active_job.is_empty():
 		poll_job()
 	if not score_job.is_empty():
@@ -649,6 +690,7 @@ func _launch_score(brain_id: String) -> bool:
 		return false
 	score_job = {"pid": pid, "result_file": result_file,
 		"progress_path": progress_path, "brain_id": brain_id}
+	_last_score_text = ""
 	print("[Director] Eval probe started for %s." % brain_id)
 	return true
 
@@ -662,11 +704,19 @@ func _poll_score() -> void:
 		if pfr != null:
 			var ptext := pfr.get_as_text().strip_edges()
 			pfr.close()
-			if ptext.begins_with("{") and ptext.ends_with("}"):
-				var pparsed = JSON.parse_string(ptext)
-				if pparsed is Dictionary:
-					score_progress.emit(int(pparsed.get("episode", 0)),
-						int(pparsed.get("total", 0)))
+			# Skip the parse when the text is unchanged; emit only on
+			# (episode, total) change.
+			if ptext != _last_score_text:
+				_last_score_text = ptext
+				if ptext.begins_with("{") and ptext.ends_with("}"):
+					var pparsed = JSON.parse_string(ptext)
+					if pparsed is Dictionary:
+						var ep_s := int(pparsed.get("episode", 0))
+						var total_s := int(pparsed.get("total", 0))
+						if ep_s != _last_score_ep or total_s != _last_score_total:
+							_last_score_ep = ep_s
+							_last_score_total = total_s
+							score_progress.emit(ep_s, total_s)
 	var f := FileAccess.open(rf, FileAccess.READ)
 	if f != null:
 		var text := f.get_as_text().strip_edges()
@@ -752,7 +802,7 @@ func evo_vault_ids() -> Array:
 	# brackets, manual deletes); elimination must skip the missing
 	# instead of aborting the generation on a ghost.
 	var ids: Array = []
-	for b in list_brains():
+	for b in list_brains_cached():
 		ids.append(str((b as Dictionary).get("id", "")))
 	return ids
 
@@ -828,7 +878,7 @@ func _battle_rate(r: Dictionary) -> float:
 
 
 func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false, consolation: bool = false, fixed_order: bool = false) -> Dictionary:
-	var all_brains: Array = list_brains() if brains_override.is_empty() else brains_override
+	var all_brains: Array = list_brains_cached() if brains_override.is_empty() else brains_override
 	var by_id := {}
 	for b in all_brains:
 		by_id[str(b.get("id", ""))] = b
@@ -1093,17 +1143,31 @@ func skip_unplayable() -> Dictionary:
 
 
 func brain_path(brain_id: String) -> String:
-	for b in list_brains():
-		if str(b.get("id", "")) == brain_id:
-			return brains_dir.path_join(str(b.get("filename", "")))
+	# Cached roster: get_load_params shells this TWICE per battle load
+	# (alpha + beta); an uncached shell here was ~1-2 s of loading each.
+	for b in list_brains_cached():
+		if str((b as Dictionary).get("id", "")) == brain_id:
+			return brains_dir.path_join(str((b as Dictionary).get("filename", "")))
 	return ""
 
 
 func get_load_params() -> Dictionary:
 	var m := current_match()
+	# One roster pass for both fighters (cached; never two shells).
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var alpha_fn := ""
+	var beta_fn := ""
+	for pid in [str(m.get("a_id", "")), str(m.get("b_id", ""))]:
+		var rec: Dictionary = by_id.get(pid, {})
+		if pid == str(m.get("a_id", "")):
+			alpha_fn = str(rec.get("filename", ""))
+		else:
+			beta_fn = str(rec.get("filename", ""))
 	return {
-		"alpha_path": brain_path(str(m.get("a_id", ""))),
-		"beta_path": brain_path(str(m.get("b_id", ""))),
+		"alpha_path": brains_dir.path_join(alpha_fn) if alpha_fn != "" else "",
+		"beta_path": brains_dir.path_join(beta_fn) if beta_fn != "" else "",
 		"tournament_id": str(tourney.get("id", "")),
 		"match": "R%dM%d" % [int(tourney.get("current_round", 0)) + 1,
 			int(tourney.get("current_match", 0)) + 1],
@@ -1565,12 +1629,29 @@ func event_load(event_id: String) -> Dictionary:
 	return parsed if parsed is Dictionary else {}
 
 
+func event_load_cached(event_id: String) -> Dictionary:
+	# Mtime-gated manifest read for tick paths: serves memory when the
+	# file is unchanged (writers write through below). Falls back to a
+	# fresh parse on any change or miss.
+	if event_id != "" and event_cache.get("id", "") == event_id:
+		var mtime := FileAccess.get_modified_time(event_path(event_id))
+		if mtime > 0 and mtime == event_cache_mtime:
+			return event_cache
+	var ev := event_load(event_id)
+	if not ev.is_empty():
+		event_cache = ev
+		event_cache_mtime = FileAccess.get_modified_time(event_path(event_id))
+	return ev
+
+
 func event_save(ev: Dictionary) -> bool:
 	var f := FileAccess.open(event_path(str(ev.get("id", ""))), FileAccess.WRITE)
 	if f == null:
 		return false
 	f.store_string(JSON.stringify(ev, "\t"))
 	f.close()
+	event_cache = ev
+	event_cache_mtime = FileAccess.get_modified_time(event_path(str(ev.get("id", ""))))
 	return true
 
 
@@ -1595,7 +1676,7 @@ func event_begin(player_ids: Array, settings: Dictionary, generation: int, brain
 	# Snake-drafts exactly 16 brains into groups A-D (ranks
 	# 1,8,9,16 / 2,7,10,15 / 3,6,11,14 / 4,5,12,13) and writes the
 	# event manifest. Returns {ok, event_id, groups}.
-	var all_brains: Array = brains_override if not brains_override.is_empty() else list_brains()
+	var all_brains: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
 	var by_id := {}
 	for b in all_brains:
 		by_id[str((b as Dictionary).get("id", ""))] = b
@@ -1827,7 +1908,7 @@ func event_eliminate(event_id: String, min_matches: int = 10, elo_cutoff: float 
 	if order.size() < 2:
 		return {"ok": false, "error": "fewer than 2 eligible brains"}
 	var live := {}
-	for b in list_brains():
+	for b in list_brains_cached():
 		var bd := b as Dictionary
 		live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
 	var out: Array = [order[0], order[1]]
@@ -1901,7 +1982,8 @@ func event_pool_qualified(event_id: String, min_train: int = 50, elo_floor: floa
 	# Bench brains ready for the ring: schooled to min_train episodes
 	# with live ELO at/above the floor (floor <= 0 disables). Pure
 	# readout for handoff/maintain checks; the draw consumes.
-	var ev := event_load(event_id)
+	# Cached manifest (mtime-gated): this feeds the 5 s tick mid-battle.
+	var ev := event_load_cached(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
 	var cards := _event_live_cards(live_override)
@@ -1995,7 +2077,7 @@ func event_overview_data(event_id: String) -> Dictionary:
 			# Upcoming group (no file yet): resolve manifest ids to
 			# cards for the preview table.
 			var by_id := {}
-			for b in list_brains():
+			for b in list_brains_cached():
 				by_id[str((b as Dictionary).get("id", ""))] = b
 			var cards: Array = []
 			var gd2: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
@@ -2013,8 +2095,9 @@ func event_overview_data(event_id: String) -> Dictionary:
 func event_topup_pick(event_id: String, target: int = 50, live_override: Dictionary = {}) -> Dictionary:
 	# Least-trained bench brain below target: {ok, id, name, episodes,
 	# deficit}. Pure over live cards (override for tests); empty when
-	# the whole bench already graduated.
-	var ev := event_load(event_id)
+	# the whole bench already graduated. Cached manifest (mtime-gated):
+	# this feeds the 30 s top-up tick.
+	var ev := event_load_cached(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
 	var cards := _event_live_cards(live_override)

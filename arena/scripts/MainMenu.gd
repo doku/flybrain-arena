@@ -13,6 +13,9 @@ var detail_label: Label
 var log_label: Label
 var archive_list_view: ItemList
 var archive_entries: Array = []
+# Refresh-debounce collapse (see refresh_vault).
+var _refresh_pending := false
+var _refresh_timer: Timer
 
 var bv_enable: CheckButton
 var bv_layer: OptionButton
@@ -90,6 +93,13 @@ func _ready() -> void:
 		return
 	_build_layout()
 	_build_busy_overlay()
+	_refresh_timer = Timer.new()
+	_refresh_timer.wait_time = 0.5
+	_refresh_timer.one_shot = true
+	_refresh_timer.timeout.connect(func():
+		if _refresh_pending:
+			refresh_vault(true))
+	add_child(_refresh_timer)
 	TournamentDirector.vault_changed.connect(refresh_vault)
 	TournamentDirector.job_progress.connect(_on_job_progress)
 	TournamentDirector.job_failed.connect(_on_job_failed)
@@ -102,7 +112,7 @@ func _ready() -> void:
 		log_label.text = "Python not found: %s" % TournamentDirector.python_probe_error
 	set_busy("Loading vault...")
 	await get_tree().process_frame
-	refresh_vault()
+	refresh_vault(true)
 	clear_busy()
 	_refresh_resume()
 
@@ -300,7 +310,7 @@ func _build_vault_column() -> VBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	c.add_child(row)
-	for spec in [["Refresh", refresh_vault], ["Delete", _on_delete], ["Export", _on_export]]:
+	for spec in [["Refresh", func(): refresh_vault(true)], ["Delete", _on_delete], ["Export", _on_export]]:
 		var b := Button.new()
 		b.text = spec[0]
 		b.pressed.connect(spec[1])
@@ -854,8 +864,18 @@ func _sync_bracket_buttons() -> void:
 
 # ── Vault ───────────────────────────────────────────────────────────
 
-func refresh_vault() -> void:
-	brains = TournamentDirector.list_brains()
+func refresh_vault(force: bool = false) -> void:
+	# Debounced collapse: train-done + progress-done + stamped signals
+	# used to trigger ~4 full rescans (2 shells each) back-to-back; they
+	# now coalesce into one rebuild 0.5 s after the last signal. Manual
+	# Refresh (and explicit user actions via force=true) stay immediate.
+	if not force:
+		_refresh_pending = true
+		if _refresh_timer.get_time_left() <= 0.0:
+			_refresh_timer.start()
+		return
+	_refresh_pending = false
+	brains = TournamentDirector.list_brains_cached()
 	brain_list.clear()
 	player_list.clear()
 	for b in brains:
@@ -908,6 +928,8 @@ func _archive_tooltip(e: Dictionary) -> String:
 
 
 func _refresh_archive() -> void:
+	# The debounced collapse (see refresh_vault) bounds rebuilds: a
+	# signal storm coalesces into one shell instead of ~4 back-to-back.
 	archive_entries = TournamentDirector.archive_list()
 	if is_instance_valid(archive_list_view):
 		archive_list_view.clear()
@@ -1483,7 +1505,7 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 		return
 	var eid := str(beg.get("event_id", ""))
 	var by_id := {}
-	for b in TournamentDirector.list_brains():
+	for b in TournamentDirector.list_brains_cached():
 		by_id[str((b as Dictionary).get("id", ""))] = b
 	var dicts: Array = []
 	for pid in (((beg.get("groups", {}) as Dictionary).get("A", {}) as Dictionary).get("players", []) as Array):

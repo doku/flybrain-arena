@@ -536,6 +536,45 @@ func test_live_cards_use_cache() -> void:
 	D.free()
 
 
+func test_event_manifest_cache() -> void:
+	# Tick paths must not re-parse the manifest every poll: served from
+	# memory when unchanged, fresh on change, write-through on save.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_event_groups"
+	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	var ev := {"id": "ECACHE1", "pool": [], "groups": {}}
+	_check(bool(D.call("event_save", ev)), "event save ok")
+	var first: Dictionary = D.call("event_load_cached", "ECACHE1")
+	_check(str(first.get("id", "")) == "ECACHE1", "manifest cached after save")
+	var mtime := int(D.event_cache_mtime)
+	# Same file: served from memory (mtime matches).
+	var again: Dictionary = D.call("event_load_cached", "ECACHE1")
+	_check(int(D.event_cache_mtime) == mtime, "unchanged file serves memory")
+	# Writer writes through: the cache tracks the new content.
+	ev["phase"] = "final"
+	D.call("event_save", ev)
+	var thru: Dictionary = D.call("event_load_cached", "ECACHE1")
+	_check(str(thru.get("phase", "")) == "final", "save writes through")
+	# External edit (no write-through): fresh parse on mtime change.
+	# FAT/exFAT mtime granularity is ~2 s, so a real gap is needed for
+	# the stamp to move (only the director writes event files in play,
+	# and writers write through - this is the staleness bound anyway).
+	OS.delay_msec(2100)
+	var f := FileAccess.open("user://test_event_groups/ECACHE1.json",
+		FileAccess.WRITE)
+	f.store_string(JSON.stringify({"id": "ECACHE1", "pool": [],
+		"groups": {}, "phase": "external"}))
+	f.close()
+	var ext: Dictionary = D.call("event_load_cached", "ECACHE1")
+	_check(str(ext.get("phase", "")) == "external", "external edit re-parses")
+	D.call("event_save", {"id": "ECACHE2"})
+	D.free()
+	if DirAccess.dir_exists_absolute("user://test_event_groups"):
+		for f2 in DirAccess.get_files_at("user://test_event_groups"):
+			DirAccess.remove_absolute("user://test_event_groups".path_join(f2))
+		DirAccess.remove_absolute("user://test_event_groups")
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -700,6 +739,7 @@ func _initialize() -> void:
 	test_spawn_hold()
 	test_worker_affinity_mask()
 	test_live_cards_use_cache()
+	test_event_manifest_cache()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
