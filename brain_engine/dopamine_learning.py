@@ -1,4 +1,9 @@
 import numpy as np
+
+# Ground-scrape aversive per step at full ground signal (moderate:
+# clear discouragement, capped by the [-2, 2] DA window; kill pulses
+# (+1.0 dominance) still dominate any scrape).
+GROUND_DA = 0.5
 from sensory_motor import FLOW_CRUISE
 
 
@@ -397,7 +402,8 @@ class DopamineReinforcement:
                 self._base_means.get("kcmbon", 0.0))
 
     def compute_reward(self, current_dist, prev_dist, azimuth_deg, dt=0.05, tail_chase=0.0,
-                       ventral=0.0, schemes=(), scent_now=0.0, scent_prev=0.0):
+                       ventral=0.0, schemes=(), scent_now=0.0, scent_prev=0.0,
+                       ground=0.0):
         """
         Computes the net dopamine neuromodulatory signal:
           - Closing distance (prev_dist > current_dist) -> PAM reward (positive DA)
@@ -441,8 +447,16 @@ class DopamineReinforcement:
             v = float(np.clip(ventral, 0.0, 1.0))
             r_flow = 0.2 * (1.0 - min(abs(v - FLOW_CRUISE) / FLOW_CRUISE, 1.0))
 
-        # Net dopamine concentration (PAM > 0 vs PPL1 < 0)
-        da_signal = np.clip(r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0)) + r_flow + r_scent, -2.0, 2.0)
+        # Net dopamine concentration (PAM > 0 vs PPL1 < 0). ground is
+        # the per-step ground-scrape signal in [0, 1] (train loop only;
+        # default 0.0 keeps every legacy caller bit-identical): bumping
+        # the floor or nose-diving into it pays aversive, so ground-
+        # clipping behavior is discouraged where it learns.
+        da_signal = np.clip(
+            r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0))
+            + r_flow + r_scent
+            - GROUND_DA * float(np.clip(ground, 0.0, 1.0)),
+            -2.0, 2.0)
         return float(da_signal)
 
     def apply_plasticity(self, brain, sensory_dict, motor_dict, da_signal, schemes=(),

@@ -43,9 +43,33 @@ func test_ram_channel() -> void:
 	f.free()
 
 
+func test_ram_window_refractory() -> void:
+	# One charge per window: sustained drive latches RAM_TIME, then a
+	# RAM_COOLDOWN refractory disarms the next charge.
+	var f = load("res://scripts/FlyPhysics.gd").new()
+	var e1: float = f.call("_ram_charge_tick", 0.05, 1.0)
+	_check(e1 > 0.0, "first tick charges")
+	_check(e1 == f.call("_ram_charge_tick", 0.05, 1.0), "window holds latched rate")
+	var t := 0.0
+	var rech := 0
+	while t < 5.0:
+		var e: float = f.call("_ram_charge_tick", 0.05, 1.0)
+		if e > 0.0 and t > 0.1:
+			rech += 1
+		t += 0.05
+	_check(f.ram_charges == 2, "exactly one recharge in 5 s (0.8 window + 3.0 refractory)")
+	# No drive: nothing charges, cooldown still ticks.
+	var g = load("res://scripts/FlyPhysics.gd").new()
+	g.call("_ram_charge_tick", 0.05, 0.0)
+	_check(g.ram_charges == 0, "no drive never charges")
+	f.free()
+	g.free()
+
+
 func _initialize() -> void:
 	test_curve()
 	test_ram_channel()
+	test_ram_window_refractory()
 	if failures == 0:
 		print("ALL DRIVE-CURVE TESTS PASSED")
 	else:

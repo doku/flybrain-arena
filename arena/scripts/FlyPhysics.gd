@@ -108,6 +108,32 @@ var current_roll_torque: float = 0.0
 var is_ram_burst: bool = false
 var ram_drive: float = 0.0
 var is_emergency_evade: bool = false
+# Ram charge refractory (mirrors the lunge cooldown): sustained DNpe017
+# drive latches ONE charge window, then a refractory beat disarms the
+# next charge so a pressed pool can't machine-gun the headroom.
+const RAM_TIME: float = 0.8
+const RAM_COOLDOWN: float = 3.0
+var ram_t: float = 0.0
+var ram_cooldown: float = 0.0
+var ram_latched: float = 0.0
+var ram_charges: int = 0
+
+
+func _ram_charge_tick(delta: float, drive: float) -> float:
+	# Effective ram headroom this tick: the latched charge rate during
+	# the window, 0 in the refractory. Pure (timer state only), so the
+	# headless drive test can exercise the window timing.
+	ram_cooldown = maxf(0.0, ram_cooldown - delta)
+	if ram_t > 0.0:
+		ram_t = maxf(0.0, ram_t - delta)
+		return ram_latched
+	if drive > 0.0 and ram_cooldown <= 0.0:
+		ram_t = RAM_TIME
+		ram_cooldown = RAM_COOLDOWN
+		ram_latched = clampf(drive, 0.0, 1.0)
+		ram_charges += 1
+		return ram_latched
+	return 0.0
 
 
 func drive_speed(activation: float) -> float:
@@ -581,8 +607,10 @@ func _physics_process(delta: float) -> void:
 
 	# Flight speed from motor activation (no base cruise: zero drive
 	# hovers) on the shared log curve, plus the ram charge headroom
-	# scaled by DNpe017 rate (never a programmed multiplier).
-	var target_speed = drive_speed(current_thrust) + RAM_EXTRA * ram_drive
+	# scaled by DNpe017 rate (never a programmed multiplier). The ram
+	# charge is refractory: one charge per window (mirrors the lunge).
+	var eff_ram := _ram_charge_tick(delta, ram_drive)
+	var target_speed = drive_speed(current_thrust) + RAM_EXTRA * eff_ram
 	var forward_vec = -global_transform.basis.z
 
 	# Yaw rotation (snapshot basis first: the seizure watch measures the
@@ -814,6 +842,9 @@ func _on_spike_hit_area(area: Area3D) -> void:
 			return
 		victim.tear_wing("left" if area.name == "LeftWingHurtbox" else "right")
 		_spike_wound(victim)
+		# Momentum knockback: the impalement shoves the victim along the
+		# attacker's momentum; the attacker bleeds a share.
+		_apply_knockback(victim, velocity, minf(rel_vel * 0.35, 6.0))
 		landed_strike.emit("wing")
 		print(fly_id, " impaled ", victim.fly_id, "'s ", area.name, "! (Rel Speed: ", rel_vel, ")")
 	elif area.name == "ThoraxHurtbox":
@@ -829,6 +860,7 @@ func _on_spike_hit_area(area: Area3D) -> void:
 			victim.last_damage_amount = 0.0
 			victim.last_damage_t = victim.fly_time
 			victim.inflict_lethal_strike()
+			_apply_knockback(victim, velocity, minf(rel_vel * 0.4, 8.0))
 			landed_strike.emit("thorax")
 			print(fly_id, " landed rear-aspect THORAX PUNCTURE on ", victim.fly_id, "!")
 	elif area.name == "FrontSpikeArea":
@@ -837,6 +869,31 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		# apart instead of self-cancelling into a permanent ram.
 		if not victim.is_disabled and (rel_vel >= 2.0 or _facing_victim(victim)):
 			_resolve_spike_clash(victim)
+
+func _apply_knockback(victim: FlyPhysics, dir: Vector3, mag: float) -> void:
+	# Momentum exchange for strike contact: the victim is shoved along
+	# the attacker's momentum, the attacker bleeds a share (conservation
+	# flavor; equal masses). Never used for clash pairs (those exchange
+	# elastically via _exchange_momentum).
+	if dir.length() < 0.001:
+		return
+	dir = dir.normalized()
+	victim.velocity += dir * mag
+	velocity -= dir * mag * 0.6
+
+
+func _exchange_momentum(a: FlyPhysics, b: FlyPhysics, axis: Vector3,
+		restitution: float) -> void:
+	# Elastic exchange along the contact axis (equal masses): axial
+	# components swap proportionally to restitution; perpendicular
+	# components ride through. No energy created beyond restitution.
+	var v1a := a.velocity.dot(axis)
+	var v2a := b.velocity.dot(axis)
+	var c1 := ((1.0 - restitution) * v1a + (1.0 + restitution) * v2a) * 0.5
+	var c2 := ((1.0 + restitution) * v1a + (1.0 - restitution) * v2a) * 0.5
+	a.velocity += axis * (c1 - v1a)
+	b.velocity += axis * (c2 - v2a)
+
 
 func _resolve_spike_clash(victim: FlyPhysics) -> void:
 	if clash_cooldown > 0.0 or victim.clash_cooldown > 0.0:
@@ -857,18 +914,19 @@ func _resolve_spike_clash(victim: FlyPhysics) -> void:
 				f.inflict_lethal_strike()
 				print(f.fly_id, " bled out in a spike clash!")
 	# Positional give along the contact axis so the capsules stop
-	# interpenetrating; knock the giver back hard, deflect the other.
+	# interpenetrating; the giver takes the bigger positional share.
 	var axis := (gives_away.global_position - braces.global_position)
 	if axis.length() < 0.001:
 		axis = Vector3(0, 0, 1)
 	axis = axis.normalized()
 	gives_away.global_position += axis * 0.6
 	braces.global_position -= axis * 0.6
-	# Elastic deflection (1.0x): separates the pair and reverses the
-	# giver without CREATING energy. The old 1.6x multiplier injected
-	# speed every clash - chained head-ons ran away to zoom velocities.
-	gives_away.velocity = -gives_away.velocity * 1.0 + Vector3.UP * 2.5
-	braces.velocity = braces.velocity * 0.4 + Vector3.UP * 1.5
+	# Momentum exchange (depends on both momentums, not programmed
+	# factors): elastic along the contact axis with mild restitution,
+	# plus a small up-bias so the pair separates instead of grinding.
+	_exchange_momentum(gives_away, braces, axis, 0.4)
+	gives_away.velocity += Vector3.UP * 2.5
+	braces.velocity += Vector3.UP * 1.5
 	clash_cooldown = CLASH_COOLDOWN
 	victim.clash_cooldown = CLASH_COOLDOWN
 	landed_strike.emit("spike_clash")
@@ -890,8 +948,11 @@ func _resolve_joust(victim: FlyPhysics) -> void:
 	axis = axis.normalized()
 	global_position -= axis * 0.4
 	victim.global_position += axis * 0.4
-	velocity = -velocity * 0.8 + Vector3.UP * 1.5
-	victim.velocity = -victim.velocity * 0.8 + Vector3.UP * 1.5
+	# Momentum exchange (both momentums, not fixed negations): the
+	# head-on parry rebounds each side off the other's guard.
+	_exchange_momentum(self, victim, axis, 0.6)
+	velocity += Vector3.UP * 1.5
+	victim.velocity += Vector3.UP * 1.5
 	print(fly_id, " CLASHED head-on with ", victim.fly_id, "'s guard! (Parried - no puncture!)")
 
 func _spike_wound(victim: FlyPhysics) -> void:
@@ -961,6 +1022,10 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	front_spike_area.position = SPIKE_BASE_POS
 	obstacle_hit_cooldown = 0.0
 	clash_cooldown = 0.0
+	ram_t = 0.0
+	ram_cooldown = 0.0
+	ram_latched = 0.0
+	ram_charges = 0
 	capped_time = 0.0
 	fly_time = 0.0
 	peak_speed = 0.0

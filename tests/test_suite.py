@@ -169,6 +169,44 @@ class TestSensoryMotor(unittest.TestCase):
         self.assertGreater(t1, t0)
         self.assertLessEqual(t1, 1.0)
 
+    def test_ground_scrape_reward(self):
+        # Moderate aversive: reward drops monotonically with the
+        # ground signal; legacy callers (ground absent) are unchanged.
+        import dopamine_learning as dl
+        rl = dl.DopamineReinforcement(self.pops)
+        base = dict(current_dist=10.0, prev_dist=11.0,
+                    azimuth_deg=0.0, dt=1.0)
+        clean = rl.compute_reward(**base)
+        self.assertAlmostEqual(clean, rl.compute_reward(**base, ground=0.0))
+        half = rl.compute_reward(**base, ground=0.5)
+        full = rl.compute_reward(**base, ground=1.0)
+        self.assertLess(half, clean)
+        self.assertLess(full, half)
+
+    def test_ground_scrape_detection(self):
+        # Floor band flags the signal; clear air does not.
+        from train_homing import KinematicFly
+        f = KinematicFly(y=0.7)
+        f.step(0.0, 0.0)
+        self.assertEqual(f.ground_now, 1.0)
+        self.assertGreater(f.scrape_time, 0.0)
+        f2 = KinematicFly(y=7.0)
+        f2.step(0.0, 0.0)
+        self.assertEqual(f2.ground_now, 0.0)
+
+    def test_fitness_ground_demerit(self):
+        # A scraper ranks below an equal clean flier; kills still
+        # dominate any scrape.
+        from evolution_engine import EvolutionManager
+        m = EvolutionManager.__new__(EvolutionManager)
+        clean = m.calc_fitness({"kills": 0, "scrape_time_s": 0.0})
+        scraper = m.calc_fitness({"kills": 0, "scrape_time_s": 6.0})
+        self.assertLess(scraper, clean)
+        killer = m.calc_fitness({"kills": 1, "scrape_time_s": 10.0})
+        self.assertGreater(killer, scraper)
+        self.assertAlmostEqual(
+            scraper, -min(6.0, 10.0) * 8.0)
+
     def test_control_channel_audit(self):
         # Every decoded output is registered in CONTROL_CHANNELS with
         # at least one driving neuron pool: reflex-only control can

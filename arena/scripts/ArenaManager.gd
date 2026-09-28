@@ -12,8 +12,8 @@ var current_round_time: float = 0.0
 var current_generation: int = 1
 var is_round_active: bool = true
 
-var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
-var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
+var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
+var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
 
 # Shared control cadence (fairness invariant): BOTH flies' commands
 # arrive in one packet, so both always share the same reply interval
@@ -1459,6 +1459,12 @@ func _physics_process(delta: float) -> void:
 		stats_alpha["tracking_time_s"] += delta
 	if sens_b.get("visual_target_visible", false):
 		stats_beta["tracking_time_s"] += delta
+	# Ground-scrape accumulation (fitness demerit): floor-band seconds
+	# per side, reported in the round stats.
+	if fly_alpha.global_position.y <= FlyPhysicsScript.FLOOR_Y + 0.3:
+		stats_alpha["scrape_time_s"] = float(stats_alpha.get("scrape_time_s", 0.0)) + delta
+	if fly_beta.global_position.y <= FlyPhysicsScript.FLOOR_Y + 0.3:
+		stats_beta["scrape_time_s"] = float(stats_beta.get("scrape_time_s", 0.0)) + delta
 	# Rear-aspect chase: on the victim's tail and facing it. This is the
 	# battle-level "who is winning the chase" score; evolution caps it so it
 	# can only decide equal-kill bouts, never outscore a kill.
@@ -3270,7 +3276,12 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 
 func _on_match_over(match_winner: String, score: String) -> void:
 	var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
-	brain_client.request_tournament_match(match_winner, _tourney_id(), tourney_match_label)
+	# A drawn split (group play) banks no title-side slot: the server
+	# banks the draw ELO, no match winner is credited.
+	if match_winner == "draw":
+		brain_client.request_tournament_match("draw", _tourney_id(), tourney_match_label)
+	else:
+		brain_client.request_tournament_match(match_winner, _tourney_id(), tourney_match_label)
 	# Advance synchronously BEFORE the overlay wait: advance_after_match
 	# is pure logic + save, while the 6 s await below dies with the scene
 	# if the user quits to menu mid-overlay - which used to swallow the
@@ -3282,8 +3293,12 @@ func _on_match_over(match_winner: String, score: String) -> void:
 	if director != null:
 		adv = director.advance_after_match()
 	# The bracket overlay carries the result: gold connectors show the
-	# path, the loser is grayed out, next lineup is visible.
-	_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), score])
+	# path, the loser is grayed out, next lineup is visible. A drawn
+	# split announces the shared point instead of a winner.
+	if match_winner == "draw":
+		_show_arena_bracket("%s DRAW %s  (point split)" % [expand_match_label(tourney_match_label), score])
+	else:
+		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), score])
 	await get_tree().create_timer(6.0).timeout
 	_hide_arena_bracket()
 	_handle_advance_result(adv)

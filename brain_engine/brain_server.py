@@ -304,21 +304,25 @@ def _bank_title(side_state, champ_label, key=None):
 
 def _bank_match_result(tourney_a, tourney_b, match_winner):
     """Match verdict banking as one unit (counters + match ELO + saves)
-    so the message loop and tests share it. Returns True when anything
-    was banked."""
+    so the message loop and tests share it. match_winner="draw" (group
+    splits): matches bump for both, no won/lost side, ELO draw update
+    (ratings move toward each other). Returns True when anything was
+    banked."""
     import brain_package as vault_pkg
     banked = False
     recs = {}
     for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
         if st["rec"] is None:
             continue
-        outcome = "win" if side == match_winner else "loss"
+        outcome = "draw" if match_winner == "draw" else (
+            "win" if side == match_winner else "loss")
         vault_pkg.record_match_result(st["rec"], outcome)
         recs[side] = st["rec"]
         banked = True
     if "alpha" in recs and "beta" in recs:
         vault_pkg.apply_elo(recs["alpha"], recs["beta"],
-                            "win" if match_winner == "alpha" else "loss",
+                            match_winner if match_winner == "draw" else (
+                                "win" if match_winner == "alpha" else "loss"),
                             vault_pkg.ELO_K_MATCH)
     for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
         if st["rec"] is None:

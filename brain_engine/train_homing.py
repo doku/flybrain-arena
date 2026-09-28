@@ -7,7 +7,8 @@ import numpy as np
 from connectome_loader import load_or_build_csr, load_or_extract_populations
 from lif_brain import FlyBrain
 from sensory_motor import (SensoryEncoder, MotorDecoder, normalize_mapping,
-                            drive_speed, RAM_EXTRA, SPEED_CAP)
+                            drive_speed, RAM_EXTRA, SPEED_CAP, RAM_TIME,
+                            RAM_COOLDOWN)
 from dopamine_learning import DopamineReinforcement
 from experimental_wiring import (experiment_arrays, experiment_suffix,
                                    build_genome_arrays, genome_suffix)
@@ -148,6 +149,22 @@ class KinematicFly:
         # behavior could only ever learn live in the arena.
         self.gust_steps = 0
         self.gust_val = 0.0
+        # Ram charge refractory (mirrors FlyPhysics RAM_TIME/COOLDOWN):
+        # one charge window per sustained DNpe017 drive.
+        self.ram_t = 0.0
+        self.ram_cooldown = 0.0
+        self.ram_latched = 0.0
+        self.ram_charges = 0
+        # Strike-contact recovery (arena asymmetry: scripted targets
+        # have no physics to exchange momentum with, so the attacker
+        # alone loses momentum on contact instead).
+        self.slow_t = 0.0
+        # Ground-scrape detection (mirror FlyPhysics scrape_time): the
+        # floor band while descending/nose-down; the train loop pays a
+        # per-step aversive on this signal, so ground-clipping learns
+        # away. scrapes counts episodes that ended scraped.
+        self.scrape_time = 0.0
+        self.ground_now = 0.0
 
     def forward_vec(self):
         cp = float(np.cos(self.pitch))
@@ -157,6 +174,22 @@ class KinematicFly:
     def right_vec(self):
         # Horizontal right vector for the dual-antenna scent model.
         return np.array([np.sin(self.heading), 0.0, -np.cos(self.heading)], dtype=np.float32)
+
+    def ram_charge_tick(self, dt, drive):
+        """Effective ram headroom this tick (mirrors FlyPhysics
+        _ram_charge_tick): latched rate during the window, 0 in the
+        refractory. Thresholds kept in sync."""
+        self.ram_cooldown = max(0.0, self.ram_cooldown - dt)
+        if self.ram_t > 0.0:
+            self.ram_t = max(0.0, self.ram_t - dt)
+            return self.ram_latched
+        if drive > 0.0 and self.ram_cooldown <= 0.0:
+            self.ram_t = RAM_TIME
+            self.ram_cooldown = RAM_COOLDOWN
+            self.ram_latched = float(np.clip(drive, 0.0, 1.0))
+            self.ram_charges += 1
+            return self.ram_latched
+        return 0.0
 
     def step(self, thrust, yaw_torque, pitch_cmd=0.0, dt=0.05,
              arena_radius=55.0, roll_cmd=0.0, ram_drive=0.0):
@@ -186,17 +219,31 @@ class KinematicFly:
 
         # Activation-driven cruise (no base speed): motor activation
         # maps to speed on the shared log curve (hover at zero drive),
-        # plus the ram charge headroom. Mirrors FlyPhysics target
-        # speed - keep the two in sync. Lunge transients ride on top
-        # (decaying boost below); the hard cap binds sustained abuse.
+        # plus the ram charge headroom (refractory: one per window).
+        # Mirrors FlyPhysics target speed - keep the two in sync.
+        # Lunge transients ride on top (decaying boost below); the
+        # hard cap binds sustained abuse.
+        eff_ram = self.ram_charge_tick(dt, ram_drive)
+        # Strike-contact recovery: a landing lunge costs momentum
+        # (cruise 0.6x for 1 s), so spearing is not free.
+        self.slow_t = max(0.0, self.slow_t - dt)
+        slow = 0.6 if self.slow_t > 0.0 else 1.0
         cruise = min(drive_speed(thrust)
-                     + RAM_EXTRA * float(np.clip(ram_drive, 0.0, 1.0)),
-                     SPEED_CAP)
+                     + RAM_EXTRA * float(np.clip(eff_ram, 0.0, 1.0)),
+                     SPEED_CAP) * slow
         speed = float(cruise)
         self.last_speed = float(speed)
         self.pos += self.forward_vec() * (speed * dt)
         # Hard altitude limits (mirror FlyPhysics CEILING/FLOOR)
         self.pos[1] = float(np.clip(self.pos[1], 0.5, 30.0))
+        # Ground-scrape signal: in the floor band (bumping or clip-
+        # through). Refreshed per step; the train loop feeds it to the
+        # dopamine term.
+        if self.pos[1] <= 0.8:
+            self.scrape_time += dt
+            self.ground_now = 1.0
+        else:
+            self.ground_now = 0.0
 
         # Arena boundary constraint (trees bounce/turn inward, horizontal)
         dist_from_center = float(np.linalg.norm(self.pos[[0, 2]]))
@@ -243,6 +290,7 @@ class KinematicFly:
             self.lunge_boost *= 0.85
             if float(dist) <= self.STRIKE_REACH:
                 event = "contact"
+                self.slow_t = 1.0  # contact momentum loss (recovery)
         return event, aimed
 
 
@@ -1220,7 +1268,8 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 ventral=senses.get("visual_flow_ventral", 0.0),
                 schemes=schemes,
                 scent_now=scent_now,
-                scent_prev=prev_scent
+                scent_prev=prev_scent,
+                ground=float(getattr(fly, "ground_now", 0.0))
             )
             prev_scent = scent_now
             # School extras: tail-close bonus (behind + closing pays up to

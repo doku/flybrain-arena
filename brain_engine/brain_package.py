@@ -346,7 +346,9 @@ def record_battle_result(record, outcome):
 
 def record_match_result(record, outcome, tournament_id=None):
     """Match-level result: bumps matches + matches_won/lost (battle wins
-    already counted per battle; no double counting)."""
+    already counted per battle; no double counting). outcome="draw"
+    (group splits) bumps matches only - the shared point lives on the
+    bracket, never in a won/lost column."""
     r = record["record"]
     r["matches"] += 1
     if outcome == "win":

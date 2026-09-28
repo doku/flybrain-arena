@@ -323,11 +323,11 @@ func test_prebuilt_overview() -> void:
 
 
 func test_draw_break_stamp() -> void:
-	# Three draws resolve by start-of-match ELO even when battle wins
-	# disagree (1-3): the match is stamped and the card tagged, so the
-	# green winner never looks wrong.
-	var ps := _brains(4, 1500)
-	D.call("build_group_bracket", ps, "A", "E0", 3, 0.5, 40.0)
+	# Finals/single-elim keep the decisive ELO tiebreak (groups split
+	# instead): three draws resolve by start-of-match ELO, stamped and
+	# tagged, so the green winner never looks wrong.
+	var ps := _brains(2, 1500)
+	D.call("build_bracket", ["f01", "f02"], 2, 3, 0.5, 40.0, false, ps, false, false)
 	var adv := {}
 	for i in range(3):
 		adv = D.call("on_battle_result", "draw", {}, {}, {})
@@ -346,10 +346,63 @@ func test_draw_break_stamp() -> void:
 	B.free()
 
 
+func test_prior_wins_and_split() -> void:
+	# Sudden death in groups: prior match-wins upset battle count
+	# (best-of-1 pairings); tied priors split 0.5/0.5.
+	var ps := _brains(4, 1500)
+	D.call("build_group_bracket", ps, "A", "E0", 1, 0.5, 40.0)
+	# p1 takes R1M1 + R2M1 (2 priors); p2 takes R2M2 (1 prior); the
+	# R3M1 pairing (p1 v p2) goes to 3 draws -> p1 on merit.
+	for p in ["alpha", "beta", "alpha", "beta"]:
+		var br: Dictionary = D.call("on_battle_result", p, {}, {}, {})
+		_check(str(br.get("action", "")) == "match_over", "pairing decides")
+		D.call("advance_after_match")
+	var adv := {}
+	for i in range(3):
+		adv = D.call("on_battle_result", "draw", {}, {}, {})
+	_check(str(adv.get("action", "")) == "match_over", "third draw ends match")
+	_check(str(adv.get("match_winner", "")) == "alpha", "prior match-wins decide")
+	# Fresh file: tied priors split.
+	var ps2 := _brains(4, 1500)
+	D.call("build_group_bracket", ps2, "A", "E0", 1, 0.5, 40.0)
+	for i in range(3):
+		adv = D.call("on_battle_result", "draw", {}, {}, {})
+	_check(str(adv.get("action", "")) == "match_over", "tie still ends match")
+	_check(str(adv.get("match_winner", "")) == "draw", "tied priors split the point")
+	_check(bool((((D.tourney.get("rounds", []) as Array)[0] as Array)[0] as Dictionary).get("drawn", false)),
+		"match stamped drawn")
+	var st: Array = D.call("group_standings")
+	_check(absf(float(st[0]["wins"]) - 0.5) < 0.001 and absf(float(st[1]["wins"]) - 0.5) < 0.001,
+		"both sides hold 0.5 wins")
+
+
+func _momentum_pair() -> Array:
+	# Two flies with opposing momenta; returns [a, b] instances.
+	var a = load("res://scripts/FlyPhysics.gd").new()
+	var b = load("res://scripts/FlyPhysics.gd").new()
+	a.velocity = Vector3(8.0, 0, 0)
+	b.velocity = Vector3(-4.0, 0, 0)
+	return [a, b]
+
+
+func test_clash_momentum_exchange() -> void:
+	var pair := _momentum_pair()
+	var a: Node3D = pair[0]
+	var b: Node3D = pair[1]
+	var p_before: Vector3 = a.velocity + b.velocity
+	a.call("_exchange_momentum", a, b, Vector3(1.0, 0, 0), 0.4)
+	var p_after: Vector3 = a.velocity + b.velocity
+	_check(absf(p_before.x - p_after.x) < 0.001, "pair momentum conserved")
+	_check(a.velocity.x < 8.0, "attacker loses axial momentum")
+	_check(b.velocity.x > -4.0, "braced side gains axial momentum")
+
+
 func _initialize() -> void:
 	_setup()
 	test_snake_draft()
 	test_draw_break_stamp()
+	test_prior_wins_and_split()
+	test_clash_momentum_exchange()
 	test_schedule_and_ko()
 	test_ko_tiebreak()
 	test_final_fixed_order()

@@ -877,6 +877,17 @@ func _new_match(a, b) -> Dictionary:
 	}
 
 
+func _match_wins(pid: String) -> int:
+	# Decided pairings taken in this event file (drawn splits count
+	# for neither side): the sudden-death tiebreak currency.
+	var n := 0
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			if str((mm as Dictionary).get("winner_id", "")) == pid:
+				n += 1
+	return n
+
+
 func _battle_wins(pid: String) -> int:
 	# Total battle wins across every round (main + consolation): the
 	# deterministic tiebreak for skipped losers finals.
@@ -1050,12 +1061,37 @@ func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dicti
 			# alpha like fitness verdicts. Both ELOs were already
 			# docked when the draw was reported.
 			sudden_death_armed = true
-			var ea := _player_elo(str(m.get("a_id", "")))
-			var eb := _player_elo(str(m.get("b_id", "")))
+			var aid := str(m.get("a_id", ""))
+			var bid := str(m.get("b_id", ""))
+			# Prior match-wins decide (baseball merit, not rating): the
+			# side that already proved itself takes the pairing. Tied
+			# priors split the point in group play (drawn, 0.5 each);
+			# finals stay decisive via the legacy ELO fallback so a
+			# champion is always crowned.
+			var wa := _match_wins(aid)
+			var wb := _match_wins(bid)
+			if wa != wb:
+				var wslot := "alpha" if wa > wb else "beta"
+				m["winner_id"] = str(m.get("a_id" if wslot == "alpha" else "b_id", ""))
+				m["decided_by_draw"] = true
+				save_state()
+				return {"action": "match_over", "match_winner": wslot,
+					"score_a": int(m.get("wins_a", 0)),
+					"score_b": int(m.get("wins_b", 0)),
+					"resolved_by_draw": true}
+			if str(tourney.get("format", "bracket")) == "groups":
+				m["drawn"] = true
+				save_state()
+				return {"action": "match_over", "match_winner": "draw",
+					"score_a": int(m.get("wins_a", 0)),
+					"score_b": int(m.get("wins_b", 0)),
+					"resolved_by_draw": true}
+			var ea := _player_elo(aid)
+			var eb := _player_elo(bid)
 			var dslot := "alpha" if ea >= eb else "beta"
 			m["winner_id"] = str(m.get("a_id" if dslot == "alpha" else "b_id", ""))
 			# Display honesty: the card shows battle score (e.g. 1-3),
-			# so the ELO tiebreak must be visible or the green winner
+			# so the tiebreak must be visible or the green winner
 			# looks wrong. The renderer tags these DRAW-BREAK.
 			m["decided_by_draw"] = true
 			save_state()
@@ -1340,6 +1376,13 @@ func match_slot_name(slot: String) -> String:
 	return str(m.get("a_name" if slot == "alpha" else "b_name", slot.to_upper()))
 
 
+func _fmt_wins(v) -> String:
+	# Fractional match wins (0.5 splits) print trimmed ("2.5"), ints
+	# stay ints ("3").
+	var f := float(v)
+	return "%d" % int(f) if absf(f - float(int(f))) < 0.01 else "%.1f" % f
+
+
 func bracket_text() -> String:
 	if tourney.is_empty():
 		return "No tournament."
@@ -1365,15 +1408,17 @@ func bracket_text() -> String:
 				lines.append("  %s advances (bye)%s" % [str(mm.get("a_name", "?")), marker])
 			else:
 				var w := ""
-				if str(mm.get("winner_id", "")) != "":
+				if bool(mm.get("drawn", false)):
+					w = "  => DRAW SPLIT"
+				elif str(mm.get("winner_id", "")) != "":
 					if _la:
 						var ln := str(mm.get("b_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("a_name", "?"))
 						w = "  => %s (loser advances)" % ln
 					else:
 						var wn := str(mm.get("a_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("b_name", "?"))
 						w = "  => %s" % wn
-				lines.append("  %s %d - %d %s%s%s" % [str(mm.get("a_name", "?")),
-					int(mm.get("wins_a", 0)), int(mm.get("wins_b", 0)),
+				lines.append("  %s %s - %s %s%s%s" % [str(mm.get("a_name", "?")),
+					_fmt_wins(mm.get("wins_a", 0)), _fmt_wins(mm.get("wins_b", 0)),
 					str(mm.get("b_name", "?")), w, marker])
 	if str(tourney.get("status", "")) == "complete":
 		lines.append("CHAMPION: %s" % champion_name())
@@ -1545,7 +1590,8 @@ func group_standings(t: Dictionary = {}) -> Array:
 		for mm in (rnd as Array):
 			var m := mm as Dictionary
 			var wid := str(m.get("winner_id", ""))
-			if wid == "":
+			var split := wid == "" and bool(m.get("drawn", false))
+			if wid == "" and not split:
 				continue
 			for slot in ["a", "b"]:
 				var sid := str(m.get(slot + "_id", ""))
@@ -1553,13 +1599,15 @@ func group_standings(t: Dictionary = {}) -> Array:
 					var row: Dictionary = table[sid]
 					row["matches"] = int(row.get("matches", 0)) + 1
 					row["kos"] = int(row.get("kos", 0)) + int(m.get("ko_" + slot, 0))
+					if split:
+						row["wins"] = float(row.get("wins", 0)) + 0.5
 			if table.has(wid):
 				var wrow: Dictionary = table[wid]
-				wrow["wins"] = int(wrow.get("wins", 0)) + 1
+				wrow["wins"] = float(wrow.get("wins", 0)) + 1.0
 	var out: Array = table.values()
 	out.sort_custom(func(x, y):
-		if int(x["wins"]) != int(y["wins"]):
-			return int(x["wins"]) > int(y["wins"])
+		if float(x["wins"]) != float(y["wins"]):
+			return float(x["wins"]) > float(y["wins"])
 		if int(x["kos"]) != int(y["kos"]):
 			return int(x["kos"]) > int(y["kos"])
 		return float(x["elo"]) > float(y["elo"]))
@@ -1658,7 +1706,8 @@ func event_eliminate_candidates(event_id: String, min_matches: int = 3, live_ove
 		for rnd in ((t as Dictionary).get("rounds", []) as Array):
 			for mm in (rnd as Array):
 				var m := mm as Dictionary
-				if str(m.get("winner_id", "")) == "":
+				if str(m.get("winner_id", "")) == "" \
+						and not bool(m.get("drawn", false)):
 					continue
 				for slot in ["a", "b"]:
 					var sid := str(m.get(slot + "_id", ""))

@@ -27,7 +27,10 @@ class EvolutionManager:
         self.pool_counts = self._load_pool_counts()
 
     def calc_fitness(self, s):
-        """Pure fitness score (no history side effects) for mid-round reads."""
+        """Pure fitness score (no history side effects) for mid-round reads.
+        scrape_time_s (floor-band seconds, arena-reported) pays a moderate
+        demerit: capped well below kill value, so scraping never outweighs
+        an exchange but a clean flier outranks an equal scraper."""
         return (
             s.get("kills", 0) * 1000.0
             + min(s.get("damage_dealt", 0.0), 80.0) * 2.0
@@ -35,6 +38,7 @@ class EvolutionManager:
             + min(s.get("tracking_time_s", 0.0), 10.0) * 8.0
             + min(s.get("tail_time_s", 0.0), 10.0) * 12.0
             + s.get("nectar_consumed", 0.0) * 2.0
+            - min(s.get("scrape_time_s", 0.0), 10.0) * 8.0
         )
 
     @staticmethod

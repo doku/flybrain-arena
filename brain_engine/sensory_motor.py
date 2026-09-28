@@ -93,6 +93,10 @@ DRIVE_VMAX = 12.0
 DRIVE_LOG_K = 6.0
 # Ram charge headroom above cruise (full ram ~= 18 m/s, as before).
 RAM_EXTRA = 6.0
+# Ram charge window + refractory (mirrors FlyPhysics RAM_TIME/COOLDOWN):
+# one charge per sustained DNpe017 drive, then a disarm beat.
+RAM_TIME = 0.8
+RAM_COOLDOWN = 3.0
 # DNpe017 spikes for a full ram charge (threshold 2 starts it).
 RAM_FULL_SCALE = 6.0
 # Hard cap mirror (FlyPhysics SPEED_CAP_MULT * max_speed): cruise speed

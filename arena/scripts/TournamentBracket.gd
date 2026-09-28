@@ -553,6 +553,8 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 		htxt += "  •  VACANT"
 	elif bool(m.get("skipped", false)):
 		htxt += "  •  SKIP"
+	elif bool(m.get("drawn", false)):
+		htxt += "  •  DRAW SPLIT"
 	elif bool(m.get("decided_by_draw", false)):
 		htxt += "  •  DRAW-BREAK"
 	elif loser_adv:
@@ -561,14 +563,20 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 	head.add_theme_font_size_override("font_size", FS_CARD_HEAD)
 	head.add_theme_color_override("font_color", COL_LIVE if live else Color(0.6, 0.6, 0.65))
 	vb.add_child(head)
-	var wa: int = int(m.get("wins_a", 0))
-	var wb: int = int(m.get("wins_b", 0))
+	var wa: float = float(m.get("wins_a", 0))
+	var wb: float = float(m.get("wins_b", 0))
 	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided, loser_adv))
 	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided, loser_adv))
 	return card
 
 
-func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false) -> HBoxContainer:
+func _fmt_wins(v: float) -> String:
+	# Fractional match wins (0.5 splits) print trimmed ("2.5"), ints
+	# stay ints ("3").
+	return "%d" % int(v) if absf(v - float(int(v))) < 0.01 else "%.1f" % v
+
+
+func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	var nm := Label.new()
@@ -601,7 +609,7 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 	nm.add_theme_color_override("font_color", col)
 	row.add_child(nm)
 	var sc := Label.new()
-	sc.text = "…" if training else str(score)
+	sc.text = _fmt_wins(score) if not training else "…"
 	sc.add_theme_font_size_override("font_size", FS_ROW)
 	sc.add_theme_color_override("font_color", col)
 	row.add_child(sc)
