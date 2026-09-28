@@ -1620,9 +1620,12 @@ func _apply_pip_slot() -> void:
 		pip_stats_alpha = _make_pip_stats(pip_alpha_box.get_parent(), true)
 	if pip_stats_beta == null and is_instance_valid(pip_beta_box):
 		pip_stats_beta = _make_pip_stats(pip_beta_box.get_parent(), false)
+	# STATS mode hides the viewport boxes outright (otherwise the
+	# last eye frame sits frozen behind the stat cards).
+	var show_views := perf_pip and pip_slot_mode != "STATS"
 	for n in [pip_alpha_box, pip_beta_box]:
 		if is_instance_valid(n):
-			(n as Control).visible = perf_pip
+			(n as Control).visible = show_views
 	for n in [pip_alpha_label, pip_beta_label, pip_alpha_feat, pip_beta_feat]:
 		if is_instance_valid(n):
 			(n as Control).visible = perf_pip and eyes

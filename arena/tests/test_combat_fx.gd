@@ -118,6 +118,24 @@ func test_pierce_releases_realtime() -> void:
 	_check(not atk.spear_pierce, "releases at real time")
 
 
+func test_pip_slot_visibility() -> void:
+	# STATS hides the viewport boxes (no frozen eye frames behind the
+	# stat cards); EYES/BRAIN keep them. Brain mode forces clouds on.
+	arena.pip_slot_mode = "STATS"
+	arena._apply_pip_slot()
+	_check(not arena.pip_alpha_box.visible, "stats hides eye box")
+	_check(not arena.pip_beta_box.visible, "stats hides beta box")
+	_check(arena.pip_stats_alpha.visible, "stats card shows in slot")
+	arena.pip_slot_mode = "BRAIN"
+	arena._apply_pip_slot()
+	_check(arena.pip_alpha_box.visible, "brain keeps box")
+	_check(arena.bv_cloud_alpha.visible, "brain forces cloud on")
+	arena.pip_slot_mode = "EYES"
+	arena._apply_pip_slot()
+	_check(arena.pip_alpha_box.visible, "eyes restore box")
+	_check(not arena.pip_stats_alpha.visible, "eyes hide stat card")
+
+
 func test_loser_drops_faster() -> void:
 	# Loser ceremony sinks at LOSER_SINK_RATE (5.5 m/s), not the old
 	# gentle 3.0.
@@ -147,6 +165,7 @@ func _process(_delta: float) -> bool:
 	test_pierce_only_on_kill()
 	test_pierce_releases_realtime()
 	test_loser_drops_faster()
+	test_pip_slot_visibility()
 	if failures == 0:
 		print("ALL COMBAT-FX TESTS PASSED")
 	else:
