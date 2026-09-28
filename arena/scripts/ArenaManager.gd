@@ -235,6 +235,14 @@ var intermission_row: HBoxContainer
 var intermission_label: Label
 var _event_skip := false
 const EVENT_INTERMISSION_SECS := 60.0
+const EVENT_PREVIEW_SECS := 30.0
+# Event gallery (bracket-view right column): rotates fighter stat
+# cards for the next pending group (all fighters pre-event). Keyed
+# cache so records refetch only when the target changes.
+var _event_gallery_active := false
+var _event_gallery_key := ""
+var _event_gallery_moved := false
+var bracket_row: HBoxContainer
 const EVENT_MIN_MATCHES := 10
 const EVENT_POOL_TARGET := 2
 const POOL_TRAIN_TARGET := 50
@@ -492,10 +500,13 @@ func _enter_tournament_mode() -> void:
 	# Pipeline kick-off: queue a wild breed for the next generation
 	# immediately, so it trains in the background while gen 1 plays.
 	# Events stock the pool bench instead (clones need the champion,
-	# so only wilds pipeline mid-event).
+	# so only wilds pipeline mid-event). Fresh events open with a
+	# 30 s tip-off: full overview plus every fighter in the gallery.
 	if _evo_active():
 		if _event_active():
 			_event_maintain_pool()
+			if _event_is_fresh():
+				await _event_pre_showcase()
 		else:
 			var evo: Dictionary = director.tourney.get("evo", {})
 			_evo_queue_wild(int(evo.get("generation", 1)) + 1)
@@ -686,6 +697,7 @@ func _build_bracket_overlay() -> void:
 	brow.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	brow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	vb.add_child(brow)
+	bracket_row = brow
 	gallery_box = VBoxContainer.new()
 	gallery_box.custom_minimum_size = Vector2(300, 0)
 	gallery_box.add_theme_constant_override("separation", 2)
@@ -724,9 +736,11 @@ func _show_arena_bracket(title_text: String) -> void:
 	bracket_title.text = title_text
 	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
 		# Event view: all four groups in one 2x2 overview (the single
-		# file would render as a fake single-elim).
+		# file would render as a fake single-elim). Gallery previews
+		# the next pending group alongside.
 		var ov: Dictionary = director.event_overview_data(_event_id())
 		arena_bracket.render_event_groups(ov, str(ov.get("current", "")))
+		_event_gallery_update()
 	else:
 		arena_bracket.render_bracket(director.tourney,
 			int(director.tourney.get("current_round", 0)),
@@ -2954,11 +2968,12 @@ func _process(delta: float) -> void:
 				_shot_done = true
 	_evo_watcher_tick(delta)
 	# Next-gen waiting room ticks (gallery rotation + training strip).
-	if nextgen_visible:
+	if nextgen_visible or _event_gallery_active:
 		nextgen_gallery_tick += delta
 		if nextgen_gallery_tick >= NEXTGEN_GALLERY_EVERY:
 			nextgen_gallery_tick = 0.0
 			_gallery_advance()
+	if nextgen_visible:
 		nextgen_strip_tick += delta
 		if nextgen_strip_tick >= NEXTGEN_STRIP_EVERY:
 			nextgen_strip_tick = 0.0
@@ -3655,6 +3670,86 @@ func _event_drain_done_to_pool() -> void:
 		print("[Arena] Event pool stocked: ", str(res.get("pool", [])))
 
 
+func _event_gallery_update(all_fighters: bool = false) -> void:
+	# Bracket-view gallery: every fighter pre-event, else the next
+	# pending group's cards (hidden once nothing is pending, e.g. the
+	# final). Records refetch only when the target changes; rotation
+	# rides the shared gallery tick.
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	if eid == "":
+		return
+	var ev: Dictionary = director.event_load(eid)
+	if ev.is_empty():
+		return
+	var key := "ALL"
+	var ids: Array = []
+	if all_fighters:
+		for g in (ev.get("group_order", []) as Array):
+			var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				if not (str(pid) in ids):
+					ids.append(str(pid))
+	else:
+		var cur := ""
+		if str(director.tourney.get("format", "")) == "groups":
+			cur = str(director.tourney.get("group", ""))
+		var nxt: String = director.event_next_group(eid, cur)
+		if nxt == "":
+			_event_gallery_active = false
+			if is_instance_valid(gallery_box):
+				gallery_box.visible = false
+			return
+		key = nxt
+		var gd2: Dictionary = (ev.get("groups", {}) as Dictionary).get(nxt, {})
+		for pid in (gd2.get("players", []) as Array):
+			ids.append(str(pid))
+	if key == _event_gallery_key and _event_gallery_active:
+		if is_instance_valid(gallery_box):
+			gallery_box.visible = true
+		return
+	_event_gallery_key = key
+	var by_id := {}
+	for b in director.list_brains():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	nextgen_brains.clear()
+	var cards: Array = []
+	for pid in ids:
+		if by_id.has(pid):
+			var bd := by_id[pid] as Dictionary
+			nextgen_brains[pid] = bd
+			cards.append({"id": pid, "name": str(bd.get("name", "?"))})
+	if cards.is_empty():
+		_event_gallery_active = false
+		return
+	_event_gallery_active = true
+	# Right column in event mode (the legacy waiting room keeps left).
+	if not _event_gallery_moved and is_instance_valid(bracket_row) \
+			and is_instance_valid(gallery_box):
+		bracket_row.move_child(gallery_box, 1)
+		_event_gallery_moved = true
+	if is_instance_valid(gallery_box):
+		gallery_box.visible = true
+	_build_gallery_entries(cards)
+
+
+func _event_pre_showcase() -> void:
+	# Brand-new event tip-off (runs once): 30 s bracket overview with
+	# all sixteen fighters rotating through the gallery, then Group A
+	# loads normally below.
+	var director := _director()
+	if director == null:
+		return
+	_event_gallery_update(true)
+	var eid := _event_id()
+	if not await _event_intermission("EVENT %s · TIP-OFF" % eid,
+			"Group A starts in", EVENT_PREVIEW_SECS, true):
+		director.quit_to_menu()
+		return
+
+
 func _event_next_phase(ev: Dictionary) -> String:
 	for g in (ev.get("group_order", []) as Array):
 		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
@@ -3799,7 +3894,23 @@ func _event_preview_sub(upcoming: String) -> String:
 	return "\n".join(lines)
 
 
-func _event_intermission(title: String, sub: String) -> bool:
+func _event_is_fresh() -> bool:
+	# Brand-new event tip-off: group A file untouched (0,0, no battles
+	# banked). Resume paths never satisfy this, so the showcase runs
+	# exactly once per event.
+	var director := _director()
+	if director == null or not _event_active():
+		return false
+	if str(director.tourney.get("format", "")) != "groups":
+		return false
+	if int(director.tourney.get("current_round", -1)) != 0 \
+			or int(director.tourney.get("current_match", -1)) != 0:
+		return false
+	var m: Dictionary = director.current_match()
+	return int(m.get("battles", 0)) == 0
+
+
+func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMISSION_SECS, gallery_all: bool = false) -> bool:
 	# Bracket preview + standings + 60 s countdown between event
 	# brackets. SKIP starts now; STOP aborts the event (quit to menu
 	# follows in the caller). Returns true when the next bracket may
@@ -3812,6 +3923,8 @@ func _event_intermission(title: String, sub: String) -> bool:
 	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
 		var ov: Dictionary = director.event_overview_data(_event_id())
 		arena_bracket.render_event_groups(ov, str(ov.get("current", "")))
+		if not gallery_all:
+			_event_gallery_update()
 	else:
 		arena_bracket.render_bracket(director.tourney, 0, 0)
 	_refresh_standings()
@@ -3822,7 +3935,7 @@ func _event_intermission(title: String, sub: String) -> bool:
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
 	_sync_bracket_button()
-	var left := EVENT_INTERMISSION_SECS
+	var left := secs
 	while left > 0.0 and not _event_skip:
 		if not _event_active():
 			break

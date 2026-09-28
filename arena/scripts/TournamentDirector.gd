@@ -1945,6 +1945,26 @@ func event_topup_pick(event_id: String, target: int = 50, live_override: Diction
 		"deficit": target - worst_eps}
 
 
+func event_next_group(event_id: String, after_letter: String = "") -> String:
+	# First unfinished group after the given letter ("" = from the top):
+	# the gallery preview target. "" when every group is done (final).
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return ""
+	var groups: Dictionary = ev.get("groups", {})
+	var order: Array = ev.get("group_order", [])
+	var past := after_letter == ""
+	for g in order:
+		var letter := str(g)
+		if not past:
+			if letter == after_letter:
+				past = true
+			continue
+		if not bool((groups.get(letter, {}) as Dictionary).get("done", false)):
+			return letter
+	return ""
+
+
 func event_set_phase(event_id: String, phase: String) -> void:
 	var ev := event_load(event_id)
 	if ev.is_empty():

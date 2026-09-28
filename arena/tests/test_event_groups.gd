@@ -413,6 +413,23 @@ func test_slowmo_safety() -> void:
 	A.free()
 
 
+func test_next_group_sequence() -> void:
+	# Gallery preview target: first unfinished group after the given
+	# one ("" from the top); "" once everything is done (the final).
+	var brains := _brains(16, 2000)
+	var ids: Array = []
+	for b in brains:
+		ids.append(str(b["id"]))
+	var beg: Dictionary = D.call("event_begin", ids,
+		{"best_of": 1, "lr_scale": 0.5, "round_time": 40.0}, 15, brains)
+	var eid := str(beg.get("event_id", ""))
+	_check(str(D.call("event_next_group", eid, "")) == "A", "starts at A")
+	_check(str(D.call("event_next_group", eid, "A")) == "B", "A previews B")
+	_check(str(D.call("event_next_group", eid, "C")) == "D", "C previews D")
+	_check(str(D.call("event_next_group", eid, "D")) == "", "D previews nothing")
+	_check(str(D.call("event_next_group", "E404", "A")) == "", "missing event is empty")
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -567,6 +584,7 @@ func _initialize() -> void:
 	test_cutoff_and_weighted_draw()
 	test_topup_pick()
 	test_bracket_close_toggle()
+	test_next_group_sequence()
 	test_slowmo_safety()
 	_cleanup()
 	if failures == 0:
