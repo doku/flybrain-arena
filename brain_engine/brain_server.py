@@ -255,14 +255,26 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         "report": (f"{battle_winner} wins by {report}"
                    if not arena_draw else f"draw ({report})"),
     }
-    if arena_draw:
-        # No plasticity on draws: weights are byte-identical, so the
-        # journal carries records-only markers and replay takes the
-        # record-only save path (no 200 MB weight payload, no zip rewrite).
-        for r in records:
-            r["weights_unchanged"] = True
-        weights = {}
+    # Journal-first, records-only: the journal carries the bumped records
+    # (idempotent replay) but no weight payloads — ~200 MB of fsync'd
+    # writes saved per battle. Post-learning weights persist on the live
+    # path below; a crash between journal and weight save falls back to
+    # pre-battle weights while records still replay exactly once.
+    # (Draws were already records-only: no plasticity, weights identical.)
+    for r in records:
+        r["weights_unchanged"] = True
+    live_weights = weights
+    weights = {}
     _write_pending_battle(battle_key, resp, records, weights)
+    # Live path: bank post-learning weights while the journal still
+    # guards the records. Crash here replays the bumped records (sidecar
+    # path) while weights fall back to pre-battle — approved tradeoff.
+    # st["rec"] sync + verdict land in recover below.
+    for entry in records:
+        side = entry["side"]
+        if side in live_weights:
+            vault_pkg.save_brain(entry["record"], live_weights[side],
+                                 backup=False, fast=True)
     _recover_pending_battle((tourney_a, tourney_b))
     try:
         sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
@@ -494,6 +506,17 @@ def _recover_pending_battle(states=()):
                         or not isinstance(entry.get("record"), dict):
                     raise ValueError("pending battle journal has bad entry")
                 if entry.get("weights_unchanged"):
+                    if not os.path.isfile(vault_pkg.package_path(
+                            entry["record"].get("filename", ""))):
+                        # Records-only entries replay via the package
+                        # sidecar, so a missing package can never complete:
+                        # quarantine like a torn write instead of failing
+                        # every message with battle recovery errors.
+                        # (Weight-bearing entries restore FROM the journal
+                        # when packages were wiped - the crash case.)
+                        raise ValueError(
+                            "records-only journal references missing "
+                            "package " + str(entry["record"].get("filename", "")))
                     continue
                 if entry["side"] not in pending:
                     raise ValueError("pending battle journal has bad entry")

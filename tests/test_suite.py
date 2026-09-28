@@ -5749,20 +5749,27 @@ class TestBattleTransaction(unittest.TestCase):
         rec = vault_pkg.new_record("RecOnly", {})
         w = np.arange(24, dtype=np.float32)
         vault_pkg.save_brain(rec, w)
+        path = vault_pkg.package_path(rec)
+        size_before = os.path.getsize(path)
+        mtime_before = os.path.getmtime(path)
         rec["record"]["wins"] = 3
         vault_pkg.save_brain_record_only(rec)
+        # Sidecar path: the zip is untouched, live counters served.
+        self.assertEqual(os.path.getsize(path), size_before)
+        self.assertEqual(os.path.getmtime(path), mtime_before)
         rec2, w2 = vault_pkg.load_brain(rec["id"])
         self.assertEqual(rec2["record"]["wins"], 3)
         np.testing.assert_array_equal(w2, w)
-        # A package missing its weights entry must fail loud, never
-        # bank half a battle.
-        path = vault_pkg.package_path(rec)
-        with zipfile.ZipFile(path, "r") as zin:
-            meta = zin.read(vault_pkg.META_ENTRY)
-        with zipfile.ZipFile(path, "w") as zout:
-            zout.writestr(vault_pkg.META_ENTRY, meta)
+        # A full save clears the sidecar: embedded metadata wins.
+        rec["record"]["wins"] = 5
+        vault_pkg.save_brain(rec, w)
+        self.assertFalse(os.path.exists(path + ".record.json"))
+        rec3, _ = vault_pkg.load_brain(rec["id"])
+        self.assertEqual(rec3["record"]["wins"], 5)
+        # A missing package must fail loud, never bank half a battle.
+        ghost = vault_pkg.new_record("Ghost", {})
         with self.assertRaises(ValueError):
-            vault_pkg.save_brain_record_only(rec)
+            vault_pkg.save_brain_record_only(ghost)
 
     def test_unkeyed_journal_preserves_previous_verdict(self):
         import copy
@@ -5820,6 +5827,37 @@ class TestBattleTransaction(unittest.TestCase):
         stored = self.srv._read_last_verdict()
         self.assertEqual(stored["key"], key)
         self.assertEqual(stored["result"]["battle_winner"], "draw")
+
+    def test_slim_journal_falls_back_to_prebattle_weights(self):
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "win")
+        vault_pkg.record_battle_result(rb, "loss")
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "SL1", "draw": False}
+        resp = {"status": "tournament_battle", "battle_winner": "alpha",
+                "fitness_alpha": 3.0, "fitness_beta": 2.0,
+                "battle_id": "SL1"}
+        # New handler protocol: records-only journal, no weight payload.
+        self.srv._write_pending_battle(
+            key, resp,
+            [{"side": "alpha", "record": ra, "weights_unchanged": True},
+             {"side": "beta", "record": rb, "weights_unchanged": True}],
+            {})
+        self.assertLess(
+            os.path.getsize(self.srv._pending_battle_path()), 65536)
+        # Crash before the live weight save: records replay exactly
+        # once, weights stay at pre-battle values.
+        self.srv._recover_pending_battle((sta, stb))
+        la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        lb, wb2 = vault_pkg.load_brain(rec_b["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        np.testing.assert_array_equal(wa2, wa)
+        np.testing.assert_array_equal(wb2, wb)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
 
     def test_battle_elo_banked(self):
         _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
@@ -5996,6 +6034,52 @@ class TestBattleTransaction(unittest.TestCase):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(b"not a zip at all")
+        with self.assertRaises(Exception):
+            self.srv._recover_pending_battle()
+        self.assertFalse(os.path.exists(p))
+        quarantined = [f for f in os.listdir(os.path.dirname(p))
+                       if f.startswith("_pending_battle.npz.corrupt-")]
+        self.assertTrue(quarantined)
+        for f in quarantined:
+            os.remove(os.path.join(os.path.dirname(p), f))
+
+    def test_missing_package_journal_quarantined(self):
+        # Regression: a records-only journal whose packages were deleted
+        # (test litter, wiped vault) can never complete - recovery must
+        # quarantine it instead of failing every message with battle
+        # recovery errors. Weight-bearing journals still restore.
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "win")
+        vault_pkg.record_battle_result(rb, "loss")
+        # 1. Weight-bearing journal + wiped packages: replay RESTORES.
+        self.srv._write_pending_battle(
+            {"tournament_id": "T", "match": "M",
+             "battle_id": "MG0", "draw": False},
+            {"status": "tournament_battle", "battle_winner": "alpha",
+             "battle_id": "MG0"},
+            [{"side": "alpha", "record": ra},
+             {"side": "beta", "record": rb}],
+            {"alpha": wa, "beta": wb})
+        os.remove(vault_pkg.package_path(rec_a))
+        self.srv._recover_pending_battle((sta, stb))
+        _la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        np.testing.assert_array_equal(wa2, wa)
+        # 2. Records-only journal + wiped packages: quarantine, never a
+        # battle-recovery error loop on every message.
+        self.srv._write_pending_battle(
+            {"tournament_id": "T", "match": "M",
+             "battle_id": "MG1", "draw": False},
+            {"status": "tournament_battle", "battle_winner": "alpha",
+             "battle_id": "MG1"},
+            [{"side": "alpha", "record": ra, "weights_unchanged": True},
+             {"side": "beta", "record": rb, "weights_unchanged": True}],
+            {})
+        p = self.srv._pending_battle_path()
+        os.remove(vault_pkg.package_path(rec_a))
+        os.remove(vault_pkg.package_path(rec_b))
         with self.assertRaises(Exception):
             self.srv._recover_pending_battle()
         self.assertFalse(os.path.exists(p))

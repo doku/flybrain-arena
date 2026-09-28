@@ -122,44 +122,62 @@ def save_brain(record, weights, backup=True, fast=False):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+    # A full rewrite supersedes any record sidecar (stale sidecars must
+    # never shadow newer embedded metadata — see _read_sidecar_record).
+    try:
+        sidecar = path + SIDECAR_SUFFIX
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
+    except OSError:
+        pass
     update_index_entry(record)
     return path
 
 
+SIDECAR_SUFFIX = ".record.json"
+
+
+def _read_sidecar_record(path):
+    """Live metadata override for a package, or None. Written by
+    save_brain_record_only when only counters/ELO move (weights
+    byte-identical): a ~KB atomic JSON write instead of a ~100 MB zip
+    rewrite. Honored only when at least as new as the package itself,
+    so a full save_brain that slips past sidecar cleanup can never be
+    shadowed by stale counters."""
+    try:
+        side = path + SIDECAR_SUFFIX
+        if os.path.isfile(side) and os.path.isfile(path) \
+                and os.path.getmtime(side) >= os.path.getmtime(path):
+            with open(side) as f:
+                d = json.load(f)
+            if isinstance(d, dict) and d.get("id"):
+                return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def save_brain_record_only(record):
-    """Rewrites only the meta entry of an existing package, copying the
-    weights bytes verbatim (draw path: weights provably unchanged, so no
-    numpy work and no recompress). Hot-save semantics: no .bak, then an
-    incremental index upsert. Raises on missing/corrupt weights so a
-    journal replay leaves the transaction for reconcile instead of
-    banking half a battle."""
+    """Persists only the metadata record via sidecar (draw / score-stamp
+    path: weights provably unchanged, so the ~100 MB zip is untouched —
+    no numpy work, no recompress, no rewrite). Hot-save semantics: no
+    .bak, then an incremental index upsert. Raises when the package is
+    missing so a journal replay leaves the transaction for reconcile
+    instead of banking half a battle."""
     os.makedirs(VAULT_DIR, exist_ok=True)
     path = package_path(record)
-    with zipfile.ZipFile(path, "r") as zin:
-        names = set(zin.namelist())
-        if WEIGHTS_ENTRY not in names or META_ENTRY not in names:
-            raise ValueError(f"{path} is not a valid .flybrain package "
-                             f"(missing {WEIGHTS_ENTRY} or {META_ENTRY})")
-        wdata = zin.read(WEIGHTS_ENTRY)
-    # Validate the copied payload decodes before touching the file.
-    with np.load(io.BytesIO(wdata)) as z:
-        z["weights"]
-    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=VAULT_DIR)
-    os.close(fd)
-    try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
-            zf.writestr(WEIGHTS_ENTRY, wdata)
-            zf.writestr(META_ENTRY, json.dumps(record, indent=2))
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    if not os.path.isfile(path):
+        raise ValueError(f"{path} is not a valid .flybrain package "
+                         f"(package file missing)")
+    _atomic_write_json(path + SIDECAR_SUFFIX, dict(record))
     update_index_entry(record)
     return path
 
 
 def load_brain(path_or_id):
-    """Loads (record, weights) by vault id, filename, or absolute path."""
+    """Loads (record, weights) by vault id, filename, or absolute path.
+    A record sidecar (see save_brain_record_only) overrides the embedded
+    metadata when newer — live counters without a zip rewrite."""
     path = _resolve(path_or_id)
     with zipfile.ZipFile(path, "r") as zf:
         names = set(zf.namelist())
@@ -169,6 +187,9 @@ def load_brain(path_or_id):
         record = json.loads(zf.read(META_ENTRY).decode("utf-8"))
         with zf.open(WEIGHTS_ENTRY) as f:
             weights = np.load(f)["weights"]
+    side = _read_sidecar_record(path)
+    if side is not None:
+        record = side
     return record, np.ascontiguousarray(weights, dtype=np.float32)
 
 
@@ -196,6 +217,9 @@ def scan_vault(silent=False):
         try:
             with zipfile.ZipFile(path, "r") as zf:
                 rec = json.loads(zf.read(META_ENTRY).decode("utf-8"))
+            side = _read_sidecar_record(path)
+            if side is not None:
+                rec = side
             rec["filename"] = fname
             records.append(rec)
         except Exception as e:
