@@ -454,6 +454,16 @@ func test_soften_worker_noop() -> void:
 	D.free()
 
 
+func test_pip_slot_cycle() -> void:
+	# PiP slot rotation: EYES -> BRAIN -> STATS -> EYES; junk resets.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	_check(A.call("pip_slot_next", "EYES") == "BRAIN", "eyes to brain")
+	_check(A.call("pip_slot_next", "BRAIN") == "STATS", "brain to stats")
+	_check(A.call("pip_slot_next", "STATS") == "EYES", "stats wraps to eyes")
+	_check(A.call("pip_slot_next", "junk") == "EYES", "unknown resets")
+	A.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -612,6 +622,7 @@ func _initialize() -> void:
 	test_slowmo_safety()
 	test_gallery_cache_key()
 	test_soften_worker_noop()
+	test_pip_slot_cycle()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

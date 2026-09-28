@@ -324,6 +324,13 @@ var perf_glow := true
 var perf_shadows := true
 var _pip_tick := 0
 var _pip_hidden := false
+# PiP-slot modes, cycled by the BRAIN button: EYES (fly-head cams),
+# BRAIN (cams parked on the spinning 3D clouds), STATS (live fly stat
+# cards instead of viewports).
+const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS"]
+var pip_slot_mode := "EYES"
+var pip_stats_alpha: Label
+var pip_stats_beta: Label
 
 # Display name for a slot: the assigned brain name in tournament/quick
 # battles, plain ALPHA/BETA in free battle (no vault identities there).
@@ -540,7 +547,7 @@ func _build_menu_bar(tournament: bool) -> void:
 		bracket_button = _menu_bar_button("BRACKET", "Show/hide the tournament bracket.")
 		bracket_button.pressed.connect(_on_bracket_toggle)
 		bar.add_child(bracket_button)
-		var brain_b := _menu_bar_button("BRAIN", "Cycle brain views: bars, flow, raster, 3D.")
+		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
 		var replay_bt := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
@@ -560,7 +567,7 @@ func _build_menu_bar(tournament: bool) -> void:
 		var restart_b := _menu_bar_button("RESTART", "Restart the round (banks rewards).")
 		restart_b.pressed.connect(_on_restart_pressed)
 		bar.add_child(restart_b)
-		var brain_b := _menu_bar_button("BRAIN", "Cycle brain views: bars, flow, raster, 3D.")
+		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
 		var replay_b2 := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
@@ -1543,6 +1550,106 @@ func _physics_process(delta: float) -> void:
 			_end_round()
 
 const PIP_TICK_EVERY := 6
+func _make_pip_stats(parent: CanvasItem, left_side: bool) -> Label:
+	# Fly-stat card overlaying a PiP slot (same rect as the viewport).
+	var l := Label.new()
+	if left_side:
+		l.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		l.offset_left = 16.0
+		l.offset_top = 30.0
+		l.offset_right = 316.0
+		l.offset_bottom = 180.0
+	else:
+		l.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		l.anchor_left = 1.0
+		l.anchor_right = 1.0
+		l.offset_left = -316.0
+		l.offset_top = 30.0
+		l.offset_right = -16.0
+		l.offset_bottom = 180.0
+	l.add_theme_font_size_override("font_size", 13)
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.visible = false
+	parent.add_child(l)
+	return l
+
+
+func _pip_stats_text(side: String) -> String:
+	# Live fly stat card: name, ELO, speed, thrust, health, KOs, damage.
+	var fly: CharacterBody3D = fly_alpha if side == "alpha" else fly_beta
+	var nm := _slot_name(side)
+	var elo := "--"
+	var director := _director()
+	if director != null:
+		var m: Dictionary = director.current_match()
+		var pid := str(m.get("a_id" if side == "alpha" else "b_id", ""))
+		for p in director.tourney.get("players", []):
+			if str((p as Dictionary).get("id", "")) == pid:
+				elo = str(int(((p as Dictionary).get("record", {}) as Dictionary).get("elo", 1200.0)))
+				break
+	var spd := 0.0
+	var thr := 0.0
+	var hp := 0.0
+	if is_instance_valid(fly):
+		spd = (fly as CharacterBody3D).velocity.length()
+		var _t = fly.get("current_thrust")
+		thr = float(_t) if _t != null else 0.0
+		var _h = fly.get("health")
+		hp = float(_h) if _h != null else 0.0
+	var st: Dictionary = stats_alpha if side == "alpha" else stats_beta
+	return "%s  (ELO %s)\nSPD %.1f  THR %.2f\nHP %.0f  KO %d  DMG %.0f" % [nm, elo, spd, thr, hp,
+		int(st.get("kills", 0)), float(st.get("damage_dealt", 0.0))]
+
+
+func _park_pip_on_cloud(cam: Camera3D, cloud: Node3D) -> void:
+	# Frame a spinning brain cloud in a PiP viewport (shared world, so
+	# no reparenting: just point the existing eye camera at it).
+	if is_instance_valid(cam) and is_instance_valid(cloud):
+		var cp: Vector3 = (cloud as Node3D).global_position
+		cam.global_transform = Transform3D(Basis(), cp + Vector3(0.6, 0.9, 2.6))
+		cam.look_at(cp)
+
+
+func _apply_pip_slot() -> void:
+	# Immediate visibility/label/cloud work for a slot change (the
+	# per-tick pump below handles cameras and stat refresh).
+	var eyes := pip_slot_mode == "EYES"
+	var brain := pip_slot_mode == "BRAIN"
+	if pip_stats_alpha == null and is_instance_valid(pip_alpha_box):
+		pip_stats_alpha = _make_pip_stats(pip_alpha_box.get_parent(), true)
+	if pip_stats_beta == null and is_instance_valid(pip_beta_box):
+		pip_stats_beta = _make_pip_stats(pip_beta_box.get_parent(), false)
+	for n in [pip_alpha_box, pip_beta_box]:
+		if is_instance_valid(n):
+			(n as Control).visible = perf_pip
+	for n in [pip_alpha_label, pip_beta_label, pip_alpha_feat, pip_beta_feat]:
+		if is_instance_valid(n):
+			(n as Control).visible = perf_pip and eyes
+	if is_instance_valid(pip_stats_alpha):
+		pip_stats_alpha.visible = perf_pip and not eyes and pip_slot_mode == "STATS"
+	if is_instance_valid(pip_stats_beta):
+		pip_stats_beta.visible = perf_pip and not eyes and pip_slot_mode == "STATS"
+	if eyes:
+		if is_instance_valid(pip_alpha_label):
+			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
+		if is_instance_valid(pip_beta_label):
+			pip_beta_label.text = _slot_name("beta") + " EYES - raw (pre-brain)"
+	elif brain:
+		if is_instance_valid(pip_alpha_label):
+			pip_alpha_label.text = _slot_name("alpha") + " BRAIN 3D"
+		if is_instance_valid(pip_beta_label):
+			pip_beta_label.text = _slot_name("beta") + " BRAIN 3D"
+	# Clouds: forced on in BRAIN mode, canonical layer visibility else.
+	if brain:
+		if is_instance_valid(bv_cloud_alpha):
+			bv_cloud_alpha.visible = true
+		if is_instance_valid(bv_cloud_beta):
+			bv_cloud_beta.visible = true
+	else:
+		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+
+
 func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 	# Eye views re-render the whole forest per viewport (scene + shadow
 	# maps, twice): throttle to every 6th physics tick (~10 Hz, plenty
@@ -1552,25 +1659,40 @@ func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 		if not _pip_hidden:
 			_pip_hidden = true
 			for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
-					pip_beta_label, pip_alpha_feat, pip_beta_feat]:
+					pip_beta_label, pip_alpha_feat, pip_beta_feat,
+					pip_stats_alpha, pip_stats_beta]:
 				if is_instance_valid(n):
 					(n as Control).visible = false
-			for v in [pip_alpha_view, pip_beta_view]:
-				if is_instance_valid(v):
-					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
 		return
 	if _pip_hidden:
 		_pip_hidden = false
-		for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
-				pip_beta_label, pip_alpha_feat, pip_beta_feat]:
-			if is_instance_valid(n):
-				(n as Control).visible = true
+		_apply_pip_slot()
 	if _pip_tick % PIP_TICK_EVERY == 0:
-		for v in [pip_alpha_view, pip_beta_view]:
-			if is_instance_valid(v):
-				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
-		_update_pip_view(pip_alpha_cam, fly_alpha, sens_a, pip_alpha_feat)
-		_update_pip_view(pip_beta_cam, fly_beta, sens_b, pip_beta_feat)
+		if pip_slot_mode == "STATS":
+			# Stat cards instead of viewports: keep renders off, refresh text.
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+			if is_instance_valid(pip_stats_alpha):
+				pip_stats_alpha.text = _pip_stats_text("alpha")
+			if is_instance_valid(pip_stats_beta):
+				pip_stats_beta.text = _pip_stats_text("beta")
+		elif pip_slot_mode == "BRAIN":
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
+			_park_pip_on_cloud(pip_alpha_cam, bv_cloud_alpha)
+			_park_pip_on_cloud(pip_beta_cam, bv_cloud_beta)
+			if is_instance_valid(bv_cloud_alpha):
+				bv_cloud_alpha.visible = true
+			if is_instance_valid(bv_cloud_beta):
+				bv_cloud_beta.visible = true
+		else:
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
+			_update_pip_view(pip_alpha_cam, fly_alpha, sens_a, pip_alpha_feat)
+			_update_pip_view(pip_beta_cam, fly_beta, sens_b, pip_beta_feat)
 	else:
 		for v in [pip_alpha_view, pip_beta_view]:
 			if is_instance_valid(v):
@@ -2127,6 +2249,12 @@ func _apply_bv_side_layer(side: String, layer: String) -> void:
 		cloud.visible = on and layer == "brain3d"
 
 
+static func pip_slot_next(cur: String) -> String:
+	# Pure slot rotation (unknown states reset to EYES).
+	var i := PIP_SLOT_MODES.find(cur)
+	return PIP_SLOT_MODES[(i + 1) % PIP_SLOT_MODES.size()] if i >= 0 else "EYES"
+
+
 func _on_brain_button() -> void:
 	# BRAIN button cycles every representation (bars/flow/raster/3D)
 	# so the views are discoverable without knowing the keys; B
@@ -2144,7 +2272,12 @@ func _on_brain_button() -> void:
 		# Spike readout lines stay hidden (see _apply_brainview_settings).
 		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 	else:
-		_cycle_bv_layer()
+		# Panels already up: advance the PiP slot instead (EYES ->
+		# BRAIN 3D -> fly STATS). Diagram layers still cycle on N.
+		pip_slot_mode = pip_slot_next(pip_slot_mode)
+		_apply_pip_slot()
+		if is_instance_valid(status_label):
+			status_label.text = "PiP slot: %s (BRAIN cycles, N diagrams)" % pip_slot_mode
 
 
 func _toggle_brainview() -> void:
