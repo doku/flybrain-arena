@@ -520,6 +520,22 @@ func test_worker_affinity_mask() -> void:
 	D.free()
 
 
+func test_live_cards_use_cache() -> void:
+	# Pool math must never shell mid-battle: with a seeded cache and
+	# no python (headless), live cards still resolve from memory.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.set("brains_cache", [{"id": "c1",
+		"record": {"elo": 1500.0, "matches": 12},
+		"training": {"episodes": 60}}])
+	D.set("brains_cache_msec", Time.get_ticks_msec())
+	var cards: Dictionary = D.call("_event_live_cards", {})
+	_check((cards.get("c1", {}) as Dictionary).get("elo", 0.0) == 1500.0,
+		"live cards served from cache")
+	_check(int((cards.get("c1", {}) as Dictionary).get("train", 0)) == 60,
+		"live cards carry cached schooling")
+	D.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -683,6 +699,7 @@ func _initialize() -> void:
 	test_roster_cache()
 	test_spawn_hold()
 	test_worker_affinity_mask()
+	test_live_cards_use_cache()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

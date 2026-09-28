@@ -1864,7 +1864,10 @@ func _event_live_cards(live_override: Dictionary = {}) -> Dictionary:
 			else:
 				cards[str(pid)] = {"elo": float(v), "train": 0, "matches": 0}
 		return cards
-	for b in list_brains():
+	# Cached roster: this feeds the 5 s watcher tick mid-battle (pool
+	# maintain/drain); an uncached shell here froze the fight ~1-2 s
+	# every tick. Pool math tolerates 60 s staleness.
+	for b in list_brains_cached():
 		var bd := b as Dictionary
 		cards[str(bd.get("id", ""))] = _event_live_card(bd)
 	return cards
