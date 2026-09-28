@@ -394,6 +394,25 @@ func test_bracket_close_toggle() -> void:
 	A.free()
 
 
+func test_slowmo_safety() -> void:
+	# Finish pacing constants sane; the timescale restore (quit/stop/
+	# load safety net) always lands back at real time.
+	var AM = load("res://scripts/ArenaManager.gd")
+	_check(AM.CALLOUT_TITLE_FS >= 40 and AM.CALLOUT_TITLE_FS <= 72,
+		"callout title readable, not full-screen")
+	_check(AM.SLOWMO_SCALE > 0.0 and AM.SLOWMO_SCALE < 1.0,
+		"slow-mo actually slows")
+	_check(AM.SLOWMO_SECS > 0.0 and AM.WINNER_BEAT_SECS > 0.0,
+		"positive finish beats")
+	var A = AM.new()
+	Engine.time_scale = AM.SLOWMO_SCALE
+	A.set("_slowmo_active", true)
+	A.call("_restore_timescale")
+	_check(Engine.time_scale == 1.0, "timescale restores to real time")
+	_check(bool(A.get("_slowmo_active")) == false, "slow-mo flag clears")
+	A.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -548,6 +567,7 @@ func _initialize() -> void:
 	test_cutoff_and_weighted_draw()
 	test_topup_pick()
 	test_bracket_close_toggle()
+	test_slowmo_safety()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

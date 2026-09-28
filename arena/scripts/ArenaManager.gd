@@ -172,6 +172,17 @@ var tree_sight_entries: Array = []
 var winner_overlay: Control
 var winner_label: Label
 var countdown_label: Label
+# Callout typography: 64pt across an 1100px floor keeps
+# "NAME TAKES BATTLE (2 - 0)" to two clean lines (name + result)
+# instead of wrapping mid-phrase at 88pt.
+const CALLOUT_TITLE_FS := 64
+# Slow-motion finish: after the final blow the fight plays at quarter
+# speed for a beat (the landing unfolds dramatically), timescale
+# restores, a 1 s beat passes, and only then the winner text lands.
+const SLOWMO_SCALE := 0.25
+const SLOWMO_SECS := 2.0
+const WINNER_BEAT_SECS := 1.0
+var _slowmo_active := false
 
 # Tournament mode (driven by the TournamentDirector autoload; off = classic
 # free battle with generational evolution).
@@ -785,11 +796,13 @@ func _on_bracket_toggle() -> void:
 		_show_arena_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name])
 
 func _on_quit_to_menu() -> void:
+	_restore_timescale()
 	var director := _director()
 	if director != null:
 		director.quit_to_menu()
 
 func _request_current_battle_load() -> void:
+	_restore_timescale()
 	var director := _director()
 	if director == null:
 		return
@@ -2487,8 +2500,8 @@ func _build_winner_overlay() -> void:
 	winner_label.name = "WinnerLabel"
 	winner_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	winner_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	winner_label.custom_minimum_size = Vector2(900, 0)
-	winner_label.add_theme_font_size_override("font_size", 88)
+	winner_label.custom_minimum_size = Vector2(1100, 0)
+	winner_label.add_theme_font_size_override("font_size", CALLOUT_TITLE_FS)
 	winner_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
 	winner_label.add_theme_constant_override("outline_size", 10)
 	vbox.add_child(winner_label)
@@ -2565,7 +2578,7 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 	# Restore winner-callout sizes (loading states shrink them).
 	if is_instance_valid(winner_label):
 		winner_label.text = title
-		winner_label.add_theme_font_size_override("font_size", 88)
+		winner_label.add_theme_font_size_override("font_size", CALLOUT_TITLE_FS)
 		winner_label.add_theme_color_override("font_color", title_color)
 	if is_instance_valid(countdown_label):
 		countdown_label.text = sub
@@ -3175,7 +3188,32 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 	# Landing ceremony instead of a frozen frame: loser drops
 	# belly-up, winner lowers onto its feet (runs behind the banner).
 	_begin_landing("beta" if victim_id == "alpha" else "alpha")
+	# Damage gates close now (no corpse hits during the replay), then
+	# the slow-motion finish plays before the round is banked.
+	_set_combat(false)
+	await _play_slowmo_finish()
 	_end_round()
+
+
+func _play_slowmo_finish() -> void:
+	# Quarter-speed beat on the final blow: clean fight view, landing
+	# unfolding slowly. Restores, holds one real second, and returns;
+	# the caller then banks the round and the winner text lands.
+	# Re-entry safe (a second KO inside the window is a no-op wait).
+	if _slowmo_active:
+		return
+	_slowmo_active = true
+	Engine.time_scale = SLOWMO_SCALE
+	await get_tree().create_timer(SLOWMO_SECS, true, false, true).timeout
+	_restore_timescale()
+	await get_tree().create_timer(WINNER_BEAT_SECS, true, false, true).timeout
+
+
+func _restore_timescale() -> void:
+	# Timescale is global: any early exit (quit, stop, new load) must
+	# leave it at 1.0 or the whole game runs in slow motion.
+	_slowmo_active = false
+	Engine.time_scale = 1.0
 
 
 func _begin_landing(winner_slot: String) -> void:
@@ -5394,6 +5432,7 @@ func _on_evo_stop() -> void:
 			status_label.text = "Evolution loop is not running."
 		return
 	_evo_kill_job()
+	_restore_timescale()
 	evo_waiting = false
 	# Kill watcher-launched pipelined workers too: they hold no global
 	# pid, so _evo_kill_job can't reach them. Otherwise they keep
