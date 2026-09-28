@@ -2830,14 +2830,17 @@ func _setup_dynamic_tree_opacity() -> void:
 func _evo_watcher_tick(delta: float) -> void:
 	# Background pipeline pump, throttled: adopts finished breeds,
 	# launches queued specs when the shared slot is free, refreshes
-	# the bottom-left status line. No-ops unless evo is active.
+	# the bottom-left status line. No-ops unless evo is active. New
+	# worker spawns wait for open air between battles (process boot
+	# spikes frame pacing); adoptions run any time.
 	if not _evo_active():
 		if is_instance_valid(evo_status_line):
 			evo_status_line.visible = false
 		return
 	_evo_adopt_finished()
 	var director := _director()
-	if director != null and not evo_waiting and director.pending_async.is_empty():
+	if director != null and not evo_waiting and director.pending_async.is_empty() \
+			and not is_round_active:
 		for spec in _evo_pending():
 			var s := spec as Dictionary
 			if not bool(s.get("launched", false)) \
@@ -2867,6 +2870,8 @@ func _event_topup_tick() -> void:
 		return
 	_event_topup_cd += EVO_STATUS_EVERY
 	if _event_topup_cd < EVENT_TOPUP_EVERY:
+		return
+	if is_round_active:
 		return
 	var director := _director()
 	if director == null:

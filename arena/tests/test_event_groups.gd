@@ -443,6 +443,17 @@ func test_gallery_cache_key() -> void:
 	A.free()
 
 
+func test_soften_worker_noop() -> void:
+	# Worker deprioritization never raises: dead/invalid pids on any
+	# host are silently ignored (fire-and-forget by design).
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.call("_soften_worker", -1)
+	D.call("_soften_worker", 0)
+	D.call("_soften_worker", 999999999)
+	_check(true, "soften invalid pids without error")
+	D.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -600,6 +611,7 @@ func _initialize() -> void:
 	test_next_group_sequence()
 	test_slowmo_safety()
 	test_gallery_cache_key()
+	test_soften_worker_noop()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

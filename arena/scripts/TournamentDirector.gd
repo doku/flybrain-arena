@@ -177,6 +177,19 @@ func _run_cli(args: Array) -> Dictionary:
 	return _parse_cli_output(out, code)
 
 
+func _soften_worker(pid: int) -> void:
+	# Background workers (breeds/trains/probes) run long CPU-heavy jobs
+	# beside the live fight: drop them below normal priority so frame
+	# pacing never contends with them. Fire-and-forget helper process;
+	# any failure (exited pid, non-Windows host) is silently ignored.
+	if pid <= 0 or OS.get_name() != "Windows":
+		return
+	OS.create_process("powershell.exe", ["-NoProfile", "-NonInteractive",
+		"-WindowStyle", "Hidden", "-Command",
+		"try { [System.Diagnostics.Process]::GetProcessById(%d).PriorityClass = 'BelowNormal' } catch {}" % pid],
+		false)
+
+
 func run_cli_async(op: String, args: Array, result_file: String,
 		timeout_msec: int = 1800000) -> Dictionary:
 	# Non-blocking vault op: the CLI writes its result JSON to result_file;
@@ -194,6 +207,7 @@ func run_cli_async(op: String, args: Array, result_file: String,
 		_cli_argv(args + ["--result-file", result_file]), false)
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
+	_soften_worker(pid)
 	pending_async = {"pid": pid, "result_file": result_file, "op": op,
 		"started": Time.get_ticks_msec(), "timeout_msec": timeout_msec}
 	return {"ok": true, "pid": pid}
@@ -333,6 +347,7 @@ func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dict
 	var pid := OS.create_process(python_exe, args, false)
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
+	_soften_worker(pid)
 	active_job = {"pid": pid, "progress_path": progress_path,
 		"result_file": result_file, "brain_id": brain_id,
 		"episodes": episodes, "school": params.has("curriculum")}
@@ -561,6 +576,7 @@ func _launch_score(brain_id: String) -> bool:
 	if pid <= 0:
 		print("[Director] Eval probe failed to spawn for %s." % brain_id)
 		return false
+	_soften_worker(pid)
 	score_job = {"pid": pid, "result_file": result_file,
 		"progress_path": progress_path, "brain_id": brain_id}
 	print("[Director] Eval probe started for %s." % brain_id)
