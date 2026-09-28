@@ -75,6 +75,10 @@ var pending_async: Dictionary = {}
 # shared worker slot frees up. In-memory only (menu restart drops it;
 # a running worker keeps going but is no longer polled).
 var train_queue: Array = []
+# Spawn hold (arena sets from is_round_active): queue pumps refuse to
+# boot workers mid-battle (process-boot spikes frame pacing); queued
+# work drains in the gaps. Never drops anything, only defers.
+var hold_spawns := false
 
 signal vault_changed()
 signal job_progress(episode: int, total: int)
@@ -88,6 +92,10 @@ signal score_queue_changed()
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	# Roster cache self-invalidates on every vault change, so hot
+	# paths can serve it without shelling Python onto the game thread.
+	if not vault_changed.is_connected(invalidate_brains_cache):
+		vault_changed.connect(invalidate_brains_cache)
 	_resolve_python()
 	var env_cli := OS.get_environment("FO_VAULT_CLI")
 	if env_cli != "":
@@ -241,12 +249,37 @@ func _poll_async() -> void:
 		async_done.emit(op2, {"ok": false, "error": "operation timed out"})
 
 
+const BRAINS_CACHE_TTL_MSEC := 60000
+var brains_cache: Array = []
+var brains_cache_msec: int = 0
+
+
+func invalidate_brains_cache() -> void:
+	brains_cache = []
+
+
 func list_brains() -> Array:
 	var res := _run_cli(["list"])
 	if res.get("ok", false):
 		return res.get("brains", [])
 	push_warning("[Director] vault list failed: %s" % res.get("error", "?"))
 	return []
+
+
+func list_brains_cached(ttl_msec: int = BRAINS_CACHE_TTL_MSEC) -> Array:
+	# Hot-path roster (topup tick, gallery, previews): serves the cache
+	# instead of booting a Python interpreter on the game thread (~1-2 s
+	# freeze per call). Self-invalidates on vault_changed; a backend
+	# hiccup serves stale rather than empty.
+	if not brains_cache.is_empty() \
+			and Time.get_ticks_msec() - brains_cache_msec < ttl_msec:
+		return brains_cache
+	var fresh := list_brains()
+	if fresh.is_empty() and not brains_cache.is_empty():
+		return brains_cache
+	brains_cache = fresh
+	brains_cache_msec = Time.get_ticks_msec()
+	return brains_cache
 
 
 func archive_list() -> Array:
@@ -455,6 +488,8 @@ func pump_train_queue() -> bool:
 
 
 func _pump_train_queue() -> bool:
+	if hold_spawns:
+		return false
 	if not active_job.is_empty() or train_queue.is_empty():
 		return false
 	var head: Dictionary = train_queue[0]
@@ -542,6 +577,8 @@ func pump_score_queue() -> bool:
 
 
 func _pump_score_queue() -> bool:
+	if hold_spawns:
+		return false
 	if not score_job.is_empty() or score_queue.is_empty():
 		return false
 	var head: Dictionary = score_queue[0]

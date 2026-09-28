@@ -475,6 +475,38 @@ func test_pip_slot_cycle() -> void:
 	A.free()
 
 
+func test_roster_cache() -> void:
+	# Hot-path roster serves cache without shelling; stale falls back
+	# to cache on backend hiccups; invalidate drops it.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	var sample := [{"id": "x", "name": "X"}]
+	D.set("brains_cache", sample)
+	D.set("brains_cache_msec", Time.get_ticks_msec())
+	_check(D.call("list_brains_cached", 60000) == sample, "fresh cache served")
+	D.set("brains_cache_msec", 0)
+	_check(D.call("list_brains_cached", 60000) == sample, "stale serves cache on backend miss")
+	D.call("invalidate_brains_cache")
+	_check((D.get("brains_cache") as Array).is_empty(), "invalidate clears")
+	_check((D.call("list_brains_cached", 60000) as Array).is_empty(), "empty cache shells to empty")
+	D.free()
+
+
+func test_spawn_hold() -> void:
+	# Queue pumps refuse while held (mid-battle) and keep the head;
+	# released, they attempt launch (no python headless: fails kept).
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.set("hold_spawns", true)
+	D.call("enqueue_training", "b1", "B1", 5, {})
+	_check(not bool(D.call("pump_train_queue")), "held pump refuses")
+	_check((D.get("train_queue") as Array).size() == 1, "held pump keeps head")
+	D.call("enqueue_score", "b1", "B1")
+	_check(not bool(D.call("pump_score_queue")), "held score pump refuses")
+	D.set("hold_spawns", false)
+	_check(not bool(D.call("pump_train_queue")), "failed launch keeps head")
+	_check((D.get("train_queue") as Array).size() == 1, "queue intact after failed launch")
+	D.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -635,6 +667,8 @@ func _initialize() -> void:
 	test_soften_worker_noop()
 	test_pip_slot_defaults()
 	test_pip_slot_cycle()
+	test_roster_cache()
+	test_spawn_hold()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

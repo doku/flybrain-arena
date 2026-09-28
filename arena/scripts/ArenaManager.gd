@@ -827,6 +827,7 @@ func _on_quit_to_menu() -> void:
 	_restore_timescale()
 	var director := _director()
 	if director != null:
+		director.hold_spawns = false
 		director.quit_to_menu()
 
 func _request_current_battle_load() -> void:
@@ -2999,6 +3000,14 @@ func _evo_watcher_tick(delta: float) -> void:
 	# the bottom-left status line. No-ops unless evo is active. New
 	# worker spawns wait for open air between battles (process boot
 	# spikes frame pacing); adoptions run any time.
+	var wdirector := _director()
+	if wdirector != null:
+		# Queue pumps (trains/scores) only boot workers in open air,
+		# in every arena mode; the flag clears itself here every tick
+		# batch, plus on quit. Evo breeds pipeline independently.
+		wdirector.hold_spawns = is_round_active
+		wdirector.pump_train_queue()
+		wdirector.pump_score_queue()
 	if not _evo_active():
 		if is_instance_valid(evo_status_line):
 			evo_status_line.visible = false
@@ -3056,7 +3065,7 @@ func _event_topup_tick() -> void:
 	var worst_eps := int(pick.get("episodes", 0))
 	var deficit := int(pick.get("deficit", 0))
 	var worst_rec := {}
-	for b in director.list_brains():
+	for b in director.list_brains_cached():
 		if str((b as Dictionary).get("id", "")) == worst:
 			worst_rec = b as Dictionary
 			break
@@ -3121,7 +3130,28 @@ var _shot_frames := 0
 var _shot_done := false
 
 
+const HITCH_SECS := 0.15
+func _log_hitch(delta: float) -> void:
+	# Frame-spike census: slow frames log which tracked workers were
+	# alive, so hitch reports point at CPU contention (or exonerate
+	# it toward GPU). Fires rarely by construction.
+	if delta < HITCH_SECS:
+		return
+	var director := _director()
+	var busy := PackedStringArray()
+	if director != null:
+		for slot in ["active_job", "score_job", "pending_async"]:
+			var job = director.get(slot)
+			if job is Dictionary and not (job as Dictionary).is_empty():
+				var pid := int((job as Dictionary).get("pid", 0))
+				var alive := pid > 0 and OS.is_process_running(pid)
+				busy.append("%s:%d(%s)" % [slot, pid, "alive" if alive else "gone"])
+	print("[Arena] Frame hitch %.0f ms (tracked workers: %s)" % [
+		delta * 1000.0, ", ".join(busy) if not busy.is_empty() else "none"])
+
+
 func _process(delta: float) -> void:
+	_log_hitch(delta)
 	_update_combat_fx(delta)
 	# Dev screenshot hook: `--shot=C:/path/out.png` saves one viewport
 	# frame ~1 s after boot. Untouched in normal runs.
@@ -3782,7 +3812,7 @@ func _pool_text(ev: Dictionary) -> String:
 	var names := PackedStringArray()
 	if director != null:
 		var by_id := {}
-		for b in director.list_brains():
+		for b in director.list_brains_cached():
 			by_id[str((b as Dictionary).get("id", ""))] = str((b as Dictionary).get("name", "?"))
 		for pid in (ev.get("pool", []) as Array):
 			names.append(str(by_id.get(str(pid), str(pid))))
@@ -3893,7 +3923,7 @@ func _event_gallery_update(all_fighters: bool = false) -> void:
 		return
 	_event_gallery_key = key
 	var by_id := {}
-	for b in director.list_brains():
+	for b in director.list_brains_cached():
 		by_id[str((b as Dictionary).get("id", ""))] = b
 	nextgen_brains.clear()
 	var cards: Array = []
@@ -4055,7 +4085,7 @@ func _event_preview_sub(upcoming: String) -> String:
 		var adv: Dictionary = director.event_advancers(str(ev.get("id", "")))
 		var qf: Array = adv.get("advancers", []) if bool(adv.get("ok", false)) else []
 		var names := {}
-		for b in director.list_brains():
+		for b in director.list_brains_cached():
 			names[str((b as Dictionary).get("id", ""))] = str((b as Dictionary).get("name", "?"))
 		var i := 0
 		while i + 1 < qf.size():
@@ -4065,7 +4095,7 @@ func _event_preview_sub(upcoming: String) -> String:
 	else:
 		var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(upcoming, {})
 		var by_id := {}
-		for b in director.list_brains():
+		for b in director.list_brains_cached():
 			var bd := b as Dictionary
 			by_id[str(bd.get("id", ""))] = "%s (%d)" % [str(bd.get("name", "?")),
 				int((bd.get("record", {}) as Dictionary).get("elo", 1200.0))]
@@ -5006,7 +5036,7 @@ func _run_evo_generation() -> void:
 	nextgen_champ_name = champ_name
 	nextgen_clone_name = director.kin_name(champ_name, target_gen)
 	nextgen_brains = {}
-	for b in director.list_brains():
+	for b in director.list_brains_cached():
 		var bd := b as Dictionary
 		nextgen_brains[str(bd.get("id", ""))] = bd
 	_show_nextgen_overlay("NEXT GENERATION %d" % target_gen)
@@ -5326,7 +5356,7 @@ func _refresh_nextgen_preview() -> void:
 	var director := _director()
 	if director != null:
 		var fresh := {}
-		for b in director.list_brains():
+		for b in director.list_brains_cached():
 			var bd := b as Dictionary
 			fresh[str(bd.get("id", ""))] = bd
 		if not fresh.is_empty():
