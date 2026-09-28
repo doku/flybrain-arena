@@ -1542,9 +1542,11 @@ func _physics_process(delta: float) -> void:
 			_end_reason = "time"
 			_end_round()
 
+const PIP_TICK_EVERY := 6
 func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
-	# Eye views re-render the whole forest per viewport: throttle to
-	# every 3rd physics tick, or hide outright when disabled.
+	# Eye views re-render the whole forest per viewport (scene + shadow
+	# maps, twice): throttle to every 6th physics tick (~10 Hz, plenty
+	# for eye views), or hide outright when disabled.
 	_pip_tick += 1
 	if not perf_pip:
 		if not _pip_hidden:
@@ -1563,7 +1565,7 @@ func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 				pip_beta_label, pip_alpha_feat, pip_beta_feat]:
 			if is_instance_valid(n):
 				(n as Control).visible = true
-	if _pip_tick % 3 == 0:
+	if _pip_tick % PIP_TICK_EVERY == 0:
 		for v in [pip_alpha_view, pip_beta_view]:
 			if is_instance_valid(v):
 				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
