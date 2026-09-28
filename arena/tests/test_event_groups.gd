@@ -151,17 +151,84 @@ func test_event_chain() -> void:
 		live[str(b["id"])] = float(b["record"]["elo"])
 	live["f16"] = 900.0
 	live["f15"] = 950.0
-	var cands: Dictionary = D.call("event_eliminate_candidates", eid, 3, live)
+	var cands: Dictionary = D.call("event_eliminate_candidates", eid, 3, 0.0, live)
 	_check(bool(cands.get("ok", false)), "candidates resolve")
 	var order: Array = cands.get("candidates", [])
 	_check(order[0] == "f16" and order[1] == "f15", "lowest ELO eliminated first")
-	# Pool bench: cap trims lowest, draw takes highest.
-	D.call("event_pool_add", eid, ["f16", "f15", "f01", "f02", "f03"], live)
+	# Pool bench: cap trims lowest, qualified draw favors the green.
+	var cards := {}
+	for b in brains:
+		cards[str(b["id"])] = {"elo": float(b["record"]["elo"]), "train": 80, "matches": 20}
+	cards["f16"] = {"elo": 900.0, "train": 80, "matches": 30}
+	cards["f15"] = {"elo": 950.0, "train": 80, "matches": 30}
+	cards["f03"] = {"elo": 1980.0, "train": 10, "matches": 1}
+	D.call("event_pool_add", eid, ["f16", "f15", "f01", "f02", "f03"], cards)
 	var ev: Dictionary = D.call("event_load", eid)
 	_check((ev.get("pool", []) as Array).size() == 4, "pool capped at 4")
 	_check(not ("f16" in (ev.get("pool", []) as Array)), "cap trims lowest ELO")
-	var draw: Dictionary = D.call("event_draw_pool", eid, 2, live)
-	_check((draw.get("drawn", []) as Array) == ["f01", "f02"], "draw takes top ELO")
+	seed(7)
+	var draw: Dictionary = D.call("event_draw_pool", eid, 2, 50, 0.0, cards)
+	var drawn: Array = draw.get("drawn", [])
+	_check(drawn.size() == 2, "draw deals two")
+	_check(not ("f03" in drawn), "undertrained bench never draws")
+	for pid in drawn:
+		_check(pid in ["f01", "f02", "f15"], "drawn are qualified")
+
+
+func test_cutoff_and_weighted_draw() -> void:
+	# Demotion cutoff filters the axe; empty shortlists fall back to
+	# matches-only order. Draws favor low-match qualifiers over time.
+	var brains := _brains(16, 2000)
+	var ids: Array = []
+	for b in brains:
+		ids.append(str(b["id"]))
+	var beg: Dictionary = D.call("event_begin", ids,
+		{"best_of": 1, "lr_scale": 0.5, "round_time": 40.0}, 11, brains)
+	var eid := str(beg.get("event_id", ""))
+	var groups: Dictionary = beg.get("groups", {})
+	var gp: Array = []
+	for pid in (((groups.get("A", {}) as Dictionary).get("players", [])) as Array):
+		for b in brains:
+			if str((b as Dictionary).get("id", "")) == str(pid):
+				gp.append(b)
+	D.call("build_group_bracket", gp, "A", eid, 1, 0.5, 40.0)
+	for _i in range(6):
+		D.call("on_battle_result", "alpha", {}, {}, {}, 1, 0)
+		D.call("advance_after_match")
+	D.call("event_record_group", eid, "A")
+	# Group A players: rig cards (only they have ring time).
+	var cards := {}
+	var rigged := [850.0, 950.0, 1250.0, 1500.0]
+	var k := 0
+	for pid in (((groups.get("A", {}) as Dictionary).get("players", [])) as Array):
+		cards[str(pid)] = {"elo": rigged[k], "train": 80, "matches": 10}
+		k += 1
+	# Cutoff 1000: exactly the two sub-1000 brains qualify, worst first.
+	var cands: Dictionary = D.call("event_eliminate_candidates", eid, 3, 1000.0, cards)
+	_check(bool(cands.get("ok", false)), "cutoff shortlist resolves")
+	var order: Array = cands.get("candidates", [])
+	_check(order.size() == 2, "cutoff yields exactly two")
+	# Cutoff nobody meets: falls back to matches-only ELO order.
+	var fb: Dictionary = D.call("event_eliminate_candidates", eid, 3, 100.0, cards)
+	var forder: Array = fb.get("candidates", [])
+	_check(forder.size() == 4, "fallback covers all experienced")
+	# Weighted draw: the 2-match rookie laps the 30-match veterans.
+	var pool_cards := {
+		"vet_a": {"elo": 1500.0, "train": 80, "matches": 30},
+		"vet_b": {"elo": 1400.0, "train": 80, "matches": 30},
+		"rook": {"elo": 1250.0, "train": 60, "matches": 2}}
+	D.call("event_pool_add", eid, ["vet_a", "vet_b", "rook"], pool_cards)
+	seed(11)
+	var tallies := {"vet_a": 0, "vet_b": 0, "rook": 0}
+	for _i in range(30):
+		D.call("event_pool_add", eid, ["vet_a", "vet_b", "rook"], pool_cards)
+		var one: Dictionary = D.call("event_draw_pool", eid, 1, 50, 0.0, pool_cards)
+		tallies[str((one.get("drawn", []) as Array)[0])] += 1
+	_check(int(tallies["rook"]) > int(tallies["vet_a"]), "rookie outdraws veterans")
+	_check(int(tallies["rook"]) > int(tallies["vet_b"]), "rookie outdraws veterans II")
+	# Training floor + ELO floor gate the bench.
+	var q: Dictionary = D.call("event_pool_qualified", eid, 50, 1450.0, pool_cards)
+	_check((q.get("qualified", []) as Array) == ["vet_a"], "floors gate qualification")
 
 
 func _panels(bracket) -> Array:
@@ -412,6 +479,7 @@ func _initialize() -> void:
 	test_event_chain()
 	test_overview_render()
 	test_prebuilt_overview()
+	test_cutoff_and_weighted_draw()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

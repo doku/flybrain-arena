@@ -61,6 +61,8 @@ var tourney_bestof: OptionButton
 var tourney_random: CheckButton
 var tourney_consolation: CheckButton
 var evo_mutate_traits: CheckButton
+var evo_min_matches: SpinBox
+var evo_elo_cutoff: SpinBox
 var tourney_lr: SpinBox
 var tourney_round_time: SpinBox
 var player_list: ItemList
@@ -758,6 +760,10 @@ func _build_tourney_column() -> VBoxContainer:
 	evo_mutate_traits.tooltip_text = "ON = each generation's winner-clone re-rolls one random trait (learning rate, dist gain, evasion, yaw bias) alongside genome structural mutation. OFF = exact hyperparameter copy."
 	evo_mutate_traits.button_pressed = true
 	c.add_child(evo_mutate_traits)
+	evo_min_matches = _spin("Evo demote: min matches", c, 1.0, 12.0, 1.0, 3.0,
+		"Ring experience required before a brain can be demoted to archives: only fighters with at least this many event matches are evaluated at generation end.")
+	evo_elo_cutoff = _spin("Evo demote: ELO below", c, 0.0, 2000.0, 25.0, 0.0,
+		"Demotion line: among experienced fighters, only those rated below this ELO are archived (0 = off, lowest-ELO pair goes regardless).")
 	bracket_status = Label.new()
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1468,7 +1474,9 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 		"round_time": tourney_round_time.value, "random_draw": false,
 		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
 			and evo_mutate_traits.button_pressed else 0,
-		"episodes": 50, "min_matches": 3}
+		"episodes": 50,
+		"min_matches": int(evo_min_matches.value) if is_instance_valid(evo_min_matches) else 3,
+		"elo_cutoff": float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 0.0}
 	var beg: Dictionary = TournamentDirector.event_begin(ids, settings, 1)
 	if not bool(beg.get("ok", false)):
 		bracket_status.text = "Cannot start: %s" % str(beg.get("error", "?"))

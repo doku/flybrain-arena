@@ -1680,10 +1680,13 @@ func event_advancers(event_id: String) -> Dictionary:
 	return {"ok": true, "advancers": qf}
 
 
-func event_eliminate_candidates(event_id: String, min_matches: int = 3, live_override: Dictionary = {}) -> Dictionary:
+func event_eliminate_candidates(event_id: String, min_matches: int = 3, elo_cutoff: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
 	# Worst-first elimination order: played >= min_matches across the
-	# event files, lowest live ELO first. Pure (no archiving) so the
-	# rule is unit-testable; event_eliminate archives the bottom two.
+	# event files, lowest live ELO first. elo_cutoff > 0 restricts the
+	# axe to brains rated below it (menu demotion line); fewer than 2
+	# qualifiers falls back to matches-only order so the loop never
+	# stalls on an empty shortlist. Pure (no archiving) so the rule is
+	# unit-testable; event_eliminate archives the bottom two.
 	var ev := event_load(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
@@ -1713,22 +1716,25 @@ func event_eliminate_candidates(event_id: String, min_matches: int = 3, live_ove
 					var sid := str(m.get(slot + "_id", ""))
 					if sid != "":
 						played[sid] = int(played.get(sid, 0)) + 1
-	var live := live_override
-	if live.is_empty():
-		for b in list_brains():
-			var bd := b as Dictionary
-			live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
-	var cands: Array = []
+	var cards := _event_live_cards(live_override)
+	var experienced: Array = []
 	for pid in played.keys():
-		if int(played[pid]) >= min_matches and live.has(pid):
-			cands.append(pid)
-	cands.sort_custom(func(x, y): return float(live[x]) < float(live[y]))
-	return {"ok": true, "candidates": cands}
+		if int(played[pid]) >= min_matches and cards.has(pid):
+			experienced.append(pid)
+	experienced.sort_custom(func(x, y): return float((cards[x] as Dictionary).get("elo", 0.0)) < float((cards[y] as Dictionary).get("elo", 0.0)))
+	if elo_cutoff > 0.0:
+		var cut: Array = []
+		for pid in experienced:
+			if float((cards[pid] as Dictionary).get("elo", 0.0)) < elo_cutoff:
+				cut.append(pid)
+		if cut.size() >= 2:
+			return {"ok": true, "candidates": cut}
+	return {"ok": true, "candidates": experienced}
 
 
-func event_eliminate(event_id: String, min_matches: int = 3) -> Dictionary:
+func event_eliminate(event_id: String, min_matches: int = 3, elo_cutoff: float = 0.0) -> Dictionary:
 	# Archives the bottom two candidates with the reason stamped.
-	var cands := event_eliminate_candidates(event_id, min_matches)
+	var cands := event_eliminate_candidates(event_id, min_matches, elo_cutoff)
 	if not bool(cands.get("ok", false)):
 		return cands
 	var order: Array = cands.get("candidates", [])
@@ -1747,12 +1753,39 @@ func event_eliminate(event_id: String, min_matches: int = 3) -> Dictionary:
 
 
 func _event_live_elo(live_override: Dictionary = {}) -> Dictionary:
-	var live := live_override
-	if live.is_empty():
-		for b in list_brains():
-			var bd := b as Dictionary
-			live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
-	return live
+	# Plain {id: elo} view (override values may be floats or full
+	# cards - normalized here so trim/sort math never sees a dict).
+	var cards := _event_live_cards(live_override)
+	var out := {}
+	for pid in cards.keys():
+		out[pid] = float((cards[pid] as Dictionary).get("elo", 0.0))
+	return out
+
+
+func _event_live_card(bd: Dictionary) -> Dictionary:
+	# Full live card for pool/elimination math: rating, schooling and
+	# ring experience in one place.
+	var r: Dictionary = bd.get("record", {})
+	var t: Dictionary = bd.get("training", {})
+	return {"elo": float(r.get("elo", 1200.0)),
+		"train": int(t.get("episodes", 0)),
+		"matches": int(r.get("matches", 0))}
+
+
+func _event_live_cards(live_override: Dictionary = {}) -> Dictionary:
+	var cards := {}
+	if not live_override.is_empty():
+		for pid in live_override.keys():
+			var v = live_override[pid]
+			if v is Dictionary:
+				cards[str(pid)] = v
+			else:
+				cards[str(pid)] = {"elo": float(v), "train": 0, "matches": 0}
+		return cards
+	for b in list_brains():
+		var bd := b as Dictionary
+		cards[str(bd.get("id", ""))] = _event_live_card(bd)
+	return cards
 
 
 func event_pool_add(event_id: String, ids: Array, live_override: Dictionary = {}) -> Dictionary:
@@ -1775,19 +1808,60 @@ func event_pool_add(event_id: String, ids: Array, live_override: Dictionary = {}
 	return {"ok": true, "pool": pool}
 
 
-func event_draw_pool(event_id: String, n: int, live_override: Dictionary = {}) -> Dictionary:
-	# Top-n live ELO from the bench; drawn ids leave the pool.
+func event_pool_qualified(event_id: String, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
+	# Bench brains ready for the ring: schooled to min_train episodes
+	# with live ELO at/above the floor (floor <= 0 disables). Pure
+	# readout for handoff/maintain checks; the draw consumes.
 	var ev := event_load(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
+	var cards := _event_live_cards(live_override)
+	var qualified: Array = []
+	for pid in (ev.get("pool", []) as Array):
+		var s := str(pid)
+		if not cards.has(s):
+			continue
+		var card: Dictionary = cards[s]
+		if int(card.get("train", 0)) >= min_train \
+				and float(card.get("elo", 0.0)) >= elo_floor:
+			qualified.append(s)
+	return {"ok": true, "qualified": qualified}
+
+
+func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
+	# Random draw weighted toward the least-experienced qualifiers
+	# (weight 1/(1+matches)): every schooled bench brain cycles into
+	# the ring over time instead of the top-ELO pair hogging every
+	# event. Drawn ids leave the pool.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var q := event_pool_qualified(event_id, min_train, elo_floor, live_override)
+	if not bool(q.get("ok", false)):
+		return q
+	var qualified: Array = q.get("qualified", [])
+	if qualified.size() < n:
+		return {"ok": false, "error": "pool short (%d/%d qualified)" % [qualified.size(), n]}
+	var cards := _event_live_cards(live_override)
+	var drawn: Array = []
+	var bag: Array = qualified.duplicate()
+	for _i in range(n):
+		var total := 0.0
+		for pid in bag:
+			total += 1.0 / (1.0 + float((cards[pid] as Dictionary).get("matches", 0)))
+		var roll := randf() * total
+		var pick := str(bag[bag.size() - 1])
+		for pid in bag:
+			roll -= 1.0 / (1.0 + float((cards[pid] as Dictionary).get("matches", 0)))
+			if roll <= 0.0:
+				pick = str(pid)
+				break
+		drawn.append(pick)
+		bag.erase(pick)
 	var pool: Array = ev.get("pool", [])
-	var live := _event_live_elo(live_override)
-	pool = pool.filter(func(pid): return live.has(str(pid)))
-	pool.sort_custom(func(x, y): return float(live[x]) > float(live[y]))
-	if pool.size() < n:
-		return {"ok": false, "error": "pool short (%d/%d)" % [pool.size(), n]}
-	var drawn: Array = pool.slice(0, n)
-	ev["pool"] = pool.slice(n)
+	for pid in drawn:
+		pool.erase(str(pid))
+	ev["pool"] = pool
 	if not event_save(ev):
 		return {"ok": false, "error": "cannot save event"}
 	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}

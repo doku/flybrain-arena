@@ -3490,20 +3490,27 @@ func _pool_text(ev: Dictionary) -> String:
 	return "POOL: " + (", ".join(names) if names.size() > 0 else "empty")
 
 
+const POOL_MIN_TRAIN := 50
+
 func _event_maintain_pool() -> void:
 	# Breed-ahead: keep wilds training toward the bench while the
 	# event plays (clones need the champion, so they queue post-final).
+	# Qualified bench + pipeline below target queues another wild.
 	if not _event_active():
 		return
 	var director := _director()
 	if director == null:
 		return
-	var ev: Dictionary = director.event_load(_event_id())
+	var eid := _event_id()
+	var ev: Dictionary = director.event_load(eid)
 	if ev.is_empty():
 		return
 	var evo: Dictionary = director.tourney.get("evo", {})
 	var gen := int(evo.get("generation", 1))
-	var busy := (ev.get("pool", []) as Array).size()
+	var st: Dictionary = ev.get("settings", {})
+	var q: Dictionary = director.event_pool_qualified(eid, POOL_MIN_TRAIN,
+		float(st.get("elo_cutoff", 0.0)))
+	var busy := (q.get("qualified", []) as Array).size()
 	for spec in _evo_pending():
 		var sk := str((spec as Dictionary).get("kind", ""))
 		if sk == "wild" or sk == "clone":
@@ -3749,40 +3756,56 @@ func _event_group_done(res: Dictionary) -> void:
 	_request_current_battle_load()
 
 
-func _event_await_pool() -> bool:
-	# Block the handoff until the bench holds two (adoptions land via
-	# the watcher; missing kinds are awaited through the shared slot).
+func _event_pool_ready_count() -> int:
+	# Qualified bench brains (schooled + above the demotion line).
+	var director := _director()
+	if director == null:
+		return 0
+	var ev: Dictionary = director.event_load(_event_id())
+	if ev.is_empty():
+		return 0
+	var st: Dictionary = ev.get("settings", {})
+	var q: Dictionary = director.event_pool_qualified(_event_id(),
+		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
+
+
+func _event_pool_wait() -> bool:
+	# Rare fallback: bench short at handoff. Waits on the FINAL review
+	# screen (bracket visible, queue status live) while the background
+	# queue works - never a bare progress bar. STOP aborts.
 	var director := _director()
 	if director == null:
 		return false
-	_event_drain_done_to_pool()
-	_show_evo_phase("STOCKING POOL", "Waiting on pool breeds...")
-	for kind in ["wild", "clone"]:
-		if not _evo_active():
-			_hide_evo_phase()
-			return false
+	_show_arena_bracket("FINAL REVIEW - STOCKING BENCH (%d/%d qualified)" % [
+		_event_pool_ready_count(), EVENT_POOL_TARGET])
+	var waited := 0.0
+	while _evo_active() and waited < EVO_AWAIT_TIMEOUT:
+		await get_tree().create_timer(5.0).timeout
+		waited += 5.0
+		_evo_adopt_finished()
 		_event_drain_done_to_pool()
-		var ev: Dictionary = director.event_load(_event_id())
-		if (ev.get("pool", []) as Array).size() >= EVENT_POOL_TARGET:
-			break
-		if _evo_has_kind(kind):
-			var got := await _evo_await_queued(kind)
-			_event_drain_done_to_pool()
-			if got == "" and _evo_active():
-				_hide_evo_phase()
-				_evo_abort(kind + " breeding failed - " + _evo_spawn_why())
-				return false
-	_hide_evo_phase()
-	var ev2: Dictionary = director.event_load(_event_id())
-	if (ev2.get("pool", []) as Array).size() < EVENT_POOL_TARGET:
-		_evo_abort("pool short - refusing a short-bench event")
+		_event_maintain_pool()
+		var ready := _event_pool_ready_count()
+		if is_instance_valid(status_label):
+			status_label.text = "Bench %d/%d qualified - queue breeding..." % [ready, EVENT_POOL_TARGET]
+		if ready >= EVENT_POOL_TARGET:
+			_hide_arena_bracket()
+			return true
+	_hide_arena_bracket()
+	if not _evo_active():
 		return false
-	return true
+	_evo_abort("pool short - refusing a short-bench event")
+	return false
 
 
 func _run_event_handoff() -> void:
 	# Final's tournament_end: the title request already went out above.
-	# Bank the record, eliminate two, stock the bench, chain next event.
+	# Bank the record, eliminate two, queue the next bench generation,
+	# and chain the next event WITHOUT blocking on training: breeds
+	# ride the background queue (their specs carry into the new event
+	# file, so no verdict ever orphans). Only a short bench parks on
+	# the review screen until the queue delivers.
 	var director := _director()
 	if director == null:
 		return
@@ -3792,7 +3815,11 @@ func _run_event_handoff() -> void:
 	_show_callout("EVENT %s CHAMPION: %s" % [eid, director.champion_name()],
 		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false)
 	_event_drain_done_to_pool()
-	var elim: Dictionary = director.event_eliminate(eid, EVENT_MIN_MATCHES)
+	var ev0: Dictionary = director.event_load(eid)
+	var st0: Dictionary = ev0.get("settings", {})
+	var elim: Dictionary = director.event_eliminate(eid,
+		int(st0.get("min_matches", EVENT_MIN_MATCHES)),
+		float(st0.get("elo_cutoff", 0.0)))
 	if not bool(elim.get("ok", false)):
 		_evo_abort("elimination failed: " + str(elim.get("error", "?")))
 		return
@@ -3806,8 +3833,10 @@ func _run_event_handoff() -> void:
 			_evo_clone_parent2(gen + 1, champ_id))
 	if not _evo_has_kind("wild"):
 		_evo_queue_wild(gen + 1)
-	if not await _event_await_pool():
-		return
+	_event_drain_done_to_pool()
+	if _event_pool_ready_count() < EVENT_POOL_TARGET:
+		if not await _event_pool_wait():
+			return
 	_event_start_next(ev, gone)
 
 
@@ -3827,7 +3856,8 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	if survivors.size() != 14:
 		_evo_abort("event survivors %d != 14" % survivors.size())
 		return
-	var draw: Dictionary = director.event_draw_pool(eid, EVENT_POOL_TARGET)
+	var draw: Dictionary = director.event_draw_pool(eid, EVENT_POOL_TARGET,
+		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
 	if not bool(draw.get("ok", false)):
 		_evo_abort("pool draw failed: " + str(draw.get("error", "?")))
 		return
@@ -3837,8 +3867,13 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 		_evo_abort("next event failed: " + str(beg.get("error", "?")))
 		return
 	var new_eid := str(beg.get("event_id", ""))
-	# Bench remainder rides into the new event; the queue starts clean
-	# (everything was awaited above, so no orphan verdicts follow).
+	# Bench remainder rides into the new event; in-flight breed specs
+	# ride along too (absolute result paths), so no verdict ever
+	# orphans across the boundary. Banked done entries stay behind:
+	# they already drained into the old pool.
+	var carried: Array = []
+	for spec in _evo_pending():
+		carried.append((spec as Dictionary).duplicate(true))
 	director.event_pool_add(new_eid,
 		(director.event_load(eid).get("pool", []) as Array))
 	var ev_new: Dictionary = director.event_load(new_eid)
@@ -3847,7 +3882,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	director.tourney["evo"] = {"active": true, "generation": gen,
 		"episodes": EVO_EPISODES,
 		"mutate_traits": int(st.get("mutate_traits", 1)),
-		"pending": [], "done": {}}
+		"pending": carried, "done": {}}
 	director.save_state()
 	if not await _event_intermission("EVENT %s · GROUP A (GEN %d)" % [new_eid, gen],
 			_event_preview_sub("A")):
