@@ -1550,7 +1550,7 @@ func _physics_process(delta: float) -> void:
 			_end_round()
 
 const PIP_TICK_EVERY := 6
-func _make_pip_stats(parent: CanvasItem, left_side: bool) -> Label:
+func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	# Fly-stat card overlaying a PiP slot (same rect as the viewport).
 	var l := Label.new()
 	if left_side:
