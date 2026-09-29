@@ -3566,11 +3566,17 @@ func _end_round() -> void:
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
 	# Server already banked dopamine + records + weights to the vault.
+	# The roster cache can't see server-side writes, so it invalidates
+	# here (clear only — the next gap tick/load refreshes; mid-battle
+	# callers serve stale by design, never shell).
 	# Late replies after a fail-loud battle timeout are dropped here so a
 	# battle is never applied twice.
 	if not _tourney_awaiting_battle:
 		print("[Arena] Ignoring late/duplicate tournament_battle (id=", _battle_id, ")")
 		return
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
 	if _battle_id != "" and _seq_battle_id != "" and _battle_id != _seq_battle_id:
 		print("[Arena] Ignoring tournament_battle id mismatch: got ", _battle_id,
 			" want ", _seq_battle_id)
@@ -3872,7 +3878,13 @@ func _event_maintain_pool() -> void:
 	# Breed-ahead: keep wilds training toward the bench while the
 	# event plays (clones need the champion, so they queue post-final).
 	# Qualified bench + pipeline below target queues another wild.
+	# Round-guarded (mirrors _event_topup_tick): the qualified-count
+	# shells the roster when the cache is cold, and that refresh must
+	# never fire mid-fight. Per-battle invalidation (see
+	# _on_tournament_battle) keeps the next gap tick fresh instead.
 	if not _event_active():
+		return
+	if is_round_active:
 		return
 	var director := _director()
 	if director == null:

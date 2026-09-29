@@ -575,6 +575,19 @@ func test_event_manifest_cache() -> void:
 		DirAccess.remove_absolute("user://test_event_groups")
 
 
+func test_battle_invalidate_primitive() -> void:
+	# The arena invalidates the roster on every battle bank (server
+	# writes are invisible to the cache): invalidate must clear so the
+	# next gap tick/load refreshes instead of serving stale ELO.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.set("brains_cache", [{"id": "x"}])
+	D.set("brains_cache_msec", Time.get_ticks_msec())
+	D.call("invalidate_brains_cache")
+	_check((D.get("brains_cache") as Array).is_empty(),
+		"battle invalidate clears roster cache")
+	D.free()
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -740,6 +753,7 @@ func _initialize() -> void:
 	test_worker_affinity_mask()
 	test_live_cards_use_cache()
 	test_event_manifest_cache()
+	test_battle_invalidate_primitive()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
