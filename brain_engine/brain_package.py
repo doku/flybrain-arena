@@ -118,12 +118,24 @@ def save_brain(record, weights, backup=True, fast=False):
             zf.writestr(META_ENTRY, json.dumps(record, indent=2))
         if os.path.exists(path) and backup:
             shutil.copyfile(path, path + ".bak")
+        # Unlink the sidecar BEFORE the replace (and keep the after-
+        # unlink below): on coarse-mtime filesystems a same-bucket full
+        # save + crash-before-unlink would leave a stale sidecar with an
+        # equal mtime that the >= guard honors over newer zip metadata.
+        # Pre-unlink closes that window — a crash then leaves either no
+        # sidecar (zip authoritative either way) or the new zip clean.
+        try:
+            sidecar = path + SIDECAR_SUFFIX
+            if os.path.exists(sidecar):
+                os.remove(sidecar)
+        except OSError:
+            pass
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    # A full rewrite supersedes any record sidecar (stale sidecars must
-    # never shadow newer embedded metadata — see _read_sidecar_record).
+    # Belt-and-braces: a sidecar reappearing between replace and here
+    # (concurrent record-only writer) must not shadow the fresh zip.
     try:
         sidecar = path + SIDECAR_SUFFIX
         if os.path.exists(sidecar):

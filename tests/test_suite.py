@@ -5829,6 +5829,24 @@ class TestBattleTransaction(unittest.TestCase):
         with self.assertRaises(ValueError):
             vault_pkg.save_brain_record_only(ghost)
 
+    def test_save_brain_clears_sidecar(self):
+        # A full save supersedes any record sidecar: after save_brain
+        # the sidecar is gone and the zip's record wins — so a stale
+        # sidecar can never shadow newer embedded metadata, whatever
+        # the mtime granularity.
+        rec = vault_pkg.new_record("Bucket", {})
+        w = np.arange(16, dtype=np.float32)
+        vault_pkg.save_brain(rec, w)
+        rec["record"]["wins"] = 3
+        vault_pkg.save_brain_record_only(rec)
+        path = vault_pkg.package_path(rec)
+        self.assertTrue(os.path.exists(path + ".record.json"))
+        rec["record"]["wins"] = 7
+        vault_pkg.save_brain(rec, w)
+        self.assertFalse(os.path.exists(path + ".record.json"))
+        rec2, _w2 = vault_pkg.load_brain(rec["id"])
+        self.assertEqual(rec2["record"]["wins"], 7)
+
     def test_unkeyed_journal_preserves_previous_verdict(self):
         import copy
         seed_key = {"tournament_id": "T", "match": "M",
