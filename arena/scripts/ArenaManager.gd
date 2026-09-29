@@ -733,33 +733,20 @@ func _build_bracket_overlay() -> void:
 	gallery_box.add_theme_constant_override("separation", 2)
 	gallery_box.visible = false
 	brow.add_child(gallery_box)
-	# Light stat card (one shared StyleBox on all three labels reads
-	# as a single card): warm paper bg, dark ink body, showcased name
-	# in the shared cyan accent (same color as the bracket rows).
-	var card_sb := StyleBoxFlat.new()
-	card_sb.bg_color = Color(0.95, 0.93, 0.85, 0.97)
-	card_sb.set_corner_radius_all(6)
-	card_sb.content_margin_left = 8.0
-	card_sb.content_margin_right = 8.0
-	card_sb.content_margin_top = 4.0
-	card_sb.content_margin_bottom = 4.0
+	# Showcased name in the shared cyan accent (same color as the
+	# bracket rows); the card keeps its original dark look.
 	gallery_title = Label.new()
 	gallery_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	gallery_title.add_theme_font_size_override("font_size", 20)
-	gallery_title.add_theme_stylebox_override("normal", card_sb)
 	gallery_title.add_theme_color_override("font_color",
 		BracketView.COL_SHOWCASE)
 	gallery_box.add_child(gallery_title)
 	gallery_elo = Label.new()
 	gallery_elo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	gallery_elo.add_theme_font_size_override("font_size", 28)
-	gallery_elo.add_theme_stylebox_override("normal", card_sb)
-	gallery_elo.add_theme_color_override("font_color", Color(0.12, 0.12, 0.14))
 	gallery_box.add_child(gallery_elo)
 	gallery_rows = Label.new()
 	gallery_rows.add_theme_font_size_override("font_size", 14)
-	gallery_rows.add_theme_stylebox_override("normal", card_sb)
-	gallery_rows.add_theme_color_override("font_color", Color(0.12, 0.12, 0.14))
 	gallery_rows.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	gallery_box.add_child(gallery_rows)
 	var scroll := ScrollContainer.new()
