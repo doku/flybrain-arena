@@ -79,6 +79,7 @@ def new_record(name, params=None):
         "created_utc": _utcnow(),
         "generator_params": merged,
         "record": {"battles": 0, "wins": 0, "losses": 0, "draws": 0,
+                 "ko": 0,
                  "matches": 0, "matches_won": 0, "matches_lost": 0,
                  "tournaments_won": 0, "elo": ELO_DEFAULT},
         "training": {"episodes": 0, "sessions": [], "score": 0.0,

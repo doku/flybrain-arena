@@ -6227,6 +6227,57 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertAlmostEqual(la["record"]["elo"], 1205.0)
         self.assertAlmostEqual(lb["record"]["elo"], 1195.0)
 
+    def test_battle_ko_banks_career(self):
+        # Career KO wins: a ko verdict banks winner ko+1 (loser
+        # untouched); time-decided wins bank none; retries and old
+        # key-less records stay exact.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BKO", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "ko"},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BKO", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["ko"], 1)
+        self.assertEqual(lb["record"]["ko"], 0)
+        # Time decision banks no KO (same pair, new battle id).
+        key2 = {"tournament_id": "T", "match": "M",
+                "battle_id": "BKO2", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "time"},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BKO2", battle_key=key2)
+        la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual(la2["record"]["ko"], 1)
+        # Old record without the key starts at 0 via .get discipline.
+        _ra3, _rb3, _wa3, _wb3, sta3, stb3 = self._two_fighters()
+        del sta3["rec"]["record"]["ko"]
+        key3 = {"tournament_id": "T", "match": "M",
+                "battle_id": "BKO3", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "ko"},
+            "alpha", 5.0, 4.0, sta3, stb3,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BKO3", battle_key=key3)
+        la3, _w3 = vault_pkg.load_brain(sta3["rec"]["id"])
+        self.assertEqual(la3["record"]["ko"], 1)
+
     def test_battle_draw_penalty(self):
         _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
 

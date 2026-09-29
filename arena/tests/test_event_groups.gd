@@ -477,13 +477,16 @@ func test_soften_worker_noop() -> void:
 
 
 func test_pip_slot_defaults() -> void:
-	# Stats view is the default slot; the stat card renders record,
-	# traits and live numbers (zeros headless, never a crash).
+	# Stats view is the default slot; the stat card renders full-word
+	# record, traits, pedigree and live numbers (zeros headless, never
+	# a crash).
 	var A = load("res://scripts/ArenaManager.gd").new()
 	_check(str(A.get("pip_slot_mode")) == "STATS", "stats on by default")
 	var txt: String = A.call("_pip_stats_text", "alpha")
-	_check(txt.contains("BTL") and txt.contains("EVA"), "card has record + traits")
-	_check(txt.contains("KO"), "card has fight numbers")
+	_check(txt.contains("Battles:") and txt.contains("Evasion:"),
+		"card has record + traits")
+	_check(txt.contains("Knockouts:") and txt.contains("Pedigree:"),
+		"card has fight numbers + pedigree")
 	A.free()
 
 
@@ -974,6 +977,82 @@ func test_showcase_overview() -> void:
 	BB.free()
 
 
+func _fighter_rows_a(A) -> PackedStringArray:
+	var rec := {"elo": 1350.0, "battles": 12, "wins": 7, "losses": 4,
+		"draws": 1, "ko": 3, "matches": 4, "matches_won": 3,
+		"tournaments_won": 1}
+	var gp := {"evasion": 0.2, "learning_rate": 0.008,
+		"experiment": "retina_wide"}
+	var lin := {"parent_ids": ["p1"], "source": "clone:x",
+		"kin": 3, "jr": 0}
+	var tr := {"episodes": 150}
+	return A._format_fighter_rows(rec, gp, lin, tr, {"p1": "Kestrel"},
+		{"spd": 4.2, "thr": 0.4, "hp": 82.0}, {"kills": 1}, 0)
+
+
+func test_fighter_rows() -> void:
+	# PiP stat rows: full words (no shorthand), identical order both
+	# flies, pedigree/DNF/KO lines present.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	var rows: PackedStringArray = _fighter_rows_a(A)
+	var text := "\n".join(rows)
+	for want in ["ELO 1350", "Battles: 12 (Wins 7, Losses 4)",
+			"Did not finish: 1", "Knockouts: 3 (1 this match)",
+			"Matches: 4 (Won 3), Titles: 1", "Schooling: 150 episodes",
+			"Pedigree: clone of Kestrel (kin 3)",
+			"Evasion: 0.20, Learning rate: 0.0080, Wiring: retina_wide",
+			"Speed: 4.2, Thrust: 0.40, Health: 82"]:
+		_check(text.contains(want), "row present: " + want)
+	for gone in ["BTL", "MTCH", "EVA ", "THR ", "SPD ", " HP ", "MN ",
+			"VS ", "LPLC2", "DN "]:
+		_check(not text.contains(gone), "no shorthand: " + gone.strip_edges())
+	# Both sides share shape: same row count, same label order.
+	var rows_b: PackedStringArray = A._format_fighter_rows(
+		{"elo": 1200.0, "battles": 1, "wins": 0, "losses": 1,
+			"draws": 0, "ko": 0, "matches": 1, "matches_won": 0,
+			"tournaments_won": 0},
+		{"evasion": 0.1, "learning_rate": 0.005}, {"source": "evo-random"},
+		{"episodes": 60}, {}, {"spd": 1.0, "thr": 0.2, "hp": 100.0},
+		{"kills": 0}, 0)
+	_check(rows.size() == rows_b.size(), "both flies same row count")
+	var heads := []
+	var heads_b := []
+	for r in rows:
+		heads.append(str(r).split(":")[0].split(" ")[0])
+	for r in rows_b:
+		heads_b.append(str(r).split(":")[0].split(" ")[0])
+	_check(heads == heads_b, "both flies same row order")
+	var text_b := "\n".join(rows_b)
+	_check(text_b.contains("Pedigree: wild"), "wild pedigree reads clean")
+	A.free()
+
+
+func test_fighter_rows_pedigrees() -> void:
+	# Pedigree line across sources: junior, crossover, reference,
+	# generated, and unknown.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	var cases := [
+		[{"source": "clone:x", "parent_ids": ["p1"], "kin": 0, "jr": 2},
+			{"p1": "Base"}, "junior of Base (junior 2)"],
+		[{"source": "crossover:axb", "parent_ids": ["a", "b"], "jr": 1},
+			{"a": "Al", "b": "Be"}, "crossover Al x Be (junior 1)"],
+		[{"source": "reference", "parent_ids": []},
+			{}, "reference stock"],
+		[{"source": "generated", "parent_ids": []},
+			{}, "generated"],
+		[{}, {}, "generated"]]
+	for c in cases:
+		var rows: PackedStringArray = A._format_fighter_rows(
+			{"elo": 1200.0}, {}, c[0], {"episodes": 0}, c[1],
+			{"spd": 0.0, "thr": 0.0, "hp": 100.0}, {"kills": 0}, 0)
+		var found := false
+		for r in rows:
+			if str(r) == "Pedigree: " + str(c[2]):
+				found = true
+		_check(found, "pedigree reads: " + str(c[2]))
+	A.free()
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -1030,6 +1109,8 @@ func _initialize() -> void:
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()
 	test_showcase_overview()
+	test_fighter_rows()
+	test_fighter_rows_pedigrees()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

@@ -332,6 +332,8 @@ const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS"]
 var pip_slot_mode := "STATS"
 var pip_stats_alpha: Label
 var pip_stats_beta: Label
+var pip_name_alpha: Label
+var pip_name_beta: Label
 
 # Display name for a slot: the assigned brain name in tournament/quick
 # battles, plain ALPHA/BETA in free battle (no vault identities there).
@@ -1583,22 +1585,49 @@ func _physics_process(delta: float) -> void:
 
 const PIP_TICK_EVERY := 6
 func _make_pip_stats(parent: Node, left_side: bool) -> Label:
-	# Fly-stat card overlaying a PiP slot (same rect as the viewport).
+	# Fly-stat card overlaying a PiP slot: name header in team color
+	# plus a full-word stat body. Top edge lines up with the health
+	# bar (y=8); same geometry both sides.
+	var is_alpha := left_side
+	var nm := Label.new()
+	if left_side:
+		nm.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		nm.offset_left = 16.0
+		nm.offset_right = 316.0
+	else:
+		nm.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		nm.anchor_left = 1.0
+		nm.anchor_right = 1.0
+		nm.offset_left = -316.0
+		nm.offset_right = -16.0
+	nm.offset_top = 8.0
+	nm.offset_bottom = 36.0
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	nm.add_theme_font_size_override("font_size", 17)
+	nm.add_theme_color_override("font_color",
+		TEAM_ALPHA if is_alpha else TEAM_BETA)
+	nm.clip_text = true
+	nm.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	nm.visible = false
+	parent.add_child(nm)
+	parent.move_child(nm, 0)
+	if is_alpha:
+		pip_name_alpha = nm
+	else:
+		pip_name_beta = nm
 	var l := Label.new()
 	if left_side:
 		l.set_anchors_preset(Control.PRESET_TOP_LEFT)
 		l.offset_left = 16.0
-		l.offset_top = 30.0
 		l.offset_right = 316.0
-		l.offset_bottom = 180.0
 	else:
 		l.set_anchors_preset(Control.PRESET_TOP_RIGHT)
 		l.anchor_left = 1.0
 		l.anchor_right = 1.0
 		l.offset_left = -316.0
-		l.offset_top = 30.0
 		l.offset_right = -16.0
-		l.offset_bottom = 180.0
+	l.offset_top = 38.0
+	l.offset_bottom = 320.0
 	l.add_theme_font_size_override("font_size", 13)
 	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1610,49 +1639,96 @@ func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	return l
 
 
+func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
+		tr: Dictionary, parents: Dictionary, live: Dictionary,
+		st: Dictionary, match_draws: int = 0) -> PackedStringArray:
+	# Pure stat-row builder (no scene/director reads, so headless tests
+	# can pin it): identical full-word row order for both flies. Career
+	# figures ride the bracket snapshot (frozen at build, refreshed per
+	# match load); live figures update on change.
+	var lines := PackedStringArray()
+	lines.append("ELO %d" % int(rec.get("elo", 1200.0)))
+	lines.append("Battles: %d (Wins %d, Losses %d)" % [
+		int(rec.get("battles", 0)), int(rec.get("wins", 0)),
+		int(rec.get("losses", 0))])
+	lines.append("Did not finish: %d" % [
+		int(rec.get("draws", 0)) + maxi(match_draws, 0)])
+	lines.append("Knockouts: %d (%d this match)" % [
+		int(rec.get("ko", 0)), int(st.get("kills", 0))])
+	lines.append("Matches: %d (Won %d), Titles: %d" % [
+		int(rec.get("matches", 0)), int(rec.get("matches_won", 0)),
+		int(rec.get("tournaments_won", 0))])
+	lines.append("Schooling: %d episodes" % int(tr.get("episodes", 0)))
+	var src := str(lin.get("source", "generated"))
+	var peds: Array = lin.get("parent_ids", [])
+	var ped := src
+	if src.begins_with("clone:"):
+		var pn := str(parents.get(str(peds[0]) if not peds.is_empty() else "", "?"))
+		ped = "junior of %s (junior %d)" % [pn, int(lin.get("jr", 0))] \
+			if int(lin.get("jr", 0)) > 0 \
+			else "clone of %s" % pn
+		if int(lin.get("kin", 0)) > 0 and int(lin.get("jr", 0)) <= 0:
+			ped += " (kin %d)" % int(lin.get("kin", 0))
+	elif src.begins_with("crossover:"):
+		var an := str(parents.get(str(peds[0]) if peds.size() > 0 else "", "?"))
+		var bn := str(parents.get(str(peds[1]) if peds.size() > 1 else "", "?"))
+		ped = "crossover %s x %s" % [an, bn]
+		if int(lin.get("jr", 0)) > 0:
+			ped += " (junior %d)" % int(lin.get("jr", 0))
+	elif src == "reference":
+		ped = "reference stock"
+	elif src == "evo-random" or src == "generated":
+		ped = "wild" if src == "evo-random" else "generated"
+	lines.append("Pedigree: %s" % ped)
+	var gid := str(gp.get("genome_id", ""))
+	if gid == "":
+		var exp = gp.get("experiment", null)
+		gid = "mix" if exp is Array else (str(exp) if exp != null and str(exp) != "" else "base")
+	lines.append("Evasion: %.2f, Learning rate: %.4f, Wiring: %s" % [
+		float(gp.get("evasion", 0.0)), float(gp.get("learning_rate", 0.0)), gid])
+	lines.append("Speed: %.1f, Thrust: %.2f, Health: %.0f" % [
+		float(live.get("spd", 0.0)), float(live.get("thr", 0.0)),
+		float(live.get("hp", 0.0))])
+	return lines
+
+
 func _pip_stats_text(side: String) -> String:
-	# Live fly stat card: record (ELO, battles, matches, titles),
-	# traits, and live flight numbers. Record/traits ride the bracket
-	# snapshot (no vault shell-outs at 10 Hz).
+	# Live fly stat card body (the name rides its own team-colored
+	# label): record, traits, pedigree, and live flight numbers.
+	# Record/traits ride the bracket snapshot (no vault shell-outs at
+	# 10 Hz); row order/shape comes from _format_fighter_rows so both
+	# flies always read identically.
 	var fly: CharacterBody3D = fly_alpha if side == "alpha" else fly_beta
-	var nm := _slot_name(side)
 	var rec := {}
 	var gp := {}
+	var lin := {}
+	var tr := {}
 	var director := _director()
+	var match_draws := 0
 	if director != null:
 		var m: Dictionary = director.current_match()
+		match_draws = int(m.get("draws", 0))
 		var pid := str(m.get("a_id" if side == "alpha" else "b_id", ""))
 		for p in director.tourney.get("players", []):
 			if str((p as Dictionary).get("id", "")) == pid:
 				rec = (p as Dictionary).get("record", {})
 				gp = (p as Dictionary).get("generator_params", {})
+				lin = (p as Dictionary).get("lineage", {})
+				tr = (p as Dictionary).get("training", {})
 				break
-	var spd := 0.0
-	var thr := 0.0
-	var hp := 0.0
+	var parents := {}
+	for ppid in (lin.get("parent_ids", []) as Array):
+		parents[str(ppid)] = _nextgen_parent_name(str(ppid))
+	var live := {"spd": 0.0, "thr": 0.0, "hp": 0.0}
 	if is_instance_valid(fly):
-		spd = (fly as CharacterBody3D).velocity.length()
+		live["spd"] = (fly as CharacterBody3D).velocity.length()
 		var _t = fly.get("current_thrust")
-		thr = float(_t) if _t != null else 0.0
+		live["thr"] = float(_t) if _t != null else 0.0
 		var _h = fly.get("health")
-		hp = float(_h) if _h != null else 0.0
+		live["hp"] = float(_h) if _h != null else 0.0
 	var st: Dictionary = stats_alpha if side == "alpha" else stats_beta
-	var gid := str(gp.get("genome_id", ""))
-	if gid == "":
-		var exp = gp.get("experiment", null)
-		gid = "mix" if exp is Array else (str(exp) if exp != null and str(exp) != "" else "base")
-	var lines := PackedStringArray()
-	lines.append("%s  (ELO %d)" % [nm, int(rec.get("elo", 1200.0))])
-	lines.append("BTL %d (W%d L%d D%d)  MTCH %d (W%d)  T%d" % [
-		int(rec.get("battles", 0)), int(rec.get("wins", 0)),
-		int(rec.get("losses", 0)), int(rec.get("draws", 0)),
-		int(rec.get("matches", 0)), int(rec.get("matches_won", 0)),
-		int(rec.get("tournaments_won", 0))])
-	lines.append("EVA %.2f  LR %.4f  %s" % [
-		float(gp.get("evasion", 0.0)), float(gp.get("learning_rate", 0.0)), gid])
-	lines.append("SPD %.1f  THR %.2f  HP %.0f  KO %d" % [spd, thr, hp,
-		int(st.get("kills", 0))])
-	return "\n".join(lines)
+	return "\n".join(_format_fighter_rows(rec, gp, lin, tr, parents,
+		live, st, match_draws))
 
 
 func _park_pip_on_cloud(cam: Camera3D, cloud: Node3D) -> void:
@@ -1686,6 +1762,10 @@ func _apply_pip_slot() -> void:
 		pip_stats_alpha.visible = perf_pip and not eyes and pip_slot_mode == "STATS"
 	if is_instance_valid(pip_stats_beta):
 		pip_stats_beta.visible = perf_pip and not eyes and pip_slot_mode == "STATS"
+	if is_instance_valid(pip_name_alpha):
+		pip_name_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
+	if is_instance_valid(pip_name_beta):
+		pip_name_beta.visible = pip_stats_beta.visible if is_instance_valid(pip_stats_beta) else false
 	if eyes:
 		if is_instance_valid(pip_alpha_label):
 			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
@@ -1716,7 +1796,8 @@ func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 			_pip_hidden = true
 			for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
 					pip_beta_label, pip_alpha_feat, pip_beta_feat,
-					pip_stats_alpha, pip_stats_beta]:
+					pip_stats_alpha, pip_stats_beta,
+					pip_name_alpha, pip_name_beta]:
 				if is_instance_valid(n):
 					(n as Control).visible = false
 		return
@@ -1733,6 +1814,10 @@ func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 				pip_stats_alpha.text = _pip_stats_text("alpha")
 			if is_instance_valid(pip_stats_beta):
 				pip_stats_beta.text = _pip_stats_text("beta")
+			if is_instance_valid(pip_name_alpha):
+				pip_name_alpha.text = _slot_name("alpha")
+			if is_instance_valid(pip_name_beta):
+				pip_name_beta.text = _slot_name("beta")
 		elif pip_slot_mode == "BRAIN":
 			for v in [pip_alpha_view, pip_beta_view]:
 				if is_instance_valid(v):
