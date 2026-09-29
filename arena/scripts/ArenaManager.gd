@@ -574,7 +574,7 @@ func _build_menu_bar(tournament: bool) -> void:
 		var replay_bt := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
 		replay_bt.pressed.connect(_toggle_replay)
 		bar.add_child(replay_bt)
-		var evo_stop_b := _menu_bar_button("EVO STOP", "Stop the evolution loop (keeps current bracket).")
+		var evo_stop_b := _menu_bar_button("STOP CONTINUOUS", "Stop the continuous tournament loop (keeps current bracket).")
 		evo_stop_b.pressed.connect(_on_evo_stop)
 		bar.add_child(evo_stop_b)
 	else:
@@ -3247,7 +3247,7 @@ func _update_evo_status_line() -> void:
 	if parts.is_empty():
 		evo_status_line.visible = false
 		return
-	evo_status_line.text = "EVO G%d • %s" % [gen, " • ".join(parts)]
+	evo_status_line.text = "CONTINUOUS G%d • %s" % [gen, " • ".join(parts)]
 	evo_status_line.visible = true
 
 
@@ -3796,7 +3796,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 		_tourney_close_ack = false
 		brain_client.request_tournament_end(champ_slot, champ_id)
 		var champ_name: String = director.champion_name()
-		# Evolution mode: skip the review-wait and breed the next
+		# Continuous mode: skip the review-wait and breed the next
 		# generation instead (champion display happens inside).
 		if _evo_active():
 			if _event_active():
@@ -3849,7 +3849,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 					_evo_clone_parent2(gen + 1, champ_id))
 				_update_evo_status_line()
 				if is_instance_valid(status_label):
-					status_label.text = "EVO GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_base_name(champ_name)]
+					status_label.text = "CONTINUOUS GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_base_name(champ_name)]
 			await get_tree().create_timer(3.0).timeout
 			_hide_arena_bracket()
 		_request_current_battle_load()
@@ -4682,7 +4682,7 @@ func _hide_evo_phase() -> void:
 
 
 func _on_evo_async(op: String, result: Dictionary) -> void:
-	# Catches breed completions for the evolution loop (only while a
+	# Catches breed completions for the continuous tournament loop (only while a
 	# breed is awaited; training jobs use their own signalling).
 	if evo_waiting and op == "evo_breed":
 		evo_wait_result = result
@@ -5076,7 +5076,7 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	if p2 != "":
 		args += ["--params2-file", p2]
 	# Kin trait mutation rides the tournament's evo settings (menu
-	# toggle at START EVOLUTION, preserved across generations).
+	# toggle at START CONTINUOUS, preserved across generations).
 	var evod: Dictionary = director.tourney.get("evo", {})
 	args += ["--mutate-traits", str(int(evod.get("mutate_traits", 1)))]
 	# Never emit an empty argv element: Godot drops it on Windows, so
@@ -5199,7 +5199,7 @@ func _evo_adopt_finished(force: bool = false) -> Dictionary:
 
 
 func _run_evo_generation() -> void:
-	# Tournament-end handoff for the evolution loop. Adopts any breeds
+	# Tournament-end handoff for the continuous tournament loop. Adopts any breeds
 	# that finished in the background (wild from tourney start, clone
 	# from consolation start), awaits stragglers via the shared slot,
 	# then rebuilds the bracket at constant roster size. STOP (menu
@@ -5214,19 +5214,19 @@ func _run_evo_generation() -> void:
 	var gen := int(evo.get("generation", 1))
 	var champ_id := str(director.tourney.get("champion_id", ""))
 	var champ_name: String = director.champion_name()
-	_show_callout("EVO GEN %d CHAMPION: %s" % [gen, champ_name],
+	_show_callout("CONTINUOUS GEN %d CHAMPION: %s" % [gen, champ_name],
 		Color(1.0, 0.85, 0.3), "BREEDING NEXT GENERATION", "", false)
-	_show_evo_phase("EVO GENERATION %d" % [gen + 1],
+	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
 		"Champion %s - ranking bottom two..." % champ_name)
 	if is_instance_valid(status_label):
-		status_label.text = "EVO gen %d champion %s - ranking bottom two..." % [gen, champ_name]
+		status_label.text = "CONTINUOUS gen %d champion %s - ranking bottom two..." % [gen, champ_name]
 	# --- Archive bottom two ---
 	var bottom: Dictionary = director.evo_bottom_two()
 	var last_id := str((bottom.get("last", {}) as Dictionary).get("id", ""))
 	var second_id := str((bottom.get("second", {}) as Dictionary).get("id", ""))
 	var via := str((bottom.get("last", {}) as Dictionary).get("via", "ranking"))
 	if via == "ranking" and is_instance_valid(status_label):
-		status_label.text = "EVO gen %d: no consolation ran - bottom two by ranking fallback." % gen
+		status_label.text = "CONTINUOUS gen %d: no consolation ran - bottom two by ranking fallback." % gen
 	if last_id == "":
 		_evo_abort("no loser found - bracket empty?")
 		return
@@ -5234,11 +5234,11 @@ func _run_evo_generation() -> void:
 		if str(pair[0]) == "":
 			continue
 		var ares: Dictionary = director.evo_archive(
-			str(pair[0]), "evo gen %d %s (%s)" % [gen, str(pair[1]), via])
+			str(pair[0]), "continuous gen %d %s (%s)" % [gen, str(pair[1]), via])
 		if not bool(ares.get("ok", false)):
 			_evo_abort("archive failed: %s" % str(ares.get("error", "?")))
 			return
-		print("[Arena] EVO gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
+		print("[Arena] CONTINUOUS gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
 	# --- Next-gen waiting room: preview bracket + gallery + strip ---
 	# Survivor context is frozen here; offspring cards refresh live as
 	# breeds adopt (synthetic "training" names until then).
@@ -5273,10 +5273,10 @@ func _run_evo_generation() -> void:
 	# Tournament is over: show whatever is left in training before
 	# blocking on stragglers (names for the done, ep counts for the
 	# live, queued for the rest).
-	_show_evo_phase("EVO GENERATION %d" % target_gen,
+	_show_evo_phase("CONTINUOUS GENERATION %d" % target_gen,
 		_evo_offspring_summary(target_gen))
 	if is_instance_valid(status_label):
-		status_label.text = "EVO gen %d over - breeding gen %d..." % [gen, target_gen]
+		status_label.text = "CONTINUOUS gen %d over - breeding gen %d..." % [gen, target_gen]
 	# Await any still-pending specs one by one via the shared slot.
 	# done is re-read between awaits: the watcher may bank the wild
 	# breed while the clone await is in flight.
@@ -5331,7 +5331,7 @@ func _run_evo_generation() -> void:
 	while roster.size() < size and topups < 2 and _evo_active():
 		var tkind := "topup%d" % topups
 		_evo_queue_spec(tkind, "", "", randi(), target_gen)
-		_show_evo_phase("EVO GENERATION %d" % target_gen,
+		_show_evo_phase("CONTINUOUS GENERATION %d" % target_gen,
 			"Short roster (%d/%d) - breeding top-up %d..." % [roster.size(), size, topups + 1])
 		var tid := await _evo_await_queued(tkind)
 		if tid == "" or tid in roster:
@@ -5369,10 +5369,10 @@ func _run_evo_generation() -> void:
 	director.save_state()
 	# Pipeline: kick off the next generation's wild breed immediately
 	_evo_queue_wild(gen + 2)
-	_show_evo_phase("EVO GENERATION %d" % [gen + 1],
+	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
 		"Roster ready (%d fighters) - loading first battle..." % roster.size())
 	if is_instance_valid(status_label):
-		status_label.text = "EVO gen %d ready (%d fighters)." % [gen + 1, roster.size()]
+		status_label.text = "CONTINUOUS gen %d ready (%d fighters)." % [gen + 1, roster.size()]
 	await get_tree().create_timer(2.0).timeout
 	_hide_nextgen()
 	_hide_evo_phase()
@@ -5969,14 +5969,14 @@ func _evo_abort(reason: String) -> void:
 	_hide_nextgen()
 	_hide_evo_phase()
 	if is_instance_valid(status_label):
-		status_label.text = "EVOLUTION STOPPED: %s" % reason
-	print("[Arena] EVOLUTION STOPPED: %s" % reason)
+		status_label.text = "CONTINUOUS STOPPED: %s" % reason
+	print("[Arena] CONTINUOUS STOPPED: %s" % reason)
 
 
 func _on_evo_stop() -> void:
 	if not _evo_active() and not evo_waiting:
 		if is_instance_valid(status_label):
-			status_label.text = "Evolution loop is not running."
+			status_label.text = "Continuous tournament loop is not running."
 		return
 	_evo_kill_job()
 	_restore_timescale()

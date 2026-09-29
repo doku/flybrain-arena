@@ -451,10 +451,11 @@ separates wiring effects from learned effects), learning verification
 conditioning), pool diagnostics (`brain_engine/diagnose_pools.py`:
 weight ratios, spike census).
 
-## 14. Evolution mode (eternal tournament loop)
+## 14. Continuous tournament mode (eternal loop)
 
-`START EVOLUTION` runs tournaments back-to-back forever (until EVO STOP
-or quit): each generation archives the single biggest loser (earliest
+`START CONTINUOUS` runs tournaments back-to-back forever (until
+STOP CONTINUOUS or quit): each generation archives the single biggest
+loser (earliest
 exit + fewest battle wins, random tie-break) to `brains/archive/` —
 invisible to the roster, listed in the menu hall of shame with per-brain
 Restore — then breeds 1 winner-clone (weight copy + noise, **fresh

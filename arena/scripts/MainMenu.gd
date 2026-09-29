@@ -760,8 +760,8 @@ func _build_tourney_column() -> VBoxContainer:
 	quick_button.pressed.connect(_on_quick_battle)
 	srow2.add_child(quick_button)
 	var evo_button := Button.new()
-	evo_button.text = "START EVOLUTION"
-	evo_button.tooltip_text = "Eternal loop: tournament, archive biggest loser, breed 1 winner-clone + 1 random (50 eps), next generation. STOP in the arena."
+	evo_button.text = "START CONTINUOUS"
+	evo_button.tooltip_text = "Continuous tournament mode: tournaments back-to-back forever — archive biggest loser, breed 1 winner-clone + 1 random (50 eps), next generation. STOP CONTINUOUS in the arena."
 	evo_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	evo_button.pressed.connect(_on_start_evolution)
 	srow2.add_child(evo_button)
@@ -1455,17 +1455,17 @@ func _on_start_tournament() -> void:
 
 
 func _on_start_evolution() -> void:
-	# Eternal evolution loop: same setup as a tournament, then the arena
+	# Continuous tournament mode: same setup as a tournament, then the arena
 	# chains generations automatically (archive loser, breed clone +
-	# random, next bracket) until EVO STOP. Offspring train 50 eps.
+	# random, next bracket) until STOP CONTINUOUS. Offspring train 50 eps.
 	var size := int(TournamentDirector.size_options()[tourney_size.selected])
 	var bestof := int(TournamentDirector.best_of_options()[tourney_bestof.selected])
 	var ids := _selected_player_ids()
-	# Evolution demands a FULL roster: a short bracket yields 7 (or 3)
+	# Continuous mode demands a FULL roster: a short bracket yields 7 (or 3)
 	# round-0 losers, consolation can never start (needs 2/4/8), and
 	# the shortness self-perpetuates every generation after.
 	if ids.size() != size:
-		bracket_status.text = "Evolution needs a full %d-brain roster (picked %d) - Ctrl+click to fill it." % [size, ids.size()]
+		bracket_status.text = "Continuous mode needs a full %d-brain roster (picked %d) - Ctrl+click to fill it." % [size, ids.size()]
 		return
 	# Size 16 runs group-stage events (4 round-robin groups + final);
 	# smaller sizes keep the single-elim + losers loop, where the
@@ -1483,14 +1483,14 @@ func _on_start_evolution() -> void:
 		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
 			and evo_mutate_traits.button_pressed else 0}
 	TournamentDirector.save_state()
-	bracket_status.text = "EVOLUTION gen 1 ready (%s)." % str(res.get("tournament_id", ""))
+	bracket_status.text = "CONTINUOUS gen 1 ready (%s)." % str(res.get("tournament_id", ""))
 	_render_bracket()
 	await get_tree().create_timer(0.5).timeout
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
 
 
 func _start_event_evolution(ids: Array, bestof: int) -> void:
-	# Group-stage evolution: snake-draft event manifest, group A file,
+	# Group-stage continuous mode: snake-draft event manifest, group A file,
 	# then the arena chains A-D + final with queue intermissions.
 	var settings := {"best_of": bestof, "lr_scale": tourney_lr.value,
 		"round_time": tourney_round_time.value, "random_draw": false,

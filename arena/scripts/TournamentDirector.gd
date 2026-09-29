@@ -770,7 +770,7 @@ func best_of_options() -> Array:
 	return [1, 3, 5, 7, 9, 11]
 
 
-# ── Evolution mode: eternal tournament loop ──────────────────────
+# ── Continuous tournament mode: eternal loop ──────────────────────
 # Each generation archives the biggest loser and breeds 1 winner-clone
 # + 1 random, holding roster size constant. State rides in
 # tourney["evo"] (persisted by save_state), so quit/resume just works.
