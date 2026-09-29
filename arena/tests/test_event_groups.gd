@@ -734,6 +734,50 @@ func test_prior_wins_and_split() -> void:
 	_check(str(D.call("_fmt_wins", 3.0)) == "3", "whole wins print as ints")
 
 
+func test_booster_rule() -> void:
+	# Booster = DNF (>=1 drawn battle) in EVERY played match.
+	# Schedule [[0,3],[1,2],[0,2],[3,1],[0,1],[2,3]]: M1 decisive,
+	# M2-M6 each open with a draw, so f2/f3 DNF everywhere while
+	# f1/f4 go clean in M1.
+	var ps := _brains(4, 1500)
+	D.call("build_group_bracket", ps, "A", "EBOOST", 1, 0.5, 40.0)
+	var br: Dictionary = D.call("on_battle_result", "alpha", {}, {}, {})
+	_check(str(br.get("action", "")) == "match_over", "M1 decisive")
+	D.call("advance_after_match")
+	for i in range(5):
+		br = D.call("on_battle_result", "draw", {}, {}, {})
+		_check(str(br.get("action", "")) == "replay", "draw replays")
+		br = D.call("on_battle_result", "alpha", {}, {}, {})
+		_check(str(br.get("action", "")) == "match_over", "replay decides")
+		D.call("advance_after_match")
+	var st: Array = D.call("group_standings")
+	var dnf := {}
+	for row in st:
+		dnf[str((row as Dictionary).get("id", ""))] = \
+			int((row as Dictionary).get("dnf", -1))
+	_check(int(dnf.get("f01", -1)) == 2, "f1 DNF 2 (M3, M5)")
+	_check(int(dnf.get("f04", -1)) == 2, "f4 DNF 2 (M4, M6)")
+	_check(int(dnf.get("f02", -1)) == 3, "f2 DNF 3 (every match)")
+	_check(int(dnf.get("f03", -1)) == 3, "f3 DNF 3 (every match)")
+	var boosters: Array = D.call("event_booster_set")
+	boosters.sort()
+	_check(boosters == ["f02", "f03"], "only all-DNF flies marked")
+	# Manifest banking: per-group list + accumulated top-level list,
+	# idempotent across repeat records.
+	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	D.call("event_save", {"id": "EBOOST", "groups": {"A": {}}})
+	var rec: Dictionary = D.call("event_record_group", "EBOOST", "A")
+	_check(bool(rec.get("ok", false)), "group record ok")
+	_check((rec.get("booster", []) as Array).size() == 2, "record returns set")
+	D.call("event_record_group", "EBOOST", "A")
+	var ev: Dictionary = D.call("event_load", "EBOOST")
+	var accum: Array = ev.get("booster", [])
+	accum.sort()
+	_check(accum == ["f02", "f03"], "top-level booster accumulates, no dupes")
+	_check((((ev.get("groups", {}) as Dictionary).get("A", {}) as Dictionary).get("booster", []) as Array).size() == 2,
+		"per-group booster banked")
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -783,6 +827,7 @@ func _initialize() -> void:
 	test_event_manifest_cache()
 	test_battle_invalidate_primitive()
 	test_poll_emit_no_flicker()
+	test_booster_rule()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

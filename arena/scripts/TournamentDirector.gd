@@ -1748,9 +1748,11 @@ func build_group_bracket(group_dicts: Array, group_letter: String, event_id: Str
 
 
 func group_standings(t: Dictionary = {}) -> Array:
-	# [{id, name, wins, kos, matches, elo}] sorted wins desc, KO scored
-	# desc, snapshot ELO desc. Undecided matches don't count. Defaults
-	# to the loaded tourney; pass any bracket dict for overviews.
+	# [{id, name, wins, kos, matches, elo, dnf}] sorted wins desc, KO
+	# scored desc, snapshot ELO desc. Undecided matches don't count.
+	# dnf = timeout-tie battles fought (both sides of every drawn
+	# battle implicate); feeds the booster rule. Defaults to the
+	# loaded tourney; pass any bracket dict for overviews.
 	var src: Dictionary = t if not t.is_empty() else tourney
 	var table := {}
 	for p in src.get("players", []):
@@ -1758,7 +1760,7 @@ func group_standings(t: Dictionary = {}) -> Array:
 		var pid := str(pd.get("id", ""))
 		if pid != "":
 			table[pid] = {"id": pid, "name": str(pd.get("name", "?")),
-				"wins": 0, "kos": 0, "matches": 0,
+				"wins": 0, "kos": 0, "matches": 0, "dnf": 0,
 				"elo": float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))}
 	for rnd in (src.get("rounds", []) as Array):
 		for mm in (rnd as Array):
@@ -1773,6 +1775,7 @@ func group_standings(t: Dictionary = {}) -> Array:
 					var row: Dictionary = table[sid]
 					row["matches"] = int(row.get("matches", 0)) + 1
 					row["kos"] = int(row.get("kos", 0)) + int(m.get("ko_" + slot, 0))
+					row["dnf"] = int(row.get("dnf", 0)) + int(m.get("draws", 0))
 					if split:
 						row["wins"] = float(row.get("wins", 0)) + 0.5
 			if table.has(wid):
@@ -1800,9 +1803,45 @@ func event_note_bracket(event_id: String, group_letter: String, bracket_id: Stri
 		event_save(ev)
 
 
+func event_booster_set() -> Array:
+	# Booster rule (pure over the loaded group bracket file — call with
+	# the completed group file loaded, same contract as
+	# event_record_group): a fly qualifies iff it played >=1 match
+	# (bye/vacant/undecided excluded by the canonical predicate) AND
+	# every played match has draws >= 1 — a timeout-tie in each outing,
+	# both sides implicated per drawn battle. Winners included: the
+	# rule is mechanical, extra school never hurts. Returns [ids].
+	var out: Array = []
+	var played := {}
+	var all_dnf := {}
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			var m := mm as Dictionary
+			var wid := str(m.get("winner_id", ""))
+			var split := wid == "" and bool(m.get("drawn", false))
+			if wid == "" and not split:
+				continue
+			var draws := int(m.get("draws", 0))
+			for slot in ["a", "b"]:
+				var sid := str(m.get(slot + "_id", ""))
+				if sid == "":
+					continue
+				played[sid] = true
+				if draws < 1:
+					all_dnf[sid] = false
+				elif not all_dnf.has(sid):
+					all_dnf[sid] = true
+	for pid in played.keys():
+		if bool(all_dnf.get(pid, false)):
+			out.append(str(pid))
+	return out
+
+
 func event_record_group(event_id: String, group_letter: String) -> Dictionary:
 	# Call with the completed group file loaded: banks its standings
-	# into the manifest and stamps the bracket id.
+	# into the manifest and stamps the bracket id. Also banks the
+	# booster set (per-group list + accumulated top-level list, deduped)
+	# for post-event +50 booster schooling.
 	var ev := event_load(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
@@ -1810,13 +1849,20 @@ func event_record_group(event_id: String, group_letter: String) -> Dictionary:
 	if not groups.has(group_letter):
 		return {"ok": false, "error": "no such group"}
 	var st := group_standings()
+	var boosters := event_booster_set()
 	var g: Dictionary = groups[group_letter]
 	g["standings"] = st
 	g["done"] = true
 	g["bracket_id"] = str(tourney.get("id", ""))
+	g["booster"] = boosters
+	var accum: Array = ev.get("booster", [])
+	for pid in boosters:
+		if not (pid in accum):
+			accum.append(pid)
+	ev["booster"] = accum
 	if not event_save(ev):
 		return {"ok": false, "error": "cannot save event"}
-	return {"ok": true, "standings": st}
+	return {"ok": true, "standings": st, "booster": boosters}
 
 
 func build_final_bracket(advancer_ids: Array, event_id: String, best_of: int, lr_scale: float, round_time: float = 40.0, brains_override: Array = []) -> Dictionary:
