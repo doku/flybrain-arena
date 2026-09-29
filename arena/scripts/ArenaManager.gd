@@ -3996,6 +3996,8 @@ func _event_gallery_update(all_fighters: bool = false) -> void:
 				tkey = "UNGROUPED"
 		key = _gallery_cache_key(eid, tkey)
 		for p in tplayers:
+			if not (p is Dictionary):
+				continue
 			var ps := str((p as Dictionary).get("id", ""))
 			if ps != "" and not (ps in ids):
 				ids.append(ps)
