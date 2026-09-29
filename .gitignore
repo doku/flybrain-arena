@@ -36,3 +36,7 @@ arena/.godot/
 *.uid
 # Owner's personal task list (never commit)
 /todo.txt
+# Vault backup snapshots + package sidecars/backups (user data, GBs)
+brains-backup-*/
+*.bak
+*.record.json
