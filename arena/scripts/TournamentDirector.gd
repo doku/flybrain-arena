@@ -1837,6 +1837,63 @@ func event_booster_set() -> Array:
 	return out
 
 
+func event_stock_bench(event_id: String, fill_to: int = 2, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+	# Bench draft: the draw only sees the bench, but most qualified
+	# brains live in the vault — fill the bench to fill_to from the
+	# lowest-match qualified non-participants (train >= min_train,
+	# ELO >= floor; current-event players excluded, they advance or
+	# eliminate on their own path). Order: matches asc, ELO asc, id
+	# asc (deterministic). Uses event_pool_add so the cap-4 trim still
+	# applies. Returns {ok, stocked:[ids], pool}.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var pool: Array = ev.get("pool", [])
+	if pool.size() >= fill_to:
+		return {"ok": true, "stocked": [], "pool": pool}
+	var participants := {}
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		for pid in (gd.get("players", []) as Array):
+			participants[str(pid)] = true
+	var roster: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
+	var cards := _event_live_cards(live_override)
+	var cands: Array = []
+	for b in roster:
+		var bd := b as Dictionary
+		var pid := str(bd.get("id", ""))
+		if pid == "" or (pid in pool) or participants.has(pid):
+			continue
+		if not cards.has(pid):
+			continue
+		var card: Dictionary = cards[pid]
+		if int(card.get("train", 0)) < min_train:
+			continue
+		if float(card.get("elo", 0.0)) < elo_floor:
+			continue
+		cands.append(pid)
+	cands.sort_custom(func(x, y):
+		var cx: Dictionary = cards[x]
+		var cy: Dictionary = cards[y]
+		if int(cx.get("matches", 0)) != int(cy.get("matches", 0)):
+			return int(cx.get("matches", 0)) < int(cy.get("matches", 0))
+		if float(cx.get("elo", 0.0)) != float(cy.get("elo", 0.0)):
+			return float(cx.get("elo", 0.0)) < float(cy.get("elo", 0.0))
+		return str(x) < str(y))
+	var picks: Array = []
+	for pid in cands:
+		if pool.size() + picks.size() >= fill_to:
+			break
+		picks.append(pid)
+	if picks.is_empty():
+		return {"ok": true, "stocked": [], "pool": pool}
+	var added: Dictionary = event_pool_add(event_id, picks, live_override)
+	if not bool(added.get("ok", false)):
+		return added
+	return {"ok": true, "stocked": picks,
+		"pool": added.get("pool", pool)}
+
+
 func event_booster_queue(event_id: String) -> Dictionary:
 	# Post-event booster schooling: every marked brain gets +50 eps
 	# with the school curriculum (own stored wiring/rates — same

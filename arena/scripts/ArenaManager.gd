@@ -4349,6 +4349,16 @@ func _run_event_handoff() -> void:
 	if not _evo_has_kind("wild"):
 		_evo_queue_wild(gen + 1)
 	_event_drain_done_to_pool()
+	# Bench draft from the vault: the draw only sees the bench, so a
+	# thin bench starves it while qualified brains sit idle. Draft the
+	# lowest-match qualified non-participants first (the many, not the
+	# few) — the waiting trainees still land via drain/top-up.
+	var stocked: Dictionary = director.event_stock_bench(eid,
+		EVENT_POOL_TARGET, POOL_MIN_TRAIN,
+		float(st0.get("elo_cutoff", 0.0)))
+	if not (stocked.get("stocked", []) as Array).is_empty():
+		print("[Arena] Event %s bench drafted: %s" % [
+			eid, str(stocked.get("stocked", []))])
 	if _event_pool_ready_count() < EVENT_POOL_TARGET:
 		if not await _event_pool_wait():
 			return
