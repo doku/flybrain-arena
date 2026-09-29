@@ -778,6 +778,53 @@ func test_booster_rule() -> void:
 		"per-group booster banked")
 
 
+func test_booster_queue() -> void:
+	# Post-event queueing: marked brains get +50 school-curriculum
+	# trains with [BOOSTER] names; ghosts skipped; ids already queued
+	# never double-enqueue (enqueue appends blindly).
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_event_groups"
+	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	D.set("brains_cache", [
+		{"id": "q1", "name": "Q1",
+			"generator_params": {"variant": "custom", "seed": 3},
+			"record": {"elo": 1500.0}, "training": {"episodes": 60}},
+		{"id": "q2", "name": "Q2",
+			"generator_params": {"variant": "custom", "seed": 4},
+			"record": {"elo": 1400.0}, "training": {"episodes": 10}}])
+	D.set("brains_cache_msec", Time.get_ticks_msec())
+	D.call("event_save", {"id": "EQ", "groups": {},
+		"booster": ["q1", "q2", "ghost"]})
+	var res: Dictionary = D.call("event_booster_queue", "EQ")
+	_check(bool(res.get("ok", false)), "booster queue ok")
+	var queued: Array = res.get("queued", [])
+	queued.sort()
+	_check(queued == ["q1", "q2"], "vault brains queued, ghost skipped")
+	var items: Array = D.get("train_queue")
+	_check(items.size() == 2, "two queue entries")
+	for item in items:
+		var it := item as Dictionary
+		_check(int(it.get("episodes", 0)) == 50, "flat +50 additional")
+		_check((it.get("params", {}) as Dictionary).has("curriculum"),
+			"school curriculum included")
+		_check(bool((it.get("params", {}) as Dictionary).has("booster")),
+			"booster marker tagged")
+		_check(str(it.get("name", "")).ends_with("[BOOSTER]"),
+			"queue name tagged")
+	# Second pass: everything already queued -> no-ops.
+	var res2: Dictionary = D.call("event_booster_queue", "EQ")
+	_check((res2.get("queued", []) as Array).is_empty(), "dedupe no-ops")
+	_check((D.get("train_queue") as Array).size() == 2, "queue intact")
+	D.free()
+
+
+func test_draw_title_dnf() -> void:
+	# Timeout-ties are called DNF, numbered by banked draws.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	_check(A.call("_draw_title") == "DNF", "first tie titled DNF")
+	A.free()
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -828,6 +875,8 @@ func _initialize() -> void:
 	test_battle_invalidate_primitive()
 	test_poll_emit_no_flicker()
 	test_booster_rule()
+	test_booster_queue()
+	test_draw_title_dnf()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

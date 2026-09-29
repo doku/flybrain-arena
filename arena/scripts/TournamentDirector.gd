@@ -1837,6 +1837,50 @@ func event_booster_set() -> Array:
 	return out
 
 
+func event_booster_queue(event_id: String) -> Dictionary:
+	# Post-event booster schooling: every marked brain gets +50 eps
+	# with the school curriculum (own stored wiring/rates — same
+	# whitelist as the top-up trainer). Skips ghosts (left the vault)
+	# and ids already queued/active (enqueue appends blindly). Called
+	# BEFORE elimination (the archived leave the vault). One pump at
+	# the end; hold_spawns keeps boots out of fights. Winners and
+	# eliminated alike: the rule is mechanical. Returns {ok, queued}.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var queued: Array = []
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	for pid in (ev.get("booster", []) as Array):
+		var s := str(pid)
+		if not by_id.has(s):
+			continue
+		var busy := str(active_job.get("brain_id", "")) == s
+		if not busy:
+			for item in train_queue:
+				if str((item as Dictionary).get("id", "")) == s:
+					busy = true
+					break
+		if busy:
+			continue
+		var bd: Dictionary = by_id[s]
+		var gp: Dictionary = (bd as Dictionary).get("generator_params", {})
+		var params := {}
+		for k in ["variant", "seed", "learning_rate", "dist_gain",
+				"evasion", "align_bonus", "experiment", "genome",
+				"genome_id", "mapping", "yaw_bias"]:
+			if gp.has(k):
+				params[k] = gp[k]
+		params["curriculum"] = {}
+		params["booster"] = {"event": event_id}
+		enqueue_training(s, str(bd.get("name", "?")) + " [BOOSTER]",
+			50, params)
+		queued.append(s)
+	pump_train_queue()
+	return {"ok": true, "queued": queued}
+
+
 func event_record_group(event_id: String, group_letter: String) -> Dictionary:
 	# Call with the completed group file loaded: banks its standings
 	# into the manifest and stamps the bracket id. Also banks the

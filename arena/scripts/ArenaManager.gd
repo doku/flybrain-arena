@@ -2857,7 +2857,7 @@ func _compose_verdict(draw: bool) -> Dictionary:
 		"dmg_a": float(stats_alpha.get("damage_dealt", 0.0)),
 		"dmg_b": float(stats_beta.get("damage_dealt", 0.0)), "line": ""}
 	if draw:
-		v["line"] = "DRAW - time expired, nobody bled"
+		v["line"] = "DNF - time expired, nobody bled"
 	elif _end_reason == "ko" and (_ko_victim == "alpha" or _ko_victim == "beta"):
 		var winner_slot := "beta" if _ko_victim == "alpha" else "alpha"
 		var blow := _killing_blow(_ko_victim)
@@ -2896,13 +2896,14 @@ func _verdict_short() -> String:
 
 
 func _draw_title() -> String:
-	# Numbered draws: the banked count doesn't include the latest one
-	# yet, so +1 (a third draw resolves the match instead of replaying).
+	# Numbered DNFs (did-not-finish timeout ties): the banked count
+	# doesn't include the latest one yet, so +1 (a third DNF resolves
+	# the match instead of replaying).
 	var director := _director()
 	var draws := 0
 	if director != null:
 		draws = int(director.current_match().get("draws", 0))
-	return "DRAW" if draws + 1 <= 1 else "DRAW x%d" % (draws + 1)
+	return "DNF" if draws + 1 <= 1 else "DNF x%d" % (draws + 1)
 
 
 func _verdict_headline() -> Dictionary:
@@ -2924,7 +2925,7 @@ func _verdict_headline() -> Dictionary:
 				float(_last_verdict.get("dmg_b", 0.0))],
 			"color": Color(0.78, 0.78, 0.85)}
 	return {"text": _draw_title(),
-		"sub": "Stalemate - nobody bled",
+		"sub": "Did not finish - nobody bled",
 		"color": Color(0.78, 0.78, 0.82)}
 
 
@@ -2963,7 +2964,7 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 			expand_match_label(tourney_match_label)]
 
 func _handle_draw() -> void:
-	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
+	print("[Arena] DNF! Time expired with zero damage - did not finish, rematch same brains.")
 	is_round_active = false
 	_set_combat(false)
 	# Both walk away: land upright for the rematch.
@@ -2980,7 +2981,7 @@ func _handle_draw() -> void:
 		_report_battle(true, third)
 		return
 	_show_winner_and_countdown(
-		"DRAW",
+		"DNF",
 		Color(0.78, 0.78, 0.82),
 		"TIME UP - NOBODY BLED - REMATCH",
 		"REMATCH")
@@ -3819,6 +3820,12 @@ func _standings_text() -> String:
 	var lines := PackedStringArray()
 	lines.append("GROUP %s — top 2 advance" % group)
 	var rows: Array = director.group_standings()
+	# Booster marks banked at group completion (manifest): show the tag
+	# when reviewing a recorded group; live tables show DNF counts only.
+	var booster: Array = []
+	if _event_active():
+		var gev: Dictionary = director.event_load_cached(_event_id())
+		booster = ((gev.get("groups", {}) as Dictionary).get(group, {}) as Dictionary).get("booster", [])
 	var top_w := -1.0
 	var top_k := -1
 	for row in rows:
@@ -3837,10 +3844,12 @@ func _standings_text() -> String:
 			tags += "  •  WINS LEADER"
 		if int(rd.get("kos", 0)) >= top_k and top_k > 0:
 			tags += "  •  KO LEADER"
-		lines.append("%s%d. %s  —  Wins: %s, Losses: %s, Knockouts: %d%s" % [mark, i,
+		if str(rd.get("id", "")) in booster:
+			tags += "  •  BOOSTER"
+		lines.append("%s%d. %s  —  Wins: %s, Losses: %s, Knockouts: %d, DNF: %d%s" % [mark, i,
 			str(rd.get("name", "?")),
 			director._fmt_wins(w), director._fmt_wins(float(played) - w),
-			int(rd.get("kos", 0)), tags])
+			int(rd.get("kos", 0)), int(rd.get("dnf", 0)), tags])
 	return "\n".join(lines)
 
 
@@ -4232,8 +4241,13 @@ func _event_group_done(res: Dictionary) -> void:
 		_evo_abort("event record failed: " + str(rec.get("error", "?")))
 		return
 	_save_bracket_record(true)
+	var _bset: Array = (rec.get("booster", []) as Array)
+	var _bsub := "STANDINGS BANKED"
+	if not _bset.is_empty():
+		_bsub += "  •  BOOSTER: %d (post-event +50 school)" % _bset.size()
+		print("[Arena] Group %s booster-marked: %s" % [group, str(_bset)])
 	_show_callout("GROUP %s COMPLETE" % group, Color(0.6, 0.85, 1.0),
-		"STANDINGS BANKED", "", false)
+		_bsub, "", false)
 	var ev: Dictionary = director.event_load(eid)
 	var nxt := _event_next_phase(ev)
 	if nxt == "":
@@ -4310,6 +4324,14 @@ func _run_event_handoff() -> void:
 	_event_drain_done_to_pool()
 	var ev0: Dictionary = director.event_load(eid)
 	var st0: Dictionary = ev0.get("settings", {})
+	# Booster schooling first (marked brains train +50 with school
+	# curriculum): elimination archives brains out of the vault, so
+	# queueing after it would ghost-skip the eliminated. Best-effort,
+	# never blocks the handoff.
+	var boost: Dictionary = director.event_booster_queue(eid)
+	if not (boost.get("queued", []) as Array).is_empty():
+		print("[Arena] Event %s booster schooling queued: %s" % [
+			eid, str(boost.get("queued", []))])
 	var elim: Dictionary = director.event_eliminate(eid,
 		int(st0.get("min_matches", EVENT_MIN_MATCHES)),
 		float(st0.get("elo_cutoff", 0.0)))
