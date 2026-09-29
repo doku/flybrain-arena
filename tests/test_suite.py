@@ -6071,6 +6071,57 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(stored["result"], resp)
         self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
 
+    def test_package_artifact_cleanup(self):
+        # Sidecars + .bak follow their package everywhere: delete
+        # drops them, archive moves them alongside, restore brings
+        # them back, archived-delete clears all three. No orphans.
+        import tempfile
+        import brain_package as vault
+        from types import SimpleNamespace
+        import vault_cli
+        tmp = tempfile.mkdtemp(prefix="vault_sweep_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("Sweep", {})
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain_record_only(rec)
+            path = vault.package_path(rec)
+            self.assertTrue(os.path.isfile(path + ".bak"))
+            self.assertTrue(os.path.isfile(path + ".record.json"))
+            vault.archive_brain(rec["id"], reason="sweep test")
+            self.assertFalse(os.path.exists(path + ".record.json"))
+            arch = os.path.join(tmp, "archive", os.path.basename(path))
+            self.assertTrue(os.path.isfile(arch + ".record.json"))
+            self.assertTrue(os.path.isfile(arch + ".bak"))
+            vault.restore_brain(rec["id"])
+            self.assertTrue(os.path.isfile(path + ".record.json"))
+            self.assertTrue(os.path.isfile(path + ".bak"))
+            self.assertEqual(
+                vault_cli.cmd_delete(SimpleNamespace(id=rec["id"])), 0)
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".record.json"))
+            self.assertFalse(os.path.exists(path + ".bak"))
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain_record_only(rec)
+            vault.archive_brain(rec["id"], reason="sweep test 2")
+            freed = vault.delete_archived(rec["id"])
+            self.assertGreater(freed["freed_bytes"], 0)
+            self.assertFalse(os.path.exists(arch))
+            self.assertFalse(os.path.exists(arch + ".record.json"))
+            self.assertFalse(os.path.exists(arch + ".bak"))
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_save_brain_record_only(self):
         import zipfile
         rec = vault_pkg.new_record("RecOnly", {})

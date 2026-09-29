@@ -150,6 +150,19 @@ def save_brain(record, weights, backup=True, fast=False):
 SIDECAR_SUFFIX = ".record.json"
 
 
+def discard_package_artifacts(path):
+    """Best-effort removal of a package's sidecar + .bak (both are
+    write-only caches: never loaded, only rewritten). Call whenever a
+    package file itself is removed, renamed away, or moved, or they
+    linger as orphans confusing future scans."""
+    for cand in (path + SIDECAR_SUFFIX, path + ".bak"):
+        try:
+            if os.path.isfile(cand):
+                os.remove(cand)
+        except OSError:
+            pass
+
+
 def _read_sidecar_record(path):
     """Live metadata override for a package, or None. Written by
     save_brain_record_only when only counters/ELO move (weights
@@ -541,6 +554,9 @@ def archive_brain(path_or_id, reason=""):
     bak = src + ".bak"
     if os.path.isfile(bak):
         shutil.move(bak, dst + ".bak")
+    side = src + SIDECAR_SUFFIX
+    if os.path.isfile(side):
+        shutil.move(side, dst + SIDECAR_SUFFIX)
     entry = {"id": rec.get("id", ""), "name": rec.get("name", "?"),
              "filename": os.path.basename(dst),
              "archived_utc": _utcnow(), "reason": reason,
@@ -583,6 +599,9 @@ def restore_brain(name_or_id):
     bak = src + ".bak"
     if os.path.isfile(bak):
         shutil.move(bak, dst + ".bak")
+    rside = src + SIDECAR_SUFFIX
+    if os.path.isfile(rside):
+        shutil.move(rside, dst + SIDECAR_SUFFIX)
     rec, _w = load_brain(dst)
     update_index_entry(rec)
     # No longer archived: drop the log entry so the Hall of Shame stops
@@ -654,7 +673,7 @@ def delete_archived(name_or_id):
     freed = 0
     for fn in fnames:
         path = os.path.join(ARCHIVE_DIR, fn)
-        for cand in (path, path + ".bak"):
+        for cand in (path, path + ".bak", path + SIDECAR_SUFFIX):
             try:
                 if os.path.isfile(cand):
                     freed += os.path.getsize(cand)

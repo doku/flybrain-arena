@@ -405,6 +405,7 @@ def cmd_delete(a):
     try:
         os.remove(path)
         vault.remove_index_entry(os.path.basename(path))
+        vault.discard_package_artifacts(path)
     except OSError as e:
         return err(str(e))
     return out({"ok": True, "deleted": os.path.basename(path)})
@@ -423,6 +424,7 @@ def cmd_rename(a):
         if os.path.abspath(old_path) != os.path.abspath(vault.package_path(rec)):
             os.remove(old_path)
             vault.remove_index_entry(os.path.basename(old_path))
+            vault.discard_package_artifacts(old_path)
     except OSError as e:
         return err(str(e))
     return out({"ok": True, "brain": rec})
@@ -490,6 +492,7 @@ def cmd_normalize_names(a):
                         vault.package_path(rec)):
                     os.remove(old_path)
                     vault.remove_index_entry(os.path.basename(old_path))
+                    vault.discard_package_artifacts(old_path)
             except OSError as e:
                 return err(str(e))
         else:
