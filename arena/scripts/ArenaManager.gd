@@ -236,6 +236,7 @@ var intermission_label: Label
 var _event_skip := false
 const EVENT_INTERMISSION_SECS := 60.0
 const EVENT_PREVIEW_SECS := 30.0
+const EVENT_FINAL_SECS := 120.0
 # Event gallery (bracket-view right column): rotates fighter stat
 # cards for the next pending group (all fighters pre-event). Keyed
 # cache so records refetch only when the target changes.
@@ -531,6 +532,11 @@ func _enter_tournament_mode() -> void:
 				await _event_pre_showcase()
 				if not _event_active():
 					return
+			elif not await _event_resume_intermission():
+				var rdirector := _director()
+				if rdirector != null:
+					rdirector.quit_to_menu()
+				return
 		else:
 			var evo: Dictionary = director.tourney.get("evo", {})
 			_evo_queue_wild(int(evo.get("generation", 1)) + 1)
@@ -3972,19 +3978,27 @@ func _event_gallery_update(all_fighters: bool = false) -> void:
 				if not (str(pid) in ids):
 					ids.append(str(pid))
 	else:
-		var cur := ""
-		if str(director.tourney.get("format", "")) == "groups":
-			cur = str(director.tourney.get("group", ""))
-		var nxt: String = director.event_next_group(eid, cur)
-		if nxt == "":
+		# Upcoming bracket's fighters, from the loaded tourney (the
+		# switch/build already ran): group letter for group files,
+		# FINAL for the final. The old event_next_group routing showed
+		# the group-after-next (B-intermission galleried C) — never
+		# the bout about to be fought.
+		var tplayers: Array = director.tourney.get("players", [])
+		if tplayers.is_empty():
 			_event_gallery_active = false
 			if is_instance_valid(gallery_box):
 				gallery_box.visible = false
 			return
-		key = _gallery_cache_key(eid, nxt)
-		var gd2: Dictionary = (ev.get("groups", {}) as Dictionary).get(nxt, {})
-		for pid in (gd2.get("players", []) as Array):
-			ids.append(str(pid))
+		var tkey := "FINAL"
+		if str(director.tourney.get("format", "")) == "groups":
+			tkey = str(director.tourney.get("group", ""))
+			if tkey == "":
+				tkey = "UNGROUPED"
+		key = _gallery_cache_key(eid, tkey)
+		for p in tplayers:
+			var ps := str((p as Dictionary).get("id", ""))
+			if ps != "" and not (ps in ids):
+				ids.append(ps)
 	if key == _event_gallery_key and _event_gallery_active:
 		if is_instance_valid(gallery_box):
 			gallery_box.visible = true
@@ -4012,6 +4026,23 @@ func _event_gallery_update(all_fighters: bool = false) -> void:
 	if is_instance_valid(gallery_box):
 		gallery_box.visible = true
 	_build_gallery_entries(cards)
+
+
+func _event_resume_intermission() -> bool:
+	# Relaunch into a live event: same bracket wait as live play (60 s
+	# groups, 120 s final) with the upcoming fighters in the gallery —
+	# resumes never jump straight into battle. SKIP/STOP keep their
+	# usual meaning; false means quit to menu.
+	var director := _director()
+	if director == null:
+		return false
+	var eid := _event_id()
+	var is_final := str(director.tourney.get("format", "")) != "groups"
+	var label := "final" if is_final else str(director.tourney.get("group", "?"))
+	var title := "EVENT %s · %s" % [eid, "FINAL" if is_final else "GROUP " + label]
+	_event_gallery_update()
+	var wait_secs := EVENT_FINAL_SECS if is_final else EVENT_INTERMISSION_SECS
+	return await _event_intermission(title, _event_preview_sub(label), wait_secs, true)
 
 
 func _event_pre_showcase() -> void:
@@ -4257,7 +4288,11 @@ func _event_group_done(res: Dictionary) -> void:
 	if not built:
 		return
 	var title := "EVENT %s · %s" % [eid, "FINAL" if nxt == "final" else "GROUP " + nxt]
-	if not await _event_intermission(title, _event_preview_sub(nxt)):
+	# Gallery primed before the wait (the intermission renders it):
+	# upcoming bracket's fighters in both cases, final included.
+	_event_gallery_update()
+	var wait_secs := EVENT_FINAL_SECS if nxt == "final" else EVENT_INTERMISSION_SECS
+	if not await _event_intermission(title, _event_preview_sub(nxt), wait_secs, true):
 		director.quit_to_menu()
 		return
 	_request_current_battle_load()
