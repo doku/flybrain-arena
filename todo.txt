@@ -1,0 +1,29 @@
+The bracket view that is in-between groups view and period, we should wait for 1 minute count down in that bracket view, so people can see all the tournament flys' stats in the gallery before we start the battle. Also during the transistion to the final bracket, the bracket view did not pop up and wait for 2 minutes count down. Please make that correction. And make sure it's also has the stats gallery like the other bracket. 
+
+The bracket view for the stats gallery, we need to choose a light color and highlight the name on the stats view and also use the same color and highlight the same name on the bracket as the same on the gallery view. So that way people can see clearly who's stats is being viewed. 
+
+
+
+We need to improve the naming scheme. We do not need G2 or G12 in the name. There is no need to keep track of generations if they are new wild remix flys. Just name them kin with number if they are breed from a pedigree. We also need a better random new names that is more memorable and easy to read, no two word namees. 
+
+How does genentics evolution works? We need a more dynamic modular system. That can be created from absolute random. Even if I want to modify the base neuron from the neuro scans, I should be able to in this system. If its reshuffle by pre grouped neuro groups, we need to improve it so it's better shuffled but keep it's function. 
+
+The stats view on the HUD during battle, we should highlight the fly name in the same color they are assigned during battle. Then move move it up closer to the top margin to line up with the health bar. We can have more stats to the stats info. It shouldn't use short hand for stats. And line it up so it's the same stats per line on both flys for the row. We should includ it's pedigree, like who their breed from, or other stats. include stats like total DNF or total KO. 
+
+The flash of the half of the screen, it's too iratating. Instead of flashing the side of the scrreen, flash the stats view on the hud. that way the flashing from the strike does not block the central view of the action. 
+
+When battle DNF, we need to measure how far the both fly are from the battle arena center minus the arena circle radius. There is a white circle marking the main arena area. For this stats remove that big circle radius, since that is appropreate area. But if they deviates too far from that radius then we mark them. Keep track of this stats. Cause the farthest from the center is more likely confused and or running away. We should have the over time battles in the next round have their health taken off by proportion of it's distance to the center to each other. Like farther you are the more health gets taken off for the overtime battle. Make sure to document and explain the reason. That way we will very unlikely need the third round of overtime, since the tie is unlikely due to health differences. 
+
+Explore some sound effects 
+
+Explore some tts anouncements of battle 
+
+Rename all the G1 G2 nameing scheme in the fly names. Have it just the main name in front. Fix any that has kin-kin1 or kin dash kin naming. Since that is bad format and it was appended in a mechanical way. We need to track the kin number internally so we can append the kins with the right numbers. 
+
+Let's do nameing like kin for differnet seed, but same gene, but use jr for junier for breed with mutation. 
+
+Let's not call it evolution tournaments any more. it's just continuous tournament mode. 
+
+use fmpeg on a seperate core and on a seperate intel gpu to do streaming to twitch server. 
+
+

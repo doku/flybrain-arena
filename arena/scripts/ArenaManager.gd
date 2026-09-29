@@ -733,16 +733,33 @@ func _build_bracket_overlay() -> void:
 	gallery_box.add_theme_constant_override("separation", 2)
 	gallery_box.visible = false
 	brow.add_child(gallery_box)
+	# Light stat card (one shared StyleBox on all three labels reads
+	# as a single card): warm paper bg, dark ink body, showcased name
+	# in the shared cyan accent (same color as the bracket rows).
+	var card_sb := StyleBoxFlat.new()
+	card_sb.bg_color = Color(0.95, 0.93, 0.85, 0.97)
+	card_sb.set_corner_radius_all(6)
+	card_sb.content_margin_left = 8.0
+	card_sb.content_margin_right = 8.0
+	card_sb.content_margin_top = 4.0
+	card_sb.content_margin_bottom = 4.0
 	gallery_title = Label.new()
 	gallery_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	gallery_title.add_theme_font_size_override("font_size", 20)
+	gallery_title.add_theme_stylebox_override("normal", card_sb)
+	gallery_title.add_theme_color_override("font_color",
+		TournamentBracket.COL_SHOWCASE)
 	gallery_box.add_child(gallery_title)
 	gallery_elo = Label.new()
 	gallery_elo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	gallery_elo.add_theme_font_size_override("font_size", 28)
+	gallery_elo.add_theme_stylebox_override("normal", card_sb)
+	gallery_elo.add_theme_color_override("font_color", Color(0.12, 0.12, 0.14))
 	gallery_box.add_child(gallery_elo)
 	gallery_rows = Label.new()
 	gallery_rows.add_theme_font_size_override("font_size", 14)
+	gallery_rows.add_theme_stylebox_override("normal", card_sb)
+	gallery_rows.add_theme_color_override("font_color", Color(0.12, 0.12, 0.14))
 	gallery_rows.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	gallery_box.add_child(gallery_rows)
 	var scroll := ScrollContainer.new()
@@ -5464,6 +5481,7 @@ func _hide_nextgen() -> void:
 	nextgen_visible = false
 	if is_instance_valid(arena_bracket):
 		arena_bracket.clear_spotlight()
+		arena_bracket.clear_showcase()
 	if is_instance_valid(gallery_box):
 		gallery_box.visible = false
 	if is_instance_valid(strip_box):
@@ -5701,14 +5719,17 @@ func _render_gallery_card(entry: Dictionary) -> void:
 		gallery_elo.text = "ELO " + str(entry.get("elo", "--"))
 	if is_instance_valid(gallery_rows):
 		gallery_rows.text = str(entry.get("rows", ""))
-	# The showcased fighter's bracket slot spotlights in sync (cleared
-	# when the card carries no key).
+	# The showcased fighter's bracket slot spotlights in sync, and
+	# every bracket row spelling the name paints cyan with the gallery
+	# title (cleared when the card carries no key).
 	if is_instance_valid(arena_bracket):
 		var k := str(entry.get("key", ""))
 		if k != "":
 			arena_bracket.set_spotlight(k)
+			arena_bracket.set_showcase(k)
 		else:
 			arena_bracket.clear_spotlight()
+			arena_bracket.clear_showcase()
 
 
 func _gallery_advance() -> void:

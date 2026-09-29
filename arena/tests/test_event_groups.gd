@@ -33,6 +33,8 @@ func _setup() -> void:
 	D = load("res://scripts/TournamentDirector.gd").new()
 	D.tournament_dir = "user://test_event_groups"
 	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	# Expected showcase accent, read from the source (not duplicated).
+	_showcase_col = load("res://scripts/TournamentBracket.gd").COL_SHOWCASE
 
 
 func _cleanup() -> void:
@@ -906,6 +908,72 @@ func test_vault_draw_excludes_participants() -> void:
 	D.free()
 
 
+var _showcase_col := Color(0.35, 0.85, 1.0)
+
+
+func _cyan_labels(node: Node) -> Array:
+	var out: Array = []
+	if node is Label:
+		var c: Color = (node as Label).get_theme_color("font_color")
+		if c == _showcase_col:
+			out.append((node as Label).text)
+	for ch in node.get_children():
+		out += _cyan_labels(ch)
+	return out
+
+
+func test_showcase_sync() -> void:
+	# Gallery sync: the showcased fighter's every bracket name paints
+	# cyan (same color as the gallery title); clear restores base.
+	var ps := _brains(4, 1500)
+	D.call("build_bracket", ["f01", "f02", "f03", "f04"], 4, 1, 0.5,
+		40.0, false, ps, false, false, false)
+	var BB = load("res://scripts/TournamentBracket.gd").new()
+	BB.call("render_bracket", D.tourney, -1, -1)
+	_check(_cyan_labels(BB).is_empty(), "no showcase before set")
+	BB.set_showcase("f01")
+	_check(BB.showcase_applied() == "f01", "showcase key stored")
+	var lit := _cyan_labels(BB)
+	_check(not lit.is_empty(), "showcased name paints cyan")
+	var hit := false
+	for t in lit:
+		if str(t).contains("F1"):
+			hit = true
+	_check(hit, "the right fighter lights up")
+	BB.clear_showcase()
+	_check(BB.showcase_applied() == "", "clear drops the key")
+	_check(_cyan_labels(BB).is_empty(), "clear restores base colors")
+	_check(BB.get("_show_rows").size() >= 2, "registry covers rows")
+	BB.free()
+
+
+func test_showcase_overview() -> void:
+	# Overview quadrants (the intermission view): quadrant tables and
+	# nested fixture rows join the sync, unknown keys no-op.
+	var brains := _brains(4, 1500)
+	D.call("build_group_bracket", brains, "A", "ESHOW", 1, 0.5, 40.0)
+	D.call("on_battle_result", "alpha", {}, {}, {}, 1, 0)
+	D.call("advance_after_match")
+	var BB = load("res://scripts/TournamentBracket.gd").new()
+	var st: Array = D.call("group_standings")
+	var cell := {"letter": "A", "players": brains,
+		"rounds": D.tourney.get("rounds", []), "standings": st,
+		"is_current": true, "is_done": false, "bracket_id": "x",
+		"cur_round": 0, "cur_match": 0}
+	BB.call("render_event_groups",
+		{"groups": [cell, cell, cell, cell], "current": "A"}, "A")
+	BB.set_showcase("f02")
+	var lit := _cyan_labels(BB)
+	var hit := false
+	for t in lit:
+		if str(t).contains("F2"):
+			hit = true
+	_check(hit, "quadrant + fixtures light up")
+	BB.set_showcase("nobody")
+	_check(BB.showcase_applied() == "", "unknown key clears")
+	BB.free()
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -960,6 +1028,8 @@ func _initialize() -> void:
 	test_draw_title_dnf()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
+	test_showcase_sync()
+	test_showcase_overview()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

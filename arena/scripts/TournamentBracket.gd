@@ -31,6 +31,7 @@ const COL_TBD := Color(0.55, 0.55, 0.6)
 const COL_CHAMP := Color(1.0, 0.85, 0.35)
 const COL_LOSER := Color(1.0, 0.35, 0.3)
 const COL_LOSER_DIM := Color(0.75, 0.3, 0.28, 0.85)
+const COL_SHOWCASE := Color(0.35, 0.85, 1.0)
 
 var segments: Array = []
 # View-relative losers start for _round_name (0 in losers-focus mode).
@@ -41,6 +42,12 @@ var _lf_view := -1
 var spotlight_key := ""
 var _spot_cards := {}
 const SPOT_PREFIX := "offspring:"
+# Gallery showcase (waiting-room preview): fighter id (or
+# "offspring:<kind>" placeholder) -> every name Label spelling it, in
+# all views. Painted cyan; base colors restore from label meta.
+var showcase_key := ""
+var _show_rows := {}
+var _show_kids: Array = []
 
 
 ## View modes: 0 = auto (focus-swap while live losers run, main
@@ -56,6 +63,9 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	segments.clear()
 	_spot_cards.clear()
 	spotlight_key = ""
+	_show_rows.clear()
+	showcase_key = ""
+	_show_kids.clear()
 	var rounds: Array = tourney.get("rounds", [])
 	var losers_from := int(tourney.get("losers_start_round", -1))
 	if rounds.is_empty() or (view == 2 and (losers_from < 0 or losers_from >= rounds.size())):
@@ -276,6 +286,50 @@ func spotlight_applied() -> String:
 	return spotlight_key
 
 
+func _register_show(key: String, nm: Label) -> void:
+	# Every name Label spelling a fighter id (all rounds, all views),
+	# so the gallery's showcased fighter lights up everywhere at once.
+	# Base color rides label meta for restore (spotlight-border pattern).
+	if key == "":
+		return
+	nm.set_meta("base_color", nm.get_theme_color("font_color"))
+	if not _show_rows.has(key):
+		_show_rows[key] = []
+	(_show_rows[key] as Array).append(nm)
+
+
+func set_showcase(key: String) -> void:
+	# Paints the showcased fighter's every name cyan (gallery sync);
+	# no-op for unknown keys. Recurses into fixture sub-brackets.
+	# Re-callers re-render first, which clears.
+	if key == showcase_key:
+		return
+	clear_showcase()
+	if key == "" or not _show_rows.has(key):
+		return
+	showcase_key = key
+	for nm in (_show_rows[key] as Array):
+		(nm as Label).add_theme_color_override("font_color", COL_SHOWCASE)
+	for kid in _show_kids:
+		kid.set_showcase(key)
+
+
+func clear_showcase() -> void:
+	if showcase_key != "" and _show_rows.has(showcase_key):
+		for nm in (_show_rows[showcase_key] as Array):
+			var lbl := nm as Label
+			if is_instance_valid(lbl) and lbl.has_meta("base_color"):
+				lbl.add_theme_color_override("font_color",
+					lbl.get_meta("base_color"))
+	showcase_key = ""
+	for kid in _show_kids:
+		kid.clear_showcase()
+
+
+func showcase_applied() -> String:
+	return showcase_key
+
+
 func _paint_card(card: PanelContainer, border: Color, bw: int) -> void:
 	# Mutates the card's own StyleBoxFlat (each card gets a fresh one
 	# in _card_panel, so neighbors are untouched).
@@ -297,6 +351,9 @@ func render_event_groups(data: Dictionary, current: String = "") -> void:
 	segments.clear()
 	_spot_cards.clear()
 	spotlight_key = ""
+	_show_rows.clear()
+	showcase_key = ""
+	_show_kids.clear()
 	_apply_metrics(4, 4)
 	var groups: Array = data.get("groups", [])
 	if groups.size() != 4:
@@ -382,6 +439,10 @@ func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
 		sl.clip_text = true
 		sl.add_theme_color_override("font_color",
 			Color(0.5, 0.5, 0.55) if (is_done and i > 2) else Color(0.92, 0.92, 0.94))
+		# Showcase registry (gallery sync): quadrant table rows too.
+		var show_id := str(rd.get("id", ""))
+		if show_id != "":
+			_register_show(show_id, sl)
 		vb.add_child(sl)
 	# Fixture cards: the group's own rounds in group view mode (real
 	# versus cards with live/result coloring, no finals, no champion).
@@ -396,6 +457,9 @@ func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
 	sub.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	sub.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	vb.add_child(sub)
+	# Showcase forwarding (gallery sync): fixture rows paint with us.
+	_show_kids.append(sub)
+	sub.set_showcase(showcase_key)
 	return card
 
 
@@ -622,6 +686,10 @@ func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: b
 		else:
 			col = COL_WIN if won else COL_LOSE
 	nm.add_theme_color_override("font_color", col)
+	# Showcase registry (gallery sync): every spelled name, all views.
+	var show_key := str(m.get("a_id" if slot == "a" else "b_id", ""))
+	if show_key != "" and not vacant and label != "TBD":
+		_register_show(show_key, nm)
 	row.add_child(nm)
 	var sc := Label.new()
 	sc.text = _fmt_wins(score) if not training else "…"
