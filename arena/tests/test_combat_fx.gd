@@ -47,6 +47,34 @@ func test_hit_feedback_path() -> void:
 		"no sim stat touched by FX path")
 
 
+func test_stats_flash_path() -> void:
+	# Strike flash lives on the HUD stat cards (never fullscreen):
+	# victim side tints red, attacker cream; hidden cards fall back
+	# to the health-row names; unknown sides no-op.
+	arena._apply_pip_slot()
+	var red := Color(1.0, 0.35, 0.35)
+	arena.pip_name_alpha.visible = true
+	arena.pip_stats_alpha.visible = true
+	arena.pip_name_beta.visible = true
+	arena.pip_stats_beta.visible = true
+	arena._flash_fighter_card("beta", red)
+	_check(arena.pip_name_beta.modulate.is_equal_approx(red),
+		"victim name tints red")
+	_check(arena.pip_stats_beta.modulate.is_equal_approx(red),
+		"victim body tints red")
+	_check(arena.pip_name_alpha.modulate.is_equal_approx(Color.WHITE),
+		"attacker card untouched by victim flash")
+	arena.pip_name_alpha.visible = false
+	arena.pip_stats_alpha.visible = false
+	arena.pip_name_beta.visible = false
+	arena.pip_stats_beta.visible = false
+	arena._flash_fighter_card("alpha", red)
+	_check(arena.alpha_row_name.modulate.is_equal_approx(red),
+		"hidden cards fall back to health-row name")
+	arena._flash_fighter_card("gamma", red)
+	_check(true, "unknown side no-ops without error")
+
+
 func test_shock_lifecycle() -> void:
 	# KO shockwave runs 0.01 -> 1.0 exactly once, then parks at 0.
 	# (Regression: it used to advance unconditionally and ripple forever.)
@@ -174,6 +202,7 @@ func _process(_delta: float) -> bool:
 		return false
 	test_builds()
 	test_hit_feedback_path()
+	test_stats_flash_path()
 	test_shock_lifecycle()
 	test_combat_gate()
 	test_ko_burst_path()

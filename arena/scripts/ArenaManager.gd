@@ -159,8 +159,7 @@ var beta_wing_l: Label
 var beta_wing_r: Label
 var alpha_row_name: Label
 var beta_row_name: Label
-var alpha_hit_flash: ColorRect
-var beta_hit_flash: ColorRect
+
 
 # Dynamic tree fade: trees sitting on the camera->fly line go translucent so
 # the fight stays visible; everything else stays solid. Rebuilt per frame.
@@ -439,7 +438,6 @@ func _ready() -> void:
 		restart_button.pressed.connect(_on_restart_pressed)
 
 	_build_health_hud()
-	_build_hit_flash()
 	_build_combat_fx()
 	_build_vignette()
 	_build_winner_overlay()
@@ -2589,30 +2587,42 @@ func _render_bv_side(rows: Dictionary, emas: Dictionary) -> void:
 		(slot[0] as ProgressBar).value = clampf(ema / float(slot[2]), 0.0, 1.0) * 100.0
 		(slot[1] as Label).text = str(int(ema))
 
-func _build_hit_flash() -> void:
-	# Full-height left/right low-alpha overlays for instant hit feedback.
-	var hud: CanvasLayer = $HUD
-	alpha_hit_flash = ColorRect.new()
-	alpha_hit_flash.name = "AlphaHitFlash"
-	alpha_hit_flash.color = Color(1.0, 0.2, 0.15, 0.0)
-	alpha_hit_flash.set_anchors_preset(Control.PRESET_LEFT_WIDE)
-	alpha_hit_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(alpha_hit_flash)
+func _flash_stats_label(lbl: Label, tint: Color) -> void:
+	# Strike flash for HUD labels: instant tint, fade back to white
+	# over 0.4 s (same timing as the old half-screen flash). The tween
+	# starts only inside the tree, so headless tests can drive the
+	# routing (tint lands synchronously either way).
+	if not is_instance_valid(lbl):
+		return
+	lbl.modulate = tint
+	if lbl.is_inside_tree():
+		var tw := lbl.create_tween()
+		tw.tween_property(lbl, "modulate", Color.WHITE, 0.4)
 
-	beta_hit_flash = ColorRect.new()
-	beta_hit_flash.name = "BetaHitFlash"
-	beta_hit_flash.color = Color(1.0, 0.2, 0.15, 0.0)
-	beta_hit_flash.anchor_left = 0.5
-	beta_hit_flash.anchor_right = 1.0
-	beta_hit_flash.anchor_top = 0.0
-	beta_hit_flash.anchor_bottom = 1.0
-	beta_hit_flash.offset_right = 0.0
-	beta_hit_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(beta_hit_flash)
+
+func _flash_fighter_card(side: String, tint: Color) -> void:
+	# Strike flash that never blocks the central view: the fighter's
+	# stat card when visible, else the always-visible health-row name.
+	# Unknown sides no-op.
+	if side != "alpha" and side != "beta":
+		return
+	var nm: Label = pip_name_alpha if side == "alpha" else pip_name_beta
+	var body: Label = pip_stats_alpha if side == "alpha" else pip_stats_beta
+	var flashed := false
+	for lbl in [nm, body]:
+		if is_instance_valid(lbl) and (lbl as Label).visible:
+			_flash_stats_label(lbl, tint)
+			flashed = true
+	if not flashed:
+		var row: Label = alpha_row_name if side == "alpha" else beta_row_name
+		_flash_stats_label(row, tint)
+
 
 func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void:
-	_flash_victim(victim_id, 0.5)
-	_flash_attacker(attacker_id, 0.22)
+	_flash_fighter_card(victim_id, Color(1.0, 0.35, 0.35))
+	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
+	_flash_fighter_card(attacker_id, Color(1.0, 0.95, 0.75))
+	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, 0.6)
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):
 		_fire_burst(hit_bursts.get(victim_id, null), victim.global_position)
@@ -2624,22 +2634,7 @@ func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void
 		else:
 			status_label.text = _slot_name(attacker_id) + " STRIKES " + _slot_name(victim_id) + " (" + part + ")!"
 
-func _flash_victim(victim_id: String, strength: float) -> void:
-	var rect := alpha_hit_flash if victim_id == "alpha" else beta_hit_flash
-	if rect != null:
-		_flash_rect(rect, Color(1.0, 0.2, 0.15), strength)
-	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
 
-func _flash_attacker(attacker_id: String, strength: float) -> void:
-	var rect := alpha_hit_flash if attacker_id == "alpha" else beta_hit_flash
-	if rect != null:
-		_flash_rect(rect, Color(1.0, 1.0, 0.8), strength)
-	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, 0.6)
-
-func _flash_rect(rect: ColorRect, color: Color, strength: float) -> void:
-	rect.color = Color(color.r, color.g, color.b, strength)
-	var tw := create_tween()
-	tw.tween_property(rect, "color:a", 0.0, 0.4)
 
 # Combat readability FX: ground-projected health rings (in-world health
 # bars with seizure/KO states + KO shockwave) and per-fly ember bursts
@@ -3516,7 +3511,8 @@ func _on_wing_torn(fly_id: String, side: String) -> void:
 	# Refresh HUD now - the round ends immediately, so physics-driven updates
 	# would never show the torn wing / dried-up health bar.
 	_update_health_hud()
-	_flash_victim(fly_id, 0.6)
+	_flash_fighter_card(fly_id, Color(1.0, 0.3, 0.3))
+	_flash_body(fly_alpha if fly_id == "alpha" else fly_beta, 1.0)
 	if is_instance_valid(status_label):
 		status_label.text = _slot_name(fly_id) + " LOST " + side.to_upper() + " WING!"
 
@@ -3528,7 +3524,8 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 
 	# Draw the final state (health floor, torn wing) BEFORE the winner text.
 	_update_health_hud()
-	_flash_victim(victim_id, 0.75)
+	_flash_fighter_card(victim_id, Color(1.0, 0.25, 0.25))
+	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):
 		_fire_burst(ko_bursts.get(victim_id, null), victim.global_position)
