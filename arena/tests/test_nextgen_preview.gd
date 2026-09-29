@@ -67,27 +67,27 @@ func test_synthetic_refresh() -> void:
 	var brains: Array = []
 	for i in range(15):
 		brains.append(_fake("p%d" % (i + 1), "F%d" % (i + 1), 1200.0))
-	brains.append({"id": "", "name": "wild G5 (training)",
+	brains.append({"id": "", "name": "wild (training)",
 		"record": {"elo": 1200.0}})
 	var pv: Dictionary = d.preview_bracket(brains, 16, false)
 	var found_synth := false
 	for m in (pv["rounds"][0] as Array):
 		var md := m as Dictionary
-		if str(md.get("a_name", "")) == "wild G5 (training)" \
-				or str(md.get("b_name", "")) == "wild G5 (training)":
+		if str(md.get("a_name", "")) == "wild (training)" \
+				or str(md.get("b_name", "")) == "wild (training)":
 			found_synth = true
 	_check(found_synth, "synthetic wild card placed in preview")
 	# Adopt: same slot, real brain.
-	brains[15] = _fake("w99", "Bristle_G5", 1210.0)
+	brains[15] = _fake("w99", "Bristle", 1210.0)
 	var pv2: Dictionary = d.preview_bracket(brains, 16, false)
 	var found_real := false
 	var found_stale := false
 	for m in (pv2["rounds"][0] as Array):
 		var md := m as Dictionary
 		for k in ["a_name", "b_name"]:
-			if str(md.get(k, "")) == "Bristle_G5":
+			if str(md.get(k, "")) == "Bristle":
 				found_real = true
-			if str(md.get(k, "")) == "wild G5 (training)":
+			if str(md.get(k, "")) == "wild (training)":
 				found_stale = true
 	_check(found_real, "adopted name replaces synthetic card")
 	_check(not found_stale, "no stale synthetic card after adopt")
@@ -109,7 +109,7 @@ func test_gallery_cards() -> void:
 		"record card battles line")
 	_check(str(real.get("rows", "")).contains("genome gABC"),
 		"record card wiring line")
-	var ghost: Dictionary = a._gallery_card("", "wild G5 (training)")
+	var ghost: Dictionary = a._gallery_card("", "wild (training)")
 	_check(str(ghost.get("elo", "")) == "--", "training card elo blank")
 	_check(str(ghost.get("rows", "")).contains("training"),
 		"training card shows training state")
@@ -150,11 +150,11 @@ func test_awaited_spec_progress() -> void:
 	a.evo_await_spec = {"kind": "wild", "name": "", "gen": 5,
 		"progress": pf, "launched": true, "mode": "graft"}
 	var res: Array = a._offspring_progress("wild")
-	_check(str(res[0]) == "wild G5", "awaited label resolves")
+	_check(str(res[0]) == "wild", "awaited label resolves")
 	_check(absf(float(res[1]) - 40.0) < 0.01, "awaited pct tracks ep file")
 	var res2: Array = a._offspring_progress("clone")
 	_check(float(res2[1]) < 0.0, "other kinds still absent")
-	var card: Dictionary = a._gallery_card("", "wild G5 (training)")
+	var card: Dictionary = a._gallery_card("", "wild (training)")
 	_check(str(card.get("rows", "")).contains("ep 20/50"),
 		"gallery training card tracks awaited spec")
 	a.evo_await_spec = {}

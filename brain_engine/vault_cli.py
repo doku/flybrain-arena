@@ -428,6 +428,81 @@ def cmd_rename(a):
     return out({"ok": True, "brain": rec})
 
 
+def cmd_normalize_names(a):
+    """One-time naming migration (dry run unless --apply): strip G<N>
+    generation tags, collapse kin-kin stacks, backfill lineage
+    base/kin/jr (jr always 0 — post-hoc mutation unknowable).
+    Collisions keep the earliest-created bare name; later ones take
+    Mk numerals. Ids never change, so brackets/keys are unaffected."""
+    import evo_breeder as evo
+    try:
+        recs = vault.scan_vault(silent=True)
+    except Exception as e:
+        return err(str(e))
+    recs.sort(key=lambda r: (r.get("created_utc", ""),
+                             r.get("id", "")))
+    plan = []
+    taken = {str(r.get("name", "")) for r in recs}
+    for rec in recs:
+        lin = (rec.get("lineage", {}) or {})
+        if "base" in lin and "kin" in lin and "jr" in lin:
+            continue
+        taken.discard(str(rec.get("name", "")))
+        base, kin = evo.normalize_display_name(str(rec.get("name", "")))
+        clean = vault._sanitize_name(base) or "Unnamed"
+        if kin > 0:
+            clean = "%s-kin%d" % (clean, kin)
+        final = clean
+        n = 2
+        while final in taken:
+            final = "%s Mk%d" % (clean, n)
+            n += 1
+        taken.add(final)
+        plan.append({"id": rec.get("id", ""), "old": rec.get("name", ""),
+                     "new": final, "base": base, "kin": kin, "jr": 0})
+    renames = sum(1 for p in plan if p["old"] != p["new"])
+    text = "normalize-names (%d brains: %d renames, %d backfills):\n" % (
+        len(recs), renames, len(plan) - renames)
+    for p in plan:
+        text += "  %(id)s '%(old)s' -> '%(new)s' (base=%(base)s kin=%(kin)d jr=%(jr)d)\n" % p
+    if not bool(getattr(a, "apply", False)):
+        return out({"ok": True, "dry_run": True, "plan": plan,
+                    "text": text + "dry run (pass --apply to write)"},
+                   getattr(a, "result_file", ""))
+    applied = 0
+    for p in plan:
+        try:
+            rec, weights = vault.load_brain(p["id"])
+        except Exception as e:
+            return err("cannot load %s: %s" % (p["id"], e))
+        old_path = vault.package_path(rec)
+        lin = rec.setdefault("lineage", {})
+        lin["base"] = p["base"]
+        lin["kin"] = p["kin"]
+        lin["jr"] = p["jr"]
+        if p["new"] != p["old"]:
+            rec["name"] = p["new"]
+            rec["filename"] = "%s_%s%s" % (
+                p["new"], rec["id"], vault.PACKAGE_EXT)
+            try:
+                vault.save_brain(rec, weights)
+                if os.path.abspath(old_path) != os.path.abspath(
+                        vault.package_path(rec)):
+                    os.remove(old_path)
+                    vault.remove_index_entry(os.path.basename(old_path))
+            except OSError as e:
+                return err(str(e))
+        else:
+            try:
+                vault.save_brain_record_only(rec)
+            except OSError as e:
+                return err(str(e))
+        applied += 1
+    return out({"ok": True, "dry_run": False, "applied": applied,
+                "text": text + "applied %d" % applied},
+               getattr(a, "result_file", ""))
+
+
 def cmd_export(a):
     try:
         rec, _w = vault.load_brain(a.id)
@@ -656,6 +731,7 @@ def main():
     q.add_argument("--parent2", default="")
     q.add_argument("--progress", default=""); q.add_argument("--result-file", default="")
     q.add_argument("--log-file", default=""); q.add_argument("--gen", type=int, default=1)
+    q = sub.add_parser("normalize-names"); q.add_argument("--apply", action="store_true")
     a = p.parse_args()
     fn = {"list": cmd_list, "info": cmd_info, "generate": cmd_generate,
            "train": cmd_train, "delete": cmd_delete, "score": cmd_score,
@@ -665,7 +741,8 @@ def main():
            "restore": cmd_restore, "archive-list": cmd_archive_list,
            "archive-delete": cmd_archive_delete,
            "derive-mapping": cmd_derive_mapping,
-           "breed": cmd_breed}[a.cmd]
+           "breed": cmd_breed,
+           "normalize-names": cmd_normalize_names}[a.cmd]
     return fn(a)
 
 

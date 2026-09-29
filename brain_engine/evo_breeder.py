@@ -45,14 +45,14 @@ WILD_ADJECTIVES = [
 WILD_STEMS = WILD_ADJECTIVES + WILD_CALLSIGNS
 
 
-def wild_name(rng, generation):
+def wild_name(rng):
     """Deterministic wild-offspring display name from a seedable rng
-    (anything with .choice, e.g. random.Random):
-    '<Stem> G<gen>' (one word plus generation tag)."""
-    return f"{rng.choice(WILD_STEMS)} G{int(generation)}"
+    (anything with .choice, e.g. random.Random): a bare memorable
+    stem, no generation tag (wild remix flies don't track generations)."""
+    return str(rng.choice(WILD_STEMS))
 
 
-def unique_wild_name(rng, generation, taken):
+def unique_wild_name(rng, taken):
     """wild_name, de-duped against a set of taken display names.
 
     First try is the plain deterministic name (no extra rng draws, so
@@ -60,7 +60,7 @@ def unique_wild_name(rng, generation, taken):
     deterministic Mk numeral (Mk2, Mk3, ...) instead of burning more
     rng state. Caps at Mk99, then falls back to a seed-hash suffix
     that cannot realistically collide."""
-    base = wild_name(rng, generation)
+    base = wild_name(rng)
     if base not in taken:
         return base
     for n in range(2, 100):
@@ -70,6 +70,63 @@ def unique_wild_name(rng, generation, taken):
     import hashlib as _hashlib
     digest = _hashlib.sha1(repr(sorted(taken)).encode()).hexdigest()[:6]
     return f"{base} X{digest}"
+
+
+def _pedigree_base(name):
+    """One-time display-name strip for lineage bootstrapping (see
+    normalize_display_name). New code never parses names (counters
+    live in lineage); this exists only for pre-migration records."""
+    return normalize_display_name(name)[0] or (name or "").strip()
+
+
+def _pedigree_counters(rec):
+    """(base, kin, jr) from a parent record: lineage source of truth.
+    Records predating the scheme (no base/kin/jr keys at all) resolve
+    once through normalize_display_name; partial lineages fill gaps
+    from the display strip. New code never parses names otherwise."""
+    lin = (rec.get("lineage", {}) or {})
+    if "base" not in lin and "kin" not in lin and "jr" not in lin:
+        base, kin = normalize_display_name(str(rec.get("name", "")))
+        return base, kin, 0
+    kin = int(lin.get("kin", 0) or 0)
+    jr = int(lin.get("jr", 0) or 0)
+    base = str(lin.get("base", "") or "")
+    if base == "":
+        base = _pedigree_base(str(rec.get("name", "")))
+    return base, max(kin, 0), max(jr, 0)
+
+
+def normalize_display_name(name):
+    """One-time migration helper: (base, kin) from a legacy display
+    name. Strips one leading G<N>-prefix, one trailing wild G<N> tag,
+    and collapses stacked -kin[N]-kin[M] runs to the highest N (empty
+    tail counts as 1). jr is always 0 for migrated brains (post-hoc
+    structural mutation is unknowable; future mutations increment from
+    there). New code never calls this (counters live in lineage)."""
+    raw = (name or "").strip()
+    base = raw
+    while True:
+        gpos = base.find("-")
+        if gpos <= 1 or base[0] != "G" or not base[1:gpos].isdigit():
+            break
+        base = base[gpos + 1:]
+    kin = 0
+    while True:
+        kpos = base.rfind("-kin")
+        if kpos < 0:
+            break
+        tail = base[kpos + 4:]
+        if tail != "" and not tail.isdigit():
+            break
+        kin = max(kin, int(tail or 1))
+        base = base[:kpos]
+    for sep in (" G", "_G"):
+        gp = base.rfind(sep)
+        if gp >= 0 and base[gp + 2:].isdigit():
+            base = base[:gp]
+            break
+    base = base or raw
+    return base, kin
 
 
 def biggest_loser(tourney, rng=None):
@@ -382,6 +439,7 @@ def breed_clone(parent_id, name, seed, episodes=None, noise=None,
                                    load_or_build_csr)
     rec, weights = vault.load_brain(parent_id)
     gp = dict(rec.get("generator_params", {}) or {})
+    base, kin, jr = _pedigree_counters(rec)
     parent_recipe = ((rec.get("lineage", {}) or {}).get("training", {}) or {})
     recipe, recipe_mut, ep1, ep2, noise, max_changes = _resolve_recipe(
         parent_recipe, seed, episodes, episodes2, noise, max_changes)
@@ -392,6 +450,8 @@ def breed_clone(parent_id, name, seed, episodes=None, noise=None,
     # max_changes = 0 (a legal inherited recipe) means a structurally
     # identical clone: skip mutate_genome, which requires >= 1. The
     # child still varies by weight noise, traits, blends and recipe.
+    # Only a taken structural mutation earns the junior suffix.
+    struct_mutated = False
     if genome is not None and mutate_structure and max_changes >= 1:
         pops = load_or_extract_populations()
         csr = load_or_build_csr()
@@ -401,6 +461,7 @@ def breed_clone(parent_id, name, seed, episodes=None, noise=None,
             gp.get("experiment"), genome, new_genome,
             np.asarray(weights, dtype=np.float32), mrng, pops, csr)
         genome = new_genome
+        struct_mutated = True
         if mapping is None:
             child_mapping = list(derive_mapping(genome))
     params = {
@@ -422,13 +483,26 @@ def breed_clone(parent_id, name, seed, episodes=None, noise=None,
     mutated.update(blend_mut)
     if genome is not None:
         attach_genome(params, genome)
-    child = vault.new_record(name, params)
+    # Pedigree naming: empty name auto-composes from the outcome — same
+    # gene re-seeded earns kin, a taken structural mutation earns
+    # junior. Explicit names pass through verbatim (counters carried).
+    # Counters live in lineage; display names are never parsed.
+    child_name = (name or "").strip()
+    if child_name == "":
+        if struct_mutated:
+            jr += 1
+            child_name = f"{base}-jr{jr}"
+        else:
+            kin += 1
+            child_name = f"{base}-kin{kin}"
+    child = vault.new_record(child_name, params)
     recipe["inherited_from"] = rec.get("id", "")
     child["lineage"] = {"parent_ids": [rec.get("id", "")],
                         "source": f"clone:{rec.get('id', '')}",
                         "trait_mutations": mutated,
                         "training": dict(recipe),
-                        "training_mutations": recipe_mut}
+                        "training_mutations": recipe_mut,
+                        "base": base, "kin": kin, "jr": jr}
     # ELO inheritance with regression to the mean: the child starts
     # strong but below the parent (wilds take the new_record default).
     parent_elo = float((rec.get("record", {}) or {}).get(
@@ -477,10 +551,12 @@ def breed_random(name, seed, episodes=None, progress_cb=None, generation=1,
     if not (name or "").strip():
         # Dedicated naming stream: extra adjective/callsign draws must
         # not shift the wiring/rate draws below for a given seed.
+        # Bare memorable stem, no generation tag (wilds don't track
+        # generations); dedupe against the vault.
         nr = _random.Random(f"wild-name:{int(seed)}")
         taken = {str(rec.get("name", ""))
                  for rec in vault.read_vault(silent=True)}
-        name = unique_wild_name(nr, generation, taken)
+        name = unique_wild_name(nr, taken)
     grng = _np.random.default_rng(int(seed))
     pops = load_or_extract_populations()
     provenance = {"mode": "legacy"}
@@ -531,7 +607,9 @@ def breed_random(name, seed, episodes=None, progress_cb=None, generation=1,
     recipe["inherited_from"] = None
     record["lineage"] = {"parent_ids": [], "source": "evo-random",
                          "explore_mode": mode, "provenance": provenance,
-                         "training": dict(recipe), "training_mutations": {}}
+                         "training": dict(recipe), "training_mutations": {},
+                         "base": str(record.get("name", "")),
+                         "kin": 0, "jr": 0}
     vault.save_brain(record, weights)
     return record, weights, summary
 
@@ -581,7 +659,9 @@ def breed_reference(name="Reference", seed=7, episodes=50,
     record["lineage"] = {"parent_ids": [], "source": "reference",
                          "explore_mode": "reference",
                          "provenance": {"mode": "reference",
-                                        "reference_id": gid}}
+                                        "reference_id": gid},
+                         "base": str(record.get("name", "")),
+                         "kin": 0, "jr": 0}
     vault.save_brain(record, weights)
     return record, weights, summary
 
@@ -681,14 +761,24 @@ def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=None,
     params.update(blend_vals)
     mutated.update(blend_mut)
     attach_genome(params, genome)
-    child = vault.new_record(name, params)
+    # Crossover builds a novel combined genome: junior off parent A
+    # (base A, jr above both parents). Empty name auto-composes;
+    # explicit names pass through verbatim (counters carried).
+    base_a, kin_a, jr_a = _pedigree_counters(rec_a)
+    _base_b, _kin_b, jr_b = _pedigree_counters(rec_b)
+    jr = max(jr_a, jr_b) + 1
+    child_name = (name or "").strip()
+    if child_name == "":
+        child_name = f"{base_a}-jr{jr}"
+    child = vault.new_record(child_name, params)
     recipe["inherited_from"] = [rec_a.get("id", ""), rec_b.get("id", "")]
     child["lineage"] = {
         "parent_ids": [rec_a.get("id", ""), rec_b.get("id", "")],
         "source": f"crossover:{rec_a.get('id', '')}x{rec_b.get('id', '')}",
         "trait_mutations": mutated, "explore_mode": "crossover",
         "provenance": provenance, "training": dict(recipe),
-        "training_mutations": recipe_mut}
+        "training_mutations": recipe_mut,
+        "base": base_a, "kin": kin_a, "jr": jr}
     elo_a = float((rec_a.get("record", {}) or {}).get(
         "elo", vault.ELO_DEFAULT))
     elo_b = float((rec_b.get("record", {}) or {}).get(

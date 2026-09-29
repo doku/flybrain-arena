@@ -1489,25 +1489,25 @@ func is_genome_bearing(pid: String) -> bool:
 	return false
 
 
-func kin_name(champ_name: String, gen: int) -> String:
-	# Clone display name that stays short across generations: strip one
-	# leading G<N>- prefix, one trailing -kin[N] suffix (remembering N),
-	# and one trailing old wild " G<N>"/"_G<N>" tag, then compose
-	# G<gen>-<base>-kin<n+1>. Never stacks (no G3-G2-...-kin-kin);
-	# unparseable names fall back to the full original.
+func kin_base_name(champ_name: String) -> String:
+	# Pedigree base for clone specs: strip one leading G<N>- prefix,
+	# one trailing -kin[N]/-jr[N] suffix, and one trailing old wild
+	# " G<N>"/"_G<N>" tag. The worker appends -kin/-jr with the
+	# lineage counters at banking (counters are never parsed); the
+	# spec carries the base only. Unparseable names fall back to the
+	# full original.
 	var base := champ_name.strip_edges()
 	var gpos := base.find("-")
 	if gpos > 1 and base.substr(0, 1) == "G" \
 			and base.substr(1, gpos - 1).is_valid_int():
 		base = base.substr(gpos + 1)
-	var n := 1
-	var kpos := base.rfind("-kin")
-	if kpos >= 0:
-		var tail := base.substr(kpos + 4)
-		if tail == "" or tail.is_valid_int():
-			if tail != "":
-				n = int(tail) + 1
-			base = base.substr(0, kpos)
+	for tag in ["-kin", "-jr"]:
+		var kpos := base.rfind(tag)
+		if kpos >= 0:
+			var tail := base.substr(kpos + 4)
+			if tail == "" or tail.is_valid_int():
+				base = base.substr(0, kpos)
+				break
 	for sep in [" G", "_G"]:
 		var gp := base.rfind(sep)
 		if gp >= 0 and base.substr(gp + 2).is_valid_int():
@@ -1515,8 +1515,7 @@ func kin_name(champ_name: String, gen: int) -> String:
 			break
 	if base == "":
 		base = champ_name.strip_edges()
-		n = 1
-	return "G%d-%s-kin%d" % [gen, base, n]
+	return base
 
 
 func _player_elo(pid: String) -> float:

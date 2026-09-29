@@ -3149,7 +3149,7 @@ func _update_evo_status_line() -> void:
 			continue
 		var label := str(s.get("name", ""))
 		if label == "":
-			label = "wild G%d" % int(s.get("gen", gen + 1))
+			label = "wild"
 		var smode := str(s.get("mode", ""))
 		if smode != "":
 			label += " [%s]" % smode
@@ -3767,7 +3767,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 					_evo_clone_parent2(gen + 1, champ_id))
 				_update_evo_status_line()
 				if is_instance_valid(status_label):
-					status_label.text = "EVO GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_name(champ_name, gen + 1)]
+					status_label.text = "EVO GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_base_name(champ_name)]
 			await get_tree().create_timer(3.0).timeout
 			_hide_arena_bracket()
 		_request_current_battle_load()
@@ -4653,7 +4653,7 @@ func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
 		return ""
 	var log_path := result_file.get_base_dir().path_join(
 		result_file.get_file().get_basename() + ".log")
-	var display := brain_name if brain_name != "" else ("wild G%d" % target_gen)
+	var display := brain_name if brain_name != "" else "wild"
 	# No --episodes/--episodes2/--noise: the breeder deals each child a
 	# recipe inherited ± a delta from its parent (fresh for wilds).
 	var args := ["breed", "--strategy", strategy,
@@ -4904,11 +4904,15 @@ func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String,
 		parent2_id: String = "") -> void:
 	if champ_id == "" or _evo_has_kind("clone"):
 		return
+	# Spec carries the pedigree BASE for display; the worker appends
+	# -kin/-jr with the lineage counters at banking (counters are
+	# never parsed). --name is withheld at spawn so the worker
+	# auto-composes from the parent record.
 	var director := _director()
-	var kin := champ_name
+	var base := champ_name
 	if director != null:
-		kin = director.kin_name(champ_name, target_gen)
-	_evo_queue_spec("clone", kin, champ_id, randi(), target_gen, "")
+		base = director.kin_base_name(champ_name)
+	_evo_queue_spec("clone", base, champ_id, randi(), target_gen, "")
 	if parent2_id != "":
 		# Crossover child: same clone slot/done-key, second parent noted.
 		for spec in _evo_pending():
@@ -4995,9 +4999,12 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	args += ["--mutate-traits", str(int(evod.get("mutate_traits", 1)))]
 	# Never emit an empty argv element: Godot drops it on Windows, so
 	# `--name ""` arrives as a bare `--name` and argparse aborts the
-	# worker (this killed every wild breed). Empty = wild auto-christen.
+	# worker (this killed every wild breed). Empty = auto-compose:
+	# wilds christen from stems, clones/crossovers from the parent
+	# record (base + lineage counters + mutation outcome). Explicit
+	# spec names forward only for other strategies.
 	var sname := str(spec.get("name", ""))
-	if sname != "":
+	if sname != "" and not (kind in ["clone", "crossover"]):
 		args += ["--name", sname]
 	if str(spec.get("parent", "")) != "":
 		args += ["--parent", str(spec.get("parent", ""))]
@@ -5164,7 +5171,7 @@ func _run_evo_generation() -> void:
 			nextgen_survivors.append(pid)
 	nextgen_champ_id = champ_id
 	nextgen_champ_name = champ_name
-	nextgen_clone_name = director.kin_name(champ_name, target_gen)
+	nextgen_clone_name = director.kin_base_name(champ_name)
 	nextgen_brains = {}
 	for b in director.list_brains_cached():
 		var bd := b as Dictionary
@@ -5307,7 +5314,7 @@ func _evo_offspring_summary(target_gen: int) -> String:
 			found = true
 			var label := str(s.get("name", ""))
 			if label == "":
-				label = "wild G%d" % int(s.get("gen", target_gen))
+				label = "wild"
 			if bool(s.get("launched", false)):
 				var prog := _evo_poll_file(str(s.get("progress", "")))
 				if prog.is_empty():
@@ -5346,7 +5353,7 @@ func _evo_spawn_why() -> String:
 
 
 func _nextgen_wild_label(target_gen: int) -> String:
-	return "wild G%d (training)" % target_gen
+	return "wild (training)"
 
 
 func _nextgen_offspring_slots() -> Array:
@@ -5536,7 +5543,7 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 			var sk := str(s.get("kind", ""))
 			var m := (want != "" and sk == want) \
 				or (str(s.get("name", "")) != "" and str(s.get("name", "")) == pname) \
-				or (sk == "wild" and pname.begins_with("wild G"))
+				or (sk == "wild" and (pname == "wild" or pname.begins_with("wild ")))
 			if not m and not (sk.begins_with("topup") and pname == sk):
 				continue
 			found_kind = sk
@@ -5748,7 +5755,7 @@ func _offspring_progress(kind: String) -> Array:
 			continue
 		label = str(s.get("name", ""))
 		if label == "":
-			label = "wild G%d" % int(s.get("gen", nextgen_gen))
+			label = "wild"
 		if not bool(s.get("launched", false)):
 			return [label + " queued", 0.0]
 		var prog := _evo_poll_file(str(s.get("progress", "")))
@@ -5802,7 +5809,7 @@ func _evo_await_queued(kind: String) -> String:
 			"progress": str(s.get("progress", "")),
 			"launched": bool(s.get("launched", false)),
 			"mode": str(s.get("mode", ""))}
-		var display0 := sname0 if sname0 != "" else ("wild G%d" % int(s.get("gen", 1)))
+		var display0 := sname0 if sname0 != "" else "wild"
 		if not bool(s.get("launched", false)):
 			# The lane may still be held by the sibling breed (e.g. wild
 			# head-start unfinished at tournament end): it trains on
@@ -5825,7 +5832,7 @@ func _evo_await_queued(kind: String) -> String:
 				else:
 					var blabel := str(blk.get("name", ""))
 					if blabel == "":
-						blabel = "wild G%d" % int(blk.get("gen", 1))
+						blabel = "wild"
 					var bprog := _evo_poll_file(str(blk.get("progress", "")))
 					var bep := "warming up"
 					if not bprog.is_empty():
@@ -5853,7 +5860,7 @@ func _evo_await_queued(kind: String) -> String:
 		# liveness gate and kill path key off evo_breed_pid.
 		evo_breed_pid = int(s.get("pid", 0))
 		var sname := str(s.get("name", ""))
-		var display := sname if sname != "" else ("wild G%d" % int(s.get("gen", 1)))
+		var display := sname if sname != "" else "wild"
 		var bred := await _evo_await_result(display,
 			str(s.get("progress", "")), str(s.get("result", "")),
 			int(s.get("seed", -1)))

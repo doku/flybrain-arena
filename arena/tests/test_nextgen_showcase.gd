@@ -43,11 +43,11 @@ func _border(card: PanelContainer) -> Color:
 func test_placeholder_row() -> void:
 	var B = load("res://scripts/TournamentBracket.gd").new()
 	var card: PanelContainer = B.call("_make_match_card",
-		_match("abc12345", "Mottled_G4", "offspring:wild", "wild G15 (training)"),
+		_match("abc12345", "Mottled", "offspring:wild", "wild (training)"),
 		0, 0, false, false)
 	var t := _row_texts(card)
-	_check(t[1] == "Mottled_G4", "real fighter row untouched")
-	_check(t[3] == "wild G15 (training) · TRAINING", "placeholder row tagged TRAINING")
+	_check(t[1] == "Mottled", "real fighter row untouched")
+	_check(t[3] == "wild (training) · TRAINING", "placeholder row tagged TRAINING")
 	_check(t[4] == "…", "placeholder score is ellipsis, not 0-0")
 	_check(t[2] == "0", "real fighter score still numeric")
 	B.free()
@@ -56,8 +56,8 @@ func test_placeholder_row() -> void:
 func test_spotlight() -> void:
 	var B = load("res://scripts/TournamentBracket.gd").new()
 	var preview := {"players": [], "size": 4, "rounds": [[
-		_match("abc12345", "Mottled_G4", "offspring:wild", "wild G15 (training)"),
-		_match("def67890", "Wasp_G5", "offspring:clone", "G15-Kin (training)")]]}
+		_match("abc12345", "Mottled", "offspring:wild", "wild (training)"),
+		_match("def67890", "Wasp", "offspring:clone", "Slate (training)")]]}
 	B.call("render_bracket", preview, -1, -1)
 	_check(B.call("spotlight_applied") == "", "no spotlight after render")
 	B.call("set_spotlight", "offspring:wild")
@@ -79,7 +79,7 @@ func test_spotlight() -> void:
 
 
 func _fixture_rec() -> Dictionary:
-	return {"id": "kid12345", "name": "G15-Slate_Cicada-kin3",
+	return {"id": "kid12345", "name": "Slate_Cicada-kin3",
 		"record": {"elo": 1312.0, "battles": 12, "wins": 7, "losses": 4,
 			"draws": 1, "matches": 4, "matches_won": 3, "matches_lost": 1,
 			"tournaments_won": 1},
@@ -97,8 +97,8 @@ func _fixture_rec() -> Dictionary:
 func test_gallery_real_card() -> void:
 	var A = load("res://scripts/ArenaManager.gd").new()
 	A.set("nextgen_brains", {"kid12345": _fixture_rec(),
-		"par67890": {"id": "par67890", "name": "Mottled_G4"}})
-	var card: Dictionary = A.call("_gallery_card", "kid12345", "G15-Slate_Cicada-kin3")
+		"par67890": {"id": "par67890", "name": "Mottled"}})
+	var card: Dictionary = A.call("_gallery_card", "kid12345", "Slate_Cicada-kin3")
 	_check(str(card.get("key", "")) == "kid12345", "gallery card carries bracket key")
 	_check(str(card.get("elo", "")) == "1312", "elo shown")
 	var rows := str(card.get("rows", ""))
@@ -110,7 +110,7 @@ func test_gallery_real_card() -> void:
 		"wiring makeup present")
 	_check(rows.contains("evasion 0.46") and rows.contains("lr 0.01"),
 		"trait makeup present")
-	_check(rows.contains("clone of Mottled_G4"),
+	_check(rows.contains("clone of Mottled"),
 		"inheritance names the parent")
 	_check(rows.contains("evasion 0.40→0.46"), "trait mutations shown")
 	_check(rows.contains("reared 55ep"), "training recipe shown")
@@ -123,7 +123,7 @@ func test_gallery_training_card() -> void:
 	var A = load("res://scripts/ArenaManager.gd").new()
 	A.set("nextgen_brains", {})
 	var card: Dictionary = A.call("_gallery_card", "offspring:wild",
-		"wild G15 (training)")
+		"wild (training)")
 	_check(str(card.get("title", "")).begins_with("NEW WILD"),
 		"wild placeholder announces NEW WILD")
 	_check(str(card.get("elo", "")) == "--", "placeholder has no elo")
@@ -131,7 +131,7 @@ func test_gallery_training_card() -> void:
 		"placeholder shows training status")
 	_check(str(card.get("key", "")) == "offspring:wild",
 		"placeholder carries its bracket key")
-	var card2: Dictionary = A.call("_gallery_card", "offspring:clone", "G15-Kin")
+	var card2: Dictionary = A.call("_gallery_card", "offspring:clone", "Slate")
 	_check(str(card2.get("title", "")).begins_with("NEW BREED"),
 		"clone placeholder announces NEW BREED")
 	A.free()

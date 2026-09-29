@@ -1608,6 +1608,65 @@ class TestBrainVault(unittest.TestCase):
         self.assertTrue(np.allclose(w, w2))
         self.assertEqual(rec2["generator_params"]["seed"], 11)
 
+    def test_normalize_names_apply(self):
+        # Dry run changes nothing; apply renames G/kin-stack names,
+        # backfills lineage base/kin/jr, and resolves collisions by
+        # creation order (first keeps the bare name). Runs in the
+        # temp vault (class fixture), never the live one.
+        from types import SimpleNamespace
+        import vault_cli
+        made = []
+        for name, stamp in [("G5-Kestrel-kin2", "2026-01-01T00:00:01"),
+                            ("Kestrel_G2", "2026-01-01T00:00:02"),
+                            ("X-kin-kin1", "2026-01-01T00:00:03"),
+                            ("Viper", "2026-01-01T00:00:04"),
+                            ("Kestrel_G9", "2026-01-01T00:00:05")]:
+            rec = vault_pkg.new_record(name, {})
+            rec["created_utc"] = stamp
+            vault_pkg.save_brain(
+                rec, np.arange(8, dtype=np.float32))
+            made.append(rec["id"])
+        import json as _json
+        import shutil as _shutil
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="normnames_")
+        rf = os.path.join(tmp, "dry.json")
+        self.assertEqual(
+            vault_cli.cmd_normalize_names(
+                SimpleNamespace(apply=False, result_file=rf)), 0)
+        with open(rf) as f:
+            dry = _json.load(f)
+        self.assertTrue(dry["ok"])
+        self.assertTrue(dry["dry_run"])
+        again, _w = vault_pkg.load_brain(made[0])
+        self.assertEqual(again["name"], "G5-Kestrel-kin2")
+        rf2 = os.path.join(tmp, "apply.json")
+        self.assertEqual(
+            vault_cli.cmd_normalize_names(
+                SimpleNamespace(apply=True, result_file=rf2)), 0)
+        with open(rf2) as f:
+            got = _json.load(f)
+        self.assertTrue(got["ok"])
+        self.assertFalse(got["dry_run"])
+        _shutil.rmtree(tmp, ignore_errors=True)
+        names = {}
+        for bid in made:
+            r, _w = vault_pkg.load_brain(bid)
+            names[bid] = r["name"]
+            lin = r.get("lineage", {})
+            self.assertIn("base", lin)
+            self.assertIn("kin", lin)
+            self.assertIn("jr", lin)
+            self.assertEqual(lin["jr"], 0)
+        self.assertEqual(names[made[0]], "Kestrel-kin2")
+        self.assertEqual(names[made[1]], "Kestrel")
+        self.assertEqual(names[made[2]], "X-kin1")
+        self.assertEqual(names[made[3]], "Viper")
+        self.assertEqual(names[made[4]], "Kestrel Mk2")
+        r0, _w0 = vault_pkg.load_brain(made[0])
+        self.assertEqual(r0["lineage"]["base"], "Kestrel")
+        self.assertEqual(r0["lineage"]["kin"], 2)
+
     def test_scan_and_records(self):
         rec = vault_pkg.new_record("Hawk", {})
         vault_pkg.save_brain(rec, np.zeros(64, dtype=np.float32))
@@ -4807,32 +4866,31 @@ class TestEvoLoop(unittest.TestCase):
     def test_wild_name_deterministic(self):
         import random
         import evo_breeder as evo
-        a = evo.wild_name(random.Random(42), 3)
-        b = evo.wild_name(random.Random(42), 3)
+        a = evo.wild_name(random.Random(42))
+        b = evo.wild_name(random.Random(42))
         self.assertEqual(a, b)
-        self.assertTrue(a.endswith(" G3"))
-        # One-word stem plus generation tag (never "Adjective_Callsign").
-        parts = a.split(" ")
-        self.assertEqual(len(parts), 2)
-        self.assertIn(parts[0], evo.WILD_STEMS)
-        self.assertEqual(parts[1], "G3")
-        self.assertNotIn("_", parts[0])
-        names = {evo.wild_name(random.Random(s), 3) for s in range(40)}
+        # Bare memorable stem, no generation tag, single word
+        # (never "Adjective_Callsign", never "Stem GN").
+        self.assertIn(a, evo.WILD_STEMS)
+        self.assertNotIn(" ", a)
+        self.assertNotIn("_", a)
+        self.assertFalse(any(ch.isdigit() for ch in a))
+        names = {evo.wild_name(random.Random(s)) for s in range(40)}
         self.assertGreater(len(names), 30)
 
     def test_unique_wild_name_collision(self):
         import random
         import evo_breeder as evo
-        base = evo.wild_name(random.Random(7), 2)
+        base = evo.wild_name(random.Random(7))
         # No collision: plain deterministic name.
         self.assertEqual(
-            evo.unique_wild_name(random.Random(7), 2, set()), base)
+            evo.unique_wild_name(random.Random(7), set()), base)
         # Collision: deterministic Mk suffix, repeatable.
-        u1 = evo.unique_wild_name(random.Random(7), 2, {base})
+        u1 = evo.unique_wild_name(random.Random(7), {base})
         self.assertTrue(u1.startswith(base + " Mk"))
         self.assertEqual(
-            u1, evo.unique_wild_name(random.Random(7), 2, {base}))
-        u2 = evo.unique_wild_name(random.Random(7), 2, {base, u1})
+            u1, evo.unique_wild_name(random.Random(7), {base}))
+        u2 = evo.unique_wild_name(random.Random(7), {base, u1})
         self.assertNotEqual(u2, u1)
         self.assertTrue(u2.startswith(base + " Mk"))
 
@@ -5275,6 +5333,114 @@ class TestElo(unittest.TestCase):
                             mutate_structure=False, mutate_traits=0)
         for k in ("learning_rate", "dist_gain", "evasion", "yaw_bias"):
             self.assertEqual(seen.get(k), parent["generator_params"][k])
+
+    def test_clone_names_kin_jr(self):
+        # Pedigree suffix encodes the outcome: same gene re-seeded ->
+        # kin, taken structural mutation -> junior. Counters live in
+        # lineage; names never stack and are never parsed (except the
+        # one-time pre-migration fallback).
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        parent = {"id": "p1", "name": "Kestrel",
+                  "generator_params": {"seed": 3},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "base": "Kestrel", "kin": 2, "jr": 0}}
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            # Genome-less: no structural change possible -> kin.
+            rec, _w, _s = evo.breed_clone("p1", "", seed=5, episodes=1,
+                                          mutate_structure=False,
+                                          mutate_traits=0)
+            self.assertEqual(rec["name"], "Kestrel-kin3")
+            self.assertEqual(rec["lineage"]["kin"], 3)
+            self.assertEqual(rec["lineage"]["jr"], 0)
+            self.assertEqual(rec["lineage"]["base"], "Kestrel")
+            # Explicit names pass through verbatim, counters carried.
+            rec2, _w2, _s2 = evo.breed_clone("p1", "Kid", seed=5,
+                                             episodes=1,
+                                             mutate_structure=False,
+                                             mutate_traits=0)
+            self.assertEqual(rec2["name"], "Kid")
+            self.assertEqual(rec2["lineage"]["kin"], 2)
+            # Unmutated child of a junior takes the kin line (history
+            # stays in lineage, never stacks in the string).
+            parent_jr = dict(parent)
+            parent_jr["name"] = "Kestrel-jr1"
+            parent_jr["lineage"] = {"parent_ids": [], "source": "x",
+                                    "base": "Kestrel", "kin": 0, "jr": 1}
+            with mock.patch("brain_package.load_brain",
+                            return_value=(parent_jr, np.zeros(
+                                8, dtype=np.float32))):
+                rec3, _w3, _s3 = evo.breed_clone(
+                    "p1", "", seed=5, episodes=1, mutate_structure=False,
+                    mutate_traits=0)
+            self.assertEqual(rec3["name"], "Kestrel-kin1")
+            self.assertEqual(rec3["lineage"]["jr"], 1)
+
+    def test_normalize_display_name(self):
+        import evo_breeder as evo
+        # One-time parse: G tags stripped, kin stacks collapse to the
+        # highest N, wilds to bare stems, jr always 0.
+        self.assertEqual(evo.normalize_display_name("G5-Kestrel-kin2"),
+                         ("Kestrel", 2))
+        self.assertEqual(evo.normalize_display_name("Kestrel_G2"),
+                         ("Kestrel", 0))
+        self.assertEqual(evo.normalize_display_name("X-kin-kin1"),
+                         ("X", 1))
+        self.assertEqual(evo.normalize_display_name("G3-G2-flow2-kin-kin1"),
+                         ("flow2", 1))
+        self.assertEqual(evo.normalize_display_name("Viper"),
+                         ("Viper", 0))
+        self.assertEqual(evo.normalize_display_name("Kestrel-kin"),
+                         ("Kestrel", 1))
+
+    def test_clone_names_jr_on_mutation(self):
+        # A taken structural mutation earns the junior suffix off the
+        # same base (reference genome parent, max_changes >= 1).
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        from train_job import fresh_weights
+        from experimental_wiring import reference_genome
+        genome = reference_genome()
+        w0 = np.ascontiguousarray(np.asarray(
+            fresh_weights(None, genome), dtype=np.float32).copy())
+        parent = {"id": "p1", "name": "Kestrel",
+                  "generator_params": {"seed": 3, "genome": genome},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "base": "Kestrel", "kin": 2, "jr": 0}}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, w0)), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            rec, _w, _s = evo.breed_clone("p1", "", seed=5, episodes=1,
+                                          max_changes=1, mutate_traits=0)
+            self.assertEqual(rec["name"], "Kestrel-jr1")
+            self.assertEqual(rec["lineage"]["jr"], 1)
+            self.assertEqual(rec["lineage"]["kin"], 2)
+            # max_changes = 0 skips the mutation: kin line instead.
+            rec2, _w2, _s2 = evo.breed_clone(
+                "p1", "", seed=6, episodes=1, max_changes=0,
+                mutate_traits=0)
+            self.assertEqual(rec2["name"], "Kestrel-kin3")
 
     def test_breed_random_rejects_bad_mode(self):
         import evo_breeder as evo
