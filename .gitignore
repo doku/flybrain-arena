@@ -34,3 +34,5 @@ server_log.txt
 arena/.godot/
 # Godot 4.4+ script UID sidecars (regenerable editor metadata)
 *.uid
+# Owner's personal task list (never commit)
+/todo.txt
