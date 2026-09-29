@@ -301,6 +301,7 @@ var event_cache_mtime: int = 0
 var _last_job_ep := -1
 var _last_job_total := -1
 var _last_job_text := ""
+var _last_job_res := {}
 var _last_score_ep := -1
 var _last_score_total := -1
 var _last_score_text := ""
@@ -438,6 +439,7 @@ func start_training(brain_id: String, episodes: int, params: Dictionary,
 		"result_file": result_file, "brain_id": brain_id,
 		"episodes": episodes, "school": params.has("curriculum")}
 	_last_job_text = ""
+	_last_job_res = {}
 	return {"ok": true, "pid": pid}
 
 
@@ -453,12 +455,17 @@ func poll_job() -> Dictionary:
 		f.close()
 		if text.begins_with("{") and text.ends_with("}"):
 			# Skip the parse when the text is unchanged (the poller
-			# re-reads between episode writes).
+			# re-reads between episode writes); reuse the last parsed
+			# dict so the emit check below never fires on a zero
+			# default (progress-bar flicker to 0 between episodes).
 			if text != _last_job_text:
 				_last_job_text = text
 				var parsed = JSON.parse_string(text)
 				if parsed is Dictionary:
 					res = parsed
+					_last_job_res = res
+			else:
+				res = _last_job_res
 	var ep_now := int(res.get("episode", 0))
 	var total_now := int(res.get("total", 0))
 	if ep_now != _last_job_ep or total_now != _last_job_total:

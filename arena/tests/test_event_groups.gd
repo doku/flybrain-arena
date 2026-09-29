@@ -6,6 +6,11 @@ extends SceneTree
 
 var failures := 0
 var D = null
+var _poll_emits: Array = []
+
+
+func _on_test_job_progress(ep: int, total: int) -> void:
+	_poll_emits.append([ep, total])
 
 
 func _check(cond: bool, label: String) -> void:
@@ -588,6 +593,29 @@ func test_battle_invalidate_primitive() -> void:
 	D.free()
 
 
+func test_poll_emit_no_flicker() -> void:
+	# Skip-parse must reuse the last parsed dict: two polls on
+	# unchanged progress text emit once with the true episode, never
+	# a spurious (0, total) flicker in between.
+	var DD = load("res://scripts/TournamentDirector.gd").new()
+	var pf := "user://test_poll_progress.json"
+	var f := FileAccess.open(pf, FileAccess.WRITE)
+	f.store_string(JSON.stringify({"episode": 3, "total": 50, "pct": 6.0}))
+	f.close()
+	DD.set("active_job", {"pid": 0, "progress_path": pf,
+		"result_file": "", "brain_id": "t", "episodes": 50,
+		"school": false})
+	_poll_emits = []
+	DD.job_progress.connect(_on_test_job_progress)
+	DD.call("poll_job")
+	DD.call("poll_job")
+	DD.call("poll_job")
+	_check(_poll_emits == [[3, 50]], "unchanged progress emits once, no zero flicker")
+	DD.free()
+	if FileAccess.file_exists(pf):
+		DirAccess.remove_absolute(pf)
+
+
 func _all_labels(node: Node) -> Array:
 	var out: Array = []
 	if node is Label:
@@ -754,6 +782,7 @@ func _initialize() -> void:
 	test_live_cards_use_cache()
 	test_event_manifest_cache()
 	test_battle_invalidate_primitive()
+	test_poll_emit_no_flicker()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
