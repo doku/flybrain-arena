@@ -298,10 +298,11 @@ def cmd_score(a):
     tr["episodes"] = int(tr.get("episodes", 0)) + eps
     tr["avg_score"] = (float(tr.get("score", 0.0)) / max(tr["episodes"], 1))
     try:
-        if same_weights:
-            vault.save_brain(cur_rec, weights)
-        else:
-            vault.save_brain_record_only(cur_rec)
+        # Unchanged (common case): weights byte-identical, so the record
+        # delta rides the sidecar — no ~100 MB zip rewrite. Raced
+        # (weights moved under the probe): record-only is also the safe
+        # writer — it never clobbers the train's newer weights in the zip.
+        vault.save_brain_record_only(cur_rec)
     except OSError as e:
         return err(str(e))
     return out({"ok": True, "eval_score": gained,

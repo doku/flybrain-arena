@@ -4318,6 +4318,50 @@ class TestRetinaVision(unittest.TestCase):
             vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_score_stamp_leaves_zip_untouched(self):
+        # Unchanged probe (no concurrent train): counters bank via the
+        # sidecar while the ~100 MB zip stays byte-identical.
+        import shutil
+        import tempfile
+        import brain_package as vault_pkg
+        from train_homing import experiment_arrays, load_or_build_csr
+        from vault_cli import cmd_score
+        tmp = tempfile.mkdtemp(prefix="score_sidecar_")
+        old_vault, old_index = vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = tmp
+        vault_pkg.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            csr = load_or_build_csr()
+            pops = load_or_extract_populations()
+            _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+            rec = vault_pkg.new_record(
+                "Sidecar", {"experiment": "retina_wide",
+                            "mapping": "retina"})
+            w0 = np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy())
+            vault_pkg.save_brain(rec, w0)
+
+            class _A:
+                pass
+            a = _A()
+            a.id = rec["id"]
+            a.episodes = 2
+            a.seed = 11
+            a.result_file = ""
+            path = vault_pkg.package_path(rec)
+            with open(path, "rb") as f:
+                before = f.read()
+            self.assertEqual(cmd_score(a), 0)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before)
+            rec2, w2 = vault_pkg.load_brain(rec["id"])
+            self.assertEqual(rec2["training"]["episodes"], 2)
+            self.assertGreater(rec2["training"]["score"], 0.0)
+            np.testing.assert_array_equal(w2, w0)
+        finally:
+            vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_score_merges_concurrent_train(self):
         # A train landing mid-probe must survive the probe's save:
         # counters merge onto the fresh record, newer weights kept.
