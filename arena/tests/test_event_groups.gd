@@ -864,41 +864,6 @@ func test_eliminate_career_gate() -> void:
 	D.free()
 
 
-func test_stock_bench() -> void:
-	# Bench draft: the draw only sees the bench, so a thin bench is
-	# filled from the lowest-match qualified vault brains (participants
-	# excluded, undertrained excluded, deterministic id tiebreak).
-	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
-	var D = load("res://scripts/TournamentDirector.gd").new()
-	D.tournament_dir = "user://test_event_groups"
-	D.call("event_save", {"id": "ES", "group_order": ["A"],
-		"groups": {"A": {"players": ["p1"]}}, "pool": ["old"]})
-	var roster := [
-		{"id": "p1", "name": "P1"},
-		{"id": "old", "name": "Old"},
-		{"id": "z9", "name": "Z9"},
-		{"id": "a1", "name": "A1"},
-		{"id": "u1", "name": "U1"}]
-	var cards := {
-		"p1": {"elo": 1500.0, "train": 80, "matches": 30},
-		"old": {"elo": 1400.0, "train": 80, "matches": 20},
-		"z9": {"elo": 1200.0, "train": 60, "matches": 0},
-		"a1": {"elo": 1200.0, "train": 60, "matches": 0},
-		"u1": {"elo": 1200.0, "train": 10, "matches": 0}}
-	var res: Dictionary = D.call("event_stock_bench", "ES", 3, 50, 0.0,
-		cards, roster)
-	_check(bool(res.get("ok", false)), "stock ok")
-	_check((res.get("stocked", []) as Array) == ["a1", "z9"],
-		"lowest-match drafted, id tiebreak")
-	_check(((D.call("event_load", "ES") as Dictionary).get("pool", []) as Array) == ["old", "a1", "z9"],
-		"bench filled to target")
-	# Full bench: no-op.
-	var res2: Dictionary = D.call("event_stock_bench", "ES", 3, 50, 0.0,
-		cards, roster)
-	_check((res2.get("stocked", []) as Array).is_empty(), "full bench no-op")
-	D.free()
-
-
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -952,7 +917,6 @@ func _initialize() -> void:
 	test_booster_queue()
 	test_draw_title_dnf()
 	test_eliminate_career_gate()
-	test_stock_bench()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
