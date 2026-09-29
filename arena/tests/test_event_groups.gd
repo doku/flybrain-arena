@@ -174,13 +174,20 @@ func test_event_chain() -> void:
 	var ev: Dictionary = D.call("event_load", eid)
 	_check((ev.get("pool", []) as Array).size() == 4, "pool capped at 4")
 	_check(not ("f16" in (ev.get("pool", []) as Array)), "cap trims lowest ELO")
+	# Vault-wide draw: the whole schooled vault is the pool (bench no
+	# longer gates); undertrained never draw. Fresh manifest so no
+	# group players are excluded as participants.
+	D.call("event_save", {"id": "EDRAW", "group_order": [], "groups": {},
+		"pool": []})
 	seed(7)
-	var draw: Dictionary = D.call("event_draw_pool", eid, 2, 50, 0.0, cards)
+	var draw: Dictionary = D.call("event_draw_pool", "EDRAW", 2, 50, 0.0,
+		cards, brains)
 	var drawn: Array = draw.get("drawn", [])
 	_check(drawn.size() == 2, "draw deals two")
-	_check(not ("f03" in drawn), "undertrained bench never draws")
+	_check(not ("f03" in drawn), "undertrained never draws")
 	for pid in drawn:
-		_check(pid in ["f01", "f02", "f15"], "drawn are qualified")
+		_check(int((cards[str(pid)] as Dictionary).get("train", 0)) >= 50,
+			"drawn are qualified")
 
 
 func test_cutoff_and_weighted_draw() -> void:
@@ -220,21 +227,26 @@ func test_cutoff_and_weighted_draw() -> void:
 	var fb: Dictionary = D.call("event_eliminate_candidates", eid, 3, 100.0, cards)
 	var forder: Array = fb.get("candidates", [])
 	_check(forder.size() == 4, "fallback covers all experienced")
-	# Weighted draw: the 2-match rookie laps the 30-match veterans.
+	# Weighted draw over the whole vault: the 2-match rookie laps the
+	# 30-match veterans. Fresh manifest (no participants to exclude).
+	D.call("event_save", {"id": "EDRAW2", "group_order": [], "groups": {},
+		"pool": []})
 	var pool_cards := {
 		"vet_a": {"elo": 1500.0, "train": 80, "matches": 30},
 		"vet_b": {"elo": 1400.0, "train": 80, "matches": 30},
 		"rook": {"elo": 1250.0, "train": 60, "matches": 2}}
-	D.call("event_pool_add", eid, ["vet_a", "vet_b", "rook"], pool_cards)
+	var droster := [{"id": "vet_a"}, {"id": "vet_b"}, {"id": "rook"}]
 	seed(11)
 	var tallies := {"vet_a": 0, "vet_b": 0, "rook": 0}
 	for _i in range(30):
-		D.call("event_pool_add", eid, ["vet_a", "vet_b", "rook"], pool_cards)
-		var one: Dictionary = D.call("event_draw_pool", eid, 1, 50, 0.0, pool_cards)
+		var one: Dictionary = D.call("event_draw_pool", "EDRAW2", 1, 50,
+			0.0, pool_cards, droster)
 		tallies[str((one.get("drawn", []) as Array)[0])] += 1
 	_check(int(tallies["rook"]) > int(tallies["vet_a"]), "rookie outdraws veterans")
 	_check(int(tallies["rook"]) > int(tallies["vet_b"]), "rookie outdraws veterans II")
-	# Training floor + ELO floor gate the bench.
+	# Training floor + ELO floor gate the bench (qualification
+	# still reads the bench; only the draw went vault-wide).
+	D.call("event_pool_add", eid, ["vet_a", "vet_b", "rook"], pool_cards)
 	var q: Dictionary = D.call("event_pool_qualified", eid, 50, 1450.0, pool_cards)
 	_check((q.get("qualified", []) as Array) == ["vet_a"], "floors gate qualification")
 
@@ -864,6 +876,36 @@ func test_eliminate_career_gate() -> void:
 	D.free()
 
 
+func test_vault_draw_excludes_participants() -> void:
+	# Promotion draws from the whole vault: qualified outsiders are
+	# drawable, current-event players never (own advancement path),
+	# undertrained never, ghosts never.
+	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_event_groups"
+	D.call("event_save", {"id": "EDRAW3", "group_order": ["A"],
+		"groups": {"A": {"players": ["star"]}}, "pool": []})
+	var roster := [{"id": "star"}, {"id": "out1"}, {"id": "out2"},
+		{"id": "green"}]
+	var cards := {
+		"star": {"elo": 2000.0, "train": 80, "matches": 30},
+		"out1": {"elo": 1200.0, "train": 60, "matches": 0},
+		"out2": {"elo": 1200.0, "train": 60, "matches": 5},
+		"green": {"elo": 1200.0, "train": 10, "matches": 0}}
+	var q: Dictionary = D.call("event_draw_candidates", "EDRAW3", 50,
+		0.0, cards, roster)
+	var qual: Array = q.get("qualified", [])
+	qual.sort()
+	_check(qual == ["out1", "out2"], "only qualified outsiders qualify")
+	seed(3)
+	var draw: Dictionary = D.call("event_draw_pool", "EDRAW3", 2, 50,
+		0.0, cards, roster)
+	var drawn: Array = draw.get("drawn", [])
+	drawn.sort()
+	_check(drawn == ["out1", "out2"], "both outsiders promoted")
+	D.free()
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -917,6 +959,7 @@ func _initialize() -> void:
 	test_booster_queue()
 	test_draw_title_dnf()
 	test_eliminate_career_gate()
+	test_vault_draw_excludes_participants()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

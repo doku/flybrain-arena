@@ -2102,15 +2102,45 @@ func event_pool_qualified(event_id: String, min_train: int = 50, elo_floor: floa
 	return {"ok": true, "qualified": qualified}
 
 
-func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
+func event_draw_candidates(event_id: String, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+	# Promotion pool: the ENTIRE vault, not the bench — every schooled
+	# brain (train >= min_train, ELO >= floor) outside the current
+	# event's players. Archived brains are absent from the vault, so
+	# they can never draw. Current-event players are excluded (they
+	# advance or eliminate on their own path; survivors re-enter via
+	# the roster, never the draw). Pure readout; the draw consumes.
+	var ev := event_load_cached(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var participants := {}
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		for pid in (gd.get("players", []) as Array):
+			participants[str(pid)] = true
+	var roster: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
+	var cards := _event_live_cards(live_override)
+	var qualified: Array = []
+	for b in roster:
+		var pid := str((b as Dictionary).get("id", ""))
+		if pid == "" or participants.has(pid) or not cards.has(pid):
+			continue
+		var card: Dictionary = cards[pid]
+		if int(card.get("train", 0)) >= min_train \
+				and float(card.get("elo", 0.0)) >= elo_floor:
+			qualified.append(pid)
+	return {"ok": true, "qualified": qualified}
+
+
+func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
 	# Random draw weighted toward the least-experienced qualifiers
-	# (weight 1/(1+matches)): every schooled bench brain cycles into
+	# (weight 1/(1+matches)): every schooled vault brain cycles into
 	# the ring over time instead of the top-ELO pair hogging every
-	# event. Drawn ids leave the pool.
+	# event. Drawn ids leave the bench pool when present there.
 	var ev := event_load(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
-	var q := event_pool_qualified(event_id, min_train, elo_floor, live_override)
+	var q := event_draw_candidates(event_id, min_train, elo_floor,
+		live_override, brains_override)
 	if not bool(q.get("ok", false)):
 		return q
 	var qualified: Array = q.get("qualified", [])

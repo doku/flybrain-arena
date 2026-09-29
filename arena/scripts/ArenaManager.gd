@@ -4264,7 +4264,8 @@ func _event_group_done(res: Dictionary) -> void:
 
 
 func _event_pool_ready_count() -> int:
-	# Qualified bench brains (schooled + above the demotion line).
+	# Promotion-ready brains vault-wide (schooled + above the demotion
+	# line, outside the current event): the draw pool, not the bench.
 	var director := _director()
 	if director == null:
 		return 0
@@ -4272,7 +4273,7 @@ func _event_pool_ready_count() -> int:
 	if ev.is_empty():
 		return 0
 	var st: Dictionary = ev.get("settings", {})
-	var q: Dictionary = director.event_pool_qualified(_event_id(),
+	var q: Dictionary = director.event_draw_candidates(_event_id(),
 		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
 	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
 
@@ -4284,7 +4285,7 @@ func _event_pool_wait() -> bool:
 	var director := _director()
 	if director == null:
 		return false
-	_show_arena_bracket("FINAL REVIEW - STOCKING BENCH (%d/%d qualified)" % [
+	_show_arena_bracket("FINAL REVIEW - PROMOTION READY (%d/%d qualified)" % [
 		_event_pool_ready_count(), EVENT_POOL_TARGET])
 	var waited := 0.0
 	while _evo_active() and waited < EVO_AWAIT_TIMEOUT:
@@ -4295,7 +4296,7 @@ func _event_pool_wait() -> bool:
 		_event_maintain_pool()
 		var ready := _event_pool_ready_count()
 		if is_instance_valid(status_label):
-			status_label.text = "Bench %d/%d qualified - queue breeding..." % [ready, EVENT_POOL_TARGET]
+			status_label.text = "Promotion-ready %d/%d - queue breeding..." % [ready, EVENT_POOL_TARGET]
 		if ready >= EVENT_POOL_TARGET:
 			_hide_arena_bracket()
 			return true
