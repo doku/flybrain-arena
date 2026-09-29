@@ -1945,12 +1945,14 @@ func event_advancers(event_id: String) -> Dictionary:
 
 
 func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
-	# Worst-first elimination order: played >= min_matches across the
-	# event files, lowest live ELO first. elo_cutoff > 0 restricts the
-	# axe to brains rated below it (menu demotion line); fewer than 2
-	# qualifiers falls back to matches-only order so the loop never
-	# stalls on an empty shortlist. Pure (no archiving) so the rule is
-	# unit-testable; event_eliminate archives the bottom two.
+	# Worst-first elimination order: event participants with CAREER
+	# matches >= min_matches (vault record, not this event's files —
+	# a whole event only plays ~6) and live ELO below the cutoff,
+	# lowest ELO first. Green brains (< min_matches career) are never
+	# demoted no matter how low their ELO. Fewer than 2 qualifiers is
+	# a loud failure, never a silent widening: the loop must not eat
+	# the unproven. Pure (no archiving) so the rule is unit-testable;
+	# event_eliminate archives the bottom two.
 	var ev := event_load(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
@@ -1983,7 +1985,11 @@ func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cut
 	var cards := _event_live_cards(live_override)
 	var experienced: Array = []
 	for pid in played.keys():
-		if int(played[pid]) >= min_matches and cards.has(pid):
+		if not cards.has(pid):
+			continue
+		# Career gate (vault record matches): green brains stay out
+		# of the axe regardless of ELO.
+		if int((cards[pid] as Dictionary).get("matches", 0)) >= min_matches:
 			experienced.append(pid)
 	experienced.sort_custom(func(x, y): return float((cards[x] as Dictionary).get("elo", 0.0)) < float((cards[y] as Dictionary).get("elo", 0.0)))
 	if elo_cutoff > 0.0:

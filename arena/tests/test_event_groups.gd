@@ -150,12 +150,15 @@ func test_event_chain() -> void:
 	var qf: Array = adv.get("advancers", [])
 	_check(qf.size() == 8, "eight advancers")
 	_check(qf[0] == "f01" and qf[1] == "f07", "QF1 A1 v B2")
-	# Elimination order with rigged ELO: lowest first, min 3 matches.
+	# Elimination order with rigged ELO: lowest first, min 3 CAREER
+	# matches (veterans only — the gate reads vault records, not the
+	# event's files).
 	var live := {}
 	for b in brains:
-		live[str(b["id"])] = float(b["record"]["elo"])
-	live["f16"] = 900.0
-	live["f15"] = 950.0
+		live[str(b["id"])] = {"elo": float(b["record"]["elo"]),
+			"train": 80, "matches": 20}
+	live["f16"] = {"elo": 900.0, "train": 80, "matches": 20}
+	live["f15"] = {"elo": 950.0, "train": 80, "matches": 20}
 	var cands: Dictionary = D.call("event_eliminate_candidates", eid, 3, 0.0, live)
 	_check(bool(cands.get("ok", false)), "candidates resolve")
 	var order: Array = cands.get("candidates", [])
@@ -825,6 +828,42 @@ func test_draw_title_dnf() -> void:
 	A.free()
 
 
+func test_eliminate_career_gate() -> void:
+	# Demotion is veterans-only: career matches >= min_matches AND
+	# below the ELO line. A green brain with the WORST live ELO is
+	# protected; low-match flies are never eaten to fill the shortlist.
+	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	var rounds := [[
+		{"a_id": "v1", "b_id": "g1", "winner_id": "v1"},
+		{"a_id": "v2", "b_id": "g2", "winner_id": "v2"}]]
+	var bf := FileAccess.open("user://test_event_groups/TCG.json",
+		FileAccess.WRITE)
+	bf.store_string(JSON.stringify({"rounds": rounds}))
+	bf.close()
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_event_groups"
+	D.call("event_save", {"id": "ECG", "group_order": ["A"],
+		"groups": {"A": {"bracket_id": "TCG"}}})
+	# g1 is the worst ELO by far but green (2 career matches).
+	var cards := {
+		"v1": {"elo": 1500.0, "train": 80, "matches": 30},
+		"v2": {"elo": 1400.0, "train": 80, "matches": 25},
+		"g1": {"elo": 800.0, "train": 80, "matches": 2},
+		"g2": {"elo": 1300.0, "train": 80, "matches": 1}}
+	var cands: Dictionary = D.call("event_eliminate_candidates",
+		"ECG", 10, 0.0, cards)
+	_check(bool(cands.get("ok", false)), "career gate resolves")
+	var order: Array = cands.get("candidates", [])
+	_check(order == ["v2", "v1"], "veterans worst-first, green protected")
+	# A cutoff only one veteran meets falls through to the full
+	# experienced list (existing behavior, cutoff ignored when short).
+	var cut: Dictionary = D.call("event_eliminate_candidates",
+		"ECG", 10, 1450.0, cards)
+	var corder: Array = cut.get("candidates", [])
+	_check(corder == ["v2", "v1"], "short cut falls back to experienced")
+	D.free()
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -877,6 +916,7 @@ func _initialize() -> void:
 	test_booster_rule()
 	test_booster_queue()
 	test_draw_title_dnf()
+	test_eliminate_career_gate()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

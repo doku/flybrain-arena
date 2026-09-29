@@ -771,7 +771,7 @@ func _build_tourney_column() -> VBoxContainer:
 	evo_mutate_traits.button_pressed = true
 	c.add_child(evo_mutate_traits)
 	evo_min_matches = _spin("Evo demote: min matches", c, 1.0, 12.0, 1.0, 10.0,
-		"Ring experience required before a brain can be demoted to archives: only fighters with at least this many event matches are evaluated at generation end.")
+		"Career ring experience required before a brain can be demoted to archives: only fighters with at least this many vault-record matches AND below the ELO line are evaluated at generation end. Green brains are never demoted.")
 	evo_elo_cutoff = _spin("Evo demote: ELO below", c, 0.0, 2000.0, 25.0, 0.0,
 		"Demotion line: among experienced fighters, only those rated below this ELO are archived (0 = off, lowest-ELO pair goes regardless).")
 	bracket_status = Label.new()
