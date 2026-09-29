@@ -1063,7 +1063,7 @@ func _on_generate() -> void:
 	if not TournamentDirector.python_ready:
 		log_label.text = "Generate failed: %s" % TournamentDirector.python_probe_error
 		return
-	set_busy("Generating '%s'... (loading connectome, up to ~1 min)" % brain_name)
+	set_busy("Generating '%s'... (fresh weights + 50-episode school, several minutes)" % brain_name)
 	await get_tree().process_frame
 	var res: Dictionary = TournamentDirector.generate_brain_async(brain_name, _gen_params())
 	if not res.get("ok", false):
@@ -1101,9 +1101,9 @@ func _on_async_done(op: String, result: Dictionary) -> void:
 
 
 func _on_breed_reference() -> void:
-	# Two-phase stock build: a fast untrained generate (reference genome
-	# forwarded opaquely, never hashed menu-side), then the training
-	# queue owns it with the shared progress bar.
+	# Two-phase stock build: generate (reference genome forwarded
+	# opaquely, never hashed menu-side — generate schools 50+ eps),
+	# then the training queue owns it with the shared progress bar.
 	if not TournamentDirector.python_ready:
 		log_label.text = "Breed failed: %s" % TournamentDirector.python_probe_error
 		return

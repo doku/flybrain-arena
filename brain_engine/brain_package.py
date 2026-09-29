@@ -440,6 +440,10 @@ ELO_DEFAULT = 1200.0
 ELO_K_BATTLE = 10.0
 ELO_K_MATCH = 30.0
 ELO_DRAW3_PENALTY = 25.0
+# Breeding/generating floor: every breed and every generated fly trains
+# at least this many episodes (more is allowed, less is not) — the pool
+# minimum, so offspring arrive ring-ready instead of needing top-up.
+MIN_BREED_EPISODES = 50
 ELO_INHERIT = 0.7
 
 

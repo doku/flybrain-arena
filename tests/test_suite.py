@@ -3369,23 +3369,32 @@ class TestStagedTraining(unittest.TestCase):
         try:
             import numpy as np
             rec = self._rec()
-            # Single stage: one call, params untouched.
+            # Single stage: one call, params untouched; small counts
+            # floor to the 50-episode breeding minimum.
             evo_breeder._staged_or_single(
                 rec, np.zeros(1), 2, {"seed": 1, "a": 1}, "n1",
                 None, None, "n2", None)
             self.assertEqual(len(seen), 1)
-            self.assertEqual(seen[0][0], 2)
-            # Staged: stage-2 inherits unset keys, keeps its own.
+            self.assertEqual(seen[0][0], 50)
+            # Staged: stage-2 inherits unset keys, keeps its own; the
+            # deficit lands on stage 1, the school stage never shrinks.
             seen.clear()
             evo_breeder._staged_or_single(
                 rec, np.zeros(1), 2, {"seed": 1, "a": 1}, "n1",
                 3, {"b": 2}, "n2", None)
             self.assertEqual(len(seen), 2)
-            self.assertEqual(seen[0][0], 2)
+            self.assertEqual(seen[0][0], 47)
             self.assertEqual(seen[1][0], 3)
             self.assertEqual(seen[1][1]["b"], 2)
             self.assertEqual(seen[1][1]["a"], 1)
             self.assertEqual(seen[1][1]["seed"], 1)
+            # Larger counts pass through untouched.
+            seen.clear()
+            evo_breeder._staged_or_single(
+                rec, np.zeros(1), 60, {"seed": 1, "a": 1}, "n1",
+                None, None, "n2", None)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], 60)
         finally:
             train_job.train_brain = real
 
@@ -5275,6 +5284,82 @@ class TestElo(unittest.TestCase):
         with self.assertRaises(ValueError):
             evo.breed_random("X", seed=1, episodes=1, mode="crossover")
 
+    def test_breed_episode_floor(self):
+        # Breeding trains at least MIN_BREED_EPISODES (more allowed):
+        # explicit small counts and small inherited recipes both floor
+        # to 50, with the lineage stamp staying honest.
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3},
+                  "record": {"battles": 4, "wins": 4, "losses": 0,
+                             "draws": 0, "matches": 1, "matches_won": 1,
+                             "matches_lost": 0, "tournaments_won": 0,
+                             "elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "training": {"episodes_total": 12,
+                                           "stage_split": 0.5,
+                                           "noise": 0.05,
+                                           "max_changes": 1}}}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            # Mirrors log_training_session: stages accumulate.
+            child["training"]["episodes"] = \
+                int(child["training"].get("episodes", 0)) + episodes
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            # Explicit small count floors.
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5,
+                                          episodes=1,
+                                          mutate_structure=False,
+                                          mutate_traits=0)
+            self.assertGreaterEqual(
+                rec["training"]["episodes"], vault_pkg.MIN_BREED_EPISODES)
+            self.assertGreaterEqual(
+                rec["lineage"]["training"]["episodes_total"],
+                vault_pkg.MIN_BREED_EPISODES)
+            # Small inherited recipe floors too (episodes=None).
+            rec2, _w2, _s2 = evo.breed_clone(
+                "p1", "Kid2", seed=6, mutate_structure=False,
+                mutate_traits=0)
+            self.assertGreaterEqual(
+                rec2["training"]["episodes"], vault_pkg.MIN_BREED_EPISODES)
+
+    def test_staged_floor_backstop(self):
+        # _staged_or_single floors direct callers (reference path):
+        # the deficit lands on stage 1, an explicit school never shrinks.
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        seen = {}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            seen.setdefault("calls", []).append(episodes)
+            return child, start_weights, {"episodes": episodes}
+
+        child = vault_pkg.new_record("Floor", {})
+        with mock.patch("train_job.train_brain",
+                        side_effect=fake_train_brain), \
+                mock.patch.object(vault_pkg, "save_brain",
+                                  return_value="mock-path"):
+            evo._staged_or_single(child, np.zeros(4, dtype=np.float32),
+                                  5, {}, "pre", None, None, "school", None)
+            self.assertEqual(seen["calls"], [50])
+            # Explicit school stage preserved, deficit on stage 1.
+            seen.clear()
+            evo._staged_or_single(child, np.zeros(4, dtype=np.float32),
+                                  5, {}, "pre", 10, {}, "school", None)
+        self.assertEqual(seen["calls"], [40, 10])
+
     def test_training_recipe_inherit(self):
         import evo_breeder as evo
         base = {"episodes_total": 50, "stage_split": 0.5, "noise": 0.05,
@@ -5396,9 +5481,15 @@ class TestElo(unittest.TestCase):
         self.assertGreater(ep2, 0)
         # Explicit episodes without episodes2 keeps single-stage.
         _r, _m, ep1, ep2, _nz, _mc = evo._resolve_recipe(
-            base, 600521426, 1, None, None, None)
-        self.assertEqual(ep1, 1)
+            base, 600521426, 60, None, None, None)
+        self.assertEqual(ep1, 60)
         self.assertIsNone(ep2)
+        # ...but never below the 50-episode breeding floor.
+        _r2, _m2, ep1f, ep2f, _nz2, _mc2 = evo._resolve_recipe(
+            base, 600521426, 1, None, None, None)
+        self.assertEqual(ep1f, 50)
+        self.assertIsNone(ep2f)
+        self.assertEqual(_r2["episodes_total"], 50)
 
     def test_breed_clone_inherits_recipe(self):
         import numpy as np
@@ -5529,14 +5620,26 @@ class TestElo(unittest.TestCase):
             a = SimpleNamespace(name="Reference",
                                 params=json.dumps(params), params_file="",
                                 result_file=rf, log_file="")
+            seen = {}
+
+            def fake_train_brain(record, weights, episodes, params=None,
+                                 progress_cb=None, notes="", save=True):
+                seen["episodes"] = episodes
+                record["training"]["episodes"] = episodes
+                return record, weights, {"episodes": episodes}
+
             with mock.patch.object(
                     vault_pkg, "save_brain",
                     return_value=os.path.join(tmp, "x.flybrain")), \
+                    mock.patch("train_job.train_brain",
+                               side_effect=fake_train_brain), \
                     mock.patch.object(vault_pkg, "read_vault",
                                       return_value=[]), \
                     mock.patch.object(vault_pkg, "scan_vault",
                                       return_value=[]):
                 self.assertEqual(vault_cli.cmd_generate(a), 0)
+            # Generate schools the fresh weights: 50+ eps, never less.
+            self.assertGreaterEqual(seen.get("episodes", 0), 50)
             with open(rf) as f:
                 res = json.load(f)
             self.assertTrue(res["ok"])

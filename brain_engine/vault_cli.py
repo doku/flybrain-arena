@@ -92,7 +92,7 @@ def cmd_generate(a):
     params = _parse_params(a)
     if isinstance(params, dict) and params.get("__error"):
         return err(params["__error"])
-    from train_job import fresh_weights
+    from train_job import fresh_weights, train_brain
     try:
         import experimental_wiring as ew
         genome = params.get("genome", None)
@@ -117,6 +117,12 @@ def cmd_generate(a):
                     return err(
                         f"reference stock already in vault: "
                         f"{rec.get('name')} ({rec.get('id')})")
+        # Generated flies school like breeds: at least MIN_BREED_EPISODES
+        # (more allowed, less not) so they arrive ring-ready.
+        eps = max(vault.MIN_BREED_EPISODES,
+                  int(getattr(a, "episodes", 0) or 0))
+        prog = _batched_progress(a.progress) \
+            if getattr(a, "progress", "") else None
         weights = fresh_weights(params.get("experiment"), genome)
         rec = vault.new_record(a.name, params)
         if params.get("reference_stock"):
@@ -125,7 +131,9 @@ def cmd_generate(a):
                               "provenance": {
                                   "mode": "reference",
                                   "reference_id": params.get("genome_id")}}
-        vault.save_brain(rec, weights)
+        rec, _w, _summary = train_brain(
+            rec, weights, eps, params, progress_cb=prog,
+            notes=f"generate x{eps}", save=True)
     except Exception as e:
         return err(str(e))
     return out({"ok": True, "brain": rec}, a.result_file)
@@ -584,6 +592,8 @@ def main():
     q = sub.add_parser("info"); q.add_argument("--id", required=True)
     q = sub.add_parser("generate"); q.add_argument("--name", required=True)
     q.add_argument("--params", default=""); q.add_argument("--params-file", default="")
+    q.add_argument("--episodes", type=int, default=50)
+    q.add_argument("--progress", default="")
     q.add_argument("--result-file", default="")
     q = sub.add_parser("train"); q.add_argument("--id", required=True)
     q.add_argument("--episodes", type=int, required=True)

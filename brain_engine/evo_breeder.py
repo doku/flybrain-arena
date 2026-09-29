@@ -107,14 +107,28 @@ def biggest_loser(tourney, rng=None):
                   "tied": sorted(tied)}
 
 
+def _floor_breed_episodes(ep1, ep2):
+    """50-episode floor for every breeding: results may exceed it, never
+    fall short (pool minimum). The deficit lands on stage 1; an explicit
+    school stage is never shrunk. Preserves ep2=None (single-stage)."""
+    e1 = int(ep1 or 0)
+    e2 = int(ep2 or 0) if ep2 is not None else None
+    if e1 + (e2 or 0) < vault.MIN_BREED_EPISODES:
+        e1 += vault.MIN_BREED_EPISODES - (e1 + (e2 or 0))
+    return e1, e2
+
+
 def _staged_or_single(child, start_weights, ep1, params, note1,
                       ep2, params2, note2, progress_cb):
     """Runs stage 1 (pre-train), then stage 2 (flight school) when ep2
     is set, on the same record. Stage-2 params inherit unset keys from
     stage 1 (same fallback philosophy as train_brain's record fallback;
-    genome/mapping carry over so arity can never mismatch). Returns
+    genome/mapping carry over so arity can never mismatch). The
+    50-episode floor applies here as the backstop (all four strategies
+    funnel through this), so direct callers are covered too. Returns
     (record, weights, summary) with a merged multi-stage summary."""
     from train_job import train_brain, train_staged, merge_summaries
+    ep1, ep2 = _floor_breed_episodes(ep1, ep2)
     ep2 = int(ep2 or 0)
     if ep2 <= 0:
         return train_brain(child, start_weights, int(ep1), params,
@@ -325,6 +339,16 @@ def _resolve_recipe(parent_recipe, seed, episodes, episodes2, noise,
     else:
         ep1 = total if episodes is None else max(1, int(episodes))
         ep2 = episodes2
+    # Floor (keeps ep1+ep2 == episodes_total, which the lineage stamp
+    # and tests pin): the deficit lands on stage 1, stamp stays honest.
+    # The mutation log records the floor as its own step (inherited 45
+    # -> floored 50), so the lineage never claims an unmoved value.
+    pre_floor = ep1 + (ep2 or 0)
+    ep1, ep2 = _floor_breed_episodes(ep1, ep2)
+    recipe["episodes_total"] = ep1 + (ep2 or 0)
+    if recipe["episodes_total"] != pre_floor:
+        old_total = mutated.get("episodes_total", [pre_floor, pre_floor])[0]
+        mutated["episodes_total"] = [old_total, recipe["episodes_total"]]
     return recipe, mutated, ep1, ep2, recipe["noise"], recipe["max_changes"]
 
 
@@ -496,6 +520,9 @@ def breed_random(name, seed, episodes=None, progress_cb=None, generation=1,
     else:
         ep1 = total if episodes is None else max(5, int(episodes))
         ep2 = episodes2
+    # Floor (stamp stays honest: the lineage training plan matches).
+    ep1, ep2 = _floor_breed_episodes(ep1, ep2)
+    recipe["episodes_total"] = ep1 + (ep2 or 0)
     record = vault.new_record(name, params)
     weights = fresh_weights(params.get("experiment"), params.get("genome"))
     record, weights, summary = _staged_or_single(
