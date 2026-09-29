@@ -32,3 +32,5 @@ server_log.txt
 # Godot editor import cache + engine binaries (170+ MB)
 /tools/
 arena/.godot/
+# Godot 4.4+ script UID sidecars (regenerable editor metadata)
+*.uid

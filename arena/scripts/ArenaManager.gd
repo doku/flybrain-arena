@@ -748,7 +748,7 @@ func _build_bracket_overlay() -> void:
 	gallery_title.add_theme_font_size_override("font_size", 20)
 	gallery_title.add_theme_stylebox_override("normal", card_sb)
 	gallery_title.add_theme_color_override("font_color",
-		TournamentBracket.COL_SHOWCASE)
+		BracketView.COL_SHOWCASE)
 	gallery_box.add_child(gallery_title)
 	gallery_elo = Label.new()
 	gallery_elo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
