@@ -1947,10 +1947,13 @@ func event_advancers(event_id: String) -> Dictionary:
 func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
 	# Worst-first elimination order: played >= min_matches across the
 	# event files, lowest live ELO first. elo_cutoff > 0 restricts the
-	# axe to brains rated below it (menu demotion line); fewer than 2
-	# qualifiers falls back to matches-only order so the loop never
-	# stalls on an empty shortlist. Pure (no archiving) so the rule is
-	# unit-testable; event_eliminate archives the bottom two.
+	# axe to brains rated below it (menu demotion line). When the
+	# experienced shortlist has fewer than 2 — e.g. min_matches above
+	# a whole event's schedule (~6 playable vs default 10) — fall back
+	# to every played brain in live ELO order (cutoff-honoring when
+	# set), so the loop never stalls on an empty shortlist. Pure (no
+	# archiving) so the rule is unit-testable; event_eliminate archives
+	# the bottom two.
 	var ev := event_load(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
@@ -1982,10 +1985,14 @@ func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cut
 						played[sid] = int(played.get(sid, 0)) + 1
 	var cards := _event_live_cards(live_override)
 	var experienced: Array = []
+	var played_ids: Array = []
 	for pid in played.keys():
-		if int(played[pid]) >= min_matches and cards.has(pid):
-			experienced.append(pid)
-	experienced.sort_custom(func(x, y): return float((cards[x] as Dictionary).get("elo", 0.0)) < float((cards[y] as Dictionary).get("elo", 0.0)))
+		if cards.has(pid):
+			played_ids.append(pid)
+			if int(played[pid]) >= min_matches:
+				experienced.append(pid)
+	var by_elo := func(x, y): return float((cards[x] as Dictionary).get("elo", 0.0)) < float((cards[y] as Dictionary).get("elo", 0.0))
+	experienced.sort_custom(by_elo)
 	if elo_cutoff > 0.0:
 		var cut: Array = []
 		for pid in experienced:
@@ -1993,7 +2000,17 @@ func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cut
 				cut.append(pid)
 		if cut.size() >= 2:
 			return {"ok": true, "candidates": cut}
-	return {"ok": true, "candidates": experienced}
+	if experienced.size() >= 2:
+		return {"ok": true, "candidates": experienced}
+	played_ids.sort_custom(by_elo)
+	if elo_cutoff > 0.0:
+		var cut2: Array = []
+		for pid in played_ids:
+			if float((cards[pid] as Dictionary).get("elo", 0.0)) < elo_cutoff:
+				cut2.append(pid)
+		if cut2.size() >= 2:
+			return {"ok": true, "candidates": cut2}
+	return {"ok": true, "candidates": played_ids}
 
 
 func event_eliminate(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0) -> Dictionary:
