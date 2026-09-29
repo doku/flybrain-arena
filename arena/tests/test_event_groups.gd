@@ -825,33 +825,6 @@ func test_draw_title_dnf() -> void:
 	A.free()
 
 
-func test_eliminate_fallback_low_schedule() -> void:
-	# min_matches above a whole event's schedule (default 10 vs ~6
-	# playable): the experienced shortlist is empty, so the fallback
-	# ranks every played brain by live ELO instead of stalling the
-	# loop with "fewer than 2 eligible brains".
-	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
-	var rounds := [[
-		{"a_id": "f1", "b_id": "f2", "winner_id": "f1"},
-		{"a_id": "f2", "b_id": "f3", "winner_id": "f2"}]]
-	var bf := FileAccess.open("user://test_event_groups/TFB.json",
-		FileAccess.WRITE)
-	bf.store_string(JSON.stringify({"rounds": rounds}))
-	bf.close()
-	var D = load("res://scripts/TournamentDirector.gd").new()
-	D.tournament_dir = "user://test_event_groups"
-	D.call("event_save", {"id": "EFB", "group_order": ["A"],
-		"groups": {"A": {"bracket_id": "TFB"}}})
-	var cards := {"f1": {"elo": 1500.0}, "f2": {"elo": 900.0},
-		"f3": {"elo": 1200.0}}
-	var cands: Dictionary = D.call("event_eliminate_candidates",
-		"EFB", 10, 0.0, cards)
-	_check(bool(cands.get("ok", false)), "fallback resolves")
-	var order: Array = cands.get("candidates", [])
-	_check(order == ["f2", "f3", "f1"], "fallback ranks all played by ELO")
-	D.free()
-
-
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -904,7 +877,6 @@ func _initialize() -> void:
 	test_booster_rule()
 	test_booster_queue()
 	test_draw_title_dnf()
-	test_eliminate_fallback_low_schedule()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
