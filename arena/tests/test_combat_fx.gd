@@ -9,6 +9,7 @@ var arena = null
 var tick := 0
 var _rec_stage := 0
 var _rec_ready_tick := 0
+var _rec_armed := false
 var _rec_old_tourney: Dictionary = {}
 var _rec_old_dir := ""
 
@@ -323,18 +324,23 @@ func test_bracket_record_contract() -> void:
 	_check(arena.bracket_overlay.visible, "bracket shown for record")
 	arena._save_bracket_record(false)
 	_check(arena.bracket_overlay.visible, "txt-only record keeps bracket up")
+	_rec_armed = true
 	arena._save_bracket_record(true)
 	_rec_stage = 1
 	_rec_ready_tick = tick + 8
 
 
 func _finish_record_contract() -> void:
-	_check(arena.bracket_overlay.visible,
-		"png record never yanks a live bracket")
-	var d = arena._director()
-	if d != null:
-		d.tourney = _rec_old_tourney
-		d.tournament_dir = _rec_old_dir
+	# Assert + restore only when the async leg was armed (a no-director
+	# run never stubbed the tourney, so there is nothing to assert and
+	# restoring {} would clobber the real state).
+	if _rec_armed:
+		_check(arena.bracket_overlay.visible,
+			"png record never yanks a live bracket")
+		var d = arena._director()
+		if d != null:
+			d.tourney = _rec_old_tourney
+			d.tournament_dir = _rec_old_dir
 	arena._hide_arena_bracket()
 	if DirAccess.dir_exists_absolute("user://test_rec"):
 		for f in DirAccess.get_files_at("user://test_rec"):
@@ -371,4 +377,11 @@ func _process(_delta: float) -> bool:
 	test_loser_drops_faster()
 	test_pip_slot_visibility()
 	test_bracket_record_contract()
+	# Un-armed (e.g. no director): finish now instead of re-running the
+	# suite every frame - the old quit-at-tick-3 contract must hold on
+	# every path.
+	if _rec_stage == 0:
+		_rec_stage = 2
+		_finish_record_contract()
+		return true
 	return false
