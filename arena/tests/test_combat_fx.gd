@@ -138,6 +138,43 @@ func test_wait_bracket_flow() -> void:
 	_check(arena._wait_bracket, "auto flag set on wait open")
 	arena._hide_wait_bracket()
 	_check(not arena.bracket_overlay.visible, "reply hides auto wait view")
+	# Outcome-on-bracket: countdown above, ownership kept, preview.
+	arena._build_bracket_overlay()
+	_check(arena.winner_overlay.get_index() > arena.bracket_overlay.get_index(),
+		"countdown draws above bracket")
+	arena._show_wait_bracket("T2  C vs D")
+	arena._wait_bracket = true
+	arena._show_wait_bracket("T2  C vs D")
+	_check(arena._wait_bracket, "re-show keeps wait ownership")
+	var bv = arena.arena_bracket
+	var m := {"a_name": "A", "b_name": "B", "wins_a": 0.0, "wins_b": 0.0}
+	bv.live_preview = {"round": 0, "match": 0, "winner_slot": "alpha"}
+	var card: PanelContainer = bv.call("_make_match_card", m, 0, 0, true)
+	var rows = card.get_child(0)
+	var nmA: Label = rows.get_child(1).get_child(0)
+	var scA: Label = rows.get_child(1).get_child(1)
+	_check(nmA.text == "A", "preview keeps winner name")
+	_check((nmA.get_theme_color("font_color") as Color).is_equal_approx(
+		Color(0.5, 1.0, 0.55)), "preview tints winner green")
+	_check(scA.text == "1", "preview bumps winner score")
+	var nmB: Label = rows.get_child(2).get_child(0)
+	var scB: Label = rows.get_child(2).get_child(1)
+	_check((nmB.get_theme_color("font_color") as Color).is_equal_approx(
+		Color(0.92, 0.92, 0.94)), "preview leaves loser default")
+	_check(scB.text == "0", "preview leaves loser score")
+	bv.live_preview = {"round": 5, "match": 0, "winner_slot": "alpha"}
+	var card2: PanelContainer = bv.call("_make_match_card", m, 0, 0, true)
+	var nmA2: Label = card2.get_child(0).get_child(1).get_child(0)
+	_check((nmA2.get_theme_color("font_color") as Color).is_equal_approx(
+		Color(0.92, 0.92, 0.94)), "preview ignores other cards")
+	bv.live_preview = {}
+	var card3: PanelContainer = bv.call("_make_match_card", m, 0, 0, true)
+	var nmA3: Label = card3.get_child(0).get_child(1).get_child(0)
+	var scA3: Label = card3.get_child(0).get_child(1).get_child(1)
+	_check((nmA3.get_theme_color("font_color") as Color).is_equal_approx(
+		Color(0.92, 0.92, 0.94)), "cleared preview restores color")
+	_check(scA3.text == "0", "cleared preview restores score")
+	arena._hide_wait_bracket()
 
 
 func test_shock_lifecycle() -> void:

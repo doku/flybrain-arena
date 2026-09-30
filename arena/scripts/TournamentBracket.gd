@@ -40,6 +40,11 @@ var _lf_view := -1
 # "offspring:<kind>" placeholder) -> its round-0 card. Orthogonal to the
 # live/decided borders; cleared on every re-render.
 var spotlight_key := ""
+# Live result preview (report-wait only): {round, match, winner_slot}
+# stamped by the arena at report time so the just-decided battle reads
+# on its card before the server reply banks it. Arena-owned (set at
+# report, cleared on reply/load); never mutated here, never persisted.
+var live_preview: Dictionary = {}
 var _spot_cards := {}
 const SPOT_PREFIX := "offspring:"
 # Gallery showcase (waiting-room preview): fighter id (or
@@ -644,8 +649,21 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 	vb.add_child(head)
 	var wa: float = float(m.get("wins_a", 0))
 	var wb: float = float(m.get("wins_b", 0))
-	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided, loser_adv))
-	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided, loser_adv))
+	# Report-wait preview: tint +1 the just-decided winner before the
+	# server reply banks it. Row text untouched (fixed card budget).
+	var pv_a := false
+	var pv_b := false
+	if live and not live_preview.is_empty() \
+			and int(live_preview.get("round", -999)) == r \
+			and int(live_preview.get("match", -999)) == mi:
+		if str(live_preview.get("winner_slot", "")) == "alpha":
+			wa += 1.0
+			pv_a = true
+		elif str(live_preview.get("winner_slot", "")) == "beta":
+			wb += 1.0
+			pv_b = true
+	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided, loser_adv, pv_a))
+	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided, loser_adv, pv_b))
 	return card
 
 
@@ -655,7 +673,7 @@ func _fmt_wins(v: float) -> String:
 	return "%d" % int(v) if absf(v - float(int(v))) < 0.01 else "%.1f" % v
 
 
-func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false) -> HBoxContainer:
+func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false, preview_win: bool = false) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	var nm := Label.new()
@@ -685,6 +703,8 @@ func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: b
 			col = COL_LOSE if won else COL_WIN
 		else:
 			col = COL_WIN if won else COL_LOSE
+	elif preview_win:
+		col = COL_WIN
 	nm.add_theme_color_override("font_color", col)
 	# Showcase registry (gallery sync): every spelled name, all views.
 	var show_key := str(m.get("a_id" if slot == "a" else "b_id", ""))

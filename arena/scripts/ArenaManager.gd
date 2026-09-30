@@ -825,6 +825,11 @@ func _build_bracket_overlay() -> void:
 	# No overlay CLOSE row: it sat under the bottom menu bar and could
 	# never receive clicks. The menu-bar "Bracket Close" button (kept
 	# in sync by _sync_bracket_button) is the close control.
+	# Countdown above bracket: WinnerOverlay is built first (lower
+	# sibling), so raise it over the bracket - the NEXT BATTLE callout
+	# then plays on top of the waiting bracket instead of under it.
+	if is_instance_valid(winner_overlay):
+		hud.move_child(winner_overlay, bracket_overlay.get_index() + 1)
 
 func _show_arena_bracket(title_text: String) -> void:
 	var director := _director()
@@ -869,11 +874,13 @@ func _show_wait_bracket(title_text: String) -> bool:
 	# load, report await, reset wait, error retry). Returns false when
 	# no bracket can render (caller falls back to fullscreen loading).
 	# Ownership: takes over only a closed overlay; a manually opened
-	# bracket stays the user's (no auto-hide on reply).
+	# bracket stays the user's (no auto-hide on reply). Never downgrade:
+	# re-shows over a visible overlay (e.g. after the callout) keep the
+	# earlier ownership so the reply still auto-hides our wait view.
 	var director := _director()
 	if director == null or arena_bracket == null or bracket_overlay == null:
 		return false
-	_wait_bracket = not bracket_overlay.visible
+	_wait_bracket = _wait_bracket or not bracket_overlay.visible
 	_show_arena_bracket(title_text)
 	return true
 
@@ -965,6 +972,10 @@ func _request_current_battle_load() -> void:
 	var director := _director()
 	if director == null:
 		return
+	# Fresh match, no preview: a fail-loud QUIT+RESUME must never
+	# resurrect the previous match's report-wait stamp on re-render.
+	if arena_bracket != null:
+		arena_bracket.live_preview = {}
 	# Walk past resolved byes / walkovers first (round-0 leading byes and
 	# legacy unresolved-bye states), so we never request a load with an
 	# empty brain path and stall waiting for brains that never come.
@@ -1559,9 +1570,13 @@ func _check_seq_watchdog() -> void:
 			var q := _seq_last_round
 			print("[Arena] Retrying battle report id=", _seq_battle_id,
 				" (same id, idempotent)")
-			_show_loading("STALLED - RETRYING BATTLE REPORT",
-				"No confirmation for battle %s yet. Re-sending the SAME report id " % expand_battle_id(_seq_battle_id)
-				+ "(the server answers repeats from its stored verdict, no double count)...")
+			var retry_sub := "No confirmation for battle %s yet. Re-sending the SAME report id " % expand_battle_id(_seq_battle_id) \
+				+ "(the server answers repeats from its stored verdict, no double count)..."
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RETRYING BATTLE REPORT",
+					retry_sub, Color(0.85, 0.85, 0.9))
+			else:
+				_show_loading("STALLED - RETRYING BATTLE REPORT", retry_sub)
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING BATTLE %s ..." % expand_battle_id(_seq_battle_id)
 			brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
@@ -1584,6 +1599,10 @@ func _check_seq_watchdog() -> void:
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for(_seq_context)
 		if _seq_context == "load" and not _seq_last_load.is_empty():
 			var p := _seq_last_load
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RETRYING LOAD",
+					"%s vs %s - brains loading (retry sent)..." % [tourney_a_name, tourney_b_name],
+					Color(0.85, 0.85, 0.9))
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING LOAD %s vs %s ..." % [tourney_a_name, tourney_b_name]
 			brain_client.request_tournament_load(
@@ -1591,6 +1610,10 @@ func _check_seq_watchdog() -> void:
 				str(p.get("tournament_id", "")), str(p.get("match", "")),
 				float(p.get("lr_scale", 0.5)))
 		else:
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RETRYING RESET",
+					"waiting for server (match reset retry sent)...",
+					Color(0.85, 0.85, 0.9))
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING RESET ..."
 			brain_client.request_match_reset(tourney_match_label)
@@ -3276,6 +3299,16 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	var head_sub := "%s\n%s - battle %s sent, waiting for server..." % [
 		str(head.get("sub", "")), expand_match_label(tourney_match_label), expand_battle_id(_seq_battle_id)]
 	var head_color: Color = head.get("color", Color(0.85, 0.85, 0.9))
+	# Live-card preview: the just-decided winner reads on its bracket
+	# card during the report wait (draws bank nothing - skip them).
+	if not draw and is_instance_valid(arena_bracket):
+		var pslot := str(_last_verdict.get("winner_slot", ""))
+		if pslot == "alpha" or pslot == "beta":
+			var rdir := _director()
+			if rdir != null:
+				arena_bracket.live_preview = {"round": int(rdir.tourney.get("current_round", 0)),
+					"match": int(rdir.tourney.get("current_match", 0)),
+					"winner_slot": pslot}
 	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
 		_set_wait_header(head_text, head_sub, head_color)
 	else:
@@ -3976,7 +4009,12 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
-	_hide_wait_bracket()
+	# The wait bracket stays raised through the NEXT BATTLE callout
+	# (countdown plays above it): the reset-wait re-show after the
+	# timer refreshes the header. Preview clears here - the re-show
+	# renders the banked on_battle_result state (auto-reconcile).
+	if arena_bracket != null:
+		arena_bracket.live_preview = {}
 	_hide_loading()
 	var director := _director()
 	if director == null:
