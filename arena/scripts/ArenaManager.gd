@@ -3228,11 +3228,16 @@ func _evo_watcher_tick(delta: float) -> void:
 
 
 func _event_topup_tick() -> void:
-	# Automatic top-up trainer: when every worker slot is idle, school
+	# Automatic top-up trainer: when the TRAINING slot is idle, school
 	# the least-trained bench brain toward POOL_TRAIN_TARGET (own
 	# stored wiring/rates + school curriculum, same as a menu school
-	# retrain). Throttled: the vault scan runs at most every 30 s, and
-	# it never steals CPU from breeds, trains, or score probes. The
+	# retrain). Throttled to every 30 s. Breeds (pending_async) and
+	# score probes (score_job) no longer gate it: they are separate
+	# workers on isolated cores (affinity + BelowNormal + single-thread
+	# BLAS), so schooling runs parallel to them and to live battles —
+	# the old all-slots-idle gate starved the bench for entire events
+	# whenever a breed was running. Boot spikes stay fenced by
+	# hold_spawns in the pump; running workers are never touched. The
 	# queue naturally rotates through the bench as each graduate
 	# outgrows the bottom slot.
 	if not _event_active():
@@ -3240,17 +3245,13 @@ func _event_topup_tick() -> void:
 	_event_topup_cd += EVO_STATUS_EVERY
 	if _event_topup_cd < EVENT_TOPUP_EVERY:
 		return
-	if is_round_active:
-		return
 	var director := _director()
 	if director == null:
 		return
 	_event_topup_cd = 0.0
 	if not (director.train_queue as Array).is_empty():
 		return
-	if not (director.active_job as Dictionary).is_empty() \
-			or not (director.pending_async as Dictionary).is_empty() \
-			or not (director.score_job as Dictionary).is_empty():
+	if not (director.active_job as Dictionary).is_empty():
 		return
 	var pick: Dictionary = director.event_topup_pick(_event_id(), POOL_TRAIN_TARGET)
 	if not bool(pick.get("ok", false)):
