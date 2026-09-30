@@ -838,6 +838,40 @@ func test_booster_queue() -> void:
 	D.free()
 
 
+func test_train_hud_parts() -> void:
+	# Training half of the EVO status line: pure helper, handler
+	# storage, and the completion ring (cap 5, newest last).
+	var A = load("res://scripts/ArenaManager.gd").new()
+	_check(A.call("_train_queue_parts", [], {}, [], -1, -1).is_empty(),
+		"train parts empty")
+	var p1: Array = A.call("_train_queue_parts",
+		[], {"brain_id": "id9", "name": "Brisk-kin-12-extra"}, [], 22, 50)
+	_check(p1 == ["TRAIN Brisk-kin-12-e 22/50"], "train active part")
+	var p1w: Array = A.call("_train_queue_parts",
+		[], {"brain_id": "id9", "name": "Kestrel"}, [], -1, -1)
+	_check(p1w == ["TRAIN Kestrel warming up"], "train warming up")
+	var q := [{"id": "a", "name": "Alpha-brain-long-name"},
+		{"id": "b", "name": "Beta"}, {"id": "c", "name": "Gamma"}]
+	var p2: Array = A.call("_train_queue_parts", q, {}, [], -1, -1)
+	_check(p2 == ["QUEUED Alpha-brain-lo +2"], "train queue part")
+	var dn := [{"name": "Old", "episodes": 10},
+		{"name": "Fresh-brain-long", "episodes": 50}]
+	var p3: Array = A.call("_train_queue_parts", [], {}, dn, -1, -1)
+	_check(p3 == ["DONE Fresh-brain-lo +50ep"], "train done part")
+	A.call("_on_train_progress", 22, 50)
+	_check(int(A.get("_train_prog_ep")) == 22, "handler stores ep")
+	_check(int(A.get("_train_prog_total")) == 50, "handler stores total")
+	A.free()
+	var DD = load("res://scripts/TournamentDirector.gd").new()
+	for i in range(7):
+		DD.call("_record_train_done", "B%d" % i, 50)
+	var ring: Array = DD.get("completed_trains")
+	_check(ring.size() == 5, "done ring caps")
+	_check(str((ring[4] as Dictionary).get("name", "")) == "B6",
+		"done ring newest last")
+	DD.free()
+
+
 func test_draw_title_dnf() -> void:
 	# Timeout-ties are called DNF, numbered by banked draws.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -1132,6 +1166,7 @@ func _initialize() -> void:
 	test_booster_rule()
 	test_booster_queue()
 	test_draw_title_dnf()
+	test_train_hud_parts()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()

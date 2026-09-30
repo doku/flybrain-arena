@@ -75,6 +75,10 @@ var pending_async: Dictionary = {}
 # shared worker slot frees up. In-memory only (menu restart drops it;
 # a running worker keeps going but is no longer polled).
 var train_queue: Array = []
+# Last finished trainings (ring of {name, episodes}, newest last, cap
+# 5): the arena HUD shows the most recent DONE so finished work stays
+# visible instead of vanishing silently. In-memory only like the queue.
+var completed_trains: Array = []
 # Spawn hold (arena sets from is_round_active): queue pumps refuse to
 # boot workers mid-battle (process-boot spikes frame pacing); queued
 # work drains in the gaps. Never drops anything, only defers.
@@ -406,7 +410,7 @@ func import_brain(npz_path: String, brain_name: String) -> Dictionary:
 
 
 func start_training(brain_id: String, episodes: int, params: Dictionary,
-		snapshot: bool = true) -> Dictionary:
+		snapshot: bool = true, brain_name: String = "") -> Dictionary:
 	if not python_ready:
 		return {"ok": false, "error": "no working python found (%s)" % python_probe_error}
 	if not active_job.is_empty():
@@ -437,7 +441,8 @@ func start_training(brain_id: String, episodes: int, params: Dictionary,
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
 	active_job = {"pid": pid, "progress_path": progress_path,
 		"result_file": result_file, "brain_id": brain_id,
-		"episodes": episodes, "school": params.has("curriculum")}
+		"episodes": episodes, "school": params.has("curriculum"),
+		"name": brain_name}
 	_last_job_text = ""
 	_last_job_res = {}
 	return {"ok": true, "pid": pid}
@@ -481,6 +486,10 @@ func poll_job() -> Dictionary:
 		# under the same rules as training.
 		var done_school := bool(active_job.get("school", false))
 		var done_id := str(active_job.get("brain_id", ""))
+		var done_name := str(active_job.get("name", ""))
+		if done_name == "":
+			done_name = done_id
+		_record_train_done(done_name, int(res.get("episode", 0)))
 		active_job = {}
 		vault_changed.emit()
 		_pump_train_queue()
@@ -502,6 +511,14 @@ func poll_job() -> Dictionary:
 		job_failed.emit(err_text)
 		_pump_train_queue()
 	return res
+
+
+func _record_train_done(brain_name: String, episodes: int) -> void:
+	# Remembers a finished training for the HUD DONE flash: a ring of
+	# the last 5 {name, episodes}, newest last.
+	completed_trains.append({"name": brain_name, "episodes": episodes})
+	while completed_trains.size() > 5:
+		completed_trains.pop_front()
 
 
 func enqueue_training(brain_id: String, brain_name: String, episodes: int,
@@ -566,7 +583,8 @@ func _pump_train_queue() -> bool:
 	# Queued/top-up trains skip the pre-train snapshot (opt-in backups):
 	# a full 19-100 MB copy per queued episode batch is disk-safety only.
 	var res: Dictionary = start_training(str(head.get("id", "")),
-		int(head.get("episodes", 0)), head.get("params", {}), false)
+		int(head.get("episodes", 0)), head.get("params", {}), false,
+		str(head.get("name", "")))
 	if not bool(res.get("ok", false)):
 		print("[Director] Queued training deferred for %s: %s" % [
 			str(head.get("name", "?")), str(res.get("error", "?"))])

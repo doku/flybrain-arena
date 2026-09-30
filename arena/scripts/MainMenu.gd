@@ -1235,7 +1235,8 @@ func _start_or_queue(bid: String, bname: String, eps: int,
 	# with the brain name, e.g. "Generated '%s'".
 	if TournamentDirector.active_job.is_empty() \
 			and TournamentDirector.train_queue.is_empty():
-		var res: Dictionary = TournamentDirector.start_training(bid, eps, params)
+		var res: Dictionary = TournamentDirector.start_training(
+			bid, eps, params, true, bname)
 		if res.get("ok", false):
 			job_bar.value = 0.0
 			job_label.text = "Training %s ..." % bname

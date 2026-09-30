@@ -468,6 +468,8 @@ func _ready() -> void:
 	var _edir := _director()
 	if _edir != null:
 		_edir.async_done.connect(_on_evo_async)
+		_edir.job_progress.connect(_on_train_progress)
+		_edir.train_queue_changed.connect(_on_train_queue_changed)
 	brain_client.raster_map_received.connect(_on_raster_map)
 	brain_client.brains_loaded.connect(_on_brains_loaded)
 	brain_client.match_ready_received.connect(_on_match_ready)
@@ -3450,6 +3452,49 @@ func _event_topup_tick() -> void:
 		str(worst_rec.get("name", "?")), deficit, worst_eps])
 
 
+func _train_queue_parts(queue: Array, job: Dictionary, done: Array,
+		ep: int, total: int) -> Array:
+	# Pure builder for the training half of the EVO status line: active
+	# job, queue head (+N overflow), most recent DONE. Narrow caps keep
+	# the joined line inside its 800 px band.
+	var out: Array = []
+	if not job.is_empty():
+		var aname := str(job.get("name", job.get("brain_id", "?")))
+		if ep >= 0 and total > 0:
+			out.append("TRAIN %s %d/%d" % [aname.left(14), ep, total])
+		else:
+			out.append("TRAIN %s warming up" % aname.left(14))
+	if not queue.is_empty():
+		var head: Dictionary = queue[0] if queue[0] is Dictionary else {}
+		var qp := "QUEUED %s" % str(head.get("name", "?")).left(14)
+		if queue.size() > 1:
+			qp += " +%d" % (queue.size() - 1)
+		out.append(qp)
+	if not done.is_empty():
+		var last := done[done.size() - 1] as Dictionary
+		if last != null and not last.is_empty():
+			out.append("DONE %s +%dep" % [str(last.get("name", "?")).left(14),
+				int(last.get("episodes", 0))])
+	return out
+
+
+func _on_train_progress(ep: int, total: int) -> void:
+	# Instant half of the training HUD: progress bar + last-known
+	# counts (the text line refreshes immediately - 4 Hz max, same cost
+	# class as the menu's job_bar).
+	_train_prog_ep = ep
+	_train_prog_total = total
+	if is_instance_valid(train_prog_bar):
+		train_prog_bar.max_value = maxi(1, total)
+		train_prog_bar.value = ep
+		train_prog_bar.visible = true
+	_update_evo_status_line()
+
+
+func _on_train_queue_changed() -> void:
+	_update_evo_status_line()
+
+
 func _update_evo_status_line() -> void:
 	if not is_instance_valid(evo_status_line):
 		return
@@ -3460,6 +3505,19 @@ func _update_evo_status_line() -> void:
 	var evo: Dictionary = director.tourney.get("evo", {})
 	var gen := int(evo.get("generation", 1))
 	var parts: Array = []
+	# Fresh job (or none): drop stale counts from the previous one so a
+	# new train reads "warming up" instead of the old ep/total.
+	var job_id := str(director.active_job.get("brain_id", ""))
+	if job_id != _train_prog_job:
+		_train_prog_job = job_id
+		_train_prog_ep = -1
+		_train_prog_total = -1
+		if is_instance_valid(train_prog_bar):
+			train_prog_bar.value = 0.0
+	# Visibility sweep on ground truth: a crashed job never emits its
+	# final progress, so the 5 s tick clears a bar the handler left up.
+	if is_instance_valid(train_prog_bar):
+		train_prog_bar.visible = not director.active_job.is_empty()
 	# The awaited spec is detached from pending: without the fallback
 	# this line flatlines for the whole (long) await, same as the strip.
 	for spec in _evo_pending() + [evo_await_spec]:
@@ -3483,6 +3541,9 @@ func _update_evo_status_line() -> void:
 			parts.append("%s queued" % label)
 	for kind in (evo.get("done", {}) as Dictionary).keys():
 		parts.append("%s done" % _evo_done_name(str(kind)))
+	parts.append_array(_train_queue_parts(director.train_queue,
+		director.active_job, director.completed_trains,
+		_train_prog_ep, _train_prog_total))
 	if parts.is_empty():
 		evo_status_line.visible = false
 		return
@@ -4849,6 +4910,13 @@ var evo_last_spawn_error := ""
 # (evo_breeder.wild_name, deterministic from seed); the arena passes
 # name "" + --gen and reads the christened name back from the result.
 var evo_status_line: Label
+# Training-queue HUD state: background-fill bar under the EVO line plus
+# last-known progress counts (the director's job_progress signal feeds
+# both; the 5 s EVO tick re-derives visibility from ground truth).
+var train_prog_bar: ProgressBar
+var _train_prog_ep := -1
+var _train_prog_total := -1
+var _train_prog_job := ""
 var evo_status_tick := 0.0
 var _adopt_last_sweep := 0.0
 const EVO_STATUS_EVERY := 5.0
@@ -4871,6 +4939,30 @@ func _build_evo_status() -> void:
 	evo_status_line.offset_bottom = -50.0
 	evo_status_line.visible = false
 	hud.add_child(evo_status_line)
+	evo_status_line.clip_text = true
+	# Training progress: same rect as the status line, drawn UNDER the
+	# text as a subtle green wash - zero new chrome, so it can never
+	# collide with the menubar below or StatusCorner above.
+	train_prog_bar = ProgressBar.new()
+	train_prog_bar.name = "TrainProgBar"
+	train_prog_bar.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	train_prog_bar.offset_left = -400.0
+	train_prog_bar.offset_right = 400.0
+	train_prog_bar.offset_top = -74.0
+	train_prog_bar.offset_bottom = -50.0
+	train_prog_bar.min_value = 0.0
+	train_prog_bar.max_value = 100.0
+	train_prog_bar.show_percentage = false
+	var prog_bg := StyleBoxFlat.new()
+	prog_bg.bg_color = Color(0, 0, 0, 0)
+	train_prog_bar.add_theme_stylebox_override("background", prog_bg)
+	var prog_fill := StyleBoxFlat.new()
+	prog_fill.bg_color = Color(0.45, 0.85, 0.5, 0.18)
+	prog_fill.set_corner_radius_all(4)
+	train_prog_bar.add_theme_stylebox_override("fill", prog_fill)
+	train_prog_bar.visible = false
+	hud.add_child(train_prog_bar)
+	hud.move_child(train_prog_bar, evo_status_line.get_index())
 # Centered evolution phase overlay: big title + status + progress bar
 # + spinner, so long breed/train waits read as a loading phase.
 var evo_panel: ColorRect
