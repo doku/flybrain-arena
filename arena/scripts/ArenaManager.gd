@@ -357,6 +357,8 @@ const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS"]
 var pip_slot_mode := "STATS"
 var pip_stats_alpha: Label
 var pip_stats_beta: Label
+var pip_flash_alpha: ColorRect
+var pip_flash_beta: ColorRect
 var pip_name_alpha: Label
 var pip_name_beta: Label
 
@@ -1637,8 +1639,31 @@ const PIP_TICK_EVERY := 6
 func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	# Fly-stat card overlaying a PiP slot: name header in team color
 	# plus a full-word stat body. Top edge lines up with the health
-	# bar (y=8); same geometry both sides.
+	# bar (y=8); same geometry both sides. A backing wash rect spans
+	# the whole card (normally transparent) so strike flashes cover
+	# the card area in team color, never just the text.
 	var is_alpha := left_side
+	var wash := ColorRect.new()
+	if left_side:
+		wash.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		wash.offset_left = 16.0
+		wash.offset_right = 316.0
+	else:
+		wash.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		wash.anchor_left = 1.0
+		wash.anchor_right = 1.0
+		wash.offset_left = -316.0
+		wash.offset_right = -16.0
+	wash.offset_top = 8.0
+	wash.offset_bottom = 320.0
+	wash.color = Color(1.0, 1.0, 1.0, 0.0)
+	wash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	wash.visible = false
+	parent.add_child(wash)
+	if is_alpha:
+		pip_flash_alpha = wash
+	else:
+		pip_flash_beta = wash
 	var nm := Label.new()
 	if left_side:
 		nm.set_anchors_preset(Control.PRESET_TOP_LEFT)
@@ -1660,7 +1685,6 @@ func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	nm.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	nm.visible = false
 	parent.add_child(nm)
-	parent.move_child(nm, 0)
 	if is_alpha:
 		pip_name_alpha = nm
 	else:
@@ -1683,9 +1707,14 @@ func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	l.visible = false
 	parent.add_child(l)
-	# Behind the bracket overlay (appended after it): the popup must
-	# cover stat cards, never the reverse.
-	parent.move_child(l, 0)
+	# Bottom of the z-stack, card order kept (wash, name, body):
+	# popups appended later (e.g. the bracket overlay) must cover stat
+	# cards, never the reverse.
+	var wash_node: ColorRect = pip_flash_alpha if is_alpha else pip_flash_beta
+	if is_instance_valid(wash_node):
+		parent.move_child(wash_node, 0)
+	parent.move_child(nm, 1)
+	parent.move_child(l, 2)
 	return l
 
 
@@ -1822,6 +1851,10 @@ func _apply_pip_slot() -> void:
 		pip_name_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
 	if is_instance_valid(pip_name_beta):
 		pip_name_beta.visible = pip_stats_beta.visible if is_instance_valid(pip_stats_beta) else false
+	if is_instance_valid(pip_flash_alpha):
+		pip_flash_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
+	if is_instance_valid(pip_flash_beta):
+		pip_flash_beta.visible = pip_stats_beta.visible if is_instance_valid(pip_stats_beta) else false
 	if eyes:
 		if is_instance_valid(pip_alpha_label):
 			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
@@ -1853,7 +1886,8 @@ func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 			for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
 					pip_beta_label, pip_alpha_feat, pip_beta_feat,
 					pip_stats_alpha, pip_stats_beta,
-					pip_name_alpha, pip_name_beta]:
+					pip_name_alpha, pip_name_beta,
+					pip_flash_alpha, pip_flash_beta]:
 				if is_instance_valid(n):
 					(n as Control).visible = false
 		return
@@ -2658,9 +2692,26 @@ func _flash_stats_label(lbl: Label, tint: Color) -> void:
 		tw.tween_property(lbl, "modulate", Color.WHITE, 0.4)
 
 
-func _flash_fighter_card(side: String, tint: Color) -> void:
+func _flash_card_wash(side: String, strength: float) -> void:
+	# Team-color wash over the whole stat-card area (the strike flash
+	# the viewer actually sees). Fades over 0.4 s; new strikes simply
+	# restart it (convergent — every tween heads to transparent).
+	if side != "alpha" and side != "beta":
+		return
+	var rect: ColorRect = pip_flash_alpha if side == "alpha" else pip_flash_beta
+	if not is_instance_valid(rect):
+		return
+	var team: Color = TEAM_ALPHA if side == "alpha" else TEAM_BETA
+	rect.color = Color(team.r, team.g, team.b, strength)
+	if rect.is_inside_tree():
+		var tw := rect.create_tween()
+		tw.tween_property(rect, "color:a", 0.0, 0.4)
+
+
+func _flash_fighter_card(side: String, tint: Color, strength: float = 0.5) -> void:
 	# Strike flash that never blocks the central view: the fighter's
-	# stat card when visible, else the always-visible health-row name.
+	# stat card area washes in team color plus a text tint when
+	# visible, else the always-visible health-row name tints.
 	# Unknown sides no-op.
 	if side != "alpha" and side != "beta":
 		return
@@ -2671,15 +2722,17 @@ func _flash_fighter_card(side: String, tint: Color) -> void:
 		if is_instance_valid(lbl) and (lbl as Label).visible:
 			_flash_stats_label(lbl, tint)
 			flashed = true
-	if not flashed:
-		var row: Label = alpha_row_name if side == "alpha" else beta_row_name
-		_flash_stats_label(row, tint)
+	if flashed:
+		_flash_card_wash(side, strength)
+		return
+	var row: Label = alpha_row_name if side == "alpha" else beta_row_name
+	_flash_stats_label(row, tint)
 
 
 func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void:
-	_flash_fighter_card(victim_id, Color(1.0, 0.35, 0.35))
+	_flash_fighter_card(victim_id, Color(1.0, 0.35, 0.35), 0.5)
 	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
-	_flash_fighter_card(attacker_id, Color(1.0, 0.95, 0.75))
+	_flash_fighter_card(attacker_id, Color(1.0, 0.95, 0.75), 0.22)
 	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, 0.6)
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):
@@ -3580,7 +3633,7 @@ func _on_wing_torn(fly_id: String, side: String) -> void:
 	# Refresh HUD now - the round ends immediately, so physics-driven updates
 	# would never show the torn wing / dried-up health bar.
 	_update_health_hud()
-	_flash_fighter_card(fly_id, Color(1.0, 0.3, 0.3))
+	_flash_fighter_card(fly_id, Color(1.0, 0.3, 0.3), 0.6)
 	_flash_body(fly_alpha if fly_id == "alpha" else fly_beta, 1.0)
 	if is_instance_valid(status_label):
 		status_label.text = _slot_name(fly_id) + " LOST " + side.to_upper() + " WING!"
@@ -3593,7 +3646,7 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 
 	# Draw the final state (health floor, torn wing) BEFORE the winner text.
 	_update_health_hud()
-	_flash_fighter_card(victim_id, Color(1.0, 0.25, 0.25))
+	_flash_fighter_card(victim_id, Color(1.0, 0.25, 0.25), 0.75)
 	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):

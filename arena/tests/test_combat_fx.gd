@@ -57,13 +57,26 @@ func test_stats_flash_path() -> void:
 	arena.pip_stats_alpha.visible = true
 	arena.pip_name_beta.visible = true
 	arena.pip_stats_beta.visible = true
+	_check(arena.pip_flash_beta.color.a == 0.0, "wash starts transparent")
 	arena._flash_fighter_card("beta", red)
 	_check(arena.pip_name_beta.modulate.is_equal_approx(red),
 		"victim name tints red")
 	_check(arena.pip_stats_beta.modulate.is_equal_approx(red),
 		"victim body tints red")
+	_check(arena.pip_flash_beta.color.a > 0.0, "victim wash covers card")
+	_check(arena.pip_flash_beta.color.r < 0.6
+		and arena.pip_flash_beta.color.b > 0.9,
+		"victim wash is team blue")
 	_check(arena.pip_name_alpha.modulate.is_equal_approx(Color.WHITE),
 		"attacker card untouched by victim flash")
+	arena._flash_fighter_card("alpha", red)
+	_check(arena.pip_flash_alpha.color.r > 0.9
+		and arena.pip_flash_alpha.color.g < 0.7,
+		"attacker wash reads orange team color")
+	var sibs: Array = arena.pip_flash_beta.get_parent().get_children()
+	_check(sibs.find(arena.pip_flash_beta) < sibs.find(arena.pip_name_beta)
+		and sibs.find(arena.pip_name_beta) < sibs.find(arena.pip_stats_beta),
+		"wash sits behind name and body")
 	arena.pip_name_alpha.visible = false
 	arena.pip_stats_alpha.visible = false
 	arena.pip_name_beta.visible = false
