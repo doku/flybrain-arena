@@ -98,9 +98,11 @@ def save_brain(record, weights, backup=True, fast=False):
     """Atomically writes record+weights to the vault (keeps .bak unless
     backup=False, used for hot per-battle tournament saves). fast=True
     skips deflate (np.savez + ZIP_STORED): ~8x quicker per save on
-    25M-synapse brains, which is what keeps battle reporting under the
-    arena's confirm deadline. Files are bigger (~100 vs ~19 MB) but load
-    identically; cold paths (generate/train) stay compressed."""
+    25M-synapse brains but ~100 MB files that stall laptop disks and
+    blow the arena's confirm deadline under load — so hot per-battle
+    saves now use single compression (compressed npz payload inside a
+    STORED outer zip, ~19 MB, no double-deflate). Outer compression
+    never mattered for loading (zipfile reads both transparently)."""
     os.makedirs(VAULT_DIR, exist_ok=True)
     path = package_path(record)
     weights = np.ascontiguousarray(np.asarray(weights), dtype=np.float32)
@@ -108,8 +110,7 @@ def save_brain(record, weights, backup=True, fast=False):
     fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=VAULT_DIR)
     os.close(fd)
     try:
-        compression = zipfile.ZIP_STORED if fast else zipfile.ZIP_DEFLATED
-        with zipfile.ZipFile(tmp, "w", compression) as zf:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
             buf = io.BytesIO()
             if fast:
                 np.savez(buf, weights=weights)
@@ -516,12 +517,26 @@ def backfill_elo():
     return stamped
 
 
+# Session history cap: raw per-session dicts ride inside every
+# journal/sidecar/zip/index rewrite, so unbounded growth slows every
+# battle. Past 50, oldest sessions fold their episode counts into the
+# sessions_archive rollup (odometers stay exact — averages never move).
+MAX_SESSIONS = 50
+
+
 def log_training_session(record, episodes, params, notes=""):
     record["training"]["episodes"] += int(episodes)
     record["training"]["sessions"].append({
         "utc": _utcnow(), "episodes": int(episodes),
         "params": params, "notes": notes,
     })
+    tr = record["training"]
+    while len(tr["sessions"]) > MAX_SESSIONS:
+        old = tr["sessions"].pop(0)
+        arch = tr.setdefault("sessions_archive",
+                             {"sessions": 0, "episodes": 0})
+        arch["sessions"] += 1
+        arch["episodes"] += int(old.get("episodes", 0))
     return record
 
 

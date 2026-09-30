@@ -6122,6 +6122,21 @@ class TestBattleTransaction(unittest.TestCase):
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_session_cap_rolls_up(self):
+        # Past 50 sessions, oldest fold episode counts into the
+        # sessions_archive rollup; odometers stay exact.
+        rec = vault_pkg.new_record("Cap", {})
+        for i in range(55):
+            vault_pkg.log_training_session(rec, 2, {}, "s%d" % i)
+        tr = rec["training"]
+        self.assertEqual(len(tr["sessions"]), 50)
+        self.assertEqual(tr["episodes"], 110)
+        arch = tr["sessions_archive"]
+        self.assertEqual(arch["sessions"], 5)
+        self.assertEqual(arch["episodes"], 10)
+        self.assertEqual(tr["sessions"][0]["notes"], "s5")
+        self.assertEqual(tr["sessions"][-1]["notes"], "s54")
+
     def test_save_brain_record_only(self):
         import zipfile
         rec = vault_pkg.new_record("RecOnly", {})

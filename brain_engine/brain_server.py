@@ -297,17 +297,27 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         r["weights_unchanged"] = True
     live_weights = weights
     weights = {}
+    _t_journal = time.perf_counter()
     _write_pending_battle(battle_key, resp, records, weights)
     # Live path: bank post-learning weights while the journal still
     # guards the records. Crash here replays the bumped records (sidecar
     # path) while weights fall back to pre-battle — approved tradeoff.
     # st["rec"] sync + verdict land in recover below.
+    _t_weights = time.perf_counter()
     for entry in records:
         side = entry["side"]
         if side in live_weights:
+            # Compressed (~19 MB, single-deflate): laptop disks stall
+            # on 100 MB uncompressed writes and blow the confirm
+            # deadline; a couple of CPU seconds is the cheaper trade.
             vault_pkg.save_brain(entry["record"], live_weights[side],
-                                 backup=False, fast=True)
+                                 backup=False, fast=False)
+    _t_recover = time.perf_counter()
     _recover_pending_battle((tourney_a, tourney_b))
+    print(f"[Server] battle {battle_id or '?'}: journal "
+          f"{_t_weights - _t_journal:.1f}s + weights "
+          f"{_t_recover - _t_weights:.1f}s + recover+verdict "
+          f"{time.perf_counter() - _t_recover:.1f}s", flush=True)
     try:
         sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
     except OSError as e:
@@ -340,7 +350,7 @@ def _bank_title(side_state, champ_label, key=None):
         return False
     st["rec"]["record"]["tournaments_won"] += 1
     vault_pkg.save_brain(st["rec"], st["brain"].weights,
-                         backup=False, fast=True)
+                         backup=False, fast=False)
     if key is not None:
         _last_title_banked = {"key": key}
     return True
@@ -372,7 +382,7 @@ def _bank_match_result(tourney_a, tourney_b, match_winner):
         if st["rec"] is None:
             continue
         vault_pkg.save_brain(st["rec"], st["brain"].weights,
-                             backup=False, fast=True)
+                             backup=False, fast=False)
     return banked
 
 
@@ -571,7 +581,7 @@ def _recover_pending_battle(states=()):
             vault_pkg.save_brain_record_only(rec)
         else:
             weights = payload[entry["side"]]
-            vault_pkg.save_brain(rec, weights, backup=False, fast=True)
+            vault_pkg.save_brain(rec, weights, backup=False, fast=False)
         for st in states:
             if st["rec"] is not None and st["rec"]["filename"] == rec["filename"]:
                 st["rec"] = deepcopy(rec)
