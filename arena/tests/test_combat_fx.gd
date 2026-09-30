@@ -7,6 +7,10 @@ extends SceneTree
 var failures := 0
 var arena = null
 var tick := 0
+var _rec_stage := 0
+var _rec_ready_tick := 0
+var _rec_old_tourney: Dictionary = {}
+var _rec_old_dir := ""
 
 
 func _check(cond: bool, label: String) -> void:
@@ -298,8 +302,59 @@ func _initialize() -> void:
 	root.add_child(arena)
 
 
+func test_bracket_record_contract() -> void:
+	# The record capture must never yank a bracket another flow raised:
+	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
+	# the un-awaited group record hid the intermission bracket ~2
+	# frames after it appeared, leaving no bracket view for the whole
+	# between-group countdown.) The PNG leg needs real frames, so its
+	# assert lands in _finish_record_contract a few ticks later.
+	var d = arena._director()
+	if d == null:
+		_check(true, "record contract skipped (no director)")
+		return
+	_rec_old_tourney = d.tourney
+	_rec_old_dir = d.tournament_dir
+	d.tournament_dir = "user://test_rec"
+	DirAccess.make_dir_recursive_absolute("user://test_rec")
+	d.tourney = {"id": "TESTREC", "rounds": [
+		[{"a_id": "a1", "b_id": "b1", "a_name": "AA", "b_name": "BB"}]]}
+	arena._show_arena_bracket("RECORD CONTRACT")
+	_check(arena.bracket_overlay.visible, "bracket shown for record")
+	arena._save_bracket_record(false)
+	_check(arena.bracket_overlay.visible, "txt-only record keeps bracket up")
+	arena._save_bracket_record(true)
+	_rec_stage = 1
+	_rec_ready_tick = tick + 8
+
+
+func _finish_record_contract() -> void:
+	_check(arena.bracket_overlay.visible,
+		"png record never yanks a live bracket")
+	var d = arena._director()
+	if d != null:
+		d.tourney = _rec_old_tourney
+		d.tournament_dir = _rec_old_dir
+	arena._hide_arena_bracket()
+	if DirAccess.dir_exists_absolute("user://test_rec"):
+		for f in DirAccess.get_files_at("user://test_rec"):
+			DirAccess.remove_absolute("user://test_rec".path_join(f))
+		DirAccess.remove_absolute("user://test_rec")
+	if failures == 0:
+		print("ALL COMBAT-FX TESTS PASSED")
+	else:
+		printerr("COMBAT-FX TESTS: %d FAILURES" % failures)
+	quit(failures)
+
+
 func _process(_delta: float) -> bool:
 	tick += 1
+	if _rec_stage == 1:
+		if tick < _rec_ready_tick:
+			return false
+		_rec_stage = 2
+		_finish_record_contract()
+		return true
 	if tick < 3:
 		return false
 	test_builds()
@@ -315,9 +370,5 @@ func _process(_delta: float) -> bool:
 	test_pierce_releases_realtime()
 	test_loser_drops_faster()
 	test_pip_slot_visibility()
-	if failures == 0:
-		print("ALL COMBAT-FX TESTS PASSED")
-	else:
-		printerr("COMBAT-FX TESTS: %d FAILURES" % failures)
-	quit(failures)
-	return true
+	test_bracket_record_contract()
+	return false

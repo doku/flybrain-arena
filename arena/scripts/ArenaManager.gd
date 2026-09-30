@@ -980,11 +980,17 @@ func _save_bracket_record(with_png: bool) -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 	if is_instance_valid(bracket_overlay) and bracket_overlay.visible:
-		var img := get_viewport().get_texture().get_image()
-		if img.save_png(base + ".png") == OK:
-			print("[Arena] Bracket screenshot saved: ", base + ".png")
+		# Headless (dummy renderer) has no real pixels: the viewport
+		# texture read errors and yields null. The frame choreography
+		# above still runs (callers await it), only the capture skips.
+		if DisplayServer.get_name() == "headless":
+			print("[Arena] Bracket screenshot skipped (headless renderer).")
 		else:
-			push_warning("[Arena] Bracket screenshot failed: " + base + ".png")
+			var img := get_viewport().get_texture().get_image()
+			if img.save_png(base + ".png") == OK:
+				print("[Arena] Bracket screenshot saved: ", base + ".png")
+			else:
+				push_warning("[Arena] Bracket screenshot failed: " + base + ".png")
 	if showed:
 		_hide_arena_bracket()
 
@@ -4834,7 +4840,16 @@ func _event_group_done(res: Dictionary) -> void:
 	if not bool(rec.get("ok", false)):
 		_evo_abort("event record failed: " + str(rec.get("error", "?")))
 		return
-	_save_bracket_record(true)
+	# Group record: keep the finished bracket up and AWAIT the capture.
+	# Un-awaited, the record's 2-frame PNG delay resumed AFTER the
+	# intermission raised the countdown overlay and its auto-hide
+	# yanked it - leaving a text-only screen for the whole 60 s wait
+	# (and the PNG captured the wrong view). Pre-showing makes
+	# showed=false (no auto-hide possible); awaiting lands the capture
+	# before group B re-renders. The callout below plays over the live
+	# bracket, so the view runs seamlessly into the intermission.
+	_show_arena_bracket("GROUP %s COMPLETE - FINAL RECORD" % group)
+	await _save_bracket_record(true)
 	var _bset: Array = (rec.get("booster", []) as Array)
 	var _bsub := "STANDINGS BANKED"
 	if not _bset.is_empty():
