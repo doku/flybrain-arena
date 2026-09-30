@@ -6377,6 +6377,71 @@ class TestBattleTransaction(unittest.TestCase):
         la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
         self.assertEqual(la2["record"]["wander"], 1)
 
+    def test_battle_time_health_win(self):
+        # Arena-decided timeout: verdict.winner_slot banks over fitness
+        # (beta-friendly stats, alpha declared) — the server records
+        # and trains, it does not re-decide.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        msg = {"arena_draw": False, "end_reason": "time",
+               "verdict": {"winner_slot": "alpha", "loser_slot": "beta",
+                           "end_reason": "time", "dmg_a": 0.0,
+                           "dmg_b": 80.0},
+               "stats_alpha": {"kills": 0, "damage_dealt": 0.0,
+                               "damage_taken": 80.0,
+                               "tracking_time_s": 20.0},
+               "stats_beta": {"kills": 0, "damage_dealt": 80.0,
+                              "damage_taken": 0.0,
+                              "tracking_time_s": 20.0}}
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BT", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), msg,
+            "beta", 4.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BT", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["battle_winner"], "alpha")
+        self.assertIn("wins on health", body["report"])
+
+    def test_battle_time_legacy_fitness(self):
+        # No winner_slot (old client): timeout still falls back to the
+        # fitness verdict.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        msg = {"arena_draw": False, "end_reason": "time",
+               "stats_alpha": {"kills": 0, "damage_dealt": 0.0,
+                               "damage_taken": 80.0,
+                               "tracking_time_s": 20.0},
+               "stats_beta": {"kills": 0, "damage_dealt": 80.0,
+                              "damage_taken": 0.0,
+                              "tracking_time_s": 20.0}}
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BL", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), msg,
+            "beta", 4.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BL", battle_key=key)
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((lb["record"]["wins"], lb["record"]["battles"]), (1, 1))
+
     def test_battle_draw_penalty(self):
         _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
 

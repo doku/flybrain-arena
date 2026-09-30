@@ -207,13 +207,22 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
     import brain_package as vault_pkg
     arena_draw = bool(msg.get("arena_draw", False))
     draw_penalty = bool(msg.get("draw_penalty", False))
-    battle_winner = "draw" if arena_draw else winner
     # Arena verdict: how the battle ended + the killing blow (absent on
     # old clients/tests - .get defaults keep those paths working).
     end_reason = str(msg.get("end_reason", "") or "")
     verdict = msg.get("verdict", None) or {}
     if not isinstance(verdict, dict):
         verdict = {}
+    # Arena-decided outcomes (KO killing blow, timeout by remaining
+    # health) arrive in verdict.winner_slot and bank as declared — the
+    # server records and trains, it does not re-decide. Empty slot
+    # keeps the message-loop fitness verdict for old clients. Draws
+    # are untouched (battle_winner stays "draw" below regardless).
+    if not arena_draw:
+        _forced = str(verdict.get("winner_slot", "") or "")
+        if _forced in ("alpha", "beta"):
+            winner = _forced
+    battle_winner = "draw" if arena_draw else winner
     if arena_draw:
         report = ("draw (3rd, both ELOs docked)" if draw_penalty
                   else "draw (clean, replay)")
@@ -226,7 +235,12 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
     elif end_reason == "time":
         da = float(verdict.get("dmg_a", 0.0) or 0.0)
         db = float(verdict.get("dmg_b", 0.0) or 0.0)
-        report = f"TIME (damage {da:.0f}-{db:.0f}, fitness decides)"
+        wslot = str(verdict.get("winner_slot", "") or "")
+        if wslot in ("alpha", "beta"):
+            report = (f"TIME ({wslot} wins on health, "
+                      f"damage {da:.0f}-{db:.0f})")
+        else:
+            report = f"TIME (damage {da:.0f}-{db:.0f}, fitness decides)"
     else:
         sa = msg.get("stats_alpha", None) or {}
         sb = msg.get("stats_beta", None) or {}

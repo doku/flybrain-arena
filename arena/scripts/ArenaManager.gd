@@ -217,9 +217,22 @@ var tourney_match_label: String = ""
 # KO/timeout handlers before _report_battle) plus the killing blow read
 # off the victim's damage ledger. Composed into _last_verdict at report
 # time so the server reply, callout, and retry all tell the same story.
+# Timeouts carry the arena-decided winner (_time_winner); ties go draw.
+const TIME_TIE_EPS := 0.5
 var _end_reason := ""
 var _ko_victim := ""
+var _time_winner := ""
 var _last_verdict := {}
+
+
+func _timeout_winner(ha: float, hb: float) -> String:
+	# Timeout decided by remaining health — most health wins, every
+	# dent counts (tree rams and ground scrapes are bad flying too).
+	# Within half a point is a tie for the DNF/overtime ladder. Pure
+	# (unit-tested); the arena decides, the server only records.
+	if absf(ha - hb) < TIME_TIE_EPS:
+		return "draw"
+	return "alpha" if ha > hb else "beta"
 var tourney_awaiting_load: bool = false
 var bracket_overlay: Control
 var arena_bracket: BracketView
@@ -1610,6 +1623,7 @@ func _reset_round() -> void:
 	stats_beta  = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 	_end_reason = ""
 	_ko_victim = ""
+	_time_winner = ""
 	_last_verdict = {}
 	flight_alpha = {}
 	flight_beta = {}
@@ -1703,20 +1717,21 @@ func _physics_process(delta: float) -> void:
 	_update_pip_throttled(sens_a, sens_b)
 
 	if current_round_time <= 0.0:
-		# Stalemate verdict: time expired AND neither fly lost a point of
-		# health (catches strikes, wing tears via prior KO, and tree-clip
-		# damage). Free battle: a clean draw rematches the SAME brains with
-		# no champion and no evolution advance. Tournament: the draw is
-		# reported to the server (recorded, no dopamine) and replayed -
-		# unless sudden death is armed, when fitness must pick a winner.
-		var clean: bool = fly_alpha.health >= 99.99 and fly_beta.health >= 99.99
-		var director := _director()
-		var sudden: bool = tournament_active and director != null and director.sudden_death_armed
-		if clean and not sudden:
+		# Timeout decided by remaining health: most health wins no
+		# matter what dented the loser (strikes, wing tears via prior
+		# KO, tree rams, ground scrapes — bad flying is bad outcome).
+		# Near-equal health is a tie for the DNF/overtime ladder.
+		# Free battle: a tie rematches the SAME brains with no champion
+		# and no evolution advance. Tournament: ties report as draws
+		# (recorded, no dopamine) and replay; wins report for banking.
+		# The arena decides; the server only records and trains.
+		var decision := _timeout_winner(fly_alpha.health, fly_beta.health)
+		if decision == "draw":
 			_end_reason = "draw"
 			_handle_draw()
 		else:
 			_end_reason = "time"
+			_time_winner = decision
 			_end_round()
 
 const PIP_TICK_EVERY := 6
@@ -3134,8 +3149,8 @@ func _killing_blow(victim_slot: String) -> Dictionary:
 
 func _compose_verdict(draw: bool) -> Dictionary:
 	# Who/how the battle ended, for the server report, callout, and
-	# retry. Timeout winners are unknown here (server picks on fitness),
-	# so the winner slot stays empty and the line says who decides.
+	# retry. Timeout winners arrive decided (_time_winner); legacy
+	# undecided timeouts keep the empty slot and the old line.
 	var v := {"end_reason": "draw" if draw else _end_reason,
 		"winner_slot": "", "loser_slot": "", "blow_source": "",
 		"blow_amount": 0.0, "time_left": maxf(current_round_time, 0.0),
@@ -3159,8 +3174,14 @@ func _compose_verdict(draw: bool) -> Dictionary:
 			_slot_name(_ko_victim)]
 	else:
 		v["end_reason"] = "time"
-		v["line"] = "TIME - damage %.0f-%.0f, server decides on fitness" % [
-			v["dmg_a"], v["dmg_b"]]
+		if _time_winner == "alpha" or _time_winner == "beta":
+			v["winner_slot"] = _time_winner
+			v["loser_slot"] = "beta" if _time_winner == "alpha" else "alpha"
+			v["line"] = "TIME - %s wins on health (damage %.0f-%.0f)" % [
+				_slot_name(_time_winner), v["dmg_a"], v["dmg_b"]]
+		else:
+			v["line"] = "TIME - damage %.0f-%.0f, server decides on fitness" % [
+				v["dmg_a"], v["dmg_b"]]
 	print("[Arena] Verdict: ", v["line"])
 	return v
 
@@ -3207,6 +3228,12 @@ func _verdict_headline() -> Dictionary:
 			"sub": "Killing blow: %s" % detail,
 			"color": Color(1.0, 0.55, 0.3) if winner_slot == "alpha" else Color(0.4, 0.75, 1.0)}
 	if reason == "time":
+		var twinner := str(_last_verdict.get("winner_slot", ""))
+		if twinner == "alpha" or twinner == "beta":
+			return {"text": "%s WINS ON HEALTH" % _slot_name(twinner),
+				"sub": "Damage %.0f-%.0f" % [float(_last_verdict.get("dmg_a", 0.0)),
+					float(_last_verdict.get("dmg_b", 0.0))],
+				"color": Color(1.0, 0.55, 0.3) if twinner == "alpha" else Color(0.4, 0.75, 1.0)}
 		return {"text": "TIME - SERVER DECIDES",
 			"sub": "Damage %.0f-%.0f" % [float(_last_verdict.get("dmg_a", 0.0)),
 				float(_last_verdict.get("dmg_b", 0.0))],

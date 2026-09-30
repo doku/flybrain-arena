@@ -401,11 +401,17 @@ no roll axis (JO-roll learns live).
   gated per fighter like the flow diagram — the active networks glow
    inside the flashing cloud.
 
-### Battle rules: DNF, overtime, wander dock
+### Battle rules: timeouts, DNF, overtime, wander dock
 
-  A battle that times out with neither fly damaged is a **DNF (did not
-  finish)** — no winner, no dopamine, both records bank a draw, and the
-  pairing replays. The first replay runs at **1.5x** the designated
+  A battle that times out is decided by **remaining health**: most
+  health wins, no matter what dented the loser (strikes, wing tears,
+  tree rams, ground scrapes — bad flying is bad outcome). Near-equal
+  health (within half a point) is a **DNF (did not finish)** — no
+  winner, no dopamine, both records bank a draw, and the pairing
+  replays through the overtime ladder below. The arena decides;
+  the server only records the outcome and trains (legacy undecided
+  timeouts still fall back to its fitness verdict).
+  The first replay runs at **1.5x** the designated
   time, the second at **2x** — each exactly once, for the immediate
   replay only: a decisive battle ends the overtime even mid-match
   (no carry-over into later battles), and new matches start clean.

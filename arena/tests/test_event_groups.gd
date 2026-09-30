@@ -1067,6 +1067,19 @@ func test_wander_dock() -> void:
 	A.free()
 
 
+func test_timeout_winner() -> void:
+	# Timeout decided by remaining health: most health wins no matter
+	# what dented the loser (tree rams included); within half a point
+	# is a tie for the overtime ladder. No server verdict needed.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	_check(A._timeout_winner(100.0, 100.0) == "draw", "untouched is a tie")
+	_check(A._timeout_winner(80.0, 80.0) == "draw", "equal damage is a tie")
+	_check(A._timeout_winner(80.0, 79.6) == "draw", "sub-point gap is a tie")
+	_check(A._timeout_winner(80.0, 79.5) == "alpha", "half point decides")
+	_check(A._timeout_winner(30.0, 90.0) == "beta", "most health wins")
+	A.free()
+
+
 func _momentum_pair() -> Array:
 	# Two flies with opposing momenta; returns [a, b] instances.
 	var a = load("res://scripts/FlyPhysics.gd").new()
@@ -1126,6 +1139,7 @@ func _initialize() -> void:
 	test_fighter_rows()
 	test_fighter_rows_pedigrees()
 	test_wander_dock()
+	test_timeout_winner()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")
