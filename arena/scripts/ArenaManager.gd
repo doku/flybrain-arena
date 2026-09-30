@@ -20,6 +20,11 @@ var is_round_active: bool = true
 const ARENA_RING_R := 30.0
 const DOCK_PER_M := 4.0
 const DOCK_CAP := 50.0
+# Chase exemption: flies within this many meters of each other are
+# still fighting, wherever they are - both chasing out past the ring
+# is valid engagement, not wandering. Only a fly that is BOTH past
+# the ring AND separated from its rival reads drift.
+const CHASE_TOGETHER_M := 8.0
 
 
 func _wander_overshoot(fly) -> float:
@@ -35,6 +40,25 @@ func _wander_dock(drift: float) -> float:
 	# Overtime starting-health dock for a drift reading. Pure
 	# (unit-tested): 0 -> 0, 2.5 -> 10, 10 -> 40, >=12.5 -> 50.
 	return clampf(float(drift) * DOCK_PER_M, 0.0, DOCK_CAP)
+
+
+func _flat_separation() -> float:
+	# XZ meters between the flies; -1 when either is missing (unknown
+	# reads disengaged - never exempt on missing data).
+	if not is_instance_valid(fly_alpha) or not is_instance_valid(fly_beta):
+		return -1.0
+	var pa := (fly_alpha as Node3D).global_position
+	var pb := (fly_beta as Node3D).global_position
+	return Vector2(pa.x - pb.x, pa.z - pb.z).length()
+
+
+func _gate_drift(drift_a: float, drift_b: float, sep_m: float) -> Array:
+	# Chase exemption, pure (unit-tested): engaged flies (within
+	# CHASE_TOGETHER_M) read zero drift even outside the ring; unknown
+	# or wide separation keeps each fly's own overshoot.
+	if sep_m >= 0.0 and sep_m <= CHASE_TOGETHER_M:
+		return [0.0, 0.0]
+	return [float(drift_a), float(drift_b)]
 
 var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
 var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
@@ -3320,11 +3344,15 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 
 func _handle_draw() -> void:
 	# Wander reading (positions valid until landing below): meters
-	# past the arena ring per fly. Rides stats_alpha/beta to the
-	# server (career wander mark) and into the match record (the
-	# overtime health dock reads the freshest pair).
+	# past the arena ring per fly, gated on separation (a chase out
+	# past the ring is engagement, not wandering). Rides stats_alpha/
+	# beta to the server (career wander mark) and into the match record
+	# (the overtime health dock reads the freshest pair).
 	var drift_a := _wander_overshoot(fly_alpha)
 	var drift_b := _wander_overshoot(fly_beta)
+	var gated := _gate_drift(drift_a, drift_b, _flat_separation())
+	drift_a = float(gated[0])
+	drift_b = float(gated[1])
 	stats_alpha["center_drift"] = drift_a
 	stats_beta["center_drift"] = drift_b
 	print("[Arena] DNF! Time expired with zero damage - did not finish, rematch same brains. (drift A %.1f m / B %.1f m past arena)" % [drift_a, drift_b])

@@ -1098,6 +1098,17 @@ func test_wander_dock() -> void:
 	_check(absf(A._wander_dock(12.5) - 50.0) < 0.001, "12.5 m hits the cap")
 	_check(absf(A._wander_dock(25.0) - 50.0) < 0.001, "cap holds past leash")
 	_check(absf(A._wander_dock(-3.0) - 0.0) < 0.001, "negative clamps zero")
+	# Chase exemption: engaged flies read zero even outside the ring;
+	# separated flies keep their own overshoot; unknown reads exempt.
+	var g1: Array = A.call("_gate_drift", 12.0, 9.0, 5.0)
+	_check(float(g1[0]) == 0.0 and float(g1[1]) == 0.0, "chase out together docks nothing")
+	var g2: Array = A.call("_gate_drift", 12.0, 0.0, 40.0)
+	_check(float(g2[0]) == 12.0 and float(g2[1]) == 0.0, "lone runner keeps drift")
+	var g3: Array = A.call("_gate_drift", 12.0, 9.0, 8.0)
+	_check(float(g3[0]) == 0.0 and float(g3[1]) == 0.0, "boundary still engaged")
+	var g4: Array = A.call("_gate_drift", 12.0, 9.0, -1.0)
+	_check(float(g4[0]) == 12.0 and float(g4[1]) == 9.0, "unknown separation keeps drift")
+	_check(float(A.call("_flat_separation")) < 0.0, "bare flies read unknown")
 	A.free()
 
 
