@@ -1514,10 +1514,10 @@ func _reset_round() -> void:
 		var director := _director()
 		if director != null:
 			current_round_time = float(director.tourney.get("round_time", round_time_limit))
-			# Overtime ladder: each banked DNF lengthens the replay
-			# (1.5x, then 2x). Computed, never persisted.
-			_round_overtime = director.overtime_scale(
-				int(director.current_match().get("draws", 0)))
+			# Overtime exactly once: the immediate replay after a DNF.
+			# Later battles in the same match run base time even with
+			# banked draws (no carry-over); new matches start clean.
+			_round_overtime = director.replay_scale(director.current_match())
 			current_round_time *= _round_overtime
 	is_round_active = true
 	stats_alpha = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
@@ -1543,21 +1543,21 @@ func _reset_round() -> void:
 	# and yaw +90 faces -X (toward alpha). Previously swapped (back-to-back).
 	fly_alpha.reset_fly(Vector3(-14.0, 7.0, 0.0), deg_to_rad(-90.0))
 	fly_beta.reset_fly(Vector3(14.0, 7.0, 0.0), deg_to_rad(90.0))
-	# Overtime wander dock: the last DNF's drift converts into missing
-	# starting health (farther ran = more docked), so the replay opens
-	# unequal and ties almost never repeat. Tournament pairings with
-	# banked draws only; first battles and free fights start whole.
-	if tournament_active:
+	# Overtime wander dock, gated on the same one-time replay scale:
+	# the last DNF's drift converts into missing starting health
+	# (farther ran = more docked), so the replay opens unequal and
+	# ties almost never repeat. First battles, post-decisive battles
+	# and free fights start whole.
+	if tournament_active and _round_overtime > 1.0:
 		var ddirector := _director()
 		if ddirector != null:
 			var dm: Dictionary = ddirector.current_match()
-			if int(dm.get("draws", 0)) > 0:
-				var dock_a := _wander_dock(float(dm.get("drift_a", 0.0)))
-				var dock_b := _wander_dock(float(dm.get("drift_b", 0.0)))
-				if is_instance_valid(fly_alpha):
-					fly_alpha.health = maxf(fly_alpha.health - dock_a, 1.0)
-				if is_instance_valid(fly_beta):
-					fly_beta.health = maxf(fly_beta.health - dock_b, 1.0)
+			var dock_a := _wander_dock(float(dm.get("drift_a", 0.0)))
+			var dock_b := _wander_dock(float(dm.get("drift_b", 0.0)))
+			if is_instance_valid(fly_alpha):
+				fly_alpha.health = maxf(fly_alpha.health - dock_a, 1.0)
+			if is_instance_valid(fly_beta):
+				fly_beta.health = maxf(fly_beta.health - dock_b, 1.0)
 	_set_combat(true)
 
 	if is_instance_valid(status_label):

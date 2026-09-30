@@ -406,8 +406,11 @@ no roll axis (JO-roll learns live).
   A battle that times out with neither fly damaged is a **DNF (did not
   finish)** — no winner, no dopamine, both records bank a draw, and the
   pairing replays. The first replay runs at **1.5x** the designated
-  time, the second at **2x**; a third DNF ends the pairing by the
-  standard resolution (prior match-wins, group split, ELO fallback).
+  time, the second at **2x** — each exactly once, for the immediate
+  replay only: a decisive battle ends the overtime even mid-match
+  (no carry-over into later battles), and new matches start clean.
+  A third DNF ends the pairing by the standard resolution (prior
+  match-wins, group split, ELO fallback).
   The white outer arena ring sits 30 m from center
   (`glade_ground.gdshader`); at every DNF the arena measures each
   fly's meters past that ring (**drift**). Why: a fly that finishes a

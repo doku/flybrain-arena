@@ -83,6 +83,37 @@ func test_draw_banks_drift() -> void:
 	d.free()
 
 
+func test_replay_scale_onetime() -> void:
+	# Overtime fires exactly once per tie: the immediate replay.
+	# A decisive battle ends it even mid-match (best-of-3 proves no
+	# carry-over into later battles); new matches start clean.
+	var d = _new_director()
+	_check(d.replay_scale({}) == 1.0, "empty match base time")
+	_check(d.replay_scale({"draws": 2}) == 1.0, "no flights means no replay")
+	var brains := [_fake_elo("f1", 1200.0), _fake_elo("f2", 1200.0),
+		_fake_elo("f3", 1200.0), _fake_elo("f4", 1200.0)]
+	d.build_bracket(_ids(brains), 4, 3, 0.5, 40.0, false, brains,
+		false, false)
+	_check(d.replay_scale(d.current_match()) == 1.0, "first battle base time")
+	var r1: Dictionary = d.on_battle_result("draw", {"samples": 0},
+		{"samples": 0}, {}, -1, -1, 5.2, 0.4)
+	_check(str(r1.get("action", "")) == "replay", "tie replays")
+	_check(d.replay_scale(d.current_match()) == 1.5, "replay runs overtime")
+	var r2: Dictionary = d.on_battle_result("alpha", {"samples": 0},
+		{"samples": 0}, {})
+	_check(str(r2.get("action", "")) == "next_battle", "1-0 continues match")
+	_check(d.replay_scale(d.current_match()) == 1.0, "no carry into next battle")
+	var r3: Dictionary = d.on_battle_result("draw", {"samples": 0},
+		{"samples": 0}, {}, -1, -1, 1.0, 8.0)
+	_check(str(r3.get("action", "")) == "replay", "second tie replays")
+	_check(d.replay_scale(d.current_match()) == 2.0, "second replay at 2x")
+	var r4: Dictionary = d.on_battle_result("beta", {"samples": 0},
+		{"samples": 0}, {})
+	_check(str(r4.get("action", "")) == "next_battle", "1-1 continues match")
+	_check(d.replay_scale(d.current_match()) == 1.0, "decisive ends overtime again")
+	d.free()
+
+
 func test_draw12_replay() -> void:
 	var d = _new_director()
 	var brains := [_fake_elo("f1", 1200.0), _fake_elo("f2", 1200.0),
@@ -203,6 +234,7 @@ func _initialize() -> void:
 	test_draw12_replay()
 	test_overtime_scale()
 	test_draw_banks_drift()
+	test_replay_scale_onetime()
 	test_draw3_higher_elo_advances()
 	test_draw3_tie_goes_alpha()
 	test_draw3_missing_elo_defaults()

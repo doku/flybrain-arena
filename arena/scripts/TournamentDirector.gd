@@ -1198,6 +1198,23 @@ func overtime_scale(draws: int) -> float:
 	return 1.0
 
 
+func replay_scale(m: Dictionary) -> float:
+	# Overtime applies to exactly ONE battle: the immediate replay
+	# after a DNF. A decisive battle ends the overtime even inside a
+	# best-of match (no carry-over to later battles); new matches
+	# start clean. The last banked battle decides: only a trailing
+	# draw replays overtime. Pure (unit-tested).
+	var draws := int(m.get("draws", 0))
+	if draws <= 0:
+		return 1.0
+	var fl: Array = m.get("flights", [])
+	if fl.is_empty():
+		return 1.0
+	if str((fl[fl.size() - 1] as Dictionary).get("winner", "")) != "draw":
+		return 1.0
+	return overtime_scale(draws)
+
+
 func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}, kills_a: int = -1, kills_b: int = -1, drift_a: float = -1.0, drift_b: float = -1.0) -> Dictionary:
 	# winner: "alpha" | "beta" | "draw". Per-battle flight telemetry is
 	# banked on the match ("flights" list) so flight-style regressions
