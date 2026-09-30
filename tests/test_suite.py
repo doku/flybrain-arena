@@ -6329,6 +6329,39 @@ class TestBattleTransaction(unittest.TestCase):
         la3, _w3 = vault_pkg.load_brain(sta3["rec"]["id"])
         self.assertEqual(la3["record"]["ko"], 1)
 
+    def test_battle_wander_banks_over_threshold(self):
+        # Career wander: a DNF battle with drift past the mark banks
+        # wander+1 per side; below-threshold drift and decisive
+        # battles bank nothing. Old key-less records start at 0.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        def _draw(key_id, drift_a, drift_b):
+            key = {"tournament_id": "T", "match": "M",
+                   "battle_id": key_id, "draw": True}
+            self.srv._handle_tournament_round_over(
+                _FakeSock(), ("127.0.0.1", 1),
+                {"arena_draw": True,
+                 "stats_alpha": {"center_drift": drift_a},
+                 "stats_beta": {"center_drift": drift_b}},
+                "draw", 5.0, 5.0, sta, stb,
+                {"tournament_id": "T", "match": "M"},
+                0.5, 0.5, lambda: "tourney T match M",
+                battle_id=key_id, battle_key=key)
+
+        _draw("BW1", 6.0, 1.0)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["wander"], 1)
+        self.assertEqual(lb["record"].get("wander", 0), 0)
+        _draw("BW2", 1.0, 1.0)
+        la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual(la2["record"]["wander"], 1)
+
     def test_battle_draw_penalty(self):
         _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
 

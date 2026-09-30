@@ -79,7 +79,7 @@ def new_record(name, params=None):
         "created_utc": _utcnow(),
         "generator_params": merged,
         "record": {"battles": 0, "wins": 0, "losses": 0, "draws": 0,
-                 "ko": 0,
+                 "ko": 0, "wander": 0,
                  "matches": 0, "matches_won": 0, "matches_lost": 0,
                  "tournaments_won": 0, "elo": ELO_DEFAULT},
         "training": {"episodes": 0, "sessions": [], "score": 0.0,
@@ -454,6 +454,9 @@ ELO_DEFAULT = 1200.0
 ELO_K_BATTLE = 10.0
 ELO_K_MATCH = 30.0
 ELO_DRAW3_PENALTY = 25.0
+# Wander mark: a DNF battle whose drift past the arena ring reaches
+# this many meters counts the fly confused/evading (career wander+1).
+WANDER_MARK_M = 5.0
 # Breeding/generating floor: every breed and every generated fly trains
 # at least this many episodes (more is allowed, less is not) — the pool
 # minimum, so offspring arrive ring-ready instead of needing top-up.

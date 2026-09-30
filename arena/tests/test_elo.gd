@@ -49,6 +49,40 @@ func _draws(d, n: int) -> Dictionary:
 	return adv
 
 
+func test_overtime_scale() -> void:
+	# Overtime ladder: base time, then 1.5x after the first DNF,
+	# 2x after the second (and beyond — the 3rd DNF ends the pairing).
+	var d = _new_director()
+	_check(d.overtime_scale(0) == 1.0, "no draws means base time")
+	_check(d.overtime_scale(1) == 1.5, "first DNF means 1.5x")
+	_check(d.overtime_scale(2) == 2.0, "second DNF means 2x")
+	_check(d.overtime_scale(9) == 2.0, "scale caps at 2x")
+	d.free()
+
+
+func test_draw_banks_drift() -> void:
+	# DNF drift rides into the match record for the overtime dock;
+	# unreported calls leave the previous pair untouched.
+	var d = _new_director()
+	var brains := [_fake_elo("f1", 1200.0), _fake_elo("f2", 1200.0),
+		_fake_elo("f3", 1200.0), _fake_elo("f4", 1200.0)]
+	d.build_bracket(_ids(brains), 4, 1, 0.5, 40.0, false, brains,
+		false, false)
+	var r1: Dictionary = d.on_battle_result("draw", {}, {}, {}, -1, -1,
+		5.2, 0.4)
+	_check(str(r1.get("action", "")) == "replay", "drifted draw replays")
+	var m: Dictionary = d.current_match()
+	_check(absf(float(m.get("drift_a", -1.0)) - 5.2) < 0.001
+		and absf(float(m.get("drift_b", -1.0)) - 0.4) < 0.001,
+		"drift pair banked on draw")
+	var r2: Dictionary = d.on_battle_result("draw", {}, {}, {})
+	_check(str(r2.get("action", "")) == "replay", "plain draw replays")
+	var m2: Dictionary = d.current_match()
+	_check(absf(float(m2.get("drift_a", -1.0)) - 5.2) < 0.001,
+		"unreported drift keeps previous pair")
+	d.free()
+
+
 func test_draw12_replay() -> void:
 	var d = _new_director()
 	var brains := [_fake_elo("f1", 1200.0), _fake_elo("f2", 1200.0),
@@ -167,6 +201,8 @@ func _initialize() -> void:
 		quit(failures)
 		return
 	test_draw12_replay()
+	test_overtime_scale()
+	test_draw_banks_drift()
 	test_draw3_higher_elo_advances()
 	test_draw3_tie_goes_alpha()
 	test_draw3_missing_elo_defaults()

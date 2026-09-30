@@ -245,6 +245,15 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
         # the key and start at 0 going forward.
         if not arena_draw and end_reason == "ko" and side == winner:
             rec["record"]["ko"] = int(rec["record"].get("ko", 0)) + 1
+        # Career wander mark (journaled with the records, so retries
+        # replay the same value). Old records lack the key (start 0).
+        if arena_draw:
+            drift = float(((msg.get("stats_alpha", {}) if side == "alpha"
+                            else msg.get("stats_beta", {})) or {}).get(
+                                "center_drift", 0.0))
+            if drift >= vault_pkg.WANDER_MARK_M:
+                rec["record"]["wander"] = int(
+                    rec["record"].get("wander", 0)) + 1
         if not arena_draw:
             vault_pkg.log_training_session(
                 rec, 0,

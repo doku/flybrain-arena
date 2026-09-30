@@ -1186,13 +1186,27 @@ func get_load_params() -> Dictionary:
 	}
 
 
-func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}, kills_a: int = -1, kills_b: int = -1) -> Dictionary:
+func overtime_scale(draws: int) -> float:
+	# Overtime ladder: a pairing's next battle runs longer after each
+	# timeout-tie — 1.5x after the first DNF, 2x after the second.
+	# Pure (unit-tested); read at reset from the banked draw count,
+	# never persisted (a stored scale would leak into later matches).
+	if draws >= 2:
+		return 2.0
+	if draws >= 1:
+		return 1.5
+	return 1.0
+
+
+func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}, kills_a: int = -1, kills_b: int = -1, drift_a: float = -1.0, drift_b: float = -1.0) -> Dictionary:
 	# winner: "alpha" | "beta" | "draw". Per-battle flight telemetry is
 	# banked on the match ("flights" list) so flight-style regressions
 	# have recorded evidence; the pool-rate stream rides along when the
 	# menu record toggle is on (gated arena-side; ~50 KB per battle).
 	# kills_a/b bank takedowns per side for group standings (negative =
-	# unreported, e.g. legacy callers). Returns sequencing action.
+	# unreported, e.g. legacy callers). drift_a/b bank meters-past-the-
+	# arena-ring per DNF side (negative = unreported); the overtime
+	# health dock reads the freshest pair. Returns sequencing action.
 	var m := current_match()
 	if m.is_empty():
 		return {"action": "idle"}
@@ -1212,6 +1226,10 @@ func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dicti
 		(m["flights"] as Array).append(entry)
 	if winner == "draw":
 		m["draws"] = int(m.get("draws", 0)) + 1
+		if drift_a >= 0.0:
+			m["drift_a"] = drift_a
+		if drift_b >= 0.0:
+			m["drift_b"] = drift_b
 		if int(m.get("draws", 0)) >= 3:
 			# Third draw resolves the match outright (no infinite
 			# rematches): higher start-of-match ELO advances, ties go
