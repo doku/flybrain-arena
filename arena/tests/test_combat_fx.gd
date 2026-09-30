@@ -303,6 +303,45 @@ func _initialize() -> void:
 	root.add_child(arena)
 
 
+func test_ko_flash_clears_attacker() -> void:
+	# KO reads single-sided: the killing strike's feedback flashed both
+	# cards, then the KO handler clears the attacker dead (tween
+	# killed, wash zeroed, labels white, body glow zeroed) - only the
+	# fly that got hurt keeps flashing.
+	arena._apply_pip_slot()
+	arena.pip_name_alpha.visible = true
+	arena.pip_stats_alpha.visible = true
+	arena.pip_name_beta.visible = true
+	arena.pip_stats_beta.visible = true
+	# Simulate the killing strike's _hit_feedback pair:
+	arena._flash_fighter_card("beta", Color(1.0, 0.35, 0.35), 0.5)
+	arena._flash_fighter_card("alpha", Color(1.0, 0.95, 0.75), 0.22)
+	arena._flash_body(arena.fly_alpha, 0.6)
+	arena._flash_body(arena.fly_beta, 1.0)
+	_check(arena.pip_flash_alpha.color.a > 0.0, "attacker wash up from strike")
+	_check(arena.pip_flash_beta.color.a > 0.0, "victim wash up from strike")
+	_check(arena.fly_alpha.flash_energy > 0.0, "attacker glow up from strike")
+	# The KO: victim flash + attacker clear (what _on_fly_knocked_out runs).
+	arena._flash_fighter_card("beta", Color(1.0, 0.25, 0.25), 0.75)
+	arena._clear_fighter_card("alpha")
+	_check(arena.pip_flash_alpha.color.a == 0.0, "attacker wash zeroed at KO")
+	_check(arena.pip_flash_beta.color.a > 0.0, "victim wash keeps flashing")
+	_check(arena.pip_name_alpha.modulate.is_equal_approx(Color.WHITE),
+		"attacker labels back to white")
+	_check(arena.fly_alpha.flash_energy == 0.0, "attacker body glow zeroed")
+	_check(arena.fly_beta.flash_energy > 0.0, "victim glow untouched")
+	var twA = arena._pip_wash_tween.get("alpha")
+	_check(twA == null or not (twA as Tween).is_valid(),
+		"attacker wash tween killed")
+	var twB = arena._pip_wash_tween.get("beta")
+	_check(twB != null and (twB as Tween).is_valid(),
+		"victim wash tween still running")
+	arena.pip_name_alpha.visible = false
+	arena.pip_stats_alpha.visible = false
+	arena.pip_name_beta.visible = false
+	arena.pip_stats_beta.visible = false
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -366,6 +405,7 @@ func _process(_delta: float) -> bool:
 	test_builds()
 	test_hit_feedback_path()
 	test_stats_flash_path()
+	test_ko_flash_clears_attacker()
 	test_server_error_routing()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()

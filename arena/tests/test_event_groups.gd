@@ -893,6 +893,52 @@ func test_countdown_gates() -> void:
 	A.free()
 
 
+func test_handoff_prebuild_all_groups() -> void:
+	# Event handoff contract (the wiring _event_start_next relies on):
+	# the new event starts with ALL FOUR group brackets built + noted -
+	# a single-A build left B/C/D lazy and the overview showed
+	# unpopulated groups. Drive the exact handoff prebuild at the
+	# director level (brains_override: no vault needed).
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_prebuild"
+	DirAccess.make_dir_recursive_absolute("user://test_prebuild")
+	var brains: Array = []
+	var ids: Array = []
+	for i in range(16):
+		brains.append({"id": "pb%02d" % i, "name": "P%d" % (i + 1),
+			"record": {"elo": 1500.0 - i}})
+		ids.append("pb%02d" % i)
+	var beg: Dictionary = D.call("event_begin", ids, {"best_of": 3}, 2, brains)
+	_check(bool(beg.get("ok", false)), "event begins with 16")
+	var eid := str(beg.get("event_id", ""))
+	for letter in ["A", "B", "C", "D"]:
+		var g: Dictionary = (beg.get("groups", {}) as Dictionary).get(letter, {})
+		var dicts: Array = []
+		for b in brains:
+			if ids.has(str(b.get("id", ""))) and (g.get("players", []) as Array).has(str(b.get("id", ""))):
+				dicts.append(b)
+		var res: Dictionary = D.call("build_group_bracket", dicts,
+			str(letter), eid, 3, 0.5, 40.0)
+		_check(bool(res.get("ok", false)), "group %s bracket built" % str(letter))
+		D.call("event_note_bracket", eid, str(letter),
+			str((res as Dictionary).get("tournament_id", "")))
+	var ev: Dictionary = D.call("event_load", eid)
+	_check(not ev.is_empty(), "event loads back")
+	for letter in ["A", "B", "C", "D"]:
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+		var bid := str(gd.get("bracket_id", ""))
+		_check(bid != "", "group %s noted" % letter)
+		_check(FileAccess.file_exists(D.tournament_dir.path_join(bid + ".json")),
+			"group %s file exists" % letter)
+	_check(((ev.get("groups", {}) as Dictionary).get("A", {})
+		as Dictionary).get("players", []).size() == 4, "group A fully drawn")
+	D.free()
+	if DirAccess.dir_exists_absolute("user://test_prebuild"):
+		for f in DirAccess.get_files_at("user://test_prebuild"):
+			DirAccess.remove_absolute("user://test_prebuild".path_join(f))
+		DirAccess.remove_absolute("user://test_prebuild")
+
+
 func test_draw_title_dnf() -> void:
 	# Timeout-ties are called DNF, numbered by banked draws.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -1200,6 +1246,7 @@ func _initialize() -> void:
 	test_draw_title_dnf()
 	test_train_hud_parts()
 	test_countdown_gates()
+	test_handoff_prebuild_all_groups()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()

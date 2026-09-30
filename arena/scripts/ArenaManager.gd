@@ -407,6 +407,11 @@ var pip_flash_alpha: ColorRect
 var pip_flash_beta: ColorRect
 var pip_name_alpha: Label
 var pip_name_beta: Label
+# Active flash tweens (one per wash rect / per label, previous killed
+# on re-flash): the KO presentation must stop the attacker's fading
+# flash DEAD, and a killed tween needs its reference.
+var _pip_wash_tween := {}
+var _label_flash_tween := {}
 
 # Display name for a slot: the assigned brain name in tournament/quick
 # battles, plain ALPHA/BETA in free battle (no vault identities there).
@@ -2855,29 +2860,68 @@ func _flash_stats_label(lbl: Label, tint: Color) -> void:
 	# Strike flash for HUD labels: instant tint, fade back to white
 	# over 0.4 s (same timing as the old half-screen flash). The tween
 	# starts only inside the tree, so headless tests can drive the
-	# routing (tint lands synchronously either way).
+	# routing (tint lands synchronously either way). One tween per
+	# label (previous killed on re-flash), so a KO clear can stop the
+	# fade dead instead of leaving it running.
 	if not is_instance_valid(lbl):
 		return
+	var old: Tween = _label_flash_tween.get(lbl)
+	if old != null and old.is_valid():
+		old.kill()
 	lbl.modulate = tint
 	if lbl.is_inside_tree():
 		var tw := lbl.create_tween()
 		tw.tween_property(lbl, "modulate", Color.WHITE, 0.4)
+		_label_flash_tween[lbl] = tw
 
 
 func _flash_card_wash(side: String, strength: float) -> void:
 	# Team-color wash over the whole stat-card area (the strike flash
-	# the viewer actually sees). Fades over 0.4 s; new strikes simply
-	# restart it (convergent — every tween heads to transparent).
+	# the viewer actually sees). Fades over 0.4 s; new strikes restart
+	# it (previous tween killed, so flashes never stack and a KO clear
+	# can stop the fade dead).
 	if side != "alpha" and side != "beta":
 		return
 	var rect: ColorRect = pip_flash_alpha if side == "alpha" else pip_flash_beta
 	if not is_instance_valid(rect):
 		return
+	var old: Tween = _pip_wash_tween.get(side)
+	if old != null and old.is_valid():
+		old.kill()
 	var team: Color = TEAM_ALPHA if side == "alpha" else TEAM_BETA
 	rect.color = Color(team.r, team.g, team.b, strength)
 	if rect.is_inside_tree():
 		var tw := rect.create_tween()
 		tw.tween_property(rect, "color:a", 0.0, 0.4)
+		_pip_wash_tween[side] = tw
+
+
+func _clear_fighter_card(side: String) -> void:
+	# Stops a side's card flash dead: wash tween + label tint tweens
+	# killed, wash alpha zeroed, labels back to white, body glow zeroed
+	# (flash_hit is max-only, so the clear sets flash_energy directly).
+	# The KO presentation calls this for the surviving attacker: only
+	# the fly that got hurt keeps flashing.
+	if side != "alpha" and side != "beta":
+		return
+	var rect: ColorRect = pip_flash_alpha if side == "alpha" else pip_flash_beta
+	var old: Tween = _pip_wash_tween.get(side)
+	if old != null and old.is_valid():
+		old.kill()
+	if is_instance_valid(rect):
+		rect.color = Color(rect.color.r, rect.color.g, rect.color.b, 0.0)
+	var nm: Label = pip_name_alpha if side == "alpha" else pip_name_beta
+	var body: Label = pip_stats_alpha if side == "alpha" else pip_stats_beta
+	var row: Label = alpha_row_name if side == "alpha" else beta_row_name
+	for lbl in [nm, body, row]:
+		if is_instance_valid(lbl):
+			var lt: Tween = _label_flash_tween.get(lbl)
+			if lt != null and lt.is_valid():
+				lt.kill()
+			lbl.modulate = Color.WHITE
+	var fly = fly_alpha if side == "alpha" else fly_beta
+	if is_instance_valid(fly):
+		fly.set("flash_energy", 0.0)
 
 
 func _flash_fighter_card(side: String, tint: Color, strength: float = 0.5) -> void:
@@ -3922,6 +3966,11 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 	_update_health_hud()
 	_flash_fighter_card(victim_id, Color(1.0, 0.25, 0.25), 0.75)
 	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
+	# Single-sided KO read: the killing strike's _hit_feedback already
+	# flashed the attacker (cream wash + body glow). The KO shows ONLY
+	# the fly that got hurt - the attacker's card flash and glow are
+	# cleared dead here (tween killed, not left fading).
+	_clear_fighter_card("beta" if victim_id == "alpha" else "alpha")
 	var victim := fly_alpha if victim_id == "alpha" else fly_beta
 	if is_instance_valid(victim):
 		_fire_burst(ko_bursts.get(victim_id, null), victim.global_position)
@@ -5007,7 +5056,15 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	director.event_pool_add(new_eid,
 		(director.event_load(eid).get("pool", []) as Array))
 	var ev_new: Dictionary = director.event_load(new_eid)
-	if not _event_build_group(ev_new, "A"):
+	# Full four-group setup at start (menu parity): every bracket file
+	# built + noted now, so the overview renders real fixtures for all
+	# quadrants from the first minute. The old single-A build left B/C/D
+	# lazy - the next event's overview showed unpopulated groups.
+	# Switch back to A after: the build loop leaves the last-built
+	# file (D) and its phase loaded.
+	if not _event_build_all_groups(ev_new):
+		return
+	if not _event_switch_group(ev_new, "A"):
 		return
 	director.tourney["evo"] = {"active": true, "generation": gen,
 		"episodes": EVO_EPISODES,
