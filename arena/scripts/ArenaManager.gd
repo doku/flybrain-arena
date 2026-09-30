@@ -225,6 +225,9 @@ var bracket_overlay: Control
 var arena_bracket: BracketView
 var bracket_scroll: ScrollContainer
 var bracket_title: Label
+var wait_title: Label
+var wait_sub: Label
+var _wait_bracket := false
 # Next-generation waiting room (evo handoff only): preview bracket +
 # rotating fighter gallery + training strip, sharing the overlay above.
 var gallery_box: VBoxContainer
@@ -696,6 +699,23 @@ func _build_bracket_overlay() -> void:
 	bracket_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	bracket_title.add_theme_font_size_override("font_size", 18)
 	vb.add_child(bracket_title)
+	# Squeezed wait header (server waits only, hidden otherwise):
+	# outcome/wait title in verdict color + white detail line. Plain
+	# minimum-size rows above the sole EXPAND_FILL scroll row, so the
+	# bracket reflows by exactly their height.
+	wait_title = Label.new()
+	wait_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	wait_title.add_theme_font_size_override("font_size", 16)
+	wait_title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wait_title.visible = false
+	vb.add_child(wait_title)
+	wait_sub = Label.new()
+	wait_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	wait_sub.add_theme_font_size_override("font_size", 13)
+	wait_sub.add_theme_color_override("font_color", Color(1, 1, 1, 0.9))
+	wait_sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wait_sub.visible = false
+	vb.add_child(wait_sub)
 	# Group standings (event group brackets only, hidden otherwise).
 	standings_label = Label.new()
 	standings_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -795,6 +815,13 @@ func _show_arena_bracket(title_text: String) -> void:
 	var director := _director()
 	if director == null or arena_bracket == null:
 		return
+	# Fresh views never carry stale wait text (wait flows set it after).
+	if is_instance_valid(wait_title):
+		wait_title.visible = false
+		wait_title.text = ""
+	if is_instance_valid(wait_sub):
+		wait_sub.visible = false
+		wait_sub.text = ""
 	bracket_title.text = title_text
 	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
 		# Event view: all four groups in one 2x2 overview (the single
@@ -820,6 +847,44 @@ func _hide_arena_bracket() -> void:
 	if bracket_overlay != null:
 		bracket_overlay.visible = false
 	_sync_bracket_button()
+
+
+func _show_wait_bracket(title_text: String) -> bool:
+	# Bracket + squeezed wait header for routine server waits (battle
+	# load, report await, reset wait, error retry). Returns false when
+	# no bracket can render (caller falls back to fullscreen loading).
+	# Ownership: takes over only a closed overlay; a manually opened
+	# bracket stays the user's (no auto-hide on reply).
+	var director := _director()
+	if director == null or arena_bracket == null or bracket_overlay == null:
+		return false
+	_wait_bracket = not bracket_overlay.visible
+	_show_arena_bracket(title_text)
+	return true
+
+
+func _set_wait_header(head: String, sub: String, head_color: Color) -> void:
+	if is_instance_valid(wait_title):
+		wait_title.text = head
+		wait_title.add_theme_color_override("font_color", head_color)
+		wait_title.visible = true
+	if is_instance_valid(wait_sub):
+		wait_sub.text = sub
+		wait_sub.visible = true
+
+
+func _hide_wait_bracket() -> void:
+	# Auto-opened wait view only; manual brackets are never yanked.
+	if not _wait_bracket:
+		return
+	_wait_bracket = false
+	if is_instance_valid(wait_title):
+		wait_title.visible = false
+		wait_title.text = ""
+	if is_instance_valid(wait_sub):
+		wait_sub.visible = false
+		wait_sub.text = ""
+	_hide_arena_bracket()
 
 
 func _sync_bracket_button() -> void:
@@ -867,8 +932,10 @@ func _save_bracket_record(with_png: bool) -> void:
 
 func _on_bracket_toggle() -> void:
 	if bracket_overlay != null and bracket_overlay.visible:
+		_wait_bracket = false
 		_hide_arena_bracket()
 	elif tournament_active:
+		_wait_bracket = false
 		_show_arena_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name])
 
 func _on_quit_to_menu() -> void:
@@ -905,16 +972,22 @@ func _request_current_battle_load() -> void:
 	tourney_b_name = str(p.get("b_name", "BETA"))
 	tourney_match_label = str(p.get("match", ""))
 	tourney_awaiting_load = true
-	_hide_arena_bracket()
 	refresh_slot_names()
 	# Freeze the arena while the server swaps brains: no steps go out, so
 	# the flies can never fight a round on stale/boot brains ("only
-	# charges" first-battle bug). A persistent loading callout proves the
-	# game is working, not frozen.
+	# charges" first-battle bug). The bracket stays up with a squeezed
+	# wait header (same strings/colors as the old fullscreen loader)
+	# so no moment shows an empty arena; fullscreen only on fallback.
 	is_round_active = false
 	_set_combat(false)
-	_show_loading("LOADING %s" % expand_match_label(tourney_match_label),
-		"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name])
+	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+		_set_wait_header("LOADING %s" % expand_match_label(tourney_match_label),
+			"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name],
+			Color(0.85, 0.85, 0.9))
+	else:
+		_hide_arena_bracket()
+		_show_loading("LOADING %s" % expand_match_label(tourney_match_label),
+			"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name])
 	if is_instance_valid(status_label):
 		status_label.text = "LOADING %s vs %s ..." % [tourney_a_name, tourney_b_name]
 	brain_client.request_tournament_load(
@@ -936,6 +1009,7 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary) -> void:
 		return
 	_clear_seq()
 	tourney_awaiting_load = false
+	_hide_wait_bracket()
 	_hide_loading()
 	_update_tourney_status("READY")
 	_reset_round()
@@ -946,6 +1020,7 @@ func _on_match_ready() -> void:
 	if _seq_context != "reset":
 		return
 	_clear_seq()
+	_hide_wait_bracket()
 	_hide_loading()
 	_reset_round()
 
@@ -962,9 +1037,15 @@ func _on_server_error(error: String) -> void:
 		var q := _seq_last_round
 		print("[Arena] Battle report errored (%s); retrying same id=" % error,
 			_seq_battle_id)
-		_show_loading("BATTLE REPORT ERRORED - RETRYING",
-			"Server error: %s. Re-sending the SAME report id %s " % [error, expand_battle_id(_seq_battle_id)]
-			+ "(the server answers repeats from its stored verdict, no double count)...")
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("BATTLE REPORT ERRORED - RETRYING",
+				"Server error: %s. Re-sending the SAME report id %s " % [error, expand_battle_id(_seq_battle_id)]
+				+ "(the server answers repeats from its stored verdict, no double count)...",
+				Color(0.85, 0.85, 0.9))
+		else:
+			_show_loading("BATTLE REPORT ERRORED - RETRYING",
+				"Server error: %s. Re-sending the SAME report id %s " % [error, expand_battle_id(_seq_battle_id)]
+				+ "(the server answers repeats from its stored verdict, no double count)...")
 		if is_instance_valid(status_label):
 			status_label.text = "BATTLE ERROR - RETRYING %s ..." % expand_battle_id(_seq_battle_id)
 		brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
@@ -975,6 +1056,7 @@ func _on_server_error(error: String) -> void:
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
+	_hide_wait_bracket()
 	_show_loading("SERVER ERROR",
 		"SERVER ERROR: %s. " % error
 		+ "See server_log.txt, then QUIT TO MENU + RESUME.")
@@ -1475,6 +1557,7 @@ func _check_seq_watchdog() -> void:
 			return
 		_tourney_awaiting_battle = false
 		_clear_seq()
+		_hide_wait_bracket()
 		_show_loading("SERVER SILENT - BATTLE NOT CONFIRMED",
 			"Battle %s was sent twice but the server never confirmed. " % expand_match_label(tourney_match_label)
 			+ "Nothing further will be re-sent. See server_log.txt, then QUIT TO MENU + RESUME.")
@@ -1499,6 +1582,7 @@ func _check_seq_watchdog() -> void:
 		return
 	# Second expiry: stay loud, stop touching the server.
 	_clear_seq()
+	_hide_wait_bracket()
 	_show_loading("STALLED - NO SERVER REPLY",
 		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
 	if is_instance_valid(status_label):
@@ -3155,12 +3239,18 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	_print_flight_line("beta", fb)
 	_arm_seq("battle")
 	# Verdict headlines big on top (winner + killing blow); the
-	# reporting detail sits beneath in smaller type.
+	# reporting detail sits beneath in smaller type. Shown squeezed
+	# into the bracket (same strings/colors); fullscreen only when no
+	# bracket can render.
 	var head := _verdict_headline()
-	_show_loading(str(head.get("text", "")),
-		"%s\n%s - battle %s sent, waiting for server..." % [
-		str(head.get("sub", "")), expand_match_label(tourney_match_label), expand_battle_id(_seq_battle_id)],
-		head.get("color", Color(0.85, 0.85, 0.9)))
+	var head_text := str(head.get("text", ""))
+	var head_sub := "%s\n%s - battle %s sent, waiting for server..." % [
+		str(head.get("sub", "")), expand_match_label(tourney_match_label), expand_battle_id(_seq_battle_id)]
+	var head_color: Color = head.get("color", Color(0.85, 0.85, 0.9))
+	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+		_set_wait_header(head_text, head_sub, head_color)
+	else:
+		_show_loading(head_text, head_sub, head_color)
 	if is_instance_valid(status_label):
 		status_label.text = "%s - %s (%s REPORTING)" % [
 			str(head.get("text", "")), str(head.get("sub", "")),
@@ -3798,6 +3888,7 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
+	_hide_wait_bracket()
 	_hide_loading()
 	var director := _director()
 	if director == null:
@@ -3845,6 +3936,11 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 			var draw_score := "%d - %d" % [int(draw_adv.get("score_a", 0)), int(draw_adv.get("score_b", 0))]
 			_on_match_over(str(draw_adv.get("match_winner", "alpha")), draw_score)
 			return
+		var rhead := _verdict_headline()
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header(str(rhead.get("text", "")),
+				str(rhead.get("sub", "")) + "\nwaiting for server (match reset)...",
+				rhead.get("color", Color(0.85, 0.85, 0.9)))
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 		return
@@ -3872,6 +3968,11 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 			sub, "NEXT BATTLE", false)
 		await get_tree().create_timer(5.0).timeout
 		_update_tourney_status("BATTLE %d" % (_battle_count() + 1))
+		var whead := _verdict_headline()
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header(str(whead.get("text", "")),
+				str(whead.get("sub", "")) + "\nwaiting for server (match reset)...",
+				whead.get("color", Color(0.85, 0.85, 0.9)))
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 
@@ -3951,6 +4052,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 		# quit. The user leaves via QUIT TO MENU in the bottom bar when
 		# done (the bracket CLOSE button only hides the overlay; BRACKET
 		# re-opens it).
+		_hide_wait_bracket()
 		_hide_loading()
 		winner_overlay.visible = false
 		_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET" % champ_name)

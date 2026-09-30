@@ -109,6 +109,37 @@ func test_server_error_routing() -> void:
 		"overlay names the server error")
 
 
+func test_wait_bracket_flow() -> void:
+	# Server waits show the bracket with a squeezed outcome header
+	# (same strings/colors), never a bare arena; replies auto-hide
+	# only auto-opened views, never the user's manual bracket.
+	arena._build_bracket_overlay()
+	_check(not arena.wait_title.visible, "wait header hidden initially")
+	arena._set_wait_header("X WINS BY KO", "Killing blow: THORAX",
+		Color(1.0, 0.55, 0.3))
+	_check(arena.wait_title.visible, "header shows on set")
+	_check(arena.wait_title.text == "X WINS BY KO", "header title text")
+	_check(arena.wait_title.get_theme_color("font_color").is_equal_approx(
+		Color(1.0, 0.55, 0.3)), "header keeps winner color")
+	_check(arena.wait_sub.visible, "sub shows on set")
+	arena._wait_bracket = true
+	arena._hide_wait_bracket()
+	_check(not arena.wait_title.visible, "auto-hide clears header")
+	_check(arena.wait_title.text == "", "auto-hide clears text")
+	_check(not arena._wait_bracket, "auto-hide drops the flag")
+	arena._set_wait_header("T", "S", Color.WHITE)
+	arena._wait_bracket = false
+	arena._hide_wait_bracket()
+	_check(arena.wait_title.visible, "manual bracket never auto-hidden")
+	arena.wait_title.visible = false
+	arena.wait_sub.visible = false
+	_check(arena._show_wait_bracket("T1  A vs B"), "wait bracket opens")
+	_check(arena.bracket_overlay.visible, "overlay visible on wait")
+	_check(arena._wait_bracket, "auto flag set on wait open")
+	arena._hide_wait_bracket()
+	_check(not arena.bracket_overlay.visible, "reply hides auto wait view")
+
+
 func test_shock_lifecycle() -> void:
 	# KO shockwave runs 0.01 -> 1.0 exactly once, then parks at 0.
 	# (Regression: it used to advance unconditionally and ripple forever.)
@@ -238,6 +269,7 @@ func _process(_delta: float) -> bool:
 	test_hit_feedback_path()
 	test_stats_flash_path()
 	test_server_error_routing()
+	test_wait_bracket_flow()
 	test_shock_lifecycle()
 	test_combat_gate()
 	test_ko_burst_path()
