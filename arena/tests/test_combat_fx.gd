@@ -75,6 +75,27 @@ func test_stats_flash_path() -> void:
 	_check(true, "unknown side no-ops without error")
 
 
+func test_server_error_routing() -> void:
+	# An explicit server error during an awaited battle retries once
+	# (same id), then lands the SERVER ERROR overlay instead of
+	# hanging in REPORTING until the watchdog gives up.
+	arena._seq_context = "battle"
+	arena._seq_battle_id = "R9M9-B9"
+	arena._tourney_awaiting_battle = true
+	arena._seq_retried = false
+	arena._seq_last_round = {"stats_a": {}, "stats_b": {},
+		"draw": false, "tournament_id": "T9", "match": "R9M9",
+		"flight_a": {}, "flight_b": {}, "end_reason": "ko",
+		"verdict": {}}
+	arena._on_server_error("boom")
+	_check(arena._seq_retried, "first error retries same id")
+	_check(arena._tourney_awaiting_battle, "still awaiting after retry")
+	arena._on_server_error("boom again")
+	_check(not arena._tourney_awaiting_battle, "second error stands down")
+	_check(str(arena.status_label.text).begins_with("SERVER ERROR"),
+		"overlay names the server error")
+
+
 func test_shock_lifecycle() -> void:
 	# KO shockwave runs 0.01 -> 1.0 exactly once, then parks at 0.
 	# (Regression: it used to advance unconditionally and ripple forever.)
@@ -203,6 +224,7 @@ func _process(_delta: float) -> bool:
 	test_builds()
 	test_hit_feedback_path()
 	test_stats_flash_path()
+	test_server_error_routing()
 	test_shock_lifecycle()
 	test_combat_gate()
 	test_ko_burst_path()

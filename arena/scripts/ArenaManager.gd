@@ -300,10 +300,12 @@ var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
 const SEQ_TIMEOUT_MSEC: int = 30000
 # Battle reports routinely take ~60 s (dopamine + gain pinning over 25M
-# synapses, then two ~100 MB vault writes + journal fsync). A 30 s
-# watchdog fired on EVERY battle and doubled server work with a retry
-# that always lost the race. 90 s still fails loud on real stalls.
-const SEQ_BATTLE_TIMEOUT_MSEC: int = 90000
+# synapses, then vault writes + journal fsync). A 30 s watchdog fired
+# on EVERY battle and doubled server work with a retry that always
+# lost the race. 240 s fails loud on real stalls while surviving
+# loaded-machine battles (compressed saves shrank the work; this is
+# the safety net, not the fix).
+const SEQ_BATTLE_TIMEOUT_MSEC: int = 240000
 # Id for the in-flight battle (match + battle number). Echoed by the
 # server for log correlation AND the idempotency key for safe retries.
 var _seq_battle_id: String = ""

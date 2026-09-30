@@ -1012,7 +1012,8 @@ func _on_brain_selected(idx: int) -> void:
 		"m": int(r.get("matches", 0)), "mw": int(r.get("matches_won", 0)),
 		"ml": int(r.get("matches_lost", 0)), "t": int(r.get("tournaments_won", 0)),
 		"elo": int(r.get("elo", 1200.0)),
-		"e": int(t.get("episodes", 0)), "s": (t.get("sessions", []) as Array).size(),
+		"e": int(t.get("episodes", 0)), "s": (t.get("sessions", []) as Array).size()
+			+ int((t.get("sessions_archive", {}) as Dictionary).get("sessions", 0)),
 		"sc": "%.0f" % score, "asc": "%.2f" % avg,
 		"v": str(p.get("variant", "?")), "sd": str(p.get("seed", "?")),
 		"lr": str(p.get("learning_rate", "?")), "g": str(p.get("dist_gain", "?")),
