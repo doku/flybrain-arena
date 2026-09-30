@@ -399,7 +399,27 @@ no roll axis (JO-roll learns live).
   auto-escalates UDP detail for spike ids. Pool-to-pool network lines
   connect real centroid positions and light with presynaptic drive,
   gated per fighter like the flow diagram — the active networks glow
-  inside the flashing cloud.
+   inside the flashing cloud.
+
+### Battle rules: DNF, overtime, wander dock
+
+  A battle that times out with neither fly damaged is a **DNF (did not
+  finish)** — no winner, no dopamine, both records bank a draw, and the
+  pairing replays. The first replay runs at **1.5x** the designated
+  time, the second at **2x**; a third DNF ends the pairing by the
+  standard resolution (prior match-wins, group split, ELO fallback).
+  The white outer arena ring sits 30 m from center
+  (`glade_ground.gdshader`); at every DNF the arena measures each
+  fly's meters past that ring (**drift**). Why: a fly that finishes a
+  battle deep in the forest fringe was most likely confused or evading
+  rather than fighting, and a plain replay would likely tie again.
+  So the overtime battle docks starting health by drift —
+  `min(drift x 4 HP/m, 50 HP)` per fly, zero drift docks zero — which
+  converts wandering into a concrete disadvantage: unequal health
+  produces unequal damage, and the timeout/KO verdict almost never
+  ties a second time. Drift past 5 m also banks a career **wander**
+  mark (`record.wander`, shown in stats/gallery); the overtime callout
+  previews each side's dock, and the timer reads `(OVERTIME x1.5)`.
 
 ## 11. Tournament protocol (UDP)
 

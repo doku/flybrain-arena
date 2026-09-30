@@ -979,15 +979,16 @@ func test_showcase_overview() -> void:
 
 func _fighter_rows_a(A) -> PackedStringArray:
 	var rec := {"elo": 1350.0, "battles": 12, "wins": 7, "losses": 4,
-		"draws": 1, "ko": 3, "matches": 4, "matches_won": 3,
-		"tournaments_won": 1}
+		"draws": 1, "ko": 3, "wander": 2, "matches": 4,
+		"matches_won": 3, "tournaments_won": 1}
 	var gp := {"evasion": 0.2, "learning_rate": 0.008,
 		"experiment": "retina_wide"}
 	var lin := {"parent_ids": ["p1"], "source": "clone:x",
 		"kin": 3, "jr": 0}
 	var tr := {"episodes": 150}
 	return A._format_fighter_rows(rec, gp, lin, tr, {"p1": "Kestrel"},
-		{"spd": 4.2, "thr": 0.4, "hp": 82.0}, {"kills": 1}, 0)
+		{"spd": 4.2, "thr": 0.4, "hp": 82.0, "drift": 5.2},
+		{"kills": 1}, 0)
 
 
 func test_fighter_rows() -> void:
@@ -1001,7 +1002,8 @@ func test_fighter_rows() -> void:
 			"Matches: 4 (Won 3), Titles: 1", "Schooling: 150 episodes",
 			"Pedigree: clone of Kestrel (kin 3)",
 			"Evasion: 0.20, Learning rate: 0.0080, Wiring: retina_wide",
-			"Speed: 4.2, Thrust: 0.40, Health: 82"]:
+			"Speed: 4.2, Thrust: 0.40, Health: 82",
+			"Wandered: 2", "Beyond arena: 5.2 m"]:
 		_check(text.contains(want), "row present: " + want)
 	for gone in ["BTL", "MTCH", "EVA ", "THR ", "SPD ", " HP ", "MN ",
 			"VS ", "LPLC2", "DN "]:
@@ -1050,6 +1052,18 @@ func test_fighter_rows_pedigrees() -> void:
 			if str(r) == "Pedigree: " + str(c[2]):
 				found = true
 		_check(found, "pedigree reads: " + str(c[2]))
+	A.free()
+
+
+func test_wander_dock() -> void:
+	# Overtime dock: 4 HP per drift meter, cap 50, floor zero.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	_check(A._wander_dock(0.0) == 0.0, "no drift docks nothing")
+	_check(absf(A._wander_dock(2.5) - 10.0) < 0.001, "2.5 m docks 10 HP")
+	_check(absf(A._wander_dock(10.0) - 40.0) < 0.001, "10 m docks 40 HP")
+	_check(absf(A._wander_dock(12.5) - 50.0) < 0.001, "12.5 m hits the cap")
+	_check(absf(A._wander_dock(25.0) - 50.0) < 0.001, "cap holds past leash")
+	_check(absf(A._wander_dock(-3.0) - 0.0) < 0.001, "negative clamps zero")
 	A.free()
 
 
@@ -1111,6 +1125,7 @@ func _initialize() -> void:
 	test_showcase_overview()
 	test_fighter_rows()
 	test_fighter_rows_pedigrees()
+	test_wander_dock()
 	_cleanup()
 	if failures == 0:
 		print("ALL EVENT-GROUP TESTS PASSED")

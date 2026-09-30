@@ -11,6 +11,30 @@ const BracketView = preload("res://scripts/TournamentBracket.gd")
 var current_round_time: float = 0.0
 var current_generation: int = 1
 var is_round_active: bool = true
+# DNF wander rule: the white outer arena ring sits 30 m from center
+# (glade_ground.gdshader). A timeout-tie measures each fly's meters
+# past that ring; farthest out reads confused/evading. Overtime
+# battles dock 4 HP per drift meter (cap 50, zero drift docks zero),
+# so wandering converts into a decisive disadvantage and a third DNF
+# gets rare: unequal health breaks the next tie on damage.
+const ARENA_RING_R := 30.0
+const DOCK_PER_M := 4.0
+const DOCK_CAP := 50.0
+
+
+func _wander_overshoot(fly) -> float:
+	# Meters past the arena ring, floor zero (inside/A-ring reads 0).
+	if not is_instance_valid(fly):
+		return 0.0
+	var flat := Vector2((fly as Node3D).global_position.x,
+		(fly as Node3D).global_position.z)
+	return maxf(flat.length() - ARENA_RING_R, 0.0)
+
+
+func _wander_dock(drift: float) -> float:
+	# Overtime starting-health dock for a drift reading. Pure
+	# (unit-tested): 0 -> 0, 2.5 -> 10, 10 -> 40, >=12.5 -> 50.
+	return clampf(float(drift) * DOCK_PER_M, 0.0, DOCK_CAP)
 
 var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
 var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
@@ -1476,14 +1500,23 @@ func _check_seq_watchdog() -> void:
 	if is_instance_valid(status_label):
 		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
 
+var _round_overtime := 1.0
+
+
 func _reset_round() -> void:
 	# New round waits for the landing ceremony (bounded inside).
 	await _await_landing()
 	current_round_time = round_time_limit
+	_round_overtime = 1.0
 	if tournament_active:
 		var director := _director()
 		if director != null:
 			current_round_time = float(director.tourney.get("round_time", round_time_limit))
+			# Overtime ladder: each banked DNF lengthens the replay
+			# (1.5x, then 2x). Computed, never persisted.
+			_round_overtime = director.overtime_scale(
+				int(director.current_match().get("draws", 0)))
+			current_round_time *= _round_overtime
 	is_round_active = true
 	stats_alpha = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 	stats_beta  = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
@@ -1508,6 +1541,21 @@ func _reset_round() -> void:
 	# and yaw +90 faces -X (toward alpha). Previously swapped (back-to-back).
 	fly_alpha.reset_fly(Vector3(-14.0, 7.0, 0.0), deg_to_rad(-90.0))
 	fly_beta.reset_fly(Vector3(14.0, 7.0, 0.0), deg_to_rad(90.0))
+	# Overtime wander dock: the last DNF's drift converts into missing
+	# starting health (farther ran = more docked), so the replay opens
+	# unequal and ties almost never repeat. Tournament pairings with
+	# banked draws only; first battles and free fights start whole.
+	if tournament_active:
+		var ddirector := _director()
+		if ddirector != null:
+			var dm: Dictionary = ddirector.current_match()
+			if int(dm.get("draws", 0)) > 0:
+				var dock_a := _wander_dock(float(dm.get("drift_a", 0.0)))
+				var dock_b := _wander_dock(float(dm.get("drift_b", 0.0)))
+				if is_instance_valid(fly_alpha):
+					fly_alpha.health = maxf(fly_alpha.health - dock_a, 1.0)
+				if is_instance_valid(fly_beta):
+					fly_beta.health = maxf(fly_beta.health - dock_b, 1.0)
 	_set_combat(true)
 
 	if is_instance_valid(status_label):
@@ -1527,6 +1575,8 @@ func _physics_process(delta: float) -> void:
 	if is_instance_valid(timer_label) and tenths != _timer_last_tenths:
 		_timer_last_tenths = tenths
 		timer_label.text = "ROUND TIME: %04.1f s" % maxf(current_round_time, 0.0)
+		if _round_overtime > 1.0:
+			timer_label.text += " (OVERTIME x%.1f)" % _round_overtime
 
 	_update_health_hud()
 
@@ -1651,6 +1701,7 @@ func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
 		int(rec.get("losses", 0))])
 	lines.append("Did not finish: %d" % [
 		int(rec.get("draws", 0)) + maxi(match_draws, 0)])
+	lines.append("Wandered: %d" % int(rec.get("wander", 0)))
 	lines.append("Knockouts: %d (%d this match)" % [
 		int(rec.get("ko", 0)), int(st.get("kills", 0))])
 	lines.append("Matches: %d (Won %d), Titles: %d" % [
@@ -1687,6 +1738,7 @@ func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
 	lines.append("Speed: %.1f, Thrust: %.2f, Health: %.0f" % [
 		float(live.get("spd", 0.0)), float(live.get("thr", 0.0)),
 		float(live.get("hp", 0.0))])
+	lines.append("Beyond arena: %.1f m" % float(live.get("drift", 0.0)))
 	return lines
 
 
@@ -1717,13 +1769,17 @@ func _pip_stats_text(side: String) -> String:
 	var parents := {}
 	for ppid in (lin.get("parent_ids", []) as Array):
 		parents[str(ppid)] = _nextgen_parent_name(str(ppid))
-	var live := {"spd": 0.0, "thr": 0.0, "hp": 0.0}
+	var live := {"spd": 0.0, "thr": 0.0, "hp": 0.0, "drift": 0.0}
 	if is_instance_valid(fly):
 		live["spd"] = (fly as CharacterBody3D).velocity.length()
 		var _t = fly.get("current_thrust")
 		live["thr"] = float(_t) if _t != null else 0.0
 		var _h = fly.get("health")
 		live["hp"] = float(_h) if _h != null else 0.0
+		var _flat := Vector2(
+			(fly as CharacterBody3D).global_position.x,
+			(fly as CharacterBody3D).global_position.z)
+		live["drift"] = maxf(_flat.length() - ARENA_RING_R, 0.0)
 	var st: Dictionary = stats_alpha if side == "alpha" else stats_beta
 	return "\n".join(_format_fighter_rows(rec, gp, lin, tr, parents,
 		live, st, match_draws))
@@ -2947,7 +3003,9 @@ func _compose_verdict(draw: bool) -> Dictionary:
 		"dmg_a": float(stats_alpha.get("damage_dealt", 0.0)),
 		"dmg_b": float(stats_beta.get("damage_dealt", 0.0)), "line": ""}
 	if draw:
-		v["line"] = "DNF - time expired, nobody bled"
+		v["line"] = "DNF - time expired, nobody bled (%.1f m / %.1f m off arena)" % [
+			float((stats_alpha as Dictionary).get("center_drift", 0.0)),
+			float((stats_beta as Dictionary).get("center_drift", 0.0))]
 	elif _end_reason == "ko" and (_ko_victim == "alpha" or _ko_victim == "beta"):
 		var winner_slot := "beta" if _ko_victim == "alpha" else "alpha"
 		var blow := _killing_blow(_ko_victim)
@@ -3054,7 +3112,15 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 			expand_match_label(tourney_match_label)]
 
 func _handle_draw() -> void:
-	print("[Arena] DNF! Time expired with zero damage - did not finish, rematch same brains.")
+	# Wander reading (positions valid until landing below): meters
+	# past the arena ring per fly. Rides stats_alpha/beta to the
+	# server (career wander mark) and into the match record (the
+	# overtime health dock reads the freshest pair).
+	var drift_a := _wander_overshoot(fly_alpha)
+	var drift_b := _wander_overshoot(fly_beta)
+	stats_alpha["center_drift"] = drift_a
+	stats_beta["center_drift"] = drift_b
+	print("[Arena] DNF! Time expired with zero damage - did not finish, rematch same brains. (drift A %.1f m / B %.1f m past arena)" % [drift_a, drift_b])
 	is_round_active = false
 	_set_combat(false)
 	# Both walk away: land upright for the rematch.
@@ -3691,15 +3757,32 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		if is_instance_valid(status_label):
 			status_label.text = "%s %s - REPLAYING" % [expand_match_label(tourney_match_label), draw_title]
 		_begin_landing("")
+		# Replay preview: the banked draw about to land makes the next
+		# battle overtime — show its scale and wander dock up front so
+		# the viewer knows why health will differ.
+		var _next_draws := 1
+		if director != null:
+			_next_draws = int(director.current_match().get("draws", 0)) + 1
+		var _scale := 1.5
+		if director != null:
+			_scale = director.overtime_scale(_next_draws)
+		var _da := float((stats_alpha as Dictionary).get("center_drift", 0.0))
+		var _db := float((stats_beta as Dictionary).get("center_drift", 0.0))
 		_show_callout(draw_title, Color(0.78, 0.78, 0.82),
-			"%s STALEMATE - REPLAY" % expand_match_label(tourney_match_label), "REMATCH", false)
+			"%s STALEMATE - REPLAY  •  OVERTIME x%.1f: %s -%d HP (%.1f m), %s -%d HP (%.1f m)" % [
+				expand_match_label(tourney_match_label), _scale,
+				_slot_name("alpha"), int(_wander_dock(_da)), _da,
+				_slot_name("beta"), int(_wander_dock(_db)), _db],
+			"REMATCH", false)
 		await get_tree().create_timer(5.0).timeout
 		var draw_adv: Dictionary = director.on_battle_result("draw",
 			_flight_summary(flight_alpha, fly_alpha),
 			_flight_summary(flight_beta, fly_beta),
 			_bv_stream_packet(),
 			int((stats_alpha as Dictionary).get("kills", 0)),
-			int((stats_beta as Dictionary).get("kills", 0)))
+			int((stats_beta as Dictionary).get("kills", 0)),
+			float((stats_alpha as Dictionary).get("center_drift", -1.0)),
+			float((stats_beta as Dictionary).get("center_drift", -1.0)))
 		# Third draw resolves the match outright (higher ELO advances)
 		# instead of replaying forever.
 		if str(draw_adv.get("action", "")) == "match_over":
@@ -5684,11 +5767,12 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 		traits += " · ctl " + " ".join(blparts)
 	var teps := int(t.get("episodes", 0))
 	var tscore := float(t.get("score", 0.0))
-	var fights := "Battles %d (W%d L%d D%d) · Matches %d (W%d L%d) · Titles %d" % [
+	var fights := "Battles %d (W%d L%d D%d) · Matches %d (W%d L%d) · Titles %d · Wandered %d" % [
 		int(r.get("battles", 0)), int(r.get("wins", 0)),
 		int(r.get("losses", 0)), int(r.get("draws", 0)),
 		int(r.get("matches", 0)), int(r.get("matches_won", 0)),
-		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0))]
+		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
+		int(r.get("wander", 0))]
 	var schooled := "Episodes %d · Avg %.2f/ep (total %.1f)" % [
 		teps, float(t.get("avg_score", 0.0)), tscore]
 	var rows := "%s\n%s\n%s\n%s\n%s" % [fights, schooled, wiring,
