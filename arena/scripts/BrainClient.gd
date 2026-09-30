@@ -7,7 +7,8 @@ signal merged(merge_count: int, archived_loser: String)
 signal restarted(round_winner: String)
 signal tournament_battle_received(battle_winner: String, fitness_alpha: float, fitness_beta: float, battle_id: String)
 signal battle_progress_received(battle_id: String)
-signal brains_loaded(alpha_info: Dictionary, beta_info: Dictionary)
+signal brains_loaded_received(alpha_info: Dictionary, beta_info: Dictionary, tournament_id: String, match_label: String)
+signal prepared_received(tournament_id: String, match_label: String)
 signal match_ready_received()
 signal match_recorded_received()
 signal tournament_closed_received()
@@ -115,6 +116,21 @@ func request_tournament_load(alpha_path: String, beta_path: String, tournament_i
 	}
 	_send_dict(msg)
 
+func request_tournament_prepare(alpha_path: String, beta_path: String, tournament_id: String, match_label: String) -> void:
+	# Preload the NEXT match into the server's prepare slot while a
+	# countdown or the current match runs: the ~5-20 s disk+binding
+	# load hides under the wait. The official load later activates the
+	# slot in O(1). Best-effort (fire-and-forget).
+	if not is_connected_server:
+		return
+	_send_dict({
+		"type": "tournament_prepare",
+		"alpha_path": alpha_path,
+		"beta_path": beta_path,
+		"tournament_id": tournament_id,
+		"match": match_label
+	})
+
 func request_raster_map(side: String, pool: String) -> void:
 	if not is_connected_server:
 		return
@@ -183,7 +199,14 @@ func _handle_server_response(data: Dictionary) -> void:
 	elif status == "battle_progress":
 		battle_progress_received.emit(str(data.get("battle_id", "")))
 	elif status == "brains_loaded":
-		brains_loaded.emit(data.get("alpha", {}), data.get("beta", {}))
+		brains_loaded_received.emit(
+			data.get("alpha", {}), data.get("beta", {}),
+			str(data.get("tournament_id", "")),
+			str(data.get("match", "")))
+	elif status == "prepared":
+		prepared_received.emit(
+			str(data.get("tournament_id", "")),
+			str(data.get("match", "")))
 	elif status == "match_ready":
 		match_ready_received.emit()
 	elif status == "match_recorded":

@@ -1204,6 +1204,45 @@ func get_load_params() -> Dictionary:
 	}
 
 
+func next_match_params() -> Dictionary:
+	# Peek the NEXT playable match without advancing: same-round
+	# next pairing (current_match+1 onward, byes/vacants walked past)
+	# is known the moment the round was built; a cross-round pairing
+	# depends on the current winner and returns {} until it resolves.
+	# Read-only (never mutates match state, never saves) - the arena
+	# preloads it into the server's prepare slot.
+	var r := int(tourney.get("current_round", 0))
+	var rounds: Array = tourney.get("rounds", [])
+	if r < 0 or r >= rounds.size():
+		return {}
+	var round_arr: Array = rounds[r]
+	var mi := int(tourney.get("current_match", 0)) + 1
+	while mi < round_arr.size():
+		var m: Dictionary = round_arr[mi]
+		if bool(m.get("vacant", false)) or bool(m.get("bye", false)):
+			mi += 1
+			continue
+		break
+	if mi >= round_arr.size():
+		return {}
+	var m: Dictionary = round_arr[mi]
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var alpha_fn := str((by_id.get(str(m.get("a_id", "")), {}) as Dictionary).get("filename", ""))
+	var beta_fn := str((by_id.get(str(m.get("b_id", "")), {}) as Dictionary).get("filename", ""))
+	if alpha_fn == "" or beta_fn == "":
+		return {}
+	return {
+		"alpha_path": brains_dir.path_join(alpha_fn),
+		"beta_path": brains_dir.path_join(beta_fn),
+		"tournament_id": str(tourney.get("id", "")),
+		"match": "R%dM%d" % [r + 1, mi + 1],
+		"a_name": str(m.get("a_name", "ALPHA")),
+		"b_name": str(m.get("b_name", "BETA")),
+	}
+
+
 func overtime_scale(draws: int) -> float:
 	# Overtime ladder: a pairing's next battle runs longer after each
 	# timeout-tie — 1.5x after the first DNF, 2x after the second.

@@ -258,6 +258,12 @@ func _timeout_winner(ha: float, hb: float) -> String:
 		return "draw"
 	return "alpha" if ha > hb else "beta"
 var tourney_awaiting_load: bool = false
+# Preload bookkeeping (NEXT match into the server's prepare slot):
+# separate from _seq_last_load so the watchdog never retries a prepare
+# as the official load. A prepared reply only marks readiness; the
+# official load (activation hit or disk fallback) stays the starter.
+var _preload_params: Dictionary = {}
+var _preload_ready := false
 var bracket_overlay: Control
 var arena_bracket: BracketView
 var bracket_scroll: ScrollContainer
@@ -507,7 +513,8 @@ func _ready() -> void:
 		_edir.job_progress.connect(_on_train_progress)
 		_edir.train_queue_changed.connect(_on_train_queue_changed)
 	brain_client.raster_map_received.connect(_on_raster_map)
-	brain_client.brains_loaded.connect(_on_brains_loaded)
+	brain_client.brains_loaded_received.connect(_on_brains_loaded)
+	brain_client.prepared_received.connect(_on_prepared)
 	brain_client.match_ready_received.connect(_on_match_ready)
 	brain_client.server_error_received.connect(_on_server_error)
 	# Title ack: the server replies tournament_closed AFTER the champion's
@@ -1075,10 +1082,67 @@ func _request_current_battle_load() -> void:
 		"lr_scale": float(p.get("lr_scale", 0.5))}
 	_arm_seq("load")
 
-func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary) -> void:
+func _preload_next_match() -> void:
+	# Sends the NEXT match's brains to the server's prepare slot while
+	# a countdown or the 6 s review runs: the ~5-20 s disk+binding load
+	# hides under the wait, so the next battle's official load becomes
+	# an O(1) activation. Every call site has the director already
+	# pointing at the next match (post-advance / post-switch), so
+	# get_load_params IS the next match. Best-effort (no director /
+	# missing paths -> no-op); never starts rounds, never touches the
+	# watchdog.
+	var director := _director()
+	if director == null or not tournament_active:
+		return
+	var p: Dictionary = director.get_load_params()
+	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
+		return
+	# Same match already held by the slot (ready or ack in flight):
+	# no-op - a duplicate prepare would redo the 5-20 s server load.
+	if str(_preload_params.get("match", "")) == str(p.get("match", "")) \
+			and str(_preload_params.get("tournament_id", "")) == str(p.get("tournament_id", "")):
+		return
+	_preload_params = p.duplicate(true)
+	_preload_ready = false
+	brain_client.request_tournament_prepare(
+		str(p.get("alpha_path", "")), str(p.get("beta_path", "")),
+		str(p.get("tournament_id", "")), str(p.get("match", "")))
+	print("[Arena] Preloading next match %s (%s vs %s)..." % [
+		str(p.get("match", "")), str(p.get("a_name", "?")),
+		str(p.get("b_name", "?"))])
+
+
+func _on_prepared(reply_tid: String, reply_match: String) -> void:
+	# The server finished loading the prepared match. Echo-checked
+	# against what WE sent (a stale prepare ack from an earlier match
+	# never marks readiness).
+	if reply_tid != "" and reply_tid != str(_preload_params.get("tournament_id", "")):
+		print("[Arena] Ignoring stale prepared ack (%s/%s)" % [reply_tid, reply_match])
+		return
+	_preload_ready = true
+	print("[Arena] Next match preloaded and ready (%s)." % reply_match)
+
+
+func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
+		reply_tid: String = "", reply_match: String = "") -> void:
 	if not tournament_active:
 		return
 	if not tourney_awaiting_load and _seq_context != "load":
+		return
+	# Match-echo validation: the reply must answer the CURRENT awaited
+	# load (same tournament file + match label). A stale/late reply
+	# from an earlier load is dropped loudly - it must never start a
+	# round on the wrong brains (the server's load may still be queued
+	# behind a 60 s battle bank). Old servers echo nothing: an empty
+	# reply passes (the latch + single-starter rule still hold).
+	if (reply_tid != "" or reply_match != "") \
+			and _seq_last_load.get("tournament_id", "") != "" \
+			and (reply_tid != str(_seq_last_load.get("tournament_id", ""))
+				or reply_match != str(_seq_last_load.get("match", ""))):
+		print("[Arena] Dropped stale brains_loaded (got %s/%s, want %s/%s)" % [
+			reply_tid, reply_match,
+			str(_seq_last_load.get("tournament_id", "")),
+			str(_seq_last_load.get("match", ""))])
 		return
 	_clear_seq()
 	tourney_awaiting_load = false
@@ -1131,6 +1195,9 @@ func _on_server_error(error: String) -> void:
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
+	# General server error during a load: clear the load latch too -
+	# a late reply must never silently start a round on this screen.
+	tourney_awaiting_load = false
 	_hide_wait_bracket()
 	_show_loading("SERVER ERROR",
 		"SERVER ERROR: %s. " % error
@@ -1671,8 +1738,11 @@ func _check_seq_watchdog() -> void:
 				status_label.text = "STALLED - RETRYING RESET ..."
 			brain_client.request_match_reset(tourney_match_label)
 		return
-	# Second expiry: stay loud, stop touching the server.
+	# Second expiry: stay loud, stop touching the server. The load
+	# latch clears too - a late reply can never silently start a round
+	# behind the fail-loud screen (QUIT TO MENU + RESUME re-loads).
 	_clear_seq()
+	tourney_awaiting_load = false
 	_hide_wait_bracket()
 	_show_loading("STALLED - NO SERVER REPLY",
 		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
@@ -4280,6 +4350,10 @@ func _on_match_over(match_winner: String, score: String) -> void:
 	var director := _director()
 	if director != null:
 		adv = director.advance_after_match()
+	# Preload during the 6 s review: after advance, the director points
+	# at the next match - its load hides under the review, so the next
+	# battle's official load becomes an O(1) activation.
+	_preload_next_match()
 	# The bracket overlay carries the result: gold connectors show the
 	# path, the loser is grayed out, next lineup is visible. A drawn
 	# split announces the shared point instead of a winner.
@@ -4858,6 +4932,11 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 	_refresh_standings()
 	intermission_label.text = sub
 	intermission_row.visible = true
+	# Preload under the countdown: the director points at the next
+	# match's file (post-switch/post-advance) - the ~5-20 s load hides
+	# inside the 30/60/120 s wait, so the post-countdown load is an
+	# O(1) activation.
+	_preload_next_match()
 	if is_instance_valid(bracket_scroll):
 		bracket_scroll.scroll_horizontal = 0
 		bracket_scroll.scroll_vertical = 0

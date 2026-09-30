@@ -3866,6 +3866,22 @@ class TestMappingMatrix(unittest.TestCase):
                 spikes = brain.integrate_50ms(enc.encode(stim))
                 self._finite_ctrl(dec.decode(spikes, sensory_hint=stim))
 
+    def test_degenerate_weights_refused(self):
+        # Zero-activity gate: an all-zero or non-finite weight vector of
+        # the right arity passes every prior check - _bind_brain must
+        # refuse it loudly instead of loading a reflex-zombie brain.
+        import brain_server as bs
+        from experimental_wiring import experiment_arrays
+        _indptr, indices, _wbasis = experiment_arrays(None, self.csr, self.pops)
+        rec = {"name": "Zed", "generator_params": {}}
+        with self.assertRaises(ValueError):
+            bs._bind_brain(rec, np.zeros(len(indices), dtype=np.float32),
+                           self.csr, self.pops, {})
+        nan_w = np.asarray(_wbasis, dtype=np.float32).copy()
+        nan_w[0] = np.nan
+        with self.assertRaises(ValueError):
+            bs._bind_brain(rec, nan_w, self.csr, self.pops, {})
+
     def test_mix_integrate_and_decode(self):
         # Representative additive mix across regimes: union wiring must
         # integrate and decode a complete finite control set like singles.
@@ -6743,6 +6759,40 @@ class TestReportIdentity(unittest.TestCase):
         self.assertFalse(bs._same_battle_slot(stored, flipped_draw))
         self.assertFalse(bs._same_battle_slot(None, replay))
         self.assertFalse(bs._same_battle_slot(stored, None))
+
+
+class TestPrepareSlot(unittest.TestCase):
+    """Preload-slot + zero-activity gates: the prepare slot activates in
+    O(1) for the exact match, and a tournament reset with no loaded
+    brains fails loud instead of running a boot-brain round."""
+    def test_prepared_slot_matches(self):
+        import brain_server as bs
+        pa = {"brain": object(), "path": "a.flybrain"}
+        pb = {"brain": object(), "path": "b.flybrain"}
+        tag = {"tournament_id": "T1", "match": "R1M1"}
+        msg = {"tournament_id": "T1", "match": "R1M1",
+               "alpha_path": "a.flybrain", "beta_path": "b.flybrain"}
+        self.assertTrue(bs._prepared_slot_matches(pa, pb, tag, msg))
+        self.assertFalse(bs._prepared_slot_matches(
+            {"brain": None, "path": "a.flybrain"}, pb, tag, msg))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, match="R1M2")))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, tournament_id="T2")))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, alpha_path="c.flybrain")))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, beta_path="c.flybrain")))
+
+    def test_reset_needs_brains(self):
+        import brain_server as bs
+        msg = {"match": "R1M1"}
+        self.assertFalse(bs._reset_needs_brains(msg, True, object(), object()))
+        self.assertTrue(bs._reset_needs_brains(msg, False, object(), object()))
+        self.assertTrue(bs._reset_needs_brains(msg, True, None, object()))
+        self.assertTrue(bs._reset_needs_brains(msg, True, object(), None))
+        # Non-tournament reset (menu/free): never gated.
+        self.assertFalse(bs._reset_needs_brains({}, True, None, None))
 
 
 if __name__ == "__main__":

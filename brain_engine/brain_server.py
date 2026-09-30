@@ -444,6 +444,18 @@ def _bind_brain(rec, weights, csr, pops, struct_cache):
             f"brain '{rec.get('name')}' declares wiring '{label}' "
             f"but carries arity {len(weights)} != {len(indices)}; "
             f"file corrupt or mislabeled")
+    # Degenerate weights: an all-zero or non-finite vector passes arity
+    # and loads "successfully" - then nothing propagates (NaN defeats
+    # every comparison) and the round runs as a reflex zombie with zero
+    # brain activity. Refuse loudly instead of announcing a bad load.
+    w = np.asarray(weights, dtype=np.float32)
+    if not np.isfinite(w).all():
+        raise ValueError(
+            f"brain '{rec.get('name')}' weights contain non-finite values; "
+            f"file corrupt")
+    if not np.any(w):
+        raise ValueError(
+            f"brain '{rec.get('name')}' weights are all zero; file corrupt")
     return FlyBrain(indptr, indices, np.ascontiguousarray(weights, dtype=np.float32).copy())
 
 
@@ -546,6 +558,28 @@ def _same_battle_slot(stored_key, battle_key):
             return False
     return _report_base(stored_key.get("battle_id")) == \
         _report_base(battle_key.get("battle_id"))
+
+
+def _prepared_slot_matches(prepare_a, prepare_b, prepare_tag, msg):
+    """True when the prepare slot holds THIS load (same tournament,
+    match label, both paths): activation swaps it in O(1) instead of
+    the full disk load. A server restart empties the slot - the
+    official load path stays the fallback. Pure (unit-tested)."""
+    return (prepare_a.get("brain") is not None
+            and prepare_tag.get("tournament_id") == str(msg.get("tournament_id", ""))
+            and prepare_tag.get("match") == str(msg.get("match", ""))
+            and prepare_a.get("path") == str(msg.get("alpha_path", ""))
+            and prepare_b.get("path") == str(msg.get("beta_path", "")))
+
+
+def _reset_needs_brains(msg, tournament_mode, rec_a, rec_b):
+    """True when a tournament-shaped reset would run on NO brains (the
+    server restarted, or free_mode hit mid-event): the handler must
+    fail loud instead of answering match_ready off boot brains - that
+    silent path was a zero-activity round. Pure (unit-tested)."""
+    if not str(msg.get("match", "")):
+        return False
+    return not tournament_mode or rec_a is None or rec_b is None
 
 
 def _emit_progress(sock, client_addr, battle_id, stage):
@@ -817,6 +851,16 @@ def run_brain_server(host="127.0.0.1", port=9999):
     tourney_b = {"rec": None, "path": None, "brain": brain_beta,
                  "enc": encoder, "dec": decoder}
     tourney_tag = {"tournament_id": "", "match": ""}
+    # Preload slot (tournament_prepare): the NEXT match's brains loaded
+    # + bound while the current one plays or a countdown runs. Never
+    # touches the live pair; tournament_load activates it in O(1) when
+    # the paths match. Lost on server restart (the official load path
+    # is the fallback).
+    prepare_a = {"rec": None, "path": None, "brain": None,
+                 "enc": None, "dec": None}
+    prepare_b = {"rec": None, "path": None, "brain": None,
+                 "enc": None, "dec": None}
+    prepare_tag = {"tournament_id": "", "match": ""}
     # Last banked match verdict (tournament_id, match): duplicate
     # tournament_match messages must not double-bank counters or ELO.
     _last_match_banked = {"key": None}
@@ -1154,30 +1198,51 @@ def run_brain_server(host="127.0.0.1", port=9999):
                         tournament_lr_scale = float(msg["lr_scale"])
                     except (TypeError, ValueError):
                         pass
-                try:
-                    rec_a, w_a = vault_pkg.load_brain(msg["alpha_path"])
-                    rec_b, w_b = vault_pkg.load_brain(msg["beta_path"])
-                except Exception as e:
-                    sock.sendto(json.dumps(
-                        {"status": "error", "error": f"tournament_load: {e}"}).encode("utf-8"),
-                        client_addr)
-                    continue
-                # Per-side native wiring: each fighter runs on the connectome
-                # its record declares (base or experimental overlay), so any
-                # two vault brains can share a bracket. Weight vectors stay
-                # native end-to-end; vault files never change shape.
-                try:
-                    new_alpha = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
-                    new_beta = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
-                    enc_a, dec_a = _bind_codecs(rec_a, pops, codec_cache)
-                    enc_b, dec_b = _bind_codecs(rec_b, pops, codec_cache)
-                except Exception as e:
-                    sock.sendto(json.dumps(
-                        {"status": "error",
-                         "error": f"tournament_load: {e}"}
-                    ).encode("utf-8"), client_addr)
-                    continue
-                brain_alpha, brain_beta = new_alpha, new_beta
+                # Preload activation: the prepare slot holding THIS match
+                # (same tournament, match label, both paths) swaps in O(1)
+                # - no disk, no re-binding. A miss (no prepare was sent, or
+                # a server restart lost the slot) falls through to the
+                # full disk load as before - the official path stays the
+                # fallback.
+                want_a = str(msg.get("alpha_path", ""))
+                want_b = str(msg.get("beta_path", ""))
+                if _prepared_slot_matches(prepare_a, prepare_b, prepare_tag, msg):
+                    brain_alpha = prepare_a["brain"]
+                    brain_beta = prepare_b["brain"]
+                    rec_a, rec_b = prepare_a["rec"], prepare_b["rec"]
+                    enc_a, dec_a = prepare_a["enc"], prepare_a["dec"]
+                    enc_b, dec_b = prepare_b["enc"], prepare_b["dec"]
+                    prepare_a.update(rec=None, path=None, brain=None,
+                                     enc=None, dec=None)
+                    prepare_b.update(rec=None, path=None, brain=None,
+                                     enc=None, dec=None)
+                    print("[Server] Preloaded brains activated (no disk load).",
+                          flush=True)
+                else:
+                    try:
+                        rec_a, w_a = vault_pkg.load_brain(msg["alpha_path"])
+                        rec_b, w_b = vault_pkg.load_brain(msg["beta_path"])
+                    except Exception as e:
+                        sock.sendto(json.dumps(
+                            {"status": "error", "error": f"tournament_load: {e}"}).encode("utf-8"),
+                            client_addr)
+                        continue
+                    # Per-side native wiring: each fighter runs on the connectome
+                    # its record declares (base or experimental overlay), so any
+                    # two vault brains can share a bracket. Weight vectors stay
+                    # native end-to-end; vault files never change shape.
+                    try:
+                        new_alpha = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
+                        new_beta = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
+                        enc_a, dec_a = _bind_codecs(rec_a, pops, codec_cache)
+                        enc_b, dec_b = _bind_codecs(rec_b, pops, codec_cache)
+                    except Exception as e:
+                        sock.sendto(json.dumps(
+                            {"status": "error",
+                             "error": f"tournament_load: {e}"}
+                        ).encode("utf-8"), client_addr)
+                        continue
+                    brain_alpha, brain_beta = new_alpha, new_beta
                 # Brain-view labels bound once here (never in the step
                 # hot loop): wiring mix + mapping per fighter.
                 tourney_a.update(rec=rec_a, path=msg["alpha_path"], brain=brain_alpha,
@@ -1194,13 +1259,56 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     tourney_tag["match"] = str(msg["match"])
                 print(f"[Server] Tournament brains loaded: "
                       f"Alpha <- {rec_a.get('name')} ({rec_a.get('id')}, "
-                      f"{len(new_alpha.weights):,} syn) vs "
+                      f"{len(brain_alpha.weights):,} syn) vs "
                       f"Beta <- {rec_b.get('name')} ({rec_b.get('id')}, "
-                      f"{len(new_beta.weights):,} syn)", flush=True)
+                      f"{len(brain_beta.weights):,} syn)", flush=True)
+                # Match echo: the arena validates WHICH load this answers -
+                # a stale/late reply must never start a round on the
+                # wrong brains.
                 sock.sendto(json.dumps({
                     "status": "brains_loaded",
                     "alpha": {"name": rec_a.get("name"), "id": rec_a.get("id")},
                     "beta": {"name": rec_b.get("name"), "id": rec_b.get("id")},
+                    "tournament_id": tourney_tag["tournament_id"],
+                    "match": tourney_tag["match"],
+                }).encode("utf-8"), client_addr)
+
+            elif msg_type == "tournament_prepare":
+                # Preload the NEXT match's brains into the prepare slot
+                # while the current one plays (or a countdown runs): the
+                # ~5-20 s disk+binding load hides under the wait. NEVER
+                # touches the live pair - a mid-battle load would clobber
+                # the live fight and bank the wrong identities.
+                import brain_package as vault_pkg
+                try:
+                    rec_a, w_a = vault_pkg.load_brain(msg["alpha_path"])
+                    rec_b, w_b = vault_pkg.load_brain(msg["beta_path"])
+                    new_alpha = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
+                    new_beta = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
+                    enc_a, dec_a = _bind_codecs(rec_a, pops, codec_cache)
+                    enc_b, dec_b = _bind_codecs(rec_b, pops, codec_cache)
+                except Exception as e:
+                    print(f"[Server] prepare failed: {e}", flush=True)
+                    sock.sendto(json.dumps(
+                        {"status": "error",
+                         "error": f"tournament_prepare: {e}"}).encode("utf-8"),
+                        client_addr)
+                    continue
+                prepare_a.update(rec=rec_a, path=str(msg.get("alpha_path", "")),
+                                 brain=new_alpha, enc=enc_a, dec=dec_a)
+                prepare_b.update(rec=rec_b, path=str(msg.get("beta_path", "")),
+                                 brain=new_beta, enc=enc_b, dec=dec_b)
+                prepare_tag["tournament_id"] = str(msg.get("tournament_id", ""))
+                prepare_tag["match"] = str(msg.get("match", ""))
+                print(f"[Server] Prepared next match {prepare_tag['match']}: "
+                      f"Alpha <- {rec_a.get('name')} vs "
+                      f"Beta <- {rec_b.get('name')}", flush=True)
+                sock.sendto(json.dumps({
+                    "status": "prepared",
+                    "alpha": {"name": rec_a.get("name"), "id": rec_a.get("id")},
+                    "beta": {"name": rec_b.get("name"), "id": rec_b.get("id")},
+                    "tournament_id": prepare_tag["tournament_id"],
+                    "match": prepare_tag["match"],
                 }).encode("utf-8"), client_addr)
 
             elif msg_type == "match_reset":
@@ -1208,6 +1316,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # learned memory) are NEVER touched here.
                 print(f"[Server] match_reset "
                       f"({tourney_note()} match={msg.get('match', '')})", flush=True)
+                # Zero-activity gate: a tournament-shaped reset with no
+                # brains loaded (server restarted, or free_mode mid-event)
+                # would answer match_ready off boot brains - a silent
+                # reflex-zombie round. Fail loud instead; the arena's
+                # error path lands the QUIT TO MENU + RESUME screen.
+                if _reset_needs_brains(msg, tournament_mode,
+                                       tourney_a["rec"], tourney_b["rec"]):
+                    sock.sendto(json.dumps(
+                        {"status": "error",
+                         "error": "match_reset: no tournament brains loaded "
+                                  "(server restarted?) - QUIT TO MENU + RESUME"
+                        }).encode("utf-8"), client_addr)
+                    continue
                 brain_alpha.reset_state()
                 brain_beta.reset_state()
                 # Fresh noses: encoder habituation must not carry a

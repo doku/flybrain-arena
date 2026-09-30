@@ -939,6 +939,59 @@ func test_handoff_prebuild_all_groups() -> void:
 		DirAccess.remove_absolute("user://test_prebuild")
 
 
+func test_preload_and_peek() -> void:
+	# Preload plumbing: director peek (same-round known, cross-round
+	# unknown, vacant/bye walked past, roster-served paths), arena echo
+	# validation (stale brains_loaded dropped), bare preload no-op.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	var roster: Array = []
+	for b in ["a", "b", "c", "d"]:
+		roster.append({"id": b, "filename": b + ".flybrain"})
+	D.set("tourney", {"id": "T1", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0, "rounds": [[
+			{"a_id": "a", "b_id": "b", "a_name": "A", "b_name": "B"},
+			{"a_id": "c", "b_id": "d", "a_name": "C", "b_name": "D"}]]})
+	_check(D.call("next_match_params").is_empty(), "peek needs a roster")
+	D.set("brains_cache", roster)
+	D.set("brains_cache_msec", Time.get_ticks_msec())
+	var p: Dictionary = D.call("next_match_params")
+	_check(str(p.get("match", "")) == "R1M2",
+		"peek sees the same-round next match")
+	_check(str(p.get("alpha_path", "")).ends_with("a.flybrain"),
+		"peek resolves alpha path")
+	_check(str(p.get("beta_path", "")).ends_with("b.flybrain"),
+		"peek resolves beta path")
+	_check(str(p.get("tournament_id", "")) == "T1", "peek echoes the tournament")
+	D.set("tourney", {"id": "T1", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 1, "rounds": [[
+			{"a_id": "a", "b_id": "b", "a_name": "A", "b_name": "B"},
+			{"a_id": "c", "b_id": "d", "a_name": "C", "b_name": "D"}]]})
+	_check(D.call("next_match_params").is_empty(), "cross-round peek unknown")
+	D.set("tourney", {"id": "T1", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0, "rounds": [[
+			{"a_id": "a", "b_id": "b", "a_name": "A", "b_name": "B",
+				"winner_id": "a"},
+			{"vacant": true},
+			{"a_id": "c", "b_id": "d", "a_name": "C", "b_name": "D"}]]})
+	var p2: Dictionary = D.call("next_match_params")
+	_check(str(p2.get("match", "")) == "R1M3", "peek walks past bye/vacant")
+	D.free()
+	var A = load("res://scripts/ArenaManager.gd").new()
+	A.set("tournament_active", true)
+	A.set("tourney_awaiting_load", true)
+	A.set("_seq_context", "load")
+	A.set("_seq_last_load", {"tournament_id": "T1", "match": "R1M1"})
+	A.call("_on_brains_loaded", {}, {}, "T2", "R1M2")
+	_check(bool(A.get("tourney_awaiting_load")),
+		"stale brains_loaded dropped (latch holds)")
+	# (Matching-echo acceptance runs on the real scene in test_combat_fx:
+	# the accept path proceeds into _reset_round, which needs real flies.)
+	A.call("_preload_next_match")
+	_check((A.get("_preload_params") as Dictionary).is_empty(),
+		"bare preload no-ops (no director)")
+	A.free()
+
+
 func test_draw_title_dnf() -> void:
 	# Timeout-ties are called DNF, numbered by banked draws.
 	var A = load("res://scripts/ArenaManager.gd").new()

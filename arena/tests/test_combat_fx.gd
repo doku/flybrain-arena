@@ -342,6 +342,38 @@ func test_ko_flash_clears_attacker() -> void:
 	arena.pip_stats_beta.visible = false
 
 
+func test_brains_loaded_accept() -> void:
+	# Match-echo validation, accept side (real scene: the accept path
+	# proceeds into _reset_round, which needs real flies): a matching
+	# echo starts the round; a no-echo reply (old server) passes too.
+	arena.tournament_active = true
+	arena._seq_context = "load"
+	arena.tourney_awaiting_load = true
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._on_brains_loaded({}, {}, "T1", "R1M1")
+	_check(not arena.tourney_awaiting_load, "matching echo accepted")
+	_check(str(arena._seq_context) == "", "accept cleared the load context")
+	# (The round itself starts after _reset_round's landing await - the
+	# single-starter rule; not asserted synchronously here.)
+	arena._seq_context = "load"
+	arena.tourney_awaiting_load = true
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._on_brains_loaded({}, {})
+	_check(not arena.tourney_awaiting_load, "old-server no-echo accepted")
+
+
+func test_load_fail_loud_clears_latch() -> void:
+	# The fail-loud screen clears the load latch: a late reply can
+	# never silently start a round behind it.
+	arena.tournament_active = true
+	arena._seq_context = "load"
+	arena._seq_retried = true
+	arena._seq_deadline_msec = 1
+	arena.tourney_awaiting_load = true
+	arena._check_seq_watchdog()
+	_check(not arena.tourney_awaiting_load, "fail-loud clears the load latch")
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -407,6 +439,8 @@ func _process(_delta: float) -> bool:
 	test_stats_flash_path()
 	test_ko_flash_clears_attacker()
 	test_server_error_routing()
+	test_brains_loaded_accept()
+	test_load_fail_loud_clears_latch()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()
 	test_combat_gate()
