@@ -587,6 +587,11 @@ func _director() -> Node:
 	return _dir_ref
 
 func _enter_tournament_mode() -> void:
+	# Close the round BEFORE the first await: the boot countdowns
+	# (tip-off / resume intermission) run ahead of any load request,
+	# and the scene's is_round_active=true default would fight and
+	# phantom-timeout behind them from the very first physics tick.
+	_close_round_for_wait()
 	tournament_active = true
 	var director := _director()
 	director.arena = self
@@ -4022,6 +4027,18 @@ func _set_combat(on: bool) -> void:
 			fly.call("set_combat_enabled", on)
 
 
+func _close_round_for_wait() -> void:
+	# Bracket-countdown safety: every pre-battle wait view (tip-off,
+	# resume, between groups, before the final, pool wait) opens with
+	# the round CLOSED. The scene default is_round_active=true would
+	# otherwise run the full round pipeline behind the countdown -
+	# steps go out, the 0 s timer times out on the first tick, and a
+	# phantom battle is reported before the official start.
+	# brains_loaded -> _reset_round is the only official starter.
+	is_round_active = false
+	_set_combat(false)
+
+
 func _end_round() -> void:
 	is_round_active = false
 	_set_combat(false)
@@ -4772,6 +4789,9 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 	if director == null:
 		return false
 	_event_skip = false
+	# The countdown is a wait view: no round may run behind it, even
+	# one left live by an unexpected entry path.
+	_close_round_for_wait()
 	bracket_title.text = title
 	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
 		var ov: Dictionary = director.event_overview_data(_event_id())
@@ -4863,6 +4883,7 @@ func _event_pool_wait() -> bool:
 	var director := _director()
 	if director == null:
 		return false
+	_close_round_for_wait()
 	_show_arena_bracket("FINAL REVIEW - PROMOTION READY (%d/%d qualified)" % [
 		_event_pool_ready_count(), EVENT_POOL_TARGET])
 	var waited := 0.0
