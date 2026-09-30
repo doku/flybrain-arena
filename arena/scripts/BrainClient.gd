@@ -6,6 +6,7 @@ signal generation_advanced(new_generation: int, winner: String)
 signal merged(merge_count: int, archived_loser: String)
 signal restarted(round_winner: String)
 signal tournament_battle_received(battle_winner: String, fitness_alpha: float, fitness_beta: float, battle_id: String)
+signal battle_progress_received(battle_id: String)
 signal brains_loaded(alpha_info: Dictionary, beta_info: Dictionary)
 signal match_ready_received()
 signal match_recorded_received()
@@ -179,6 +180,8 @@ func _handle_server_response(data: Dictionary) -> void:
 			float(data.get("fitness_alpha", 0.0)),
 			float(data.get("fitness_beta", 0.0)),
 			str(data.get("battle_id", "")))
+	elif status == "battle_progress":
+		battle_progress_received.emit(str(data.get("battle_id", "")))
 	elif status == "brains_loaded":
 		brains_loaded.emit(data.get("alpha", {}), data.get("beta", {}))
 	elif status == "match_ready":

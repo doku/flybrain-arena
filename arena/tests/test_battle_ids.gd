@@ -40,6 +40,72 @@ func test_expand_battle() -> void:
 	_check(A.expand_battle_id("junk") == "junk", "junk passes through")
 
 
+func test_report_id_unique() -> void:
+	# Cross-group collision-proofing: every report carries a nonce, and
+	# display strips it back to the familiar label.
+	var A = load("res://scripts/ArenaManager.gd")
+	_check(A.expand_battle_id("R1M1-B7-1728001234-5678")
+		== "Round 1, Match 1, Battle 7", "nonce strips in display")
+	_check(A.expand_battle_id("R1M1-B7") == "Round 1, Match 1, Battle 7",
+		"un-nonced legacy still expands")
+	var I = load("res://scripts/ArenaManager.gd").new()
+	I.set("tourney_match_label", "R1M1")
+	var seen := {}
+	for i in range(10):
+		var bid: String = I.call("_current_battle_id")
+		seen[bid] = true
+		_check(A.expand_battle_id(bid) == "Round 1, Match 1, Battle 1",
+			"fresh id displays clean")
+	_check(seen.size() >= 9, "report ids unique per call")
+	I.free()
+
+
+func test_forgivable_reply() -> void:
+	# Post-fail-loud late replies apply only for the still-owed battle.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	A.set("tourney_match_label", "R1M1")
+	A.set("tournament_active", true)
+	_check(not bool(A.call("_forgivable_reply", "R1M1-B7-1-1")),
+		"nothing owed, nothing forgiven")
+	A.set("_seq_forgive_match", {"tournament_id": "", "match": "R1M1",
+		"battle": "R1M1-B7-100-200"})
+	_check(bool(A.call("_forgivable_reply", "R1M1-B7-100-200")),
+		"owed battle forgiven")
+	_check(not bool(A.call("_forgivable_reply", "R1M1-B7-100-201")),
+		"fresh nonce not forgiven")
+	_check(not bool(A.call("_forgivable_reply", "R1M1-B8-100-200")),
+		"other battle not forgiven")
+	A.set("tourney_match_label", "R1M2")
+	_check(not bool(A.call("_forgivable_reply", "R1M1-B7-100-200")),
+		"moved-on match not forgiven")
+	A.set("tourney_match_label", "R1M1")
+	A.set("tournament_active", false)
+	_check(not bool(A.call("_forgivable_reply", "R1M1-B7-100-200")),
+		"free mode not forgiven")
+	A.free()
+
+
+func test_battle_progress_extends() -> void:
+	# Server proof-of-life pushes the confirm deadline out; stray ids
+	# and idle contexts never move it.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	A.set("_seq_context", "battle")
+	A.set("_seq_battle_id", "R1M1-B7-1-1")
+	A.set("_seq_deadline_msec", 1)
+	A.call("_on_battle_progress", "R1M1-B7-1-1")
+	_check(int(A.get("_seq_deadline_msec")) > Time.get_ticks_msec(),
+		"heartbeat extends deadline")
+	A.set("_seq_deadline_msec", 1)
+	A.call("_on_battle_progress", "R1M1-B7-1-2")
+	_check(int(A.get("_seq_deadline_msec")) == 1,
+		"stray id never moves deadline")
+	A.set("_seq_context", "")
+	A.call("_on_battle_progress", "R1M1-B7-1-1")
+	_check(int(A.get("_seq_deadline_msec")) == 1,
+		"idle context never moves deadline")
+	A.free()
+
+
 func test_tournament_id_unique() -> void:
 	# Same-second rebuilds must never share an id (shared ids share a
 	# state file AND the server's battle dedup key).
@@ -67,6 +133,9 @@ func _cleanup() -> void:
 func _initialize() -> void:
 	test_expand_match()
 	test_expand_battle()
+	test_report_id_unique()
+	test_forgivable_reply()
+	test_battle_progress_extends()
 	test_tournament_id_unique()
 	_cleanup()
 	if failures == 0:

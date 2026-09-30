@@ -338,6 +338,12 @@ var _seq_deadline_msec: int = 0
 var _seq_retried: bool = false
 var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
+# Forgiveness context for a banked-but-unconfirmed battle: set at
+# report, cleared when its reply is applied. A post-fail-loud reply
+# matching this triple is applied instead of dropped (self-heals
+# SERVER SILENT when the bank actually landed); anything else stays
+# dropped so a battle is never applied twice.
+var _seq_forgive_match: Dictionary = {}
 const SEQ_TIMEOUT_MSEC: int = 30000
 # Battle reports routinely take ~60 s (dopamine + gain pinning over 25M
 # synapses, then vault writes + journal fsync). A 30 s watchdog fired
@@ -489,6 +495,7 @@ func _ready() -> void:
 	brain_client.merged.connect(_on_merged)
 	brain_client.restarted.connect(_on_restarted)
 	brain_client.tournament_battle_received.connect(_on_tournament_battle)
+	brain_client.battle_progress_received.connect(_on_battle_progress)
 	var _edir := _director()
 	if _edir != null:
 		_edir.async_done.connect(_on_evo_async)
@@ -1098,11 +1105,13 @@ func _on_server_error(error: String) -> void:
 				+ "(the server answers repeats from its stored verdict, no double count)...")
 		if is_instance_valid(status_label):
 			status_label.text = "BATTLE ERROR - RETRYING %s ..." % expand_battle_id(_seq_battle_id)
+		brain_client.reconnect()
 		brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 			bool(q.get("draw", false)), _seq_battle_id,
 			str(q.get("tournament_id", "")), str(q.get("match", "")),
 			q.get("flight_a", {}), q.get("flight_b", {}),
-			false, str(q.get("end_reason", "")), q.get("verdict", {}))
+			bool(q.get("draw_penalty", false)),
+			str(q.get("end_reason", "")), q.get("verdict", {}))
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
@@ -1603,11 +1612,15 @@ func _check_seq_watchdog() -> void:
 				_show_loading("STALLED - RETRYING BATTLE REPORT", retry_sub)
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING BATTLE %s ..." % expand_battle_id(_seq_battle_id)
+			# Heal a poisoned UDP socket before resending: the reply to
+			# the first send may be chasing a dead port already.
+			brain_client.reconnect()
 			brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 				bool(q.get("draw", false)), _seq_battle_id,
 				str(q.get("tournament_id", "")), str(q.get("match", "")),
 				q.get("flight_a", {}), q.get("flight_b", {}),
-				false, str(q.get("end_reason", "")), q.get("verdict", {}))
+				bool(q.get("draw_penalty", false)),
+				str(q.get("end_reason", "")), q.get("verdict", {}))
 			return
 		_tourney_awaiting_battle = false
 		_clear_seq()
@@ -3096,10 +3109,11 @@ static func expand_match_label(code: String) -> String:
 
 
 static func expand_battle_id(code: String) -> String:
-	# "R1M1-B1" -> "Round 1, Match 1, Battle 1". Display only.
+	# "R1M1-B1[-<msec>-<rand>]" -> "Round 1, Match 1, Battle 1".
+	# Display only: the report nonce (uniqueness) strips here.
 	if _RX_BATTLE == null:
 		_RX_BATTLE = RegEx.new()
-		_RX_BATTLE.compile("^(.*)-B(\\d+)$")
+		_RX_BATTLE.compile("^(.*)-B(\\d+)(?:-\\d+-\\d+)?$")
 	var m := _RX_BATTLE.search(code.strip_edges())
 	if m == null:
 		return expand_match_label(code)
@@ -3110,8 +3124,15 @@ static func expand_battle_id(code: String) -> String:
 
 
 func _current_battle_id() -> String:
-	# Correlation-only id, echoed by the server for log matching.
-	return "%s-B%d" % [tourney_match_label, _battle_count() + 1]
+	# Globally unique per report: base R1M1-B7 plus msec + random nonce,
+	# so group A's R1M1-B7 and group C's R1M1-B7 (or a QUIT+RESUME
+	# replay) never share an id string. Retries resend the STORED id
+	# (exact resend -> server dedups); a genuinely new report for the
+	# same battle slot replays via the base triple (tournament, match,
+	# base) server-side instead of double-banking. Display strips the
+	# nonce (expand_battle_id); matcher compares full strings.
+	return "%s-B%d-%d-%d" % [tourney_match_label, _battle_count() + 1,
+		Time.get_ticks_msec(), randi() % 100000]
 
 func _show_loading(title: String, sub: String, title_color: Color = Color(0.85, 0.85, 0.9)) -> void:
 	# Persistent overlay (no countdown): proves the game is waiting on the
@@ -3299,12 +3320,15 @@ func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	# draw_penalty marks a 3rd draw so the server docks both ELOs.
 	_seq_battle_id = _current_battle_id()
 	_tourney_awaiting_battle = true
+	_seq_forgive_match = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "battle": _seq_battle_id}
 	var fa := _flight_summary(flight_alpha, fly_alpha)
 	var fb := _flight_summary(flight_beta, fly_beta)
 	_last_verdict = _compose_verdict(draw)
 	_seq_last_round = {
 		"stats_a": stats_alpha.duplicate(), "stats_b": stats_beta.duplicate(),
-		"draw": draw, "tournament_id": _tourney_id(), "match": tourney_match_label,
+		"draw": draw, "draw_penalty": draw_penalty,
+		"tournament_id": _tourney_id(), "match": tourney_match_label,
 		"flight_a": fa, "flight_b": fb,
 		"end_reason": str(_last_verdict.get("end_reason", "")),
 		"verdict": _last_verdict.duplicate()}
@@ -4018,16 +4042,49 @@ func _end_round() -> void:
 	brain_client.send_round_over(stats_alpha, stats_beta, false, free_id, "", "", fa, fb,
 		false, str(_last_verdict.get("end_reason", "")), _last_verdict)
 
+func _forgivable_reply(battle_id: String) -> bool:
+	# True when a post-fail-loud reply is the still-owed battle (same
+	# full nonce id, same tournament file, same match label, still in
+	# a tournament): applying it heals a false-positive SERVER SILENT.
+	# Pure (unit-tested).
+	if _seq_forgive_match.is_empty():
+		return false
+	if battle_id != str(_seq_forgive_match.get("battle", "")):
+		return false
+	if str(_seq_forgive_match.get("tournament_id", "")) != _tourney_id():
+		return false
+	if str(_seq_forgive_match.get("match", "")) != tourney_match_label:
+		return false
+	return tournament_active
+
+
+func _on_battle_progress(battle_id: String) -> void:
+	# Server proof-of-life while banking: extend the battle deadline a
+	# full window from each heartbeat instead of firing a duplicate
+	# report that doubles the server's work. Stray ids never move it.
+	if _seq_context == "battle" and battle_id != "" \
+			and battle_id == _seq_battle_id:
+		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("battle")
+
+
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
 	# Server already banked dopamine + records + weights to the vault.
 	# The roster cache can't see server-side writes, so it invalidates
 	# here (clear only — the next gap tick/load refreshes; mid-battle
 	# callers serve stale by design, never shell).
 	# Late replies after a fail-loud battle timeout are dropped here so a
-	# battle is never applied twice.
+	# battle is never applied twice - UNLESS the reply matches the
+	# still-owed forgive triple (banked but unconfirmed: the fail-loud
+	# was a false positive). Forgiven replies fall through and apply;
+	# anything else stays dropped.
 	if not _tourney_awaiting_battle:
-		print("[Arena] Ignoring late/duplicate tournament_battle (id=", _battle_id, ")")
-		return
+		if _battle_id != "" and _forgivable_reply(_battle_id):
+			print("[Arena] Forgiving late tournament_battle (id=",
+				_battle_id, "): banked but unconfirmed, applying now.")
+		else:
+			print("[Arena] Ignoring late/duplicate tournament_battle (id=",
+				_battle_id, ")")
+			return
 	var bdirector := _director()
 	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
 		bdirector.call("invalidate_brains_cache")
@@ -4037,6 +4094,9 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 		return
 	_tourney_awaiting_battle = false
 	_clear_seq()
+	# Consuming the owed reply closes the forgive window: any further
+	# duplicate of this battle drops at the guards above.
+	_seq_forgive_match = {}
 	# The wait bracket stays raised through the NEXT BATTLE callout
 	# (countdown plays above it): the reset-wait re-show after the
 	# timer refreshes the header. Preview clears here - the re-show

@@ -312,12 +312,14 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
     live_weights = weights
     weights = {}
     _t_journal = time.perf_counter()
+    _emit_progress(sock, client_addr, battle_id, "journal")
     _write_pending_battle(battle_key, resp, records, weights)
     # Live path: bank post-learning weights while the journal still
     # guards the records. Crash here replays the bumped records (sidecar
     # path) while weights fall back to pre-battle — approved tradeoff.
     # st["rec"] sync + verdict land in recover below.
     _t_weights = time.perf_counter()
+    _emit_progress(sock, client_addr, battle_id, "weights")
     for entry in records:
         side = entry["side"]
         if side in live_weights:
@@ -327,6 +329,7 @@ def _handle_tournament_round_over(sock, client_addr, msg, winner, fit_a, fit_b,
             vault_pkg.save_brain(entry["record"], live_weights[side],
                                  backup=False, fast=False)
     _t_recover = time.perf_counter()
+    _emit_progress(sock, client_addr, battle_id, "recover")
     _recover_pending_battle((tourney_a, tourney_b))
     print(f"[Server] battle {battle_id or '?'}: journal "
           f"{_t_weights - _t_journal:.1f}s + weights "
@@ -518,6 +521,45 @@ def _write_last_verdict(key, result):
     os.replace(tmp, _last_verdict_path())
 
 
+def _report_base(battle_id):
+    """Strips the arena's report nonce (R1M1-B7-<msec>-<rand> -> R1M1-B7).
+    Anything without a nonce tail passes through untouched."""
+    bid = str(battle_id or "")
+    if "-B" not in bid:
+        return bid
+    head, _, tail = bid.rpartition("-B")
+    parts = tail.split("-")
+    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+        return "%s-B%s" % (head, parts[0])
+    return bid
+
+
+def _same_battle_slot(stored_key, battle_key):
+    """True when a report names the same battle slot as the stored verdict
+    (same tournament file, match, base id, draw flag) under a fresh nonce:
+    a QUIT+RESUME replay of a banked-but-unconfirmed battle. Genuinely new
+    battles always differ in base id, cross-group battles in tournament_id."""
+    if not isinstance(stored_key, dict) or not isinstance(battle_key, dict):
+        return False
+    for f in ("tournament_id", "match", "draw"):
+        if stored_key.get(f) != battle_key.get(f):
+            return False
+    return _report_base(stored_key.get("battle_id")) == \
+        _report_base(battle_key.get("battle_id"))
+
+
+def _emit_progress(sock, client_addr, battle_id, stage):
+    """Proof-of-life while a battle banks: the arena extends its confirm
+    deadline on each heartbeat instead of firing a duplicate report that
+    doubles this work. Best-effort (never breaks banking)."""
+    try:
+        sock.sendto(json.dumps({"status": "battle_progress",
+                                "battle_id": battle_id,
+                                "stage": stage}).encode("utf-8"), client_addr)
+    except OSError:
+        pass
+
+
 def _pending_battle_path():
     return os.path.join(PROJECT_ROOT, "tournaments", "_pending_battle.npz")
 
@@ -583,10 +625,16 @@ def _recover_pending_battle(states=()):
             os.replace(path, bad)
         except OSError:
             pass
+        # Auto-reconcile: a torn journal can never replay, and failing
+        # every message on it wedges the server (retries, loads, resets
+        # all take the recovery error path). The un-replayed bumps are
+        # lost, but the arena's in-flight retry re-banks the battle fresh
+        # on the same idempotency key, so serving continues exactly-once.
         print(f"[Server] QUARANTINED unreadable pending battle journal -> "
-              f"{bad} ({e}). Vault files may be half-written; reconcile "
-              f"before resuming.", flush=True)
-        raise
+              f"{bad} ({e}). Its record bumps were NOT replayed; the next "
+              f"report for that battle re-banks them. Serving continues.",
+              flush=True)
+        return
     # Phase 2: replay. Failures here (vault/verdict IO) leave the journal
     # in place so the next message or boot retries the SAME record bumps.
     for entry in transaction["records"]:
@@ -999,6 +1047,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             except OSError as e:
                                 print(f"[Server] resend failed: {e}", flush=True)
                             continue
+                        if stored is not None and _same_battle_slot(
+                                stored.get("key"), battle_key):
+                            print(f"[Server] Replay {battle_key['match']}-"
+                                  f"{_report_base(battle_id)} "
+                                  f"({battle_key['tournament_id']}) under a fresh "
+                                  f"nonce: banked already, resending stored "
+                                  f"verdict, no re-bank.", flush=True)
+                            try:
+                                sock.sendto(json.dumps(
+                                    stored["result"]).encode("utf-8"), client_addr)
+                            except OSError as e:
+                                print(f"[Server] resend failed: {e}", flush=True)
+                            continue
                     else:
                         battle_key = None
                     if tournament_mode:
@@ -1046,6 +1107,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                         # evaluate_match still names a fitness "winner" on
                         # ties, and banking +pulse/-0.8*pulse on that basis
                         # would teach a win/loss split for a drawn fight.
+                        if tournament_mode and battle_id:
+                            _emit_progress(sock, client_addr, battle_id,
+                                           "dopamine")
                         _apply_round_learning(
                             dopamine_rl, brain_alpha, brain_beta, winner,
                             last_sens_a, last_sens_b, last_ctrl_a, last_ctrl_b,

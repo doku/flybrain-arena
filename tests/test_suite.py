@@ -6594,8 +6594,9 @@ class TestBattleTransaction(unittest.TestCase):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(b"not a zip at all")
-        with self.assertRaises(Exception):
-            self.srv._recover_pending_battle()
+        # Auto-reconcile: quarantine + serve on, never raise into the
+        # message loop (a raise here wedged every later message).
+        self.srv._recover_pending_battle()
         self.assertFalse(os.path.exists(p))
         quarantined = [f for f in os.listdir(os.path.dirname(p))
                        if f.startswith("_pending_battle.npz.corrupt-")]
@@ -6640,8 +6641,9 @@ class TestBattleTransaction(unittest.TestCase):
         p = self.srv._pending_battle_path()
         os.remove(vault_pkg.package_path(rec_a))
         os.remove(vault_pkg.package_path(rec_b))
-        with self.assertRaises(Exception):
-            self.srv._recover_pending_battle()
+        # Auto-reconcile: quarantine + serve on, never raise into the
+        # message loop (a raise here wedged every later message).
+        self.srv._recover_pending_battle()
         self.assertFalse(os.path.exists(p))
         quarantined = [f for f in os.listdir(os.path.dirname(p))
                        if f.startswith("_pending_battle.npz.corrupt-")]
@@ -6711,6 +6713,36 @@ class TestSeizureDetection(unittest.TestCase):
         self.assertLessEqual(SEIZURE_DRAIN, 5.0)
         # Full health survives 10 s of continuous seizure.
         self.assertGreater(100.0 - SEIZURE_DRAIN * 10.0, 0.0)
+
+
+class TestReportIdentity(unittest.TestCase):
+    """Report-id uniqueness + resume-replay dedup: group A and group C
+    must never share an id string, and a fresh-nonce replay of an
+    already-banked battle slot must match the stored verdict."""
+    def test_report_base_strips_nonce(self):
+        import brain_server as bs
+        self.assertEqual(bs._report_base("R1M1-B7-1728001234-5678"), "R1M1-B7")
+        self.assertEqual(bs._report_base("R1M1-B7"), "R1M1-B7")
+        self.assertEqual(bs._report_base("FREE-123456"), "FREE-123456")
+        self.assertEqual(bs._report_base(""), "")
+
+    def test_same_slot_replay_matches(self):
+        import brain_server as bs
+        stored = {"tournament_id": "TC", "match": "R1M1",
+                  "battle_id": "R1M1-B7-100-200", "draw": False}
+        replay = {"tournament_id": "TC", "match": "R1M1",
+                  "battle_id": "R1M1-B7-999-111", "draw": False}
+        self.assertTrue(bs._same_battle_slot(stored, replay))
+        other_group = dict(replay, tournament_id="TA")
+        self.assertFalse(bs._same_battle_slot(stored, other_group))
+        other_battle = dict(replay, battle_id="R1M1-B8-999-111")
+        self.assertFalse(bs._same_battle_slot(stored, other_battle))
+        other_match = dict(replay, match="R1M2")
+        self.assertFalse(bs._same_battle_slot(stored, other_match))
+        flipped_draw = dict(replay, draw=True)
+        self.assertFalse(bs._same_battle_slot(stored, flipped_draw))
+        self.assertFalse(bs._same_battle_slot(None, replay))
+        self.assertFalse(bs._same_battle_slot(stored, None))
 
 
 if __name__ == "__main__":
