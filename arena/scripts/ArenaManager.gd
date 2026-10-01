@@ -430,14 +430,30 @@ var _pip_tick := 0
 var _pip_hidden := false
 # PiP-slot modes, cycled by the BRAIN button: EYES (fly-head cams),
 # BRAIN (cams parked on the spinning 3D clouds), STATS (live fly stat
-# cards instead of viewports).
-const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS"]
+# cards instead of viewports), MOTORS (live motor-command debug: text
+# rows + bipolar bars + scrolling command traces per fly).
+const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS", "MOTORS"]
 var pip_slot_mode := "STATS"
 var pip_stats_alpha: Label
 var pip_stats_beta: Label
 var pip_flash_alpha: ColorRect
 var pip_flash_beta: ColorRect
 var pip_name_alpha: Label
+# Motor debug (MOTORS PiP slot): last-120 command snapshots per side
+# for the scrolling traces, consecutive zero-spike replies per side
+# for the silence badge, spike-rate EMAs for the tick readout.
+const MOTOR_TRACE_MAX := 120
+const MOTOR_SILENT_REPLIES := 10
+var _motor_trace_alpha: Array = []
+var _motor_trace_beta: Array = []
+var _motor_silent_alpha := 0
+var _motor_silent_beta := 0
+var _motor_spike_ema_alpha := 0.0
+var _motor_spike_ema_beta := 0.0
+var pip_motor_bars_alpha: Array = []
+var pip_motor_bars_beta: Array = []
+var pip_motor_trace_alpha: Control
+var pip_motor_trace_beta: Control
 var pip_name_beta: Label
 # Active flash tweens (one per wash rect / per label, previous killed
 # on re-flash): the KO presentation must stop the attacker's fading
@@ -2058,6 +2074,72 @@ func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 	return l
 
 
+func _make_pip_motors(parent: Node, left_side: bool) -> void:
+	# MOTORS-slot debug widgets in the same card rect: 4 bipolar
+	# command bars (thrust 0..1, yaw/pitch/roll -1..+1) plus a scrolling
+	# command-trace canvas below. Same geometry both sides; hidden
+	# unless the PiP slot is MOTORS.
+	var is_alpha := left_side
+	var bars: Array = []
+	var keys := ["t", "y", "p", "r"]
+	var mins := [0.0, -1.0, -1.0, -1.0]
+	var fills := [TEAM_ALPHA if is_alpha else TEAM_BETA, Color(1, 1, 1),
+		Color(1.0, 0.85, 0.3), Color(0.35, 0.85, 1.0)]
+	for i in range(4):
+		var bar := ProgressBar.new()
+		if left_side:
+			bar.set_anchors_preset(Control.PRESET_TOP_LEFT)
+			bar.offset_left = 16.0
+			bar.offset_right = 316.0
+		else:
+			bar.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+			bar.anchor_left = 1.0
+			bar.anchor_right = 1.0
+			bar.offset_left = -316.0
+			bar.offset_right = -16.0
+		bar.offset_top = 148.0 + float(i) * 20.0
+		bar.offset_bottom = 164.0 + float(i) * 20.0
+		bar.min_value = mins[i]
+		bar.max_value = 1.0
+		bar.value = 0.0
+		bar.show_percentage = false
+		var bg := StyleBoxFlat.new()
+		bg.bg_color = Color(0, 0, 0, 0.45)
+		bar.add_theme_stylebox_override("background", bg)
+		var fill := StyleBoxFlat.new()
+		fill.bg_color = fills[i]
+		bar.add_theme_stylebox_override("fill", fill)
+		bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		bar.visible = false
+		parent.add_child(bar)
+		bars.append(bar)
+	if is_alpha:
+		pip_motor_bars_alpha = bars
+	else:
+		pip_motor_bars_beta = bars
+	var trace := Control.new()
+	if left_side:
+		trace.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		trace.offset_left = 16.0
+		trace.offset_right = 316.0
+	else:
+		trace.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		trace.anchor_left = 1.0
+		trace.anchor_right = 1.0
+		trace.offset_left = -316.0
+		trace.offset_right = -16.0
+	trace.offset_top = 232.0
+	trace.offset_bottom = 316.0
+	trace.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	trace.visible = false
+	parent.add_child(trace)
+	trace.draw.connect(_on_motor_trace_draw.bind("alpha" if is_alpha else "beta"))
+	if is_alpha:
+		pip_motor_trace_alpha = trace
+	else:
+		pip_motor_trace_beta = trace
+
+
 func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
 		tr: Dictionary, parents: Dictionary, live: Dictionary,
 		st: Dictionary, match_draws: int = 0) -> PackedStringArray:
@@ -2170,13 +2252,14 @@ func _apply_pip_slot() -> void:
 	# per-tick pump below handles cameras and stat refresh).
 	var eyes := pip_slot_mode == "EYES"
 	var brain := pip_slot_mode == "BRAIN"
+	var motors := pip_slot_mode == "MOTORS"
 	if pip_stats_alpha == null and is_instance_valid(pip_alpha_box):
 		pip_stats_alpha = _make_pip_stats(pip_alpha_box.get_parent(), true)
 	if pip_stats_beta == null and is_instance_valid(pip_beta_box):
 		pip_stats_beta = _make_pip_stats(pip_beta_box.get_parent(), false)
-	# STATS mode hides the viewport boxes outright (otherwise the
-	# last eye frame sits frozen behind the stat cards).
-	var show_views := perf_pip and pip_slot_mode != "STATS"
+	# STATS and MOTORS hide the viewport boxes outright (otherwise the
+	# last eye frame sits frozen behind the cards).
+	var show_views := perf_pip and pip_slot_mode != "STATS" and not motors
 	for n in [pip_alpha_box, pip_beta_box]:
 		if is_instance_valid(n):
 			(n as Control).visible = show_views
@@ -2184,9 +2267,9 @@ func _apply_pip_slot() -> void:
 		if is_instance_valid(n):
 			(n as Control).visible = perf_pip and eyes
 	if is_instance_valid(pip_stats_alpha):
-		pip_stats_alpha.visible = perf_pip and not eyes and pip_slot_mode == "STATS"
+		pip_stats_alpha.visible = perf_pip and not eyes and (pip_slot_mode == "STATS" or motors)
 	if is_instance_valid(pip_stats_beta):
-		pip_stats_beta.visible = perf_pip and not eyes and pip_slot_mode == "STATS"
+		pip_stats_beta.visible = perf_pip and not eyes and (pip_slot_mode == "STATS" or motors)
 	if is_instance_valid(pip_name_alpha):
 		pip_name_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
 	if is_instance_valid(pip_name_beta):
@@ -2195,6 +2278,19 @@ func _apply_pip_slot() -> void:
 		pip_flash_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
 	if is_instance_valid(pip_flash_beta):
 		pip_flash_beta.visible = pip_stats_beta.visible if is_instance_valid(pip_stats_beta) else false
+	# Motor debug widgets (bars + trace per side): built lazily like
+	# the stat cards, shown only in MOTORS mode.
+	if pip_motor_bars_alpha.is_empty() and is_instance_valid(pip_alpha_box):
+		_make_pip_motors(pip_alpha_box.get_parent(), true)
+	if pip_motor_bars_beta.is_empty() and is_instance_valid(pip_beta_box):
+		_make_pip_motors(pip_beta_box.get_parent(), false)
+	for bar in pip_motor_bars_alpha + pip_motor_bars_beta:
+		if is_instance_valid(bar):
+			(bar as Control).visible = perf_pip and motors
+	if is_instance_valid(pip_motor_trace_alpha):
+		pip_motor_trace_alpha.visible = perf_pip and motors
+	if is_instance_valid(pip_motor_trace_beta):
+		pip_motor_trace_beta.visible = perf_pip and motors
 	if eyes:
 		if is_instance_valid(pip_alpha_label):
 			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
@@ -2213,6 +2309,119 @@ func _apply_pip_slot() -> void:
 			bv_cloud_beta.visible = true
 	else:
 		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+
+
+static func _motor_debug_text(ctrl: Dictionary, spike_rate: float, silent_n: int) -> String:
+	# Pure builder for the MOTORS card text: command values with a sign
+	# legend (+yaw=right, +pitch=climb, +roll=bank-right), spike rate,
+	# and the silence badge once the quiet streak passes the threshold.
+	# Unit-tested.
+	var t := float(ctrl.get("thrust", 0.0))
+	var y := float(ctrl.get("yaw_torque", 0.0))
+	var p := float(ctrl.get("pitch_torque", 0.0))
+	var r := float(ctrl.get("roll_torque", 0.0))
+	var sp := float(ctrl.get("spear_thrust", 0.0))
+	var ram := float(ctrl.get("ram_drive", 0.0))
+	var ev := "EVADE" if bool(ctrl.get("emergency_evade", false)) else "-"
+	var yd := "R" if y > 0.05 else ("L" if y < -0.05 else "-")
+	var text := "THR %.2f   SPK %.0f/s\nYAW %+.2f%s\nPITCH %+.2f\nROLL %+.2f\nSPEAR %.2f RAM %.1f %s\nY+:right P+:climb R+:bankR" % [
+		t, spike_rate, y, yd, p, r, sp, ram, ev]
+	if silent_n >= MOTOR_SILENT_REPLIES:
+		text += "\nSILENT (reflex only)"
+	return text
+
+
+func _set_motor_bars(bars: Array, ctrl: Dictionary) -> void:
+	# Pushes the latest command into the 4 bipolar meters (thrust 0..1,
+	# yaw/pitch/roll -1..+1). Guards the build order.
+	if bars.size() < 4:
+		return
+	var vals := [float(ctrl.get("thrust", 0.0)),
+		float(ctrl.get("yaw_torque", 0.0)),
+		float(ctrl.get("pitch_torque", 0.0)),
+		float(ctrl.get("roll_torque", 0.0))]
+	for i in range(4):
+		var bar = bars[i]
+		if is_instance_valid(bar):
+			(bar as ProgressBar).value = clampf(vals[i],
+				0.0 if i == 0 else -1.0, 1.0)
+
+
+func _on_motor_trace_draw(side: String) -> void:
+	# Scrolling command traces: thrust 0..1 (top-down) + yaw/pitch/roll
+	# -1..+1 around the zero line, over the last MOTOR_TRACE_MAX
+	# replies. Drawn only while the MOTORS slot shows the canvas.
+	var trace_ctl: Control = pip_motor_trace_alpha if side == "alpha" else pip_motor_trace_beta
+	if not is_instance_valid(trace_ctl):
+		return
+	var buf: Array = _motor_trace_alpha if side == "alpha" else _motor_trace_beta
+	var w := trace_ctl.size.x
+	var h := trace_ctl.size.y
+	if w <= 0.0 or h <= 0.0 or buf.is_empty():
+		return
+	trace_ctl.draw_line(Vector2(0, h * 0.5), Vector2(w, h * 0.5),
+		Color(1, 1, 1, 0.25))
+	var cols := {"t": Color(0.45, 0.85, 0.5), "y": Color(1, 1, 1),
+		"p": Color(1.0, 0.85, 0.3), "r": Color(0.35, 0.85, 1.0)}
+	var n := buf.size()
+	for key in ["t", "y", "p", "r"]:
+		var pts := PackedVector2Array()
+		for i in range(n):
+			var v := float((buf[i] as Dictionary).get(key, 0.0))
+			var yn := h - (v * h) if key == "t" else h * 0.5 - (v * h * 0.5)
+			pts.append(Vector2(w * float(i) / float(maxi(n - 1, 1)),
+				clampf(yn, 0.0, h)))
+		if pts.size() > 1:
+			trace_ctl.draw_polyline(pts, cols[key], 1.0)
+
+
+func _push_motor_sample(side: String, ctrl: Dictionary, st: Dictionary) -> void:
+	# Per-reply motor telemetry: command snapshot onto the trace ring,
+	# silence streak + spike EMA for the badge/readout. A few floats
+	# per reply - always on, drawing gated on MOTORS visibility.
+	var trace: Array = _motor_trace_alpha if side == "alpha" else _motor_trace_beta
+	trace.append({"t": float(ctrl.get("thrust", 0.0)),
+		"y": float(ctrl.get("yaw_torque", 0.0)),
+		"p": float(ctrl.get("pitch_torque", 0.0)),
+		"r": float(ctrl.get("roll_torque", 0.0))})
+	while trace.size() > MOTOR_TRACE_MAX:
+		trace.pop_front()
+	var spikes := int(st.get("spikes", 0))
+	if side == "alpha":
+		_motor_spike_ema_alpha = lerpf(_motor_spike_ema_alpha, float(spikes), 0.35)
+		if spikes == 0:
+			_motor_silent_alpha += 1
+			if _motor_silent_alpha == MOTOR_SILENT_REPLIES \
+					and is_instance_valid(status_label):
+				status_label.text = "%s BRAIN SILENT (reflex only)" % _slot_name("alpha")
+		else:
+			_motor_silent_alpha = 0
+	else:
+		_motor_spike_ema_beta = lerpf(_motor_spike_ema_beta, float(spikes), 0.35)
+		if spikes == 0:
+			_motor_silent_beta += 1
+			if _motor_silent_beta == MOTOR_SILENT_REPLIES \
+					and is_instance_valid(status_label):
+				status_label.text = "%s BRAIN SILENT (reflex only)" % _slot_name("beta")
+		else:
+			_motor_silent_beta = 0
+
+
+func _update_motor_cards() -> void:
+	# MOTORS slot refresh (10 Hz tick): debug text + bar values +
+	# trace redraw per side. Silence badge state lives in the text.
+	var hz := 1.0 / maxf(bv_reply_ema, 0.001)
+	for side in ["alpha", "beta"]:
+		var ctrl: Dictionary = _last_ctrl_a if side == "alpha" else _last_ctrl_b
+		var ema := _motor_spike_ema_alpha if side == "alpha" else _motor_spike_ema_beta
+		var silent := _motor_silent_alpha if side == "alpha" else _motor_silent_beta
+		var body: Label = pip_stats_alpha if side == "alpha" else pip_stats_beta
+		if is_instance_valid(body):
+			body.text = _motor_debug_text(ctrl, ema * hz, silent)
+		_set_motor_bars(pip_motor_bars_alpha if side == "alpha" else pip_motor_bars_beta, ctrl)
+		var trace: Control = pip_motor_trace_alpha if side == "alpha" else pip_motor_trace_beta
+		if is_instance_valid(trace):
+			trace.queue_redraw()
 
 
 func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
@@ -2258,6 +2467,11 @@ func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 				bv_cloud_alpha.visible = true
 			if is_instance_valid(bv_cloud_beta):
 				bv_cloud_beta.visible = true
+		elif pip_slot_mode == "MOTORS":
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+			_update_motor_cards()
 		else:
 			for v in [pip_alpha_view, pip_beta_view]:
 				if is_instance_valid(v):
@@ -2858,7 +3072,8 @@ func _on_brain_button() -> void:
 		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 	else:
 		# Panels already up: advance the PiP slot instead (EYES ->
-		# BRAIN 3D -> fly STATS). Diagram layers still cycle on N.
+		# BRAIN 3D -> fly STATS -> MOTORS debug). Diagram layers still
+		# cycle on N.
 		pip_slot_mode = pip_slot_next(pip_slot_mode)
 		_apply_pip_slot()
 		if is_instance_valid(status_label):
@@ -4010,6 +4225,8 @@ func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int,
 	# here is one assignment per reply, no copies.
 	_last_ctrl_a = ctrl_alpha
 	_last_ctrl_b = ctrl_beta
+	_push_motor_sample("alpha", ctrl_alpha, stats.get("alpha", {}))
+	_push_motor_sample("beta", ctrl_beta, stats.get("beta", {}))
 	if is_instance_valid(fly_alpha):
 		fly_alpha.hold_tau = bv_shared_tau
 	if is_instance_valid(fly_beta):

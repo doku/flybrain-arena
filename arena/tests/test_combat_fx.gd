@@ -449,6 +449,35 @@ func test_server_brain_loss_reloads() -> void:
 	_check(arena._server_reloads == 0, "unrelated errors never reload")
 
 
+func test_motors_slot() -> void:
+	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
+	# refresh from the last command; the silence badge flips on a
+	# quiet streak; STATS restores the old visibility.
+	arena.pip_slot_mode = "MOTORS"
+	arena._apply_pip_slot()
+	_check(arena.pip_motor_bars_alpha.size() == 4, "motor bars built")
+	var bar0: ProgressBar = arena.pip_motor_bars_alpha[0]
+	_check(bar0.visible, "motor bars show in MOTORS")
+	_check(arena.pip_motor_trace_alpha.visible, "trace shows in MOTORS")
+	_check(not arena.pip_alpha_box.visible, "views hide in MOTORS")
+	arena._last_ctrl_a = {"thrust": 0.5, "yaw_torque": -0.4,
+		"pitch_torque": 0.0, "roll_torque": 0.0}
+	arena._update_motor_cards()
+	_check(str(arena.pip_stats_alpha.text).contains("THR 0.50"),
+		"motor text refreshes")
+	_check(absf(float(bar0.value) - 0.5) < 0.001, "motor bars refresh")
+	for i in range(10):
+		arena._push_motor_sample("alpha", {}, {"spikes": 0})
+	arena._update_motor_cards()
+	_check(str(arena.pip_stats_alpha.text).contains("SILENT"),
+		"silence badge shows")
+	arena.pip_slot_mode = "STATS"
+	arena._apply_pip_slot()
+	_check(not bar0.visible, "motor bars hide outside MOTORS")
+	_check(not arena.pip_motor_trace_alpha.visible,
+		"trace hides outside MOTORS")
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -520,6 +549,7 @@ func _process(_delta: float) -> bool:
 	test_forgivable_matchbank()
 	test_matchbank_retry()
 	test_server_brain_loss_reloads()
+	test_motors_slot()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()
 	test_combat_gate()

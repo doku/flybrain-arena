@@ -491,11 +491,13 @@ func test_pip_slot_defaults() -> void:
 
 
 func test_pip_slot_cycle() -> void:
-	# PiP slot rotation: EYES -> BRAIN -> STATS -> EYES; junk resets.
+	# PiP slot rotation: EYES -> BRAIN -> STATS -> MOTORS -> EYES;
+	# junk resets.
 	var A = load("res://scripts/ArenaManager.gd").new()
 	_check(A.call("pip_slot_next", "EYES") == "BRAIN", "eyes to brain")
 	_check(A.call("pip_slot_next", "BRAIN") == "STATS", "brain to stats")
-	_check(A.call("pip_slot_next", "STATS") == "EYES", "stats wraps to eyes")
+	_check(A.call("pip_slot_next", "STATS") == "MOTORS", "stats to motors")
+	_check(A.call("pip_slot_next", "MOTORS") == "EYES", "motors wraps to eyes")
 	_check(A.call("pip_slot_next", "junk") == "EYES", "unknown resets")
 	A.free()
 
@@ -1025,6 +1027,52 @@ func test_match_batch_flow() -> void:
 	A.free()
 
 
+func test_motor_debug() -> void:
+	# MOTORS PiP debug: text formatting, silence streak counting,
+	# trace ring cap, bar value mapping + clamping. (The 4-mode cycle
+	# itself is pinned in test_pip_slot_cycle.)
+	var A = load("res://scripts/ArenaManager.gd").new()
+	var t: String = A.call("_motor_debug_text",
+		{"thrust": 0.62, "yaw_torque": 0.31, "pitch_torque": -0.12,
+			"roll_torque": 0.05, "spear_thrust": 0.0, "ram_drive": 0.0,
+			"emergency_evade": false}, 142.0, 0)
+	_check(t == "THR 0.62   SPK 142/s\nYAW +0.31R\nPITCH -0.12\nROLL +0.05\nSPEAR 0.00 RAM 0.0 -\nY+:right P+:climb R+:bankR",
+		"motor text formats")
+	var t9: String = A.call("_motor_debug_text", {}, 0.0, 9)
+	_check(not t9.contains("SILENT"), "no badge below threshold")
+	var t10: String = A.call("_motor_debug_text", {}, 0.0, 10)
+	_check(t10.contains("SILENT (reflex only)"), "badge at threshold")
+	for i in range(10):
+		A.call("_push_motor_sample", "alpha", {}, {"spikes": 0})
+	_check(int(A.get("_motor_silent_alpha")) == 10, "silence streak counts")
+	A.call("_push_motor_sample", "alpha", {}, {"spikes": 5})
+	_check(int(A.get("_motor_silent_alpha")) == 0, "spikes reset the streak")
+	for i in range(130):
+		A.call("_push_motor_sample", "beta", {"thrust": 0.5}, {"spikes": 3})
+	_check((A.get("_motor_trace_beta") as Array).size() == 120,
+		"trace ring caps")
+	var bars: Array = []
+	for i in range(4):
+		var b := ProgressBar.new()
+		b.min_value = 0.0 if i == 0 else -1.0
+		b.max_value = 1.0
+		bars.append(b)
+	A.call("_set_motor_bars", bars,
+		{"thrust": 2.0, "yaw_torque": -2.0, "pitch_torque": 0.5,
+			"roll_torque": -0.25})
+	_check(float((bars[0] as ProgressBar).value) == 1.0, "thrust clamps high")
+	_check(float((bars[1] as ProgressBar).value) == -1.0, "yaw clamps low")
+	_check(absf(float((bars[2] as ProgressBar).value) - 0.5) < 0.001,
+		"pitch passes")
+	_check(absf(float((bars[3] as ProgressBar).value) + 0.25) < 0.001,
+		"roll passes")
+	A.call("_set_motor_bars", [], {})
+	_check(true, "empty bars no-op")
+	for b in bars:
+		(b as ProgressBar).free()
+	A.free()
+
+
 func test_draw_title_dnf() -> void:
 	# Timeout-ties are called DNF, numbered by banked draws.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -1335,6 +1383,7 @@ func _initialize() -> void:
 	test_handoff_prebuild_all_groups()
 	test_preload_and_peek()
 	test_match_batch_flow()
+	test_motor_debug()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()
