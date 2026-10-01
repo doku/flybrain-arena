@@ -2168,6 +2168,16 @@ func _make_pip_motors(parent: Node, left_side: bool) -> void:
 	else:
 		pip_motor_trace_beta = trace
 		pip_motor_scope_beta = scope
+	# Z-order: these build lazily on first MOTORS entry, long after the
+	# bracket overlay - without this they would draw ON TOP of it (the
+	# stat cards avoid this via move_child 0/1/2 at build). Tuck every
+	# widget just below the bracket overlay, which itself stays below
+	# the WinnerOverlay callouts.
+	if is_instance_valid(bracket_overlay):
+		var below := bracket_overlay.get_index()
+		for w in bars + [trace, scope]:
+			if is_instance_valid(w):
+				parent.move_child(w, below)
 
 
 func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,

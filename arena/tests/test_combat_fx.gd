@@ -453,6 +453,10 @@ func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
 	# quiet streak; STATS restores the old visibility.
+	# Layering: lazily built motor widgets must sit BELOW the bracket
+	# overlay (which itself stays below the WinnerOverlay callouts) -
+	# otherwise the debug card draws on top of the bracket view.
+	arena._build_bracket_overlay()
 	arena.pip_slot_mode = "MOTORS"
 	arena._apply_pip_slot()
 	_check(arena.pip_motor_bars_alpha.size() == 4, "motor bars built")
@@ -460,6 +464,17 @@ func test_motors_slot() -> void:
 	_check(bar0.visible, "motor bars show in MOTORS")
 	_check(arena.pip_motor_trace_alpha.visible, "trace shows in MOTORS")
 	_check(not arena.pip_alpha_box.visible, "views hide in MOTORS")
+	var bi: int = arena.bracket_overlay.get_index()
+	var below := true
+	for w in arena.pip_motor_bars_alpha + arena.pip_motor_bars_beta \
+			+ [arena.pip_motor_trace_alpha, arena.pip_motor_trace_beta,
+				arena.pip_motor_scope_alpha, arena.pip_motor_scope_beta]:
+		if is_instance_valid(w) and (w as Node).get_index() >= bi:
+			below = false
+	_check(below, "motor widgets below the bracket overlay")
+	_check(arena.bracket_overlay.get_index()
+		< arena.winner_overlay.get_index(),
+		"bracket overlay stays below the callouts")
 	arena._last_ctrl_a = {"thrust": 0.5, "yaw_torque": -0.4,
 		"pitch_torque": 0.0, "roll_torque": 0.0}
 	arena._update_motor_cards()
