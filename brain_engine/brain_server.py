@@ -1586,6 +1586,17 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     tourney_note)
                 continue
 
+            elif msg_type == "get_server_state":
+                # Proactive desync check: the arena polls before/while
+                # waiting so a restarted (FREE-mode) server is caught
+                # BEFORE the battle/bank fails, not after.
+                sock.sendto(json.dumps({
+                    "status": "server_state",
+                    "tournament_mode": tournament_mode,
+                    "tournament_id": tourney_tag.get("tournament_id", ""),
+                    "match": tourney_tag.get("match", ""),
+                }).encode("utf-8"), client_addr)
+
             elif msg_type == "tournament_match":
                 # Match verdict: bump match counters + match ELO on both
                 # identities. Duplicate messages (same id) resend the ack

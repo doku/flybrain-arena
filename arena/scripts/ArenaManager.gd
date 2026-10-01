@@ -375,6 +375,10 @@ var _server_reloads := 0
 # report (same nonce, idempotent) goes out again instead of starting a
 # round. Set on the free-mode error, consumed in _on_brains_loaded.
 var _pending_matchbank_resend := false
+# A supervisor reload is in flight: errors/state replies arriving now
+# are attributed but never re-trigger (the refusal that MOTIVATED the
+# recovery can land after it armed; brains_loaded consumes it).
+var _recover_in_flight := false
 # Forgiveness context for a banked-but-unconfirmed battle: set at
 # report, cleared when its reply is applied. A post-fail-loud reply
 # matching this triple is applied instead of dropped (self-heals
@@ -557,6 +561,7 @@ func _ready() -> void:
 	brain_client.restarted.connect(_on_restarted)
 	brain_client.tournament_battle_received.connect(_on_tournament_battle)
 	brain_client.match_banked_received.connect(_on_match_banked)
+	brain_client.server_state_received.connect(_on_server_state)
 	brain_client.battle_progress_received.connect(_on_battle_progress)
 	var _edir := _director()
 	if _edir != null:
@@ -1150,6 +1155,9 @@ func _request_current_battle_load() -> void:
 		"tournament_id": str(p.get("tournament_id", "")),
 		"match": tourney_match_label,
 		"lr_scale": float(p.get("lr_scale", 0.5))}
+	# State poll rides along (attribution: the reply logs the server's
+	# mode/tag at every wait entry).
+	brain_client.request_server_state()
 	_arm_seq("load")
 
 func _preload_next_match() -> void:
@@ -1217,8 +1225,10 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 	_clear_seq()
 	tourney_awaiting_load = false
 	# A clean load resets the self-heal cap (each match gets fresh
-	# recovery budget against server restarts).
+	# recovery budget against server restarts) and consumes the
+	# in-flight marker (recovery complete; later errors act again).
 	_server_reloads = 0
+	_recover_in_flight = false
 	# Pending bank resend (recovery reload after a restart killed the
 	# bank): do NOT start a round - the match is over, its battles are
 	# tallied, and only the bank is missing. Re-arm from the STORED
@@ -1308,27 +1318,43 @@ func _on_server_error(error: String) -> void:
 	# and the arena's cached battles still bank at match over. Capped
 	# (then the fail-loud below still lands).
 	if err_context == "reset" and tournament_active \
-			and error.begins_with("match_reset: no tournament brains loaded") \
-			and _server_reloads < MAX_SERVER_RELOADS:
-		_server_reloads += 1
-		print("[Arena] Server lost tournament brains mid-match - reloading %s (attempt %d/%d)..." % [
-			expand_match_label(tourney_match_label), _server_reloads, MAX_SERVER_RELOADS])
-		_request_current_battle_load()
-		return
+			and error.begins_with("match_reset: no tournament brains loaded"):
+		# Server lost its tournament brains mid-match (restart/crash):
+		# the supervisor reloads the current match - the fresh load's
+		# _reset_round starts the next battle and the cached battles
+		# still bank at match over.
+		if _recover_server_state("server brain loss"):
+			return
 	# Same self-heal for a bank interrupted by a restart: the fresh
 	# server refuses the report (FREE mode) with nothing banked. Reload
 	# the finished match, then resend the STORED report (same nonce) on
 	# brains_loaded - a new nonce here would risk double-banking the
 	# battles if the old server actually finished before dying.
+	# Idempotent via the pending flag (a state-poll recovery may have
+	# armed it already).
 	if err_context == "matchbank" and tournament_active \
 			and error.begins_with("match_report while in FREE mode") \
 			and not _seq_last_match_report.is_empty() \
-			and _server_reloads < MAX_SERVER_RELOADS:
-		_server_reloads += 1
-		_pending_matchbank_resend = true
-		print("[Arena] Server lost state mid-bank - reloading %s to resend the stored report (attempt %d/%d)..." % [
-			expand_match_label(tourney_match_label), _server_reloads, MAX_SERVER_RELOADS])
-		_request_current_battle_load()
+			and not _pending_matchbank_resend:
+		# Reload the finished match, then resend the STORED report
+		# (same nonce) on brains_loaded - a new nonce here would risk
+		# double-banking the battles if the old server actually
+		# finished before dying. Flag set only when the reload armed
+		# (a capped recovery leaves it clean for the fail-loud).
+		if _recover_server_state("bank interrupted"):
+			_pending_matchbank_resend = true
+			return
+	# A recovery load is already in flight (the state poll or a prior
+	# error armed it): the refusal that motivated it can arrive now -
+	# attribute it, never re-trigger or park loud mid-recovery.
+	if _recover_in_flight:
+		print("[Arena] Recovery in flight - error attributed, no action: ", error)
+		return
+	# ANY other server error: the quit+resume recipe runs in place
+	# (fresh seq/latches/socket + re-issued load) before anything lands
+	# loud. Only a persistently broken server (cap exhausted) parks on
+	# the fail-loud screen.
+	if tournament_active and _recover_server_state("server error: " + error):
 		return
 	_hide_wait_bracket()
 	_show_loading("SERVER ERROR",
@@ -1841,6 +1867,12 @@ func _check_seq_watchdog() -> void:
 			return
 		_tourney_awaiting_battle = false
 		_clear_seq()
+		# The battle was sent twice with no confirmation. In batch mode
+		# this context cannot fire (battles carry no server round
+		# trip); free/legacy paths recover via the supervisor before
+		# parking loud (the reload re-plays the unbanked battle fresh).
+		if tournament_active and _recover_server_state("battle unconfirmed"):
+			return
 		_hide_wait_bracket()
 		_show_loading("SERVER SILENT - BATTLE NOT CONFIRMED",
 			"Battle %s was sent twice but the server never confirmed. " % expand_match_label(tourney_match_label)
@@ -1879,6 +1911,9 @@ func _check_seq_watchdog() -> void:
 					Color(0.85, 0.85, 0.9))
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING LOAD %s vs %s ..." % [tourney_a_name, tourney_b_name]
+			# Heal a poisoned socket before the retry (the first send's
+			# reply may be chasing a dead port already).
+			brain_client.reconnect()
 			brain_client.request_tournament_load(
 				str(p.get("alpha_path", "")), str(p.get("beta_path", "")),
 				str(p.get("tournament_id", "")), str(p.get("match", "")),
@@ -1892,11 +1927,15 @@ func _check_seq_watchdog() -> void:
 				status_label.text = "STALLED - RETRYING RESET ..."
 			brain_client.request_match_reset(tourney_match_label)
 		return
-	# Second expiry: stay loud, stop touching the server. The load
-	# latch clears too - a late reply can never silently start a round
-	# behind the fail-loud screen (QUIT TO MENU + RESUME re-loads).
+	# Second expiry: the quit+resume recipe runs in place before
+	# anything parks loud (a wedged load/reset/matchbank un-wedges with
+	# a fresh seq/socket + re-issued load; a late reply can never
+	# silently start a round behind the recovery). Only a persistently
+	# broken server (cap exhausted) lands the fail-loud screen.
 	_clear_seq()
 	tourney_awaiting_load = false
+	if tournament_active and _recover_server_state("no server reply"):
+		return
 	_hide_wait_bracket()
 	_show_loading("STALLED - NO SERVER REPLY",
 		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
@@ -4811,6 +4850,9 @@ func _send_match_report(match_winner: String, partial: bool = false) -> void:
 		tourney_match_label, _seq_match_id, _match_battle_cache, partial)
 	_match_battle_cache.clear()
 	_arm_seq("matchbank")
+	# Proactive desync poll: a restarted (FREE-mode) server is caught
+	# by the state reply BEFORE the 240 s watchdog cycle would.
+	brain_client.request_server_state()
 	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
 		_set_wait_header(str(head.get("text", "")),
 			str(head.get("sub", "")) + "\nbanking the match...",
@@ -5589,6 +5631,58 @@ func _event_pool_wait() -> String:
 		return "stopped by user"
 	_evo_abort("pool short - refusing a short-bench event")
 	return "pool short - refusing a short-bench event"
+
+
+func _recover_server_state(reason: String) -> bool:
+	# The quit+resume recipe, in place (no scene change): fresh
+	# seq/latches, fresh UDP socket, re-issued load from the current
+	# director position. Stored payloads resend under their SAME nonce
+	# where one is owed (callers set the pending-resend flag BEFORE
+	# calling; consumed in _on_brains_loaded). Capped: MAX_SERVER_RELOADS
+	# between clean loads; past the cap the caller parks loud (a
+	# persistently broken server is not automatable). Status line only
+	# - silent healing otherwise.
+	if tournament_active and _server_reloads >= MAX_SERVER_RELOADS:
+		return false
+	_server_reloads += 1
+	_restore_timescale()
+	_clear_seq()
+	tourney_awaiting_load = false
+	_tourney_awaiting_battle = false
+	_tourney_awaiting_matchbank = false
+	_seq_forgive_match = {}
+	_seq_forgive_matchbank = {}
+	_hide_wait_bracket()
+	_hide_loading()
+	brain_client.reconnect()
+	print("[Arena] AUTO-RECOVER (%s): reloading %s (attempt %d/%d)..." % [
+		reason, expand_match_label(tourney_match_label),
+		_server_reloads, MAX_SERVER_RELOADS])
+	if is_instance_valid(status_label):
+		status_label.text = "RECOVERING: %s - reloading %s..." % [reason,
+			expand_match_label(tourney_match_label)]
+	_recover_in_flight = true
+	_request_current_battle_load()
+	return true
+
+
+func _on_server_state(mode: bool, tid: String, match_label: String) -> void:
+	# State-poll reply: attribution log at every wait, and one proactive
+	# recovery - a FREE-mode server while a match bank is owed means it
+	# restarted mid-bank: reload + stored-report resend NOW instead of
+	# after the 240 s watchdog cycle.
+	print("[Arena] Server state: mode=%s tourney=%s match=%s (awaiting %s)" % [
+		mode, tid, match_label, _seq_context])
+	if _seq_context == "matchbank" and not mode and tournament_active \
+			and not _recover_in_flight and not _pending_matchbank_resend \
+			and not _seq_last_match_report.is_empty():
+		# FREE-mode server while a bank is owed: it restarted mid-bank.
+		# Arm the stored-report resend and reload NOW - the in-flight
+		# report is about to be refused anyway, and this skips the whole
+		# 240 s watchdog cycle. (The refusal error that follows is
+		# attributed silently: recovery already in flight.)
+		if _recover_server_state("bank interrupted (state poll)"):
+			_pending_matchbank_resend = true
 
 
 func _show_handoff_failure(title: String, reason: String) -> void:

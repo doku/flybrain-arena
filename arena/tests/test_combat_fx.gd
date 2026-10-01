@@ -446,6 +446,9 @@ func test_server_brain_loss_reloads() -> void:
 	arena._on_server_error(
 		"match_reset: no tournament brains loaded (server restarted?) - QUIT")
 	_check(arena._server_reloads == 1, "brain-loss error reloads once")
+	# Leg 1 armed a recovery; this suite skips its brains_loaded, so
+	# reset the in-flight marker before the cap leg.
+	arena._recover_in_flight = false
 	arena._server_reloads = 2
 	arena._seq_context = "reset"
 	arena._on_server_error(
@@ -455,8 +458,10 @@ func test_server_brain_loss_reloads() -> void:
 		"past-cap error still lands loud")
 	arena._server_reloads = 0
 	arena._seq_context = "reset"
+	arena._recover_in_flight = false
 	arena._on_server_error("some other failure")
-	_check(arena._server_reloads == 0, "unrelated errors never reload")
+	_check(arena._server_reloads == 1, "unrelated errors recover too")
+	arena._recover_in_flight = false
 
 
 func test_motors_slot() -> void:
@@ -505,13 +510,14 @@ func test_motors_slot() -> void:
 
 func test_matchbank_brain_loss_resends() -> void:
 	# Server restart killed the bank: the free-mode error arms a
-	# stored-report resend (flag + reload, capped); the reload landing
-	# resends WITHOUT starting a round (the match is over).
+	# stored-report resend (supervisor reload, capped); the reload
+	# landing resends WITHOUT starting a round (the match is over).
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
 	arena._seq_context = "matchbank"
 	arena._server_reloads = 0
 	arena._pending_matchbank_resend = false
+	arena._recover_in_flight = false
 	arena._seq_last_match_report = {"match_winner": "alpha",
 		"tournament_id": "T1", "match": "R1M1", "match_id": "M1",
 		"partial": false, "battles": []}
@@ -629,6 +635,87 @@ func test_tipoff_freshness() -> void:
 		DirAccess.remove_absolute("user://test_fresh")
 
 
+func test_auto_recover_supervisor() -> void:
+	# The quit+resume recipe in place: fresh seq/latches/socket + a
+	# re-issued load (director stubbed so the load actually arms);
+	# capped; in-flight marker consumed on the clean load.
+	var d = arena._director()
+	if d == null:
+		_check(true, "supervisor skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1",
+			"a_name": "A", "b_name": "B"}]]}
+	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
+		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._server_reloads = 0
+	arena._seq_context = "battle"
+	arena._tourney_awaiting_battle = true
+	arena.tourney_awaiting_load = true
+	arena._recover_in_flight = false
+	var ok: bool = arena._recover_server_state("unit test")
+	_check(ok, "supervisor recovers under the cap")
+	_check(not arena._tourney_awaiting_battle, "latches cleared")
+	_check(arena.tourney_awaiting_load, "load re-issued")
+	_check(str(arena._seq_context) == "load", "load watchdog armed")
+	_check(arena._recover_in_flight, "recovery marked in flight")
+	_check(str(arena.status_label.text).contains("LOADING"),
+		"status shows the recovery load")
+	# Cap: past-max returns false, caller parks loud.
+	arena._recover_in_flight = false
+	arena._server_reloads = 2
+	arena._seq_context = "battle"
+	arena._tourney_awaiting_battle = true
+	_check(not bool(arena._recover_server_state("unit test")),
+		"cap exhausted, no recovery")
+	_check(str(arena._seq_context) == "battle", "cap path touches nothing")
+	_check(not arena._recover_in_flight, "cap path arms nothing")
+	# Clean load resets the cap + consumes the in-flight marker.
+	arena._server_reloads = 2
+	arena.tourney_awaiting_load = true
+	arena._seq_context = "load"
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._on_brains_loaded({}, {}, "T1", "R1M1")
+	_check(arena._server_reloads == 0, "clean load resets the cap")
+	_check(not arena._recover_in_flight, "clean load consumes in-flight")
+	arena.is_round_active = false
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+
+
+func test_state_poll() -> void:
+	# Proactive desync catch: a FREE-mode server while a match bank is
+	# owed arms the stored-report resend immediately (no 240 s cycle).
+	arena.tournament_active = true
+	arena._seq_context = "matchbank"
+	arena._tourney_awaiting_matchbank = true
+	arena._pending_matchbank_resend = false
+	arena._seq_last_match_report = {"match_winner": "alpha",
+		"tournament_id": "T1", "match": "R1M1", "match_id": "M1",
+		"partial": false, "battles": []}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._on_server_state(false, "", "")
+	_check(arena._pending_matchbank_resend, "FREE-mode poll arms resend")
+	_check(arena._server_reloads == 1, "poll recovery counted")
+	# Tournament-mode reply: attribution only, no recovery.
+	arena._pending_matchbank_resend = false
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._on_server_state(true, "T1", "R1M1")
+	_check(not arena._pending_matchbank_resend, "healthy poll is inert")
+	_check(arena._server_reloads == 0, "healthy poll counts nothing")
+	arena._seq_context = ""
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -713,6 +800,8 @@ func _process(_delta: float) -> bool:
 	test_matchbank_retry()
 	test_server_brain_loss_reloads()
 	test_matchbank_brain_loss_resends()
+	test_auto_recover_supervisor()
+	test_state_poll()
 	test_motors_slot()
 	test_callout_static()
 	test_handoff_failure_view()

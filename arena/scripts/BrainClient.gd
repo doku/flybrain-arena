@@ -15,6 +15,7 @@ signal match_recorded_received()
 signal tournament_closed_received()
 signal server_error_received(error: String)
 signal raster_map_received(side: String, pool: String, ids: Array, total: int)
+signal server_state_received(tournament_mode: bool, tournament_id: String, match_label: String)
 
 @export var server_host: String = "127.0.0.1"
 @export var server_port: int = 9999
@@ -178,6 +179,12 @@ func request_free_mode() -> void:
 		return
 	_send_dict({"type": "free_mode"})
 
+func request_server_state() -> void:
+	# Proactive desync poll: tiny, no bank work on the server side.
+	if not is_connected_server:
+		return
+	_send_dict({"type": "get_server_state"})
+
 func request_tournament_match(match_winner: String, tournament_id: String = "", match_label: String = "") -> void:
 	if not is_connected_server:
 		return
@@ -254,5 +261,10 @@ func _handle_server_response(data: Dictionary) -> void:
 		raster_map_received.emit(
 			str(data.get("side", "")), str(data.get("pool", "")),
 			data.get("ids", []), int(data.get("total", 0)))
+	elif status == "server_state":
+		server_state_received.emit(
+			bool(data.get("tournament_mode", false)),
+			str(data.get("tournament_id", "")),
+			str(data.get("match", "")))
 	elif status == "error":
 		server_error_received.emit(str(data.get("error", "unknown")))
