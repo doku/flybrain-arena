@@ -773,12 +773,19 @@ def _prepared_slot_matches(prepare_a, prepare_b, prepare_tag, msg):
 
 def _reset_needs_brains(msg, tournament_mode, rec_a, rec_b):
     """True when a tournament-shaped reset would run on NO brains (the
-    server restarted, or free_mode hit mid-event): the handler must
-    fail loud instead of answering match_ready off boot brains - that
+    server restarted, or free_mode mid-event): the handler must fail
+    loud instead of answering match_ready off boot brains - that
     silent path was a zero-activity round. Pure (unit-tested)."""
     if not str(msg.get("match", "")):
         return False
     return not tournament_mode or rec_a is None or rec_b is None
+
+
+# Stable contract: the arena matches this prefix to trigger its
+# mid-match auto-reload (see ArenaManager._on_server_error). Rewording
+# the head breaks tournament self-healing - pinned by test.
+MATCH_RESET_NO_BRAINS_ERROR = ("match_reset: no tournament brains loaded "
+                               "(server restarted?) - QUIT TO MENU + RESUME")
 
 
 def _emit_progress(sock, client_addr, battle_id, stage):
@@ -1519,13 +1526,14 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # brains loaded (server restarted, or free_mode mid-event)
                 # would answer match_ready off boot brains - a silent
                 # reflex-zombie round. Fail loud instead; the arena's
-                # error path lands the QUIT TO MENU + RESUME screen.
+                # error path self-heals via reload (or lands QUIT TO
+                # MENU + RESUME past the cap). The message prefix is a
+                # stable contract (arena matches it; pinned by test).
                 if _reset_needs_brains(msg, tournament_mode,
                                        tourney_a["rec"], tourney_b["rec"]):
                     sock.sendto(json.dumps(
                         {"status": "error",
-                         "error": "match_reset: no tournament brains loaded "
-                                  "(server restarted?) - QUIT TO MENU + RESUME"
+                         "error": MATCH_RESET_NO_BRAINS_ERROR
                         }).encode("utf-8"), client_addr)
                     continue
                 brain_alpha.reset_state()

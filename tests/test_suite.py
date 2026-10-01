@@ -6910,6 +6910,14 @@ class TestPrepareSlot(unittest.TestCase):
         self.assertFalse(bs._prepared_slot_matches(
             pa, pb, tag, dict(msg, beta_path="c.flybrain")))
 
+    def test_match_reset_error_contract(self):
+        # Stable contract: the arena matches this prefix to trigger its
+        # mid-match auto-reload. Rewording the head breaks tournament
+        # self-healing.
+        import brain_server as bs
+        self.assertTrue(bs.MATCH_RESET_NO_BRAINS_ERROR.startswith(
+            "match_reset: no tournament brains loaded"))
+
     def test_reset_needs_brains(self):
         import brain_server as bs
         msg = {"match": "R1M1"}

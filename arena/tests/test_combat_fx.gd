@@ -425,6 +425,30 @@ func test_matchbank_retry() -> void:
 	_check(arena._seq_retried, "matchbank retry fires once")
 
 
+func test_server_brain_loss_reloads() -> void:
+	# Server restarted mid-match: the brainless-reset error triggers a
+	# self-healing reload of the current match (capped) instead of the
+	# fail-loud that used to kill the tournament on screen.
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._seq_context = "reset"
+	arena._server_reloads = 0
+	arena._on_server_error(
+		"match_reset: no tournament brains loaded (server restarted?) - QUIT")
+	_check(arena._server_reloads == 1, "brain-loss error reloads once")
+	arena._server_reloads = 2
+	arena._seq_context = "reset"
+	arena._on_server_error(
+		"match_reset: no tournament brains loaded (server restarted?) - QUIT")
+	_check(arena._server_reloads == 2, "reload cap holds past the max")
+	_check(str(arena.status_label.text).begins_with("SERVER ERROR"),
+		"past-cap error still lands loud")
+	arena._server_reloads = 0
+	arena._seq_context = "reset"
+	arena._on_server_error("some other failure")
+	_check(arena._server_reloads == 0, "unrelated errors never reload")
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -495,6 +519,7 @@ func _process(_delta: float) -> bool:
 	test_match_over_sends_report()
 	test_forgivable_matchbank()
 	test_matchbank_retry()
+	test_server_brain_loss_reloads()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()
 	test_combat_gate()

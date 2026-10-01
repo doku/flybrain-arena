@@ -362,6 +362,14 @@ var _seq_deadline_msec: int = 0
 var _seq_retried: bool = false
 var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
+# Mid-match server-brain-loss recovery: the server restarts (or is
+# relaunched) under a live tournament, and the next match_reset fails
+# on the fresh server. Reloading the CURRENT match self-heals (the
+# fresh load's _reset_round continues the match; the arena's cached
+# battles still bank at match over) where the old fail-loud killed the
+# tournament. Capped: a persistently broken server still lands loud.
+const MAX_SERVER_RELOADS := 2
+var _server_reloads := 0
 # Forgiveness context for a banked-but-unconfirmed battle: set at
 # report, cleared when its reply is applied. A post-fail-loud reply
 # matching this triple is applied instead of dropped (self-heals
@@ -1185,6 +1193,9 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 		return
 	_clear_seq()
 	tourney_awaiting_load = false
+	# A clean load resets the self-heal cap (each match gets fresh
+	# recovery budget against server restarts).
+	_server_reloads = 0
 	_hide_wait_bracket()
 	_hide_loading()
 	_update_tourney_status("READY")
@@ -1233,10 +1244,27 @@ func _on_server_error(error: String) -> void:
 			str(q.get("end_reason", "")), q.get("verdict", {}))
 		return
 	_tourney_awaiting_battle = false
+	# Captured before _clear_seq wipes it (the recovery below needs it).
+	var err_context := _seq_context
 	_clear_seq()
 	# General server error during a load: clear the load latch too -
 	# a late reply must never silently start a round on this screen.
 	tourney_awaiting_load = false
+	# Self-healing reload BEFORE the fail-loud below: the server lost
+	# its tournament brains mid-match (restart/crash - the gate error
+	# the server sends for a brainless match_reset). Reloading the
+	# CURRENT match continues it in ~5-20 s instead of killing the
+	# tournament: the fresh load's _reset_round starts the next battle
+	# and the arena's cached battles still bank at match over. Capped
+	# (then the fail-loud below still lands).
+	if err_context == "reset" and tournament_active \
+			and error.begins_with("match_reset: no tournament brains loaded") \
+			and _server_reloads < MAX_SERVER_RELOADS:
+		_server_reloads += 1
+		print("[Arena] Server lost tournament brains mid-match - reloading %s (attempt %d/%d)..." % [
+			expand_match_label(tourney_match_label), _server_reloads, MAX_SERVER_RELOADS])
+		_request_current_battle_load()
+		return
 	_hide_wait_bracket()
 	_show_loading("SERVER ERROR",
 		"SERVER ERROR: %s. " % error
