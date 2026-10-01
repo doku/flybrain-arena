@@ -22,7 +22,9 @@ func _match(a_id: String, a_name: String, b_id: String, b_name: String) -> Dicti
 
 
 func _row_texts(card: PanelContainer) -> Array:
-	# [head, name_a, score_a, name_b, score_b] label texts.
+	# [head, name_a, score_a, name_b, score_b] label texts. The score
+	# is the LAST child: the red showcase asterisk sits between name
+	# and score.
 	var vb: VBoxContainer = card.get_child(0)
 	var rows: Array = []
 	for ch in vb.get_children():
@@ -31,7 +33,7 @@ func _row_texts(card: PanelContainer) -> Array:
 	var out: Array = [(vb.get_child(0) as Label).text]
 	for r in rows:
 		out.append((r.get_child(0) as Label).text)
-		out.append((r.get_child(1) as Label).text)
+		out.append((r.get_child(r.get_child_count() - 1) as Label).text)
 	return out
 
 
@@ -63,7 +65,9 @@ func test_spotlight() -> void:
 	B.call("set_spotlight", "offspring:wild")
 	_check(B.call("spotlight_applied") == "offspring:wild", "spotlight key stored")
 	var wild_card: PanelContainer = B.get("_spot_cards")["offspring:wild"]
-	_check(_border(wild_card) == Color(1.0, 0.82, 0.3, 1.0), "spotlit card gold-framed")
+	# Gold is reserved for live cards: the spotlight tracks the key but
+	# paints nothing.
+	_check(_border(wild_card) != Color(1.0, 0.82, 0.3, 1.0), "spotlit card not gold-framed")
 	# "def67890" rides the OTHER match card (a card holds both its
 	# fighters), so the first card must restore when the spotlight
 	# leaves it.
@@ -76,6 +80,56 @@ func test_spotlight() -> void:
 	B.call("clear_spotlight")
 	_check(B.call("spotlight_applied") == "", "clear empties spotlight")
 	B.free()
+
+
+func test_showcase_asterisk() -> void:
+	# Gallery marker: the showcased fighter's rows carry a visible red
+	# "*" after the name (before the score); other fighters show none;
+	# clearing hides them again. No non-live card ever gold-frames;
+	# the live card keeps its creation-time gold (gold == live only).
+	var B = load("res://scripts/TournamentBracket.gd").new()
+	var preview := {"players": [], "size": 4, "rounds": [[
+		_match("abc12345", "Mottled", "offspring:wild", "wild (training)"),
+		_match("def67890", "Wasp", "offspring:clone", "Slate (training)")]]}
+	B.call("render_bracket", preview, -1, -1)
+	B.call("set_showcase", "abc12345")
+	var mottled_stars := 0
+	var wasp_stars := 0
+	var star_red := false
+	for key in (B.get("_show_rows") as Dictionary).keys():
+		for nm in ((B.get("_show_rows") as Dictionary).get(key) as Array):
+			var st = (nm as Label).get_meta("asterisk", null)
+			if st is Label and (st as Label).visible:
+				if str((st as Label).text) == "*" \
+						and (st as Label).get_theme_color("font_color").is_equal_approx(
+							Color(1.0, 0.38, 0.3)):
+					star_red = true
+				if str(key) == "abc12345":
+					mottled_stars += 1
+				else:
+					wasp_stars += 1
+	_check(mottled_stars > 0, "showcased rows show the star")
+	_check(star_red, "star is red")
+	_check(wasp_stars == 0, "other rows show no star")
+	for ckey in (B.get("_spot_cards") as Dictionary).keys():
+		var card: PanelContainer = (B.get("_spot_cards") as Dictionary).get(ckey)
+		_check(_border(card) != Color(1.0, 0.82, 0.3, 1.0),
+			"non-live card never gold")
+	B.call("clear_showcase")
+	var leftover := 0
+	for key in (B.get("_show_rows") as Dictionary).keys():
+		for nm in ((B.get("_show_rows") as Dictionary).get(key) as Array):
+			var st = (nm as Label).get_meta("asterisk", null)
+			if st is Label and (st as Label).visible:
+				leftover += 1
+	_check(leftover == 0, "clear hides every star")
+	B.free()
+	var L = load("res://scripts/TournamentBracket.gd").new()
+	L.call("render_bracket", preview, 0, 0)
+	var live_card: PanelContainer = (L.get("_spot_cards") as Dictionary).get("abc12345")
+	_check(_border(live_card) == Color(1.0, 0.82, 0.3, 1.0),
+		"live card keeps its gold (gold == live only)")
+	L.free()
 
 
 func _fixture_rec() -> Dictionary:
@@ -140,6 +194,7 @@ func test_gallery_training_card() -> void:
 func _initialize() -> void:
 	test_placeholder_row()
 	test_spotlight()
+	test_showcase_asterisk()
 	test_gallery_real_card()
 	test_gallery_training_card()
 	if failures == 0:

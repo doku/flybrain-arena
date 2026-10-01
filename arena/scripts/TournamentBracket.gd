@@ -32,6 +32,9 @@ const COL_CHAMP := Color(1.0, 0.85, 0.35)
 const COL_LOSER := Color(1.0, 0.35, 0.3)
 const COL_LOSER_DIM := Color(0.75, 0.3, 0.28, 0.85)
 const COL_SHOWCASE := Color(0.35, 0.85, 1.0)
+# Gallery marker: red asterisk beside the showcased fighter's name.
+# Gold (COL_LIVE) is reserved for the live/current-match card only.
+const COL_MARKER := Color(1.0, 0.38, 0.3)
 
 var segments: Array = []
 # View-relative losers start for _round_name (0 in losers-focus mode).
@@ -268,15 +271,17 @@ func _register_spot(m: Dictionary, slot: String, card: PanelContainer) -> void:
 
 
 func set_spotlight(key: String) -> void:
-	# Gold-frames one round-0 card (the gallery's showcased fighter);
+	# Tracks the gallery's showcased fighter key (round-0 card holder);
 	# no-op for unknown keys. Re-callers re-render first, which clears.
+	# Deliberately paints NOTHING: gold (COL_LIVE) is reserved for the
+	# live/current-match card, and the showcase asterisk (set_showcase)
+	# is the gallery marker.
 	if key == spotlight_key:
 		return
 	clear_spotlight()
 	if key == "" or not _spot_cards.has(key):
 		return
 	spotlight_key = key
-	_paint_card(_spot_cards[key], COL_LIVE, 3)
 
 
 func clear_spotlight() -> void:
@@ -304,9 +309,10 @@ func _register_show(key: String, nm: Label) -> void:
 
 
 func set_showcase(key: String) -> void:
-	# Paints the showcased fighter's every name cyan (gallery sync);
-	# no-op for unknown keys. Recurses into fixture sub-brackets.
-	# Re-callers re-render first, which clears.
+	# Paints the showcased fighter's every name cyan (gallery sync) and
+	# shows its red asterisk marker; no-op for unknown keys. Recurses
+	# into fixture sub-brackets. Re-callers re-render first, which
+	# clears.
 	if key == showcase_key:
 		return
 	clear_showcase()
@@ -315,6 +321,9 @@ func set_showcase(key: String) -> void:
 	showcase_key = key
 	for nm in (_show_rows[key] as Array):
 		(nm as Label).add_theme_color_override("font_color", COL_SHOWCASE)
+		var st = (nm as Label).get_meta("asterisk", null)
+		if st is Label and is_instance_valid(st):
+			(st as Label).visible = true
 	for kid in _show_kids:
 		kid.set_showcase(key)
 
@@ -326,6 +335,10 @@ func clear_showcase() -> void:
 			if is_instance_valid(lbl) and lbl.has_meta("base_color"):
 				lbl.add_theme_color_override("font_color",
 					lbl.get_meta("base_color"))
+			if is_instance_valid(lbl) and lbl.has_meta("asterisk"):
+				var st = lbl.get_meta("asterisk")
+				if st is Label and is_instance_valid(st):
+					(st as Label).visible = false
 	showcase_key = ""
 	for kid in _show_kids:
 		kid.clear_showcase()
@@ -711,6 +724,20 @@ func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: b
 	if show_key != "" and not vacant and label != "TBD":
 		_register_show(show_key, nm)
 	row.add_child(nm)
+	# Gallery marker: red asterisk after the name, before the score.
+	# A separate Label (not a text suffix) so the star stays red while
+	# the name keeps its state color, and it never clips away with the
+	# name text.
+	var st := Label.new()
+	st.text = "*"
+	st.clip_text = false
+	st.custom_minimum_size = Vector2(10.0, ROW_H)
+	st.add_theme_font_size_override("font_size", FS_ROW)
+	st.add_theme_color_override("font_color", COL_MARKER)
+	st.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	st.visible = false
+	row.add_child(st)
+	nm.set_meta("asterisk", st)
 	var sc := Label.new()
 	sc.text = _fmt_wins(score) if not training else "…"
 	sc.add_theme_font_size_override("font_size", FS_ROW)

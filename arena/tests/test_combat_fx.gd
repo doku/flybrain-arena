@@ -162,13 +162,15 @@ func test_wait_bracket_flow() -> void:
 	var card: PanelContainer = bv.call("_make_match_card", m, 0, 0, true)
 	var rows = card.get_child(0)
 	var nmA: Label = rows.get_child(1).get_child(0)
-	var scA: Label = rows.get_child(1).get_child(1)
+	# Score is the row's last child (the red showcase asterisk sits
+	# between name and score).
+	var scA: Label = rows.get_child(1).get_child(2)
 	_check(nmA.text == "A", "preview keeps winner name")
 	_check((nmA.get_theme_color("font_color") as Color).is_equal_approx(
 		Color(0.5, 1.0, 0.55)), "preview tints winner green")
 	_check(scA.text == "1", "preview bumps winner score")
 	var nmB: Label = rows.get_child(2).get_child(0)
-	var scB: Label = rows.get_child(2).get_child(1)
+	var scB: Label = rows.get_child(2).get_child(2)
 	_check((nmB.get_theme_color("font_color") as Color).is_equal_approx(
 		Color(0.92, 0.92, 0.94)), "preview leaves loser default")
 	_check(scB.text == "0", "preview leaves loser score")
@@ -180,7 +182,7 @@ func test_wait_bracket_flow() -> void:
 	bv.live_preview = {}
 	var card3: PanelContainer = bv.call("_make_match_card", m, 0, 0, true)
 	var nmA3: Label = card3.get_child(0).get_child(1).get_child(0)
-	var scA3: Label = card3.get_child(0).get_child(1).get_child(1)
+	var scA3: Label = card3.get_child(0).get_child(1).get_child(2)
 	_check((nmA3.get_theme_color("font_color") as Color).is_equal_approx(
 		Color(0.92, 0.92, 0.94)), "cleared preview restores color")
 	_check(scA3.text == "0", "cleared preview restores score")
