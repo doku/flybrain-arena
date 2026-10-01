@@ -6225,6 +6225,132 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(stored["key"], seed_key)
         self.assertEqual(stored["result"], seed_resp)
 
+    def test_handle_match_report_batches_match(self):
+        # Batched match reporting: one message banks N battles in order
+        # (dopamine replay via the fake RL, ELO chain, records/ko/wander/
+        # sessions) plus the match bank (matches + K_MATCH) - one
+        # journal, one save pair, one reply echoing every battle.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def __init__(self):
+                self.calls = []
+            def begin_episode(self, brain):
+                self.calls.append(("begin",))
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                self.calls.append(("plastic", sig))
+            def pin_gains(self, brain, legacy=False):
+                self.calls.append(("pin", legacy))
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+        msg = {"match_winner": "alpha", "tournament_id": "T",
+               "match": "M", "match_id": "M1", "partial": False,
+               "battles": [
+                   {"battle_id": "M-B1", "draw": False, "draw_penalty": False,
+                    "end_reason": "ko",
+                    "verdict": {"winner_slot": "alpha",
+                                "blow_source": "thorax", "blow_amount": 80.0,
+                                "loser_slot": "beta"},
+                    "stats_a": {"kills": 1}, "stats_b": {"kills": 0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl},
+                   {"battle_id": "M-B2", "draw": True, "draw_penalty": False,
+                    "end_reason": "tie",
+                    "verdict": {"winner_slot": ""},
+                    "stats_a": {"kills": 0, "center_drift": 0.0},
+                    "stats_b": {"kills": 0, "center_drift": 0.0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl}]}
+        rl = _FakeRL()
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, sta, stb,
+            {"tournament_id": "T", "match": "M"}, 0.5, True,
+            _FakeEvo(), rl, 1.0, sta["brain"], stb["brain"],
+            lambda: "tourney T match M")
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "tournament_match_battled")
+        self.assertEqual(body["match_winner"], "alpha")
+        self.assertEqual(len(body["battles"]), 2)
+        self.assertEqual(body["battles"][0]["battle_winner"], "alpha")
+        self.assertEqual(body["battles"][1]["battle_winner"], "draw")
+        # Dopamine replayed for the non-draw battle only (draws skip
+        # plasticity wholesale).
+        self.assertEqual(rl.calls.count(("begin",)), 2)
+        self.assertIn(("plastic", 1.0), rl.calls)
+        self.assertIn(("pin", False), rl.calls)
+        la, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _ = vault_pkg.load_brain(stb["rec"]["id"])
+        ra, rb = la["record"], lb["record"]
+        self.assertEqual((ra["battles"], ra["wins"], ra["draws"]), (2, 1, 1))
+        self.assertEqual((rb["battles"], rb["losses"], rb["draws"]), (2, 1, 1))
+        self.assertEqual(ra["ko"], 1)
+        self.assertEqual((ra["matches"], ra["matches_won"]), (1, 1))
+        self.assertEqual((rb["matches"], rb["matches_lost"]), (1, 1))
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["match"], "M")
+        self.assertEqual(stored["result"]["match_winner"], "alpha")
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+        # Exact resend (same nonce): resend, no re-bank.
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, sta, stb,
+            {"tournament_id": "T", "match": "M"}, 0.5, True,
+            _FakeEvo(), _FakeRL(), 1.0, sta["brain"], stb["brain"],
+            lambda: "tourney T match M")
+        la2, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual(la2["record"]["battles"], 2)
+        self.assertEqual(la2["record"]["matches"], 1)
+
+    def test_handle_match_report_partial_skips_match_bank(self):
+        # Quit-flush: partial reports bank battles only, the match
+        # result stays undecided (no match counters).
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("beta", 5.0, 4.0)
+
+        msg = {"match_winner": "pending", "tournament_id": "T",
+               "match": "MP", "match_id": "MP1", "partial": True,
+               "battles": [
+                   {"battle_id": "MP-B1", "draw": False,
+                    "draw_penalty": False, "end_reason": "time",
+                    "verdict": {"winner_slot": "beta", "dmg_a": 80.0,
+                                "dmg_b": 90.0},
+                    "stats_a": {"kills": 0}, "stats_b": {"kills": 0},
+                    "sens_a": {}, "sens_b": {},
+                    "ctrl_a": {}, "ctrl_b": {}}]}
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, sta, stb,
+            {"tournament_id": "T", "match": "MP"}, 0.5, True,
+            _FakeEvo(), _FakeRL(), 1.0, sta["brain"], stb["brain"],
+            lambda: "tourney T match MP")
+        la, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual((la["record"]["battles"], la["record"]["losses"]), (1, 1))
+        self.assertEqual(la["record"]["matches"], 0)
+
     def test_handle_draw_records_draws_without_sessions(self):
         _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
         sent = {}

@@ -374,6 +374,57 @@ func test_load_fail_loud_clears_latch() -> void:
 	_check(not arena.tourney_awaiting_load, "fail-loud clears the load latch")
 
 
+func test_match_over_sends_report() -> void:
+	# ONE bank per match: match over stamps the nonce, flushes the
+	# cache into the report, arms the matchbank watchdog (no
+	# per-battle sends happened).
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._match_battle_cache = [{"battle_id": "R1M1-B1-1-1", "draw": false,
+		"verdict": {"winner_slot": "alpha"}}]
+	arena._last_verdict = {"end_reason": "ko", "winner_slot": "alpha",
+		"blow_source": "thorax", "blow_amount": 80.0,
+		"loser_slot": "beta", "line": "X"}
+	arena._on_match_over("alpha", "1 - 0")
+	_check(arena._last_match_winner == "alpha", "match winner stored")
+	_check(arena._last_match_score == "1 - 0", "match score stored")
+	_check(str(arena._seq_match_id) != "", "match nonce stamped")
+	_check((arena._match_battle_cache as Array).is_empty(),
+		"cache flushed into the report")
+	_check(arena._tourney_awaiting_matchbank, "match bank awaited")
+	_check(str(arena._seq_context) == "matchbank", "matchbank watchdog armed")
+
+
+func test_forgivable_matchbank() -> void:
+	# Post-fail-loud bank acks apply only for the still-owed match.
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._seq_forgive_matchbank = {}
+	_check(not arena._forgivable_matchbank("X"), "nothing owed, nothing forgiven")
+	arena._seq_forgive_matchbank = {"tournament_id": arena._tourney_id(),
+		"match": "R1M1", "battle": "M1"}
+	_check(arena._forgivable_matchbank("M1"), "owed ack forgiven")
+	_check(not arena._forgivable_matchbank("M2"), "other ack dropped")
+	arena._tourney_awaiting_matchbank = false
+	arena._seq_forgive_matchbank = {}
+	arena._on_match_banked("alpha", 0.0, 0.0, "X")
+	_check(not arena._tourney_awaiting_matchbank, "stray bank ack drops clean")
+
+
+func test_matchbank_retry() -> void:
+	# The matchbank watchdog resends the SAME nonce once (idempotent),
+	# then the fail-loud takes its normal path.
+	arena.tournament_active = true
+	arena._seq_context = "matchbank"
+	arena._seq_retried = false
+	arena._seq_deadline_msec = 1
+	arena._seq_last_match_report = {"match_winner": "alpha",
+		"tournament_id": "T1", "match": "R1M1", "match_id": "R1M1-MATCH-1-2",
+		"partial": false, "battles": []}
+	arena._check_seq_watchdog()
+	_check(arena._seq_retried, "matchbank retry fires once")
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -441,6 +492,9 @@ func _process(_delta: float) -> bool:
 	test_server_error_routing()
 	test_brains_loaded_accept()
 	test_load_fail_loud_clears_latch()
+	test_match_over_sends_report()
+	test_forgivable_matchbank()
+	test_matchbank_retry()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()
 	test_combat_gate()

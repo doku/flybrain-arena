@@ -7,6 +7,7 @@ signal merged(merge_count: int, archived_loser: String)
 signal restarted(round_winner: String)
 signal tournament_battle_received(battle_winner: String, fitness_alpha: float, fitness_beta: float, battle_id: String)
 signal battle_progress_received(battle_id: String)
+signal match_banked_received(match_winner: String, fitness_alpha: float, fitness_beta: float, match_id: String)
 signal brains_loaded_received(alpha_info: Dictionary, beta_info: Dictionary, tournament_id: String, match_label: String)
 signal prepared_received(tournament_id: String, match_label: String)
 signal match_ready_received()
@@ -103,6 +104,25 @@ func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw
 	}
 	_send_dict(msg)
 
+func request_match_report(match_winner: String, tournament_id: String,
+		match_label: String, match_id: String, battles: Array,
+		partial: bool = false) -> void:
+	# ONE bank per match: every cached battle rides one message; the
+	# server replays them in order, then banks the match (one journal,
+	# one save pair). Partial = quit-flush: banks battles only, the
+	# match result stays undecided.
+	if not is_connected_server:
+		return
+	_send_dict({
+		"type": "match_report",
+		"match_winner": match_winner,
+		"tournament_id": tournament_id,
+		"match": match_label,
+		"match_id": match_id,
+		"battles": battles,
+		"partial": partial
+	})
+
 func request_tournament_load(alpha_path: String, beta_path: String, tournament_id: String, match_label: String, lr_scale: float = 0.5) -> void:
 	if not is_connected_server:
 		return
@@ -193,6 +213,12 @@ func _handle_server_response(data: Dictionary) -> void:
 	elif status == "tournament_battle":
 		tournament_battle_received.emit(
 			data.get("battle_winner", "draw"),
+			float(data.get("fitness_alpha", 0.0)),
+			float(data.get("fitness_beta", 0.0)),
+			str(data.get("battle_id", "")))
+	elif status == "tournament_match_battled":
+		match_banked_received.emit(
+			data.get("match_winner", "draw"),
 			float(data.get("fitness_alpha", 0.0)),
 			float(data.get("fitness_beta", 0.0)),
 			str(data.get("battle_id", "")))

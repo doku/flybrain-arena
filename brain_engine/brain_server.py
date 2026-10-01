@@ -403,6 +403,205 @@ def _bank_match_result(tourney_a, tourney_b, match_winner):
     return banked
 
 
+def _handle_match_report(sock, client_addr, msg, tourney_a, tourney_b,
+                         tourney_tag, tournament_lr_scale, tournament_mode,
+                         evo_mgr, dopamine_rl, base_lr, brain_alpha,
+                         brain_beta, tourney_note):
+    """ONE bank per match: the arena cached every battle's stats/verdicts
+    and reports the whole match at match over. Battles replay in order -
+    evaluate_match, dopamine+pin per battle (the battle's shipped sens/
+    ctrl context + a fresh budget episode), K_BATTLE ELO chain, records/
+    ko/wander/session bumps - then the match bank (K_MATCH ELO + match
+    counters). One journal (records-only) + one save pair for the whole
+    match; the reply echoes every battle. A partial report (quit flush)
+    banks battles only - the match result stays undecided."""
+    import brain_package as vault_pkg
+    battles = msg.get("battles", [])
+    if not isinstance(battles, list) or not battles:
+        sock.sendto(json.dumps({"status": "error",
+                                "error": "match_report: no battles"}
+                               ).encode("utf-8"), client_addr)
+        return
+    match_id = str(msg.get("match_id", ""))
+    tid = str(msg.get("tournament_id", "")
+              or tourney_tag.get("tournament_id") or "")
+    mlabel = str(msg.get("match", "") or tourney_tag.get("match") or "")
+    partial = bool(msg.get("partial", False))
+    match_winner = str(msg.get("match_winner", "") or "pending")
+    # Exact-resend dedup: the same match nonce was banked already ->
+    # resend the stored result, no re-bank. Fresh-nonce reports of the
+    # same match bank fresh (quit-resume partials are continuations,
+    # not replays - the resumed battles are new fights).
+    match_key = {"tournament_id": tid, "match": mlabel, "battle_id": match_id}
+    stored = _read_last_verdict()
+    if stored is not None and stored.get("key") == match_key:
+        print(f"[Server] Duplicate match report {mlabel}-{match_id}: "
+              f"resending stored result, no re-bank.", flush=True)
+        try:
+            sock.sendto(json.dumps(stored["result"]).encode("utf-8"),
+                        client_addr)
+        except OSError as e:
+            print(f"[Server] resend failed: {e}", flush=True)
+        return
+    if not tournament_mode:
+        # Match reports are tournament-shaped: refuse loudly in free
+        # mode (the arena heals via QUIT TO MENU + RESUME). Silently
+        # banking one would evolve boot brains.
+        print(f"[Server] ERROR: match_report {match_id} while in FREE "
+              f"mode ({tourney_note()}). Refused.", flush=True)
+        sock.sendto(json.dumps({"status": "error",
+                                "error": "match_report while in FREE mode "
+                                         "- QUIT TO MENU + RESUME"
+                               }).encode("utf-8"), client_addr)
+        return
+    t_start = time.perf_counter()
+    # Accumulated record copies: battle N+1's ELO reads battle N's
+    # updated ratings (the chain is order-bound); the journal stores
+    # the FINAL absolute snapshots, so replay is idempotent.
+    records = []
+    for side, st in (("alpha", tourney_a), ("beta", tourney_b)):
+        if st["rec"] is None:
+            continue
+        records.append({"side": side, "record": deepcopy(st["rec"])})
+    echoes = []
+    fit_a, fit_b = 0.0, 0.0
+    for bi, b in enumerate(battles):
+        if not isinstance(b, dict):
+            continue
+        bstats_a = b.get("stats_a", {}) or {}
+        bstats_b = b.get("stats_b", {}) or {}
+        bverdict = b.get("verdict", {}) or {}
+        if not isinstance(bverdict, dict):
+            bverdict = {}
+        bdraw = bool(b.get("draw", False))
+        bdraw_penalty = bool(b.get("draw_penalty", False))
+        bend = str(b.get("end_reason", "") or "")
+        winner, fit_a, fit_b = evo_mgr.evaluate_match(
+            bstats_a, bstats_b,
+            rec_a=tourney_a.get("rec"), rec_b=tourney_b.get("rec"))
+        # The arena owns every outcome: the declared winner banks
+        # (same contract as the per-battle verdict forcing).
+        _forced = str(bverdict.get("winner_slot", "") or "")
+        if not bdraw and _forced in ("alpha", "beta"):
+            winner = _forced
+        ko_win = bool(bstats_a.get("kills") or bstats_b.get("kills"))
+        pulse = 1.0 if ko_win else 0.5
+        dopamine_rl.lr = base_lr * tournament_lr_scale
+        schemes_a = normalize_mapping(
+            ((tourney_a["rec"] or {}).get("generator_params", {}) or {}).get("mapping", None))
+        schemes_b = normalize_mapping(
+            ((tourney_b["rec"] or {}).get("generator_params", {}) or {}).get("mapping", None))
+        legacy_a = is_legacy_record(tourney_a["rec"])
+        legacy_b = is_legacy_record(tourney_b["rec"])
+        try:
+            _emit_progress(sock, client_addr, match_id,
+                           "battle %d dopamine" % (bi + 1))
+            _apply_round_learning(
+                dopamine_rl, brain_alpha, brain_beta, winner,
+                b.get("sens_a", {}) or {}, b.get("sens_b", {}) or {},
+                b.get("ctrl_a", {}) or {}, b.get("ctrl_b", {}) or {},
+                pulse, schemes_a, schemes_b, legacy_a, legacy_b,
+                arena_draw=bdraw)
+        finally:
+            dopamine_rl.lr = base_lr
+        # Records: additive bumps + the order-bound K_BATTLE ELO chain,
+        # applied to the accumulating copies (identical arithmetic to
+        # the old per-battle schedule, just deferred).
+        ra = next((r["record"] for r in records if r["side"] == "alpha"), None)
+        rb = next((r["record"] for r in records if r["side"] == "beta"), None)
+        if ra is not None and rb is not None:
+            out_a = "draw" if bdraw else ("win" if winner == "alpha" else "loss")
+            out_b = "draw" if bdraw else ("loss" if winner == "alpha" else "win")
+            vault_pkg.record_battle_result(ra, out_a)
+            vault_pkg.record_battle_result(rb, out_b)
+            if not bdraw and bend == "ko" and winner == "alpha":
+                ra["record"]["ko"] = int(ra["record"].get("ko", 0)) + 1
+            if not bdraw and bend == "ko" and winner == "beta":
+                rb["record"]["ko"] = int(rb["record"].get("ko", 0)) + 1
+            if bdraw:
+                da = float(bstats_a.get("center_drift", 0.0) or 0.0)
+                db = float(bstats_b.get("center_drift", 0.0) or 0.0)
+                if da >= vault_pkg.WANDER_MARK_M:
+                    ra["record"]["wander"] = int(
+                        ra["record"].get("wander", 0)) + 1
+                if db >= vault_pkg.WANDER_MARK_M:
+                    rb["record"]["wander"] = int(
+                        rb["record"].get("wander", 0)) + 1
+            if not bdraw:
+                vault_pkg.log_training_session(
+                    ra, 0, {"lr_scale": tournament_lr_scale,
+                            "pulse": pulse,
+                            "outcome": out_a},
+                    f"tournament battle {out_a} ({tourney_note()})")
+                vault_pkg.log_training_session(
+                    rb, 0, {"lr_scale": tournament_lr_scale,
+                            "pulse": -0.8 * pulse,
+                            "outcome": out_b},
+                    f"tournament battle {out_b} ({tourney_note()})")
+            vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_BATTLE)
+            if bdraw and bdraw_penalty:
+                vault_pkg.apply_draw3_penalty(ra, rb)
+        echoes.append({"battle_id": str(b.get("battle_id", "")),
+                       "battle_winner": ("draw" if bdraw else winner)})
+    # Match bank folded in (unless partial): match counters + K_MATCH
+    # ELO on the same accumulated copies. One save pair + one journal
+    # for the whole match follow below.
+    if not partial:
+        ra = next((r["record"] for r in records if r["side"] == "alpha"), None)
+        rb = next((r["record"] for r in records if r["side"] == "beta"), None)
+        if ra is not None and rb is not None:
+            out_a = ("win" if match_winner == "alpha"
+                     else "loss" if match_winner == "beta" else "draw")
+            vault_pkg.record_match_result(ra, out_a)
+            vault_pkg.record_match_result(rb, "draw" if match_winner == "draw"
+                                          else ("loss" if match_winner == "alpha"
+                                                else "win"))
+            vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_MATCH)
+    fit_a, fit_b = _sanitize_fit(fit_a), _sanitize_fit(fit_b)
+    print(f"[Server] Match report banked {mlabel}-{match_id} "
+          f"({tourney_note()}): {len(echoes)} battles, "
+          f"winner={match_winner}, dopamine+records "
+          f"{time.perf_counter() - t_start:.1f}s (vault save next)",
+          flush=True)
+    resp = {
+        "status": "tournament_match_battled",
+        "match_winner": match_winner,
+        "fitness_alpha": fit_a,
+        "fitness_beta": fit_b,
+        "battle_id": match_id,
+        "tournament_id": tid,
+        "match": mlabel,
+        "battles": echoes,
+        "report": (f"match banked: {len(echoes)} battles "
+                   f"(winner {match_winner})"),
+    }
+    for r in records:
+        r["weights_unchanged"] = True
+    live_weights = {"alpha": brain_alpha.weights, "beta": brain_beta.weights}
+    _t_journal = time.perf_counter()
+    _emit_progress(sock, client_addr, match_id, "journal")
+    _write_pending_battle(match_key, resp, records, {})
+    _t_weights = time.perf_counter()
+    _emit_progress(sock, client_addr, match_id, "weights")
+    for side in ("alpha", "beta"):
+        rec = next((r["record"] for r in records if r["side"] == side), None)
+        if rec is not None and side in live_weights:
+            vault_pkg.save_brain(rec, live_weights[side],
+                                 backup=False, fast=False)
+    _t_recover = time.perf_counter()
+    _emit_progress(sock, client_addr, match_id, "recover")
+    _recover_pending_battle((tourney_a, tourney_b))
+    print(f"[Server] match {match_id}: journal "
+          f"{_t_weights - _t_journal:.1f}s + weights "
+          f"{_t_recover - _t_weights:.1f}s + recover+verdict "
+          f"{time.perf_counter() - _t_recover:.1f}s", flush=True)
+    try:
+        sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+    except OSError as e:
+        print(f"[Server] send tournament_match_battled failed "
+              f"(kept verdict): {e}", flush=True)
+
+
 def _norm_experiment(value):
     """Canonical wiring key: None for base, else a sorted tuple of names
     (additive mixes; see experimental_wiring.normalize_experiment)."""
@@ -1359,6 +1558,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 brain_alpha.reset_state()
                 brain_beta.reset_state()
                 sock.sendto(json.dumps({"status": "free_ready"}).encode("utf-8"), client_addr)
+
+            elif msg_type == "match_report":
+                # ONE bank per match: the arena cached every battle and
+                # reports the whole match at match over (battles replay
+                # in order inside; one journal, one save pair). Old
+                # per-battle round_over banking is retired for
+                # tournaments - this is the new smooth-battle path.
+                _handle_match_report(
+                    sock, client_addr, msg, tourney_a, tourney_b,
+                    tourney_tag, tournament_lr_scale, tournament_mode,
+                    evo_mgr, dopamine_rl, base_lr, brain_alpha, brain_beta,
+                    tourney_note)
+                continue
 
             elif msg_type == "tournament_match":
                 # Match verdict: bump match counters + match ELO on both

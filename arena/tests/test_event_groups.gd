@@ -957,9 +957,9 @@ func test_preload_and_peek() -> void:
 	var p: Dictionary = D.call("next_match_params")
 	_check(str(p.get("match", "")) == "R1M2",
 		"peek sees the same-round next match")
-	_check(str(p.get("alpha_path", "")).ends_with("a.flybrain"),
+	_check(str(p.get("alpha_path", "")).ends_with("c.flybrain"),
 		"peek resolves alpha path")
-	_check(str(p.get("beta_path", "")).ends_with("b.flybrain"),
+	_check(str(p.get("beta_path", "")).ends_with("d.flybrain"),
 		"peek resolves beta path")
 	_check(str(p.get("tournament_id", "")) == "T1", "peek echoes the tournament")
 	D.set("tourney", {"id": "T1", "lr_scale": 0.5,
@@ -989,6 +989,39 @@ func test_preload_and_peek() -> void:
 	A.call("_preload_next_match")
 	_check((A.get("_preload_params") as Dictionary).is_empty(),
 		"bare preload no-ops (no director)")
+	A.free()
+
+
+func test_match_batch_flow() -> void:
+	# Batched match reporting: battles cache locally (id, draw flags,
+	# verdict, stats, sens/ctrl context) with no server send; nothing
+	# arms a battle await. The match report send is a real-scene path
+	# (test_combat_fx: watchdogs touch live nodes).
+	var A = load("res://scripts/ArenaManager.gd").new()
+	A.set("tournament_active", true)
+	_check((A.get("_match_battle_cache") as Array).is_empty(),
+		"cache starts empty")
+	A.call("_battle_done_local", false, false)
+	var cache: Array = A.get("_match_battle_cache")
+	_check(cache.size() == 1, "battle cached, no server send")
+	var b: Dictionary = cache[0]
+	_check(b.has("battle_id") and b.has("draw") and b.has("draw_penalty"),
+		"cache carries id + draw flags")
+	_check((b.get("verdict", {}) as Dictionary).has("winner_slot"),
+		"cache carries verdict")
+	_check((b.get("stats_a", {}) as Dictionary).has("kills"),
+		"cache carries stats")
+	_check(b.has("sens_a") and b.has("sens_b")
+		and b.has("ctrl_a") and b.has("ctrl_b"),
+		"cache carries sens/ctrl context")
+	A.call("_battle_done_local", true, false)
+	_check((A.get("_match_battle_cache") as Array).size() == 2,
+		"draw caches too")
+	_check(not bool(A.get("_tourney_awaiting_battle")),
+		"no battle await armed")
+	_check(str(A.get("_seq_context")) == "", "no battle watchdog armed")
+	_check(not bool(A.call("_forgivable_matchbank", "M1")),
+		"empty match forgive map")
 	A.free()
 
 
@@ -1300,6 +1333,8 @@ func _initialize() -> void:
 	test_train_hud_parts()
 	test_countdown_gates()
 	test_handoff_prebuild_all_groups()
+	test_preload_and_peek()
+	test_match_batch_flow()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()
