@@ -3707,14 +3707,21 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 	# Let the callout land before the countdown starts.
 	await get_tree().create_timer(1.2).timeout
 
-	for i in range(3, 0, -1):
-		if is_instance_valid(countdown_label):
-			countdown_label.text = "%s IN %d..." % [countdown_prefix, i]
-		await get_tree().create_timer(1.0).timeout
+	# Informational banners (empty prefix: GROUP COMPLETE, CHAMPION,
+	# quick-battle) hold statically - only a real next step counts
+	# down. An empty prefix used to play a phantom " IN 3... FIGHT!"
+	# over the incoming bracket view.
+	if countdown_prefix != "":
+		for i in range(3, 0, -1):
+			if is_instance_valid(countdown_label):
+				countdown_label.text = "%s IN %d..." % [countdown_prefix, i]
+			await get_tree().create_timer(1.0).timeout
 
-	if is_instance_valid(countdown_label):
-		countdown_label.text = "FIGHT!"
-	await get_tree().create_timer(0.8).timeout
+		if is_instance_valid(countdown_label):
+			countdown_label.text = "FIGHT!"
+		await get_tree().create_timer(0.8).timeout
+	else:
+		await get_tree().create_timer(0.8).timeout
 
 	winner_overlay.visible = false
 	if auto_reset:
@@ -5414,8 +5421,12 @@ func _event_preview_sub(upcoming: String) -> String:
 
 func _event_is_fresh() -> bool:
 	# Brand-new event tip-off: group A file untouched (0,0, no battles
-	# banked). Resume paths never satisfy this, so the showcase runs
-	# exactly once per event.
+	# banked) AND no group done anywhere in the manifest. The manifest
+	# clause matters: quitting during a later group's intermission (or
+	# before its first battle banks) leaves a fresh-looking group file,
+	# and without it the resume would play the 30 s tip-off (mislabeled
+	# "Group A starts in") instead of the 60 s resume intermission for
+	# the right group.
 	var director := _director()
 	if director == null or not _event_active():
 		return false
@@ -5424,6 +5435,11 @@ func _event_is_fresh() -> bool:
 	if int(director.tourney.get("current_round", -1)) != 0 \
 			or int(director.tourney.get("current_match", -1)) != 0:
 		return false
+	var ev := _event_manifest()
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		if bool(gd.get("done", false)):
+			return false
 	var m: Dictionary = director.current_match()
 	return int(m.get("battles", 0)) == 0
 
@@ -5461,9 +5477,13 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
 	_sync_bracket_button()
+	# Countdown provenance: title carries the caller (TIP-OFF / GROUP
+	# A..D / FINAL), so any "wrong length" report is attributable.
+	print("[Arena] Intermission '%s' for %ds" % [title, int(secs)])
 	var left := secs
 	while left > 0.0 and not _event_skip:
 		if not _event_active():
+			print("[Arena] Intermission '%s' broke early (%.0fs left): event inactive" % [title, left])
 			break
 		intermission_label.text = "%s\nNext bracket in %d s — SKIP to start now" % [sub, int(ceil(left))]
 		await get_tree().create_timer(1.0).timeout
@@ -5538,13 +5558,15 @@ func _event_pool_ready_count() -> int:
 	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
 
 
-func _event_pool_wait() -> bool:
+func _event_pool_wait() -> String:
 	# Rare fallback: bench short at handoff. Waits on the FINAL review
 	# screen (bracket visible, queue status live) while the background
-	# queue works - never a bare progress bar. STOP aborts.
+	# queue works - never a bare progress bar. STOP aborts. Returns ""
+	# when the bench filled, else the reason (the caller parks on
+	# FINAL REVIEW with it, never a bare return).
 	var director := _director()
 	if director == null:
-		return false
+		return "no director"
 	_close_round_for_wait()
 	_show_arena_bracket("FINAL REVIEW - PROMOTION READY (%d/%d qualified)" % [
 		_event_pool_ready_count(), EVENT_POOL_TARGET])
@@ -5560,12 +5582,22 @@ func _event_pool_wait() -> bool:
 			status_label.text = "Promotion-ready %d/%d - queue breeding..." % [ready, EVENT_POOL_TARGET]
 		if ready >= EVENT_POOL_TARGET:
 			_hide_arena_bracket()
-			return true
-	_hide_arena_bracket()
+			return ""
+	# Failure paths leave FINAL REVIEW up for the caller's failure
+	# view (hiding into nothing was the bare-arena stall).
 	if not _evo_active():
-		return false
+		return "stopped by user"
 	_evo_abort("pool short - refusing a short-bench event")
-	return false
+	return "pool short - refusing a short-bench event"
+
+
+func _show_handoff_failure(title: String, reason: String) -> void:
+	# Handoff/start_next failures park here, never on a bare arena:
+	# freeze like an abort, then raise FINAL REVIEW carrying the reason.
+	# Callers quit to menu after a short review (show-then-quit), so the
+	# viewer reads what broke instead of staring at an empty field.
+	_evo_abort(reason)
+	_show_arena_bracket(title)
 
 
 func _run_event_handoff() -> void:
@@ -5580,7 +5612,13 @@ func _run_event_handoff() -> void:
 		return
 	var eid := _event_id()
 	var champ_id := str(director.tourney.get("champion_id", ""))
-	_save_bracket_record(true)
+	# The handoff runs bracket-first: every build/queue step below shows
+	# on FINAL REVIEW, so a stall or failure never strands the viewer on
+	# a bare arena. Awaited capture: an un-awaited record's delayed
+	# hide would yank a later overlay (same race as group intermissions).
+	_show_arena_bracket("EVENT %s - BUILDING NEXT EVENT" % eid)
+	await _save_bracket_record(true)
+	_show_arena_bracket("EVENT %s - BUILDING NEXT EVENT" % eid)
 	_show_callout("EVENT %s CHAMPION: %s" % [eid, director.champion_name()],
 		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false)
 	_event_drain_done_to_pool()
@@ -5597,11 +5635,26 @@ func _run_event_handoff() -> void:
 	var elim: Dictionary = director.event_eliminate(eid,
 		int(st0.get("min_matches", EVENT_MIN_MATCHES)),
 		float(st0.get("elo_cutoff", 0.0)))
+	# Green-roster tolerance: fewer than 2 career-eligible brains means
+	# nobody has the matches to demote, so elimination is WAIVED this
+	# generation (the green-protection promise holds; the event simply
+	# refights without fresh blood) instead of aborting the chain.
+	# Loud, never silent - a stalled composition must read somewhere.
+	var gone: Array = []
 	if not bool(elim.get("ok", false)):
-		_evo_abort("elimination failed: " + str(elim.get("error", "?")))
-		return
-	var gone: Array = elim.get("eliminated", [])
-	print("[Arena] Event %s eliminated %s" % [eid, str(gone)])
+		if str(elim.get("error", "")) == "fewer than 2 eligible brains":
+			print("[Arena] Event %s: green roster, elimination waived (no fresh blood this generation)." % eid)
+			if is_instance_valid(status_label):
+				status_label.text = "EVENT %s: GREEN ROSTER - NO ELIMINATION THIS GENERATION" % eid
+		else:
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+				"elimination failed: " + str(elim.get("error", "?")))
+			await get_tree().create_timer(8.0).timeout
+			director.quit_to_menu()
+			return
+	else:
+		gone = elim.get("eliminated", [])
+		print("[Arena] Event %s eliminated %s" % [eid, str(gone)])
 	director.event_finish(eid, champ_id)
 	var ev: Dictionary = director.event_load(eid)
 	var gen := int(ev.get("generation", 1))
@@ -5612,7 +5665,11 @@ func _run_event_handoff() -> void:
 		_evo_queue_wild(gen + 1)
 	_event_drain_done_to_pool()
 	if _event_pool_ready_count() < EVENT_POOL_TARGET:
-		if not await _event_pool_wait():
+		var why := await _event_pool_wait()
+		if why != "":
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid, why)
+			await get_tree().create_timer(8.0).timeout
+			director.quit_to_menu()
 			return
 	_event_start_next(ev, gone)
 
@@ -5630,18 +5687,32 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 		for pid in (gd.get("players", []) as Array):
 			if not (str(pid) in gone) and not (str(pid) in survivors):
 				survivors.append(str(pid))
-	if survivors.size() != 14:
-		_evo_abort("event survivors %d != 14" % survivors.size())
+	# Normally 14 (16 minus 2 eliminated); a waived elimination leaves
+	# 15-16 and the draw shrinks to fit - the roster still lands on 16.
+	# Anything else is a corrupt manifest, not a stall: show it, quit.
+	var need := 16 - survivors.size()
+	if need < 0 or need > 2:
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"event survivors %d (need 14-16)" % survivors.size())
+		await get_tree().create_timer(8.0).timeout
+		director.quit_to_menu()
 		return
-	var draw: Dictionary = director.event_draw_pool(eid, EVENT_POOL_TARGET,
+	var draw: Dictionary = director.event_draw_pool(eid, need,
 		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
-	if not bool(draw.get("ok", false)):
-		_evo_abort("pool draw failed: " + str(draw.get("error", "?")))
+	if not bool(draw.get("ok", false)) \
+			or (draw.get("drawn", []) as Array).size() != need:
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"pool draw failed: " + str(draw.get("error", "short bench")))
+		await get_tree().create_timer(8.0).timeout
+		director.quit_to_menu()
 		return
 	var roster: Array = survivors + (draw.get("drawn", []) as Array)
 	var beg: Dictionary = director.event_begin(roster, st, gen)
 	if not bool(beg.get("ok", false)):
-		_evo_abort("next event failed: " + str(beg.get("error", "?")))
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"next event failed: " + str(beg.get("error", "?")))
+		await get_tree().create_timer(8.0).timeout
+		director.quit_to_menu()
 		return
 	var new_eid := str(beg.get("event_id", ""))
 	# Bench remainder rides into the new event; in-flight breed specs
@@ -5661,8 +5732,16 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	# Switch back to A after: the build loop leaves the last-built
 	# file (D) and its phase loaded.
 	if not _event_build_all_groups(ev_new):
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"next event brackets failed to build")
+		await get_tree().create_timer(8.0).timeout
+		director.quit_to_menu()
 		return
 	if not _event_switch_group(ev_new, "A"):
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"next event group A failed to load")
+		await get_tree().create_timer(8.0).timeout
+		director.quit_to_menu()
 		return
 	director.tourney["evo"] = {"active": true, "generation": gen,
 		"episodes": EVO_EPISODES,
@@ -5670,7 +5749,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 		"pending": carried, "done": {}}
 	director.save_state()
 	if not await _event_intermission("EVENT %s · GROUP A (GEN %d)" % [new_eid, gen],
-			_event_preview_sub("A")):
+			_event_preview_sub("A"), EVENT_INTERMISSION_SECS):
 		director.quit_to_menu()
 		return
 	_request_current_battle_load()

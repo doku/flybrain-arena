@@ -12,6 +12,11 @@ var _rec_ready_tick := 0
 var _rec_armed := false
 var _rec_old_tourney: Dictionary = {}
 var _rec_old_dir := ""
+var _tests_done := false
+var _callout_fire_at := 0
+var _callout_watch := false
+var _callout_bad := false
+var _callout_until := 0
 
 
 func _check(cond: bool, label: String) -> void:
@@ -528,6 +533,97 @@ func test_matchbank_brain_loss_resends() -> void:
 		"capped bank error still lands loud")
 
 
+func test_callout_static() -> void:
+	# Informational banners (empty prefix, e.g. GROUP COMPLETE) hold
+	# statically: no " IN 3..." countdown, no FIGHT! Fired on a delay
+	# so the free-boot phantom REMATCH (first ~5 s wall) is done first;
+	# the watch then samples the label every tick until the overlay
+	# hides (~2 s).
+	_callout_fire_at = Time.get_ticks_msec() + 8000
+
+
+func _watch_callout_tick() -> void:
+	# Samples the callout label every tick while an informational
+	# banner plays; clears (with the verdict) when the overlay hides
+	# or the wall deadline passes.
+	if is_instance_valid(arena.countdown_label):
+		var t := str(arena.countdown_label.text)
+		if t.contains(" IN ") or t == "FIGHT!":
+			_callout_bad = true
+	if (is_instance_valid(arena.winner_overlay) and not arena.winner_overlay.visible) \
+			or Time.get_ticks_msec() > _callout_until:
+		_callout_watch = false
+		_check(not _callout_bad, "static callout never counts down")
+
+
+func test_handoff_failure_view() -> void:
+	# Handoff failures park on FINAL REVIEW with the reason, never on
+	# a bare arena. (The timed quit lives in the callers, untouched
+	# here so the scene survives the suite.)
+	var d = arena._director()
+	var old_tourney: Dictionary = {}
+	var old_dir := ""
+	if d != null:
+		old_tourney = d.tourney
+		old_dir = d.tournament_dir
+		d.tournament_dir = "user://test_failview"
+		DirAccess.make_dir_recursive_absolute("user://test_failview")
+	arena._show_handoff_failure("FINAL REVIEW - TEST", "unit test reason")
+	_check(arena.bracket_overlay.visible, "failure parks on the bracket")
+	_check(str(arena.status_label.text).contains("unit test reason"),
+		"failure names the reason")
+	arena._hide_arena_bracket()
+	if d != null:
+		d.tourney = old_tourney
+		d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_failview"):
+		for f in DirAccess.get_files_at("user://test_failview"):
+			DirAccess.remove_absolute("user://test_failview".path_join(f))
+		DirAccess.remove_absolute("user://test_failview")
+
+
+func test_tipoff_freshness() -> void:
+	# Tip-off runs once per event: a fresh group-B file (quit during
+	# its intermission, 0 battles banked) must NOT read as a brand-new
+	# event, or the resume plays the 30 s mislabeled tip-off instead
+	# of the 60 s resume intermission for the right group.
+	var d = arena._director()
+	if d == null:
+		_check(true, "freshness skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_fresh"
+	DirAccess.make_dir_recursive_absolute("user://test_fresh")
+	var groups := {}
+	for letter in ["A", "B", "C", "D"]:
+		groups[letter] = {"players": [], "bracket_id": "",
+			"standings": [], "done": letter == "A"}
+	d.event_save({"id": "EFRESH", "status": "running", "generation": 1,
+		"settings": {}, "groups": groups, "group_order": ["A", "B", "C", "D"],
+		"final_id": "", "champion_id": "", "pool": [], "phase": "groups_B"})
+	d.tourney = {"id": "TB", "format": "groups", "group": "B",
+		"event_id": "EFRESH", "evo": {"active": true},
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a", "b_id": "b", "battles": 0}]]}
+	_check(not arena._event_is_fresh(), "done groups defeat freshness")
+	(groups["A"] as Dictionary)["done"] = false
+	d.event_save({"id": "EFRESH", "status": "running", "generation": 1,
+		"settings": {}, "groups": groups, "group_order": ["A", "B", "C", "D"],
+		"final_id": "", "champion_id": "", "pool": [], "phase": "groups_A"})
+	d.tourney = {"id": "TA", "format": "groups", "group": "A",
+		"event_id": "EFRESH", "evo": {"active": true},
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a", "b_id": "b", "battles": 0}]]}
+	_check(arena._event_is_fresh(), "untouched event 1 stays fresh")
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_fresh"):
+		for f in DirAccess.get_files_at("user://test_fresh"):
+			DirAccess.remove_absolute("user://test_fresh".path_join(f))
+		DirAccess.remove_absolute("user://test_fresh")
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -558,7 +654,8 @@ func test_bracket_record_contract() -> void:
 func _finish_record_contract() -> void:
 	# Assert + restore only when the async leg was armed (a no-director
 	# run never stubbed the tourney, so there is nothing to assert and
-	# restoring {} would clobber the real state).
+	# restoring {} would clobber the real state). Summary + quit moved
+	# to _process so the callout watch can finish alongside.
 	if _rec_armed:
 		_check(arena.bracket_overlay.visible,
 			"png record never yanks a live bracket")
@@ -571,21 +668,32 @@ func _finish_record_contract() -> void:
 		for f in DirAccess.get_files_at("user://test_rec"):
 			DirAccess.remove_absolute("user://test_rec".path_join(f))
 		DirAccess.remove_absolute("user://test_rec")
-	if failures == 0:
-		print("ALL COMBAT-FX TESTS PASSED")
-	else:
-		printerr("COMBAT-FX TESTS: %d FAILURES" % failures)
-	quit(failures)
 
 
 func _process(_delta: float) -> bool:
 	tick += 1
+	if _callout_fire_at != 0 and Time.get_ticks_msec() >= _callout_fire_at:
+		_callout_fire_at = 0
+		arena._show_callout("T", Color.WHITE, "S", "", false)
+		_callout_watch = true
+		_callout_bad = false
+		_callout_until = Time.get_ticks_msec() + 8000
+	if _callout_watch:
+		_watch_callout_tick()
 	if _rec_stage == 1:
 		if tick < _rec_ready_tick:
 			return false
 		_rec_stage = 2
 		_finish_record_contract()
-		return true
+	if _tests_done:
+		if _rec_stage == 2 and _callout_fire_at == 0 and not _callout_watch:
+			if failures == 0:
+				print("ALL COMBAT-FX TESTS PASSED")
+			else:
+				printerr("COMBAT-FX TESTS: %d FAILURES" % failures)
+			quit(failures)
+			return true
+		return false
 	if tick < 3:
 		return false
 	test_builds()
@@ -601,6 +709,9 @@ func _process(_delta: float) -> bool:
 	test_server_brain_loss_reloads()
 	test_matchbank_brain_loss_resends()
 	test_motors_slot()
+	test_callout_static()
+	test_handoff_failure_view()
+	test_tipoff_freshness()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()
 	test_combat_gate()
@@ -611,11 +722,11 @@ func _process(_delta: float) -> bool:
 	test_loser_drops_faster()
 	test_pip_slot_visibility()
 	test_bracket_record_contract()
+	_tests_done = true
 	# Un-armed (e.g. no director): finish now instead of re-running the
 	# suite every frame - the old quit-at-tick-3 contract must hold on
 	# every path.
 	if _rec_stage == 0:
 		_rec_stage = 2
 		_finish_record_contract()
-		return true
 	return false

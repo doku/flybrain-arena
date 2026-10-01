@@ -1076,6 +1076,43 @@ func test_motor_debug() -> void:
 	A.free()
 
 
+func test_eliminate_green_roster() -> void:
+	# Green roster (nobody with 10 career matches): elimination has no
+	# one to demote - the rule fails LOUD with the contract string the
+	# handoff matches to waive elimination (instead of stalling).
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_elim"
+	DirAccess.make_dir_recursive_absolute("user://test_elim")
+	var roster: Array = []
+	for i in range(4):
+		roster.append({"id": "g%02d" % i, "name": "G%d" % (i + 1),
+			"record": {"elo": 1500.0 - i * 10, "matches": 3}})
+	D.set("brains_cache", roster)
+	D.set("brains_cache_msec", Time.get_ticks_msec())
+	var tour := {"id": "TELIM", "rounds": [[
+		{"a_id": "g00", "b_id": "g01", "winner_id": "g00"},
+		{"a_id": "g02", "b_id": "g03", "winner_id": "g02"}]]}
+	var bf := FileAccess.open("user://test_elim/TELIM.json", FileAccess.WRITE)
+	bf.store_string(JSON.stringify(tour))
+	bf.close()
+	D.call("event_save", {"id": "EELIM", "group_order": ["A"],
+		"groups": {"A": {"players": ["g00", "g01", "g02", "g03"],
+			"bracket_id": "TELIM", "standings": [], "done": false}}})
+	var cands: Dictionary = D.call("event_eliminate_candidates",
+		"EELIM", 10, 0.0)
+	_check(((cands.get("candidates", []) as Array)).size() < 2,
+		"green roster yields no candidates")
+	var elim: Dictionary = D.call("event_eliminate", "EELIM", 10, 0.0)
+	_check(not bool(elim.get("ok", false)), "green elimination fails loud")
+	_check(str(elim.get("error", "")) == "fewer than 2 eligible brains",
+		"failure carries the waive contract string")
+	D.free()
+	if DirAccess.dir_exists_absolute("user://test_elim"):
+		for f in DirAccess.get_files_at("user://test_elim"):
+			DirAccess.remove_absolute("user://test_elim".path_join(f))
+		DirAccess.remove_absolute("user://test_elim")
+
+
 func test_draw_title_dnf() -> void:
 	# Timeout-ties are called DNF, numbered by banked draws.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -1384,6 +1421,7 @@ func _initialize() -> void:
 	test_train_hud_parts()
 	test_countdown_gates()
 	test_handoff_prebuild_all_groups()
+	test_eliminate_green_roster()
 	test_preload_and_peek()
 	test_match_batch_flow()
 	test_motor_debug()
