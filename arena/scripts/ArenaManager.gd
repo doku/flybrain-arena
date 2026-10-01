@@ -1221,9 +1221,17 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 			reply_tid, reply_match,
 			str(_seq_last_load.get("tournament_id", "")),
 			str(_seq_last_load.get("match", ""))])
+		_arena_log("dropped stale brains_loaded: got %s/%s want %s/%s" % [
+			reply_tid, reply_match,
+			str(_seq_last_load.get("tournament_id", "")),
+			str(_seq_last_load.get("match", ""))])
 		return
 	_clear_seq()
 	tourney_awaiting_load = false
+	_arena_log("brains loaded: %s vs %s (%s)" % [
+		str((_alpha_info as Dictionary).get("name", "?")),
+		str((_beta_info as Dictionary).get("name", "?")),
+		tourney_match_label])
 	# A clean load resets the self-heal cap (each match gets fresh
 	# recovery budget against server restarts) and consumes the
 	# in-flight marker (recovery complete; later errors act again).
@@ -1277,6 +1285,7 @@ func _on_server_error(error: String) -> void:
 	# repeats from its stored verdict, so this cannot double-count).
 	# Anything else stands the watchdog down so retry text never overwrites
 	# the real reason; a late battle reply is dropped, never applied twice.
+	_arena_log("server error: %s (awaiting %s)" % [error, _seq_context])
 	if _seq_context == "battle" and _tourney_awaiting_battle \
 			and not _seq_retried and not _seq_last_round.is_empty():
 		_seq_retried = true
@@ -1835,6 +1844,8 @@ func _check_seq_watchdog() -> void:
 		return
 	print("[Arena] Sequencing watchdog fired (context=", _seq_context,
 		" retry_sent=", _seq_retried, " battle_id=", _seq_battle_id, ")")
+	_arena_log("watchdog fired: context=%s retry_sent=%s battle_id=%s" % [
+		_seq_context, str(_seq_retried), _seq_battle_id])
 	if _seq_context == "battle":
 		# Safe retry: the server answers a resent round_over with the SAME
 		# battle id from its persisted verdict instead of banking twice,
@@ -5522,6 +5533,7 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 	# Countdown provenance: title carries the caller (TIP-OFF / GROUP
 	# A..D / FINAL), so any "wrong length" report is attributable.
 	print("[Arena] Intermission '%s' for %ds" % [title, int(secs)])
+	_arena_log("intermission '%s' for %ds" % [title, int(secs)])
 	var left := secs
 	while left > 0.0 and not _event_skip:
 		if not _event_active():
@@ -5633,6 +5645,21 @@ func _event_pool_wait() -> String:
 	return "pool short - refusing a short-bench event"
 
 
+func _arena_log(msg: String) -> void:
+	# Persistent client-side session log (user://arena_log.txt): the
+	# wedge/recovery timeline stdout never captures (the game window
+	# owns it). Rare events only - open/append/close per line.
+	var path := "user://arena_log.txt"
+	var mode := FileAccess.READ_WRITE if FileAccess.file_exists(path) else FileAccess.WRITE
+	var f := FileAccess.open(path, mode)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line("%s  %s" % [
+		Time.get_datetime_string_from_system().replace("T", " "), msg])
+	f.close()
+
+
 func _recover_server_state(reason: String) -> bool:
 	# The quit+resume recipe, in place (no scene change): fresh
 	# seq/latches, fresh UDP socket, re-issued load from the current
@@ -5643,8 +5670,12 @@ func _recover_server_state(reason: String) -> bool:
 	# persistently broken server is not automatable). Status line only
 	# - silent healing otherwise.
 	if tournament_active and _server_reloads >= MAX_SERVER_RELOADS:
+		_arena_log("RECOVERY CAP EXHAUSTED: %s (reloads %d/%d)" % [reason,
+			_server_reloads, MAX_SERVER_RELOADS])
 		return false
 	_server_reloads += 1
+	_arena_log("AUTO-RECOVER (%s): reloading %s (attempt %d/%d)" % [reason,
+		tourney_match_label, _server_reloads, MAX_SERVER_RELOADS])
 	_restore_timescale()
 	_clear_seq()
 	tourney_awaiting_load = false
@@ -5672,6 +5703,8 @@ func _on_server_state(mode: bool, tid: String, match_label: String) -> void:
 	# restarted mid-bank: reload + stored-report resend NOW instead of
 	# after the 240 s watchdog cycle.
 	print("[Arena] Server state: mode=%s tourney=%s match=%s (awaiting %s)" % [
+		mode, tid, match_label, _seq_context])
+	_arena_log("server state poll: mode=%s tourney=%s match=%s (awaiting %s)" % [
 		mode, tid, match_label, _seq_context])
 	if _seq_context == "matchbank" and not mode and tournament_active \
 			and not _recover_in_flight and not _pending_matchbank_resend \

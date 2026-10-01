@@ -1113,6 +1113,27 @@ func test_eliminate_green_roster() -> void:
 		DirAccess.remove_absolute("user://test_elim")
 
 
+func test_arena_session_log() -> void:
+	# Persistent client-side session log: wedge/recovery events survive
+	# the game window (stdout dies with it). Appends with a timestamp;
+	# recovery + error paths write identifiable lines.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	if DirAccess.dir_exists_absolute("user://"):
+		for f in ["arena_log.txt"]:
+			DirAccess.remove_absolute("user://".path_join(f))
+	A.call("_arena_log", "unit test marker")
+	var f := FileAccess.open("user://arena_log.txt", FileAccess.READ)
+	_check(f != null, "session log created")
+	if f != null:
+		var text := f.get_as_text()
+		f.close()
+		_check(text.contains("unit test marker"),
+			"session log carries the event")
+		_check(text.length() > 24, "session log stamps the line")
+		DirAccess.remove_absolute("user://arena_log.txt")
+	A.free()
+
+
 func test_draw_title_dnf() -> void:
 	# Timeout-ties are called DNF, numbered by banked draws.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -1425,6 +1446,7 @@ func _initialize() -> void:
 	test_preload_and_peek()
 	test_match_batch_flow()
 	test_motor_debug()
+	test_arena_session_log()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()

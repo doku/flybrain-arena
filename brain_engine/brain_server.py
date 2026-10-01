@@ -1556,10 +1556,15 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # Leave tournament/quick mode: rebuild pristine boot brains
                 # (full objects: a tournament brain may carry a different
                 # wiring, so restoring weights alone would corrupt the shape).
+                # Attribution: a mid-tournament free_mode is the classic
+                # wedge trigger, so the SENDER is logged - a stale client
+                # (old test boot, zombie process) is then identifiable.
+                print(f"[Server] free_mode from {client_addr}: "
+                      + (f"leaving tournament ({tourney_note()}), "
+                         f"boot brains restored." if tournament_mode
+                         else "already free (boot/duplicate)."),
+                      flush=True)
                 if tournament_mode:
-                    print(f"[Server] free_mode: leaving tournament "
-                          f"({tourney_note()}), boot brains restored.",
-                          flush=True)
                     tournament_mode = False
                     brain_alpha = FlyBrain(boot_struct[0], boot_struct[1],
                                            boot_weights_a.copy())
@@ -1728,17 +1733,63 @@ def run_brain_server(host="127.0.0.1", port=9999):
             # changes). Back off instead of tight-looping the log: pending
             # datagrams are still read once the notifications drain.
             if "10054" in str(e):
+                # Counted, not muted: storm SIZE was invisible before -
+                # a burst of N dead-port replies is a different diagnosis
+                # than a stray one.
+                run_brain_server._n10054 = getattr(
+                    run_brain_server, "_n10054", 0) + 1
                 now = time.monotonic()
                 if now - getattr(run_brain_server, "_last_10054", 0.0) > 5.0:
-                    print(f"[Server Error] {e} (further repeats muted 5s)",
-                          flush=True)
+                    print(f"[Server Error] {e} ({run_brain_server._n10054}x "
+                          f"in the last 5s)", flush=True)
                     run_brain_server._last_10054 = now
+                    run_brain_server._n10054 = 0
                 time.sleep(0.05)
             else:
-                print(f"[Server Error] {e}", flush=True)
+                print(f"[Server Error] {e} {_disk_note()}", flush=True)
+
+
+def _disk_note():
+    """Free-space attribution for IO failure logs (rare path only): a
+    full disk reads identically to a locked-file race without this."""
+    try:
+        import shutil
+        free_gb = shutil.disk_usage(PROJECT_ROOT).free / 1e9
+        return f"(disk free {free_gb:.1f} GB)"
+    except Exception:
+        return ""
+
+
+class _StampedStdout:
+    """Per-line wall-clock stamps for server_log.txt: previously only
+    boot banners carried a time, so gap lengths between events were
+    unmeasurable. Line-buffered - a partial trailing chunk holds until
+    its newline arrives, then flushes stamped."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._pending = ""
+
+    def write(self, s):
+        self._pending += s
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            self._inner.write(time.strftime("[%H:%M:%S] ") + line + "\n")
+        return len(s)
+
+    def flush(self):
+        if self._pending:
+            self._inner.write(time.strftime("[%H:%M:%S] ") + self._pending)
+            self._pending = ""
+        self._inner.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 if __name__ == "__main__":
     # Test isolation: BRAIN_PORT moves the server off 9999 (the
     # protocol suite runs its own instance; production never sets it).
+    if os.environ.get("FLY_LOG_STAMPS", "1") != "0":
+        sys.stdout = _StampedStdout(sys.stdout)
     run_brain_server(port=int(os.environ.get("BRAIN_PORT", "9999")))
