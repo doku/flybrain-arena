@@ -170,22 +170,14 @@ const BV_NET_COLORS := {
 	"mbon_app": Color(0.7, 0.4, 1.0), "mbon_av": Color(0.5, 0.2, 0.8),
 	"dn_left": Color(1.0, 0.6, 0.15), "dn_right": Color(1.0, 0.6, 0.15),
 }
-# Replay (L4): per-battle pool-rate stream. One count array per motor
+# Pool-rate stream (flights telemetry): one count array per motor
 # reply (~5 Hz), capped; banked into the tournament JSON `flights`
-# entry when the menu record toggle is on, plus an in-memory copy for
-# the post-battle scrubber. ~50 KB per 40 s battle — toggle-gated.
+# entry when the menu record toggle is on. ~50 KB per 40 s battle -
+# toggle-gated. (The post-battle scrubber viewer was removed: the
+# REPLAY button never worked and was never used.)
 const BV_STREAM_MAX := 600
 var bv_stream_alpha: Array = []
 var bv_stream_beta: Array = []
-var bv_replay_mode := false
-var bv_replay_idx := 0
-var bv_replay_playing := false
-var bv_replay_accum := 0.0
-var bv_replay_panel: PanelContainer
-var bv_replay_slider: HSlider
-var bv_replay_playbtn: Button
-var bv_replay_label: Label
-var bv_replay_prior_bars: Array = []
 
 # Per-battle flight telemetry (answered by control step): altitude profile,
 # thrust/pitch command means, evade/ram exposure, spear demand. Reported
@@ -721,9 +713,6 @@ func _build_menu_bar(tournament: bool) -> void:
 		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
-		var replay_bt := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
-		replay_bt.pressed.connect(_toggle_replay)
-		bar.add_child(replay_bt)
 		var evo_stop_b := _menu_bar_button("STOP CONTINUOUS", "Stop the continuous tournament loop (keeps current bracket).")
 		evo_stop_b.pressed.connect(_on_evo_stop)
 		bar.add_child(evo_stop_b)
@@ -741,9 +730,6 @@ func _build_menu_bar(tournament: bool) -> void:
 		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
-		var replay_b2 := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
-		replay_b2.pressed.connect(_toggle_replay)
-		bar.add_child(replay_b2)
 
 
 const BV_LAYERS := ["bars", "flow", "raster", "brain3d"]
@@ -1985,7 +1971,6 @@ func _reset_round() -> void:
 	bv_last_reply = -1.0
 	bv_stream_alpha.clear()
 	bv_stream_beta.clear()
-	_exit_replay()
 	if is_instance_valid(bv_raster_alpha):
 		bv_raster_alpha.clear()
 	if is_instance_valid(bv_raster_beta):
@@ -2822,7 +2807,6 @@ func _build_brainview() -> void:
 	bv_flow_alpha.set("title", "ALPHA FLOW")
 	bv_flow_beta.set("title", "BETA FLOW")
 	_build_brain_clouds()
-	_build_replay_panel(hud)
 	_apply_brainview_settings()
 
 
@@ -2859,131 +2843,6 @@ func _make_bv_cloud(cname: String, campos: Vector3) -> Node3D:
 		holder.queue_free()
 		return null
 	return holder
-
-
-func _build_replay_panel(hud: CanvasLayer) -> void:
-	# Post-battle scrubber: play/pause + slider over the banked
-	# pool-rate stream, rendered through the same bars + diagram.
-	bv_replay_panel = PanelContainer.new()
-	bv_replay_panel.name = "ReplayPanel"
-	bv_replay_panel.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-	bv_replay_panel.offset_left = -320.0
-	bv_replay_panel.offset_right = 320.0
-	bv_replay_panel.offset_top = -104.0
-	bv_replay_panel.offset_bottom = -56.0
-	bv_replay_panel.visible = false
-	hud.add_child(bv_replay_panel)
-	var hb := HBoxContainer.new()
-	hb.add_theme_constant_override("separation", 8)
-	bv_replay_panel.add_child(hb)
-	var tag := Label.new()
-	tag.text = "REPLAY"
-	tag.add_theme_font_size_override("font_size", 12)
-	hb.add_child(tag)
-	bv_replay_playbtn = Button.new()
-	bv_replay_playbtn.text = "Play"
-	bv_replay_playbtn.pressed.connect(_on_replay_play)
-	hb.add_child(bv_replay_playbtn)
-	bv_replay_slider = HSlider.new()
-	bv_replay_slider.min_value = 0.0
-	bv_replay_slider.max_value = 1.0
-	bv_replay_slider.step = 1.0
-	bv_replay_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	bv_replay_slider.value_changed.connect(_on_replay_scrub)
-	hb.add_child(bv_replay_slider)
-	bv_replay_label = Label.new()
-	bv_replay_label.text = "0/0"
-	bv_replay_label.add_theme_font_size_override("font_size", 12)
-	hb.add_child(bv_replay_label)
-	var close_b := Button.new()
-	close_b.text = "X"
-	close_b.pressed.connect(_exit_replay)
-	hb.add_child(close_b)
-
-
-func _toggle_replay() -> void:
-	if bv_replay_mode:
-		_exit_replay()
-		return
-	if is_round_active:
-		if is_instance_valid(status_label):
-			status_label.text = "REPLAY available between battles."
-		return
-	if bv_stream_alpha.is_empty():
-		if is_instance_valid(status_label):
-			status_label.text = "No recorded stream (menu record toggle?)."
-		return
-	bv_replay_mode = true
-	bv_replay_idx = 0
-	bv_replay_playing = false
-	bv_replay_playbtn.text = "Play"
-	bv_replay_slider.max_value = float(bv_stream_alpha.size() - 1)
-	bv_replay_slider.value = 0.0
-	bv_replay_panel.visible = true
-	# Replay forces the bars visible; prior state restores on exit.
-	bv_replay_prior_bars = [
-		is_instance_valid(bv_panel_alpha) and bv_panel_alpha.visible,
-		is_instance_valid(bv_panel_beta) and bv_panel_beta.visible]
-	if is_instance_valid(bv_panel_alpha):
-		bv_panel_alpha.visible = true
-	if is_instance_valid(bv_panel_beta):
-		bv_panel_beta.visible = true
-	_render_replay_frame()
-
-
-func _exit_replay() -> void:
-	bv_replay_mode = false
-	bv_replay_playing = false
-	if is_instance_valid(bv_replay_panel):
-		bv_replay_panel.visible = false
-	if bv_replay_prior_bars.size() == 2:
-		if is_instance_valid(bv_panel_alpha):
-			bv_panel_alpha.visible = bool(bv_replay_prior_bars[0])
-		if is_instance_valid(bv_panel_beta):
-			bv_panel_beta.visible = bool(bv_replay_prior_bars[1])
-		bv_replay_prior_bars.clear()
-
-
-func _on_replay_play() -> void:
-	bv_replay_playing = not bv_replay_playing
-	bv_replay_playbtn.text = "Pause" if bv_replay_playing else "Play"
-
-
-func _on_replay_scrub(value: float) -> void:
-	if not bv_replay_mode:
-		return
-	bv_replay_idx = int(value)
-	_render_replay_frame()
-
-
-func _render_replay_frame() -> void:
-	var n := bv_stream_alpha.size()
-	if n == 0:
-		return
-	bv_replay_idx = clampi(bv_replay_idx, 0, n - 1)
-	bv_replay_label.text = "%d/%d" % [bv_replay_idx + 1, n]
-	var keys: Array = []
-	for spec in BV_POOLS:
-		keys.append(str(spec[0]))
-	_render_replay_side(bv_rows_alpha, bv_ema_alpha, bv_stream_alpha[bv_replay_idx], keys)
-	_render_replay_side(bv_rows_beta, bv_ema_beta, bv_stream_beta[bv_replay_idx], keys)
-	if is_instance_valid(bv_flow_alpha):
-		bv_flow_alpha.refresh(_replay_emas(bv_stream_alpha[bv_replay_idx], keys),
-			bv_caps, bv_wiring_alpha, bv_mapping_alpha)
-	if is_instance_valid(bv_flow_beta):
-		bv_flow_beta.refresh(_replay_emas(bv_stream_beta[bv_replay_idx], keys),
-			bv_caps, bv_wiring_beta, bv_mapping_beta)
-
-
-func _replay_emas(row: Array, keys: Array) -> Dictionary:
-	var emas := {}
-	for i in range(mini(row.size(), keys.size())):
-		emas[keys[i]] = float(row[i])
-	return emas
-
-
-func _render_replay_side(rows: Dictionary, _live_emas: Dictionary, row: Array, keys: Array) -> void:
-	_render_bv_side(rows, _replay_emas(row, keys))
 
 
 func _make_bv_flow(hud: CanvasLayer, vname: String, anchor: Control.LayoutPreset,
@@ -4298,19 +4157,6 @@ func _process(delta: float) -> void:
 		bv_cloud_alpha.rotate_y(0.25 * delta)
 	if is_instance_valid(bv_cloud_beta) and bv_cloud_beta.visible:
 		bv_cloud_beta.rotate_y(0.25 * delta)
-	# Replay playback: 5 Hz frame advance through the banked stream.
-	if bv_replay_mode and bv_replay_playing and not bv_stream_alpha.is_empty():
-		bv_replay_accum += delta
-		while bv_replay_accum >= 0.2:
-			bv_replay_accum -= 0.2
-			if bv_replay_idx < bv_stream_alpha.size() - 1:
-				bv_replay_idx += 1
-				bv_replay_slider.value = float(bv_replay_idx)
-				_render_replay_frame()
-			else:
-				bv_replay_playing = false
-				bv_replay_playbtn.text = "Play"
-				break
 	# Update tree transparency every rendered frame.
 	if tree_sight_entries.is_empty():
 		return
