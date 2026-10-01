@@ -1042,6 +1042,9 @@ func test_motor_debug() -> void:
 	_check(not t9.contains("SILENT"), "no badge below threshold")
 	var t10: String = A.call("_motor_debug_text", {}, 0.0, 10)
 	_check(t10.contains("SILENT (reflex only)"), "badge at threshold")
+	var tc: String = A.call("_motor_debug_text",
+		{"thrust": 0.2, "yaw_torque": 0.0}, 0.0, 0)
+	_check(tc.contains("YAW +0.00\n"), "centered yaw carries no letter")
 	for i in range(10):
 		A.call("_push_motor_sample", "alpha", {}, {"spikes": 0})
 	_check(int(A.get("_motor_silent_alpha")) == 10, "silence streak counts")

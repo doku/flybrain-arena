@@ -454,6 +454,8 @@ var pip_motor_bars_alpha: Array = []
 var pip_motor_bars_beta: Array = []
 var pip_motor_trace_alpha: Control
 var pip_motor_trace_beta: Control
+var pip_motor_scope_alpha: PanelContainer
+var pip_motor_scope_beta: PanelContainer
 var pip_name_beta: Label
 # Active flash tweens (one per wash rect / per label, previous killed
 # on re-flash): the KO presentation must stop the attacker's fading
@@ -2081,7 +2083,6 @@ func _make_pip_motors(parent: Node, left_side: bool) -> void:
 	# unless the PiP slot is MOTORS.
 	var is_alpha := left_side
 	var bars: Array = []
-	var keys := ["t", "y", "p", "r"]
 	var mins := [0.0, -1.0, -1.0, -1.0]
 	var fills := [TEAM_ALPHA if is_alpha else TEAM_BETA, Color(1, 1, 1),
 		Color(1.0, 0.85, 0.3), Color(0.35, 0.85, 1.0)]
@@ -2097,8 +2098,8 @@ func _make_pip_motors(parent: Node, left_side: bool) -> void:
 			bar.anchor_right = 1.0
 			bar.offset_left = -316.0
 			bar.offset_right = -16.0
-		bar.offset_top = 148.0 + float(i) * 20.0
-		bar.offset_bottom = 164.0 + float(i) * 20.0
+		bar.offset_top = 165.0 + float(i) * 20.0
+		bar.offset_bottom = 181.0 + float(i) * 20.0
 		bar.min_value = mins[i]
 		bar.max_value = 1.0
 		bar.value = 0.0
@@ -2128,16 +2129,45 @@ func _make_pip_motors(parent: Node, left_side: bool) -> void:
 		trace.anchor_right = 1.0
 		trace.offset_left = -316.0
 		trace.offset_right = -16.0
-	trace.offset_top = 232.0
+	trace.offset_top = 246.0
 	trace.offset_bottom = 316.0
 	trace.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	trace.visible = false
 	parent.add_child(trace)
+	# Opaque scope backing: the trace rect overlaps the brain side
+	# panels - the dark card reads as a deliberate inset instead of
+	# trace lines crossing pool text. Added after the trace so it sits
+	# below it in z.
+	var scope := PanelContainer.new()
+	if left_side:
+		scope.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		scope.offset_left = 16.0
+		scope.offset_right = 316.0
+	else:
+		scope.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		scope.anchor_left = 1.0
+		scope.anchor_right = 1.0
+		scope.offset_left = -316.0
+		scope.offset_right = -16.0
+	scope.offset_top = 246.0
+	scope.offset_bottom = 316.0
+	var sbg := StyleBoxFlat.new()
+	sbg.bg_color = Color(0.06, 0.06, 0.09, 0.94)
+	sbg.set_border_width_all(1)
+	sbg.border_color = Color(0.4, 0.4, 0.46)
+	sbg.set_corner_radius_all(4)
+	scope.add_theme_stylebox_override("panel", sbg)
+	scope.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	scope.visible = false
+	parent.add_child(scope)
+	parent.move_child(scope, trace.get_index())
 	trace.draw.connect(_on_motor_trace_draw.bind("alpha" if is_alpha else "beta"))
 	if is_alpha:
 		pip_motor_trace_alpha = trace
+		pip_motor_scope_alpha = scope
 	else:
 		pip_motor_trace_beta = trace
+		pip_motor_scope_beta = scope
 
 
 func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
@@ -2291,6 +2321,10 @@ func _apply_pip_slot() -> void:
 		pip_motor_trace_alpha.visible = perf_pip and motors
 	if is_instance_valid(pip_motor_trace_beta):
 		pip_motor_trace_beta.visible = perf_pip and motors
+	if is_instance_valid(pip_motor_scope_alpha):
+		pip_motor_scope_alpha.visible = perf_pip and motors
+	if is_instance_valid(pip_motor_scope_beta):
+		pip_motor_scope_beta.visible = perf_pip and motors
 	if eyes:
 		if is_instance_valid(pip_alpha_label):
 			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
@@ -2323,7 +2357,7 @@ static func _motor_debug_text(ctrl: Dictionary, spike_rate: float, silent_n: int
 	var sp := float(ctrl.get("spear_thrust", 0.0))
 	var ram := float(ctrl.get("ram_drive", 0.0))
 	var ev := "EVADE" if bool(ctrl.get("emergency_evade", false)) else "-"
-	var yd := "R" if y > 0.05 else ("L" if y < -0.05 else "-")
+	var yd := "R" if y > 0.05 else ("L" if y < -0.05 else "")
 	var text := "THR %.2f   SPK %.0f/s\nYAW %+.2f%s\nPITCH %+.2f\nROLL %+.2f\nSPEAR %.2f RAM %.1f %s\nY+:right P+:climb R+:bankR" % [
 		t, spike_rate, y, yd, p, r, sp, ram, ev]
 	if silent_n >= MOTOR_SILENT_REPLIES:
@@ -2410,7 +2444,11 @@ func _push_motor_sample(side: String, ctrl: Dictionary, st: Dictionary) -> void:
 func _update_motor_cards() -> void:
 	# MOTORS slot refresh (10 Hz tick): debug text + bar values +
 	# trace redraw per side. Silence badge state lives in the text.
-	var hz := 1.0 / maxf(bv_reply_ema, 0.001)
+	# Reply-rate guard mirrors _update_ctrl_label (no replies yet ->
+	# 0 Hz, never an exploded rate).
+	var hz := 0.0
+	if bv_reply_ema > 0.001:
+		hz = 1.0 / bv_reply_ema
 	for side in ["alpha", "beta"]:
 		var ctrl: Dictionary = _last_ctrl_a if side == "alpha" else _last_ctrl_b
 		var ema := _motor_spike_ema_alpha if side == "alpha" else _motor_spike_ema_beta
