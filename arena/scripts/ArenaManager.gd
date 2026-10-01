@@ -370,6 +370,11 @@ var _seq_last_round: Dictionary = {}
 # tournament. Capped: a persistently broken server still lands loud.
 const MAX_SERVER_RELOADS := 2
 var _server_reloads := 0
+# Pending match-bank resend across a recovery reload: the server lost
+# state mid-bank (restart), the reload restores brains, then the STORED
+# report (same nonce, idempotent) goes out again instead of starting a
+# round. Set on the free-mode error, consumed in _on_brains_loaded.
+var _pending_matchbank_resend := false
 # Forgiveness context for a banked-but-unconfirmed battle: set at
 # report, cleared when its reply is applied. A post-fail-loud reply
 # matching this triple is applied instead of dropped (self-heals
@@ -1214,6 +1219,33 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 	# A clean load resets the self-heal cap (each match gets fresh
 	# recovery budget against server restarts).
 	_server_reloads = 0
+	# Pending bank resend (recovery reload after a restart killed the
+	# bank): do NOT start a round - the match is over, its battles are
+	# tallied, and only the bank is missing. Re-arm from the STORED
+	# report (same nonce, idempotent) and resend: the fresh server
+	# banks it, or answers from disk if the old server finished the
+	# bank before dying.
+	if _pending_matchbank_resend and not _seq_last_match_report.is_empty():
+		_pending_matchbank_resend = false
+		var mr := _seq_last_match_report
+		_tourney_awaiting_matchbank = true
+		_seq_match_id = str(mr.get("match_id", ""))
+		_seq_forgive_matchbank = {"tournament_id": str(mr.get("tournament_id", "")),
+			"match": str(mr.get("match", "")), "battle": _seq_match_id}
+		_hide_wait_bracket()
+		_hide_loading()
+		brain_client.request_match_report(
+			str(mr.get("match_winner", "")), str(mr.get("tournament_id", "")),
+			str(mr.get("match", "")), _seq_match_id,
+			(mr.get("battles", []) as Array), bool(mr.get("partial", false)))
+		_arm_seq("matchbank")
+		print("[Arena] Resent stored match report %s after reload." % _seq_match_id)
+		var rhead := _verdict_headline()
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header(str(rhead.get("text", "")),
+				str(rhead.get("sub", "")) + "\nbanking the match (resend)...",
+				rhead.get("color", Color(0.85, 0.85, 0.9)))
+		return
 	_hide_wait_bracket()
 	_hide_loading()
 	_update_tourney_status("READY")
@@ -1280,6 +1312,21 @@ func _on_server_error(error: String) -> void:
 			and _server_reloads < MAX_SERVER_RELOADS:
 		_server_reloads += 1
 		print("[Arena] Server lost tournament brains mid-match - reloading %s (attempt %d/%d)..." % [
+			expand_match_label(tourney_match_label), _server_reloads, MAX_SERVER_RELOADS])
+		_request_current_battle_load()
+		return
+	# Same self-heal for a bank interrupted by a restart: the fresh
+	# server refuses the report (FREE mode) with nothing banked. Reload
+	# the finished match, then resend the STORED report (same nonce) on
+	# brains_loaded - a new nonce here would risk double-banking the
+	# battles if the old server actually finished before dying.
+	if err_context == "matchbank" and tournament_active \
+			and error.begins_with("match_report while in FREE mode") \
+			and not _seq_last_match_report.is_empty() \
+			and _server_reloads < MAX_SERVER_RELOADS:
+		_server_reloads += 1
+		_pending_matchbank_resend = true
+		print("[Arena] Server lost state mid-bank - reloading %s to resend the stored report (attempt %d/%d)..." % [
 			expand_match_label(tourney_match_label), _server_reloads, MAX_SERVER_RELOADS])
 		_request_current_battle_load()
 		return
@@ -4745,6 +4792,7 @@ func _send_match_report(match_winner: String, partial: bool = false) -> void:
 	_seq_match_id = "%s-MATCH-%d-%d" % [tourney_match_label,
 		Time.get_ticks_msec(), randi() % 100000]
 	_tourney_awaiting_matchbank = true
+	_pending_matchbank_resend = false
 	_seq_forgive_matchbank = {"tournament_id": _tourney_id(),
 		"match": tourney_match_label, "battle": _seq_match_id}
 	_seq_last_match_report = {"match_winner": match_winner,
@@ -4807,6 +4855,7 @@ func _on_match_banked(match_echo: String, _fit_a: float, _fit_b: float,
 	_clear_seq()
 	# Consuming the owed ack closes the forgive window.
 	_seq_forgive_matchbank = {}
+	_pending_matchbank_resend = false
 	_hide_wait_bracket()
 	_hide_loading()
 	var director := _director()

@@ -493,6 +493,41 @@ func test_motors_slot() -> void:
 		"trace hides outside MOTORS")
 
 
+func test_matchbank_brain_loss_resends() -> void:
+	# Server restart killed the bank: the free-mode error arms a
+	# stored-report resend (flag + reload, capped); the reload landing
+	# resends WITHOUT starting a round (the match is over).
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._seq_context = "matchbank"
+	arena._server_reloads = 0
+	arena._pending_matchbank_resend = false
+	arena._seq_last_match_report = {"match_winner": "alpha",
+		"tournament_id": "T1", "match": "R1M1", "match_id": "M1",
+		"partial": false, "battles": []}
+	arena._on_server_error(
+		"match_report while in FREE mode - QUIT TO MENU + RESUME")
+	_check(arena._pending_matchbank_resend, "bank-loss error arms resend")
+	_check(arena._server_reloads == 1, "bank-loss reload counted")
+	# Reload landing: re-arms the bank from the stored report, no round.
+	arena._seq_context = "load"
+	arena.tourney_awaiting_load = true
+	arena.is_round_active = false
+	arena._on_brains_loaded({}, {})
+	_check(not arena._pending_matchbank_resend, "resend flag consumed")
+	_check(arena._tourney_awaiting_matchbank, "bank re-armed after reload")
+	_check(str(arena._seq_context) == "matchbank", "matchbank watchdog back")
+	_check(not arena.is_round_active, "reload landing starts no round")
+	# Cap: past-max errors land loud, flag stays down.
+	arena._server_reloads = 2
+	arena._seq_context = "matchbank"
+	arena._on_server_error(
+		"match_report while in FREE mode - QUIT TO MENU + RESUME")
+	_check(not arena._pending_matchbank_resend, "capped bank error no resend")
+	_check(str(arena.status_label.text).begins_with("SERVER ERROR"),
+		"capped bank error still lands loud")
+
+
 func test_bracket_record_contract() -> void:
 	# The record capture must never yank a bracket another flow raised:
 	# visible-on-entry -> showed=false -> no auto-hide. (Regression:
@@ -564,6 +599,7 @@ func _process(_delta: float) -> bool:
 	test_forgivable_matchbank()
 	test_matchbank_retry()
 	test_server_brain_loss_reloads()
+	test_matchbank_brain_loss_resends()
 	test_motors_slot()
 	test_wait_bracket_flow()
 	test_shock_lifecycle()
