@@ -21,6 +21,31 @@ from experimental_wiring import EXPERIMENTS, apply_overlay, experiment_arrays
 import brain_package as vault_pkg
 
 
+def _free_udp_port():
+    # Probe an ephemeral port for an isolated test server (the live
+    # server owns 9999; headless suites must never touch it).
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _isolated_server_env(tmp_root, port):
+    # Private vault + tournaments + port for a spawned test server, so
+    # protocol suites run fully isolated (previously they banked into
+    # the LIVE vault/server on 9999 mid-tournament).
+    vault_dir = os.path.join(tmp_root, "brains")
+    os.makedirs(vault_dir, exist_ok=True)
+    tour_dir = os.path.join(tmp_root, "tournaments")
+    os.makedirs(tour_dir, exist_ok=True)
+    env = dict(os.environ)
+    env["FLY_VAULT_DIR"] = vault_dir
+    env["FLY_TOURNAMENTS_DIR"] = tour_dir
+    env["BRAIN_PORT"] = str(port)
+    return env, vault_dir, tour_dir
+
+
 class TestConnectomeData(unittest.TestCase):
     """Verifies that connectome files and mapped populations are intact and valid."""
     @classmethod
@@ -1476,23 +1501,40 @@ class TestEvolutionEngine(unittest.TestCase):
 
 class TestUDPServerIntegration(unittest.TestCase):
     """Verifies end-to-end UDP network protocol with the Brain Server."""
+    # Isolated instance (own port/vault/tournaments): this suite used
+    # to hit the LIVE server on 9999 mid-tournament.
+    srv_port = 9999
     @classmethod
     def setUpClass(cls):
+        import tempfile
+        cls.tmp = tempfile.mkdtemp(prefix="udp_proto_")
+        cls.srv_port = _free_udp_port()
+        _env, _vdir, _tdir = _isolated_server_env(cls.tmp, cls.srv_port)
+        # stdout to a FILE, never PIPE: an undrained pipe fills (64 KB)
+        # and BLOCKS the single-threaded server loop mid-print - the
+        # wedge that only hit combined runs. The file also doubles as
+        # the isolated run's diagnostic log.
+        cls._srv_log = open(os.path.join(cls.tmp, "server_test.log"), "w")
         cls.server_proc = subprocess.Popen(
             [sys.executable, "-u", "brain_server.py"],
             cwd=BRAIN_ENGINE_DIR,
-            stdout=subprocess.PIPE,
+            env=_env,
+            stdout=cls._srv_log,
             stderr=subprocess.STDOUT
         )
         time.sleep(5.0) # Allow server to bind and load graph (boot is heavy)
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
         cls.server_proc.terminate()
         try:
             cls.server_proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             cls.server_proc.kill()
+        finally:
+            cls._srv_log.close()
+            shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_udp_step_and_round_over(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1501,7 +1543,7 @@ class TestUDPServerIntegration(unittest.TestCase):
         if hasattr(socket, "SIO_UDP_CONNRESET"):
             sock.ioctl(socket.SIO_UDP_CONNRESET, False)
 
-        server_addr = ("127.0.0.1", 9999)
+        server_addr = ("127.0.0.1", self.srv_port)
 
         # Ensure server is listening
         step_packet = {
@@ -1823,12 +1865,27 @@ class TestBrainVault(unittest.TestCase):
 
 class TestTournamentProtocol(unittest.TestCase):
     """Live server: tournament_load -> battles (KO + draw) -> match/end records."""
+    # Fully isolated instance (own port/vault/tournaments): this suite
+    # used to hit the LIVE server on 9999 and the live vault
+    # mid-tournament.
+    srv_port = 9999
     @classmethod
     def setUpClass(cls):
+        import tempfile
+        cls.tmp = tempfile.mkdtemp(prefix="tourney_proto_")
+        cls._real_vault = vault_pkg.VAULT_DIR
+        cls._real_index = vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = os.path.join(cls.tmp, "brains")
+        vault_pkg.VAULT_INDEX = os.path.join(vault_pkg.VAULT_DIR, "vault_index.json")
+        cls.srv_port = _free_udp_port()
+        _env, _vdir, _tdir = _isolated_server_env(cls.tmp, cls.srv_port)
+        # stdout to a FILE (undrained PIPE blocks the server loop).
+        cls._srv_log = open(os.path.join(cls.tmp, "server_test.log"), "w")
         cls.server_proc = subprocess.Popen(
             [sys.executable, "-u", "brain_server.py"],
             cwd=BRAIN_ENGINE_DIR,
-            stdout=subprocess.PIPE,
+            env=_env,
+            stdout=cls._srv_log,
             stderr=subprocess.STDOUT
         )
         time.sleep(5.0)
@@ -1858,6 +1915,7 @@ class TestTournamentProtocol(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
         for bid in (getattr(cls, "id_a", ""), getattr(cls, "id_b", ""),
                     getattr(cls, "id_c", ""), getattr(cls, "id_x", "")):
             try:
@@ -1866,27 +1924,40 @@ class TestTournamentProtocol(unittest.TestCase):
             except OSError:
                 pass
         vault_pkg.refresh_index()
+        vault_pkg.VAULT_DIR = cls._real_vault
+        vault_pkg.VAULT_INDEX = cls._real_index
         cls.server_proc.terminate()
         try:
             cls.server_proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             cls.server_proc.kill()
+        finally:
+            cls._srv_log.close()
+            shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def _rpc(self, msg, timeout=120.0):
+    def _rpc(self, msg, timeout=300.0):
         # Tournament round_overs trigger dopamine + vault saves (~10s), so
         # send ONCE and wait patiently: resending would queue duplicate
-        # battles on the single-threaded server.
+        # battles on the single-threaded server. Vault saves on this box
+        # have measured 60-136 s (slow-disk days), so the default waits
+        # 300 s - the arena's own battle budget is 240 s for the same
+        # reason. battle_progress
+        # heartbeats ride the same socket while a bank runs: keep-alive
+        # only, never the answer - skip them and keep waiting.
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(5.0)
         if hasattr(socket, "SIO_UDP_CONNRESET"):
             sock.ioctl(socket.SIO_UDP_CONNRESET, False)
         deadline = time.time() + timeout
         try:
-            sock.sendto(json.dumps(msg).encode("utf-8"), ("127.0.0.1", 9999))
+            sock.sendto(json.dumps(msg).encode("utf-8"), ("127.0.0.1", self.srv_port))
             while time.time() < deadline:
                 try:
                     data, _ = sock.recvfrom(65535)
-                    return json.loads(data.decode("utf-8"))
+                    reply = json.loads(data.decode("utf-8"))
+                    if reply.get("status") == "battle_progress":
+                        continue
+                    return reply
                 except (socket.timeout, ConnectionResetError):
                     pass
         finally:

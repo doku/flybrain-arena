@@ -82,6 +82,8 @@ func test_no_partner_asexual() -> void:
 
 
 func _initialize() -> void:
+	# Quarantine: no packet from this suite may reach any server.
+	load("res://scripts/BrainClient.gd").test_mute = true
 	var scene = load("res://scenes/ArenaGlade.tscn")
 	arena = scene.instantiate()
 	root.add_child(arena)

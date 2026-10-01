@@ -701,9 +701,15 @@ def _bind_codecs(rec, pops, codec_cache):
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Test isolation: FLY_TOURNAMENTS_DIR redirects journals/verdicts (the
+# protocol test suite runs its own server so headless suites can never
+# touch the live tournament state). Production never sets it.
+TOURNAMENTS_DIR = os.environ.get("FLY_TOURNAMENTS_DIR") or os.path.join(
+    PROJECT_ROOT, "tournaments")
+
 
 def _last_verdict_path():
-    return os.path.join(PROJECT_ROOT, "tournaments", "_last_battle_verdict.json")
+    return os.path.join(TOURNAMENTS_DIR, "_last_battle_verdict.json")
 
 
 def _read_last_verdict():
@@ -801,7 +807,7 @@ def _emit_progress(sock, client_addr, battle_id, stage):
 
 
 def _pending_battle_path():
-    return os.path.join(PROJECT_ROOT, "tournaments", "_pending_battle.npz")
+    return os.path.join(TOURNAMENTS_DIR, "_pending_battle.npz")
 
 
 def _write_pending_battle(key, result, records, weights):
@@ -1722,4 +1728,6 @@ def run_brain_server(host="127.0.0.1", port=9999):
 
 
 if __name__ == "__main__":
-    run_brain_server()
+    # Test isolation: BRAIN_PORT moves the server off 9999 (the
+    # protocol suite runs its own instance; production never sets it).
+    run_brain_server(port=int(os.environ.get("BRAIN_PORT", "9999")))

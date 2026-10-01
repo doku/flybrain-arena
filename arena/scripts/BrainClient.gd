@@ -19,6 +19,15 @@ signal raster_map_received(side: String, pool: String, ids: Array, total: int)
 @export var server_host: String = "127.0.0.1"
 @export var server_port: int = 9999
 
+# Test quarantine: when true, NO packet leaves this client (every
+# sender drops at _send_dict). Test harnesses set it before
+# instantiating anything - a headless suite must never talk to the
+# live tournament server (free_mode/round_over from a test boot used
+# to yank live tournaments into FREE mid-match). Socket state machine
+# (connect/reconnect/is_connected_server) still works, so link tests
+# keep their meaning.
+static var test_mute := false
+
 var udp := PacketPeerUDP.new()
 var is_connected_server: bool = false
 var last_sent_time: float = 0.0
@@ -46,6 +55,8 @@ func reconnect() -> bool:
 
 
 func _send_dict(payload: Dictionary) -> void:
+	if test_mute:
+		return
 	if not is_connected_server:
 		return
 	var json_data = JSON.stringify(payload).to_utf8_buffer()

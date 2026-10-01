@@ -21,7 +21,10 @@ from datetime import datetime, timezone
 import numpy as np
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VAULT_DIR = os.path.join(PROJECT_ROOT, "brains")
+# Test isolation: FLY_VAULT_DIR redirects all vault reads/writes (the
+# protocol test suite runs its own server + vault so headless suites
+# can never touch the live tournament vault). Production never sets it.
+VAULT_DIR = os.environ.get("FLY_VAULT_DIR") or os.path.join(PROJECT_ROOT, "brains")
 VAULT_INDEX = os.path.join(VAULT_DIR, "vault_index.json")
 
 WEIGHTS_ENTRY = "weights.npz"

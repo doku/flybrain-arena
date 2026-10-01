@@ -305,6 +305,9 @@ func test_loser_drops_faster() -> void:
 
 
 func _initialize() -> void:
+	# Quarantine: no packet from this suite may reach any server (a
+	# headless arena boot used to free_mode the LIVE tournament).
+	load("res://scripts/BrainClient.gd").test_mute = true
 	var scene = load("res://scenes/ArenaGlade.tscn")
 	arena = scene.instantiate()
 	root.add_child(arena)

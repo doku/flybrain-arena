@@ -18,6 +18,7 @@ func _check(cond: bool, label: String) -> void:
 
 
 func _new_client():
+	load("res://scripts/BrainClient.gd").test_mute = true
 	var b = load("res://scripts/BrainClient.gd").new()
 	b.server_port = DEAD_PORT
 	return b
