@@ -602,6 +602,209 @@ def _handle_match_report(sock, client_addr, msg, tourney_a, tourney_b,
               f"(kept verdict): {e}", flush=True)
 
 
+def _handle_round_report(sock, client_addr, msg, tourney_a, tourney_b,
+                         tourney_tag, tournament_lr_scale, tournament_mode,
+                         evo_mgr, dopamine_rl, base_lr, tourney_note,
+                         csr, pops, struct_cache):
+    """ONE bank per round: each match reloads its brains from vault
+    (pre-round weights - nothing saves mid-round), replays its battles
+    in order (evaluate, dopamine+pin with shipped sens/ctrl, K_BATTLE
+    ELO chain, records/ko/wander/sessions), then ONE journal (absolute
+    final snapshots) + ONE save set (each brain fought once, saved
+    once). Crash windows match the per-battle protocol exactly
+    (journal-first, atomic replace, preamble recover, exact-nonce
+    dedup), so retries never double-bank. Pending matches (quit-flush
+    strays) bank battles only. NOTE: transient RAM holds all replayed
+    weight arrays (~100 MB per brain) until the save loop frees them;
+    the tradeoff for journal-first crash safety."""
+    import brain_package as vault_pkg
+    matches = msg.get("matches", [])
+    if not isinstance(matches, list) or not matches:
+        sock.sendto(json.dumps({"status": "error",
+                                "error": "round_report: no matches"}
+                               ).encode("utf-8"), client_addr)
+        return
+    round_id = str(msg.get("round_nonce", ""))
+    tid = str(msg.get("tournament_id", "")
+              or tourney_tag.get("tournament_id") or "")
+    mlabel = str(msg.get("match", "") or tourney_tag.get("match") or "")
+    round_key = {"tournament_id": tid, "match": mlabel, "battle_id": round_id}
+    stored = _read_last_verdict()
+    if stored is not None and stored.get("key") == round_key:
+        print(f"[Server] Duplicate round report {mlabel}-{round_id}: "
+              f"resending stored result, no re-bank.", flush=True)
+        try:
+            sock.sendto(json.dumps(stored["result"]).encode("utf-8"),
+                        client_addr)
+        except OSError as e:
+            print(f"[Server] resend failed: {e}", flush=True)
+        return
+    if not tournament_mode:
+        print(f"[Server] ERROR: round_report {round_id} while in FREE "
+              f"mode ({tourney_note()}). Refused.", flush=True)
+        sock.sendto(json.dumps({"status": "error",
+                                "error": "round_report while in FREE mode "
+                                         "- QUIT TO MENU + RESUME"
+                               }).encode("utf-8"), client_addr)
+        return
+    t_start = time.perf_counter()
+    # Final absolute record snapshots (one entry per fighter) + final
+    # weight refs (freed progressively by the save loop below).
+    final_records = []
+    final_weights = {}
+    echoes = []
+    fit_a, fit_b = 0.0, 0.0
+    for mi, m in enumerate(matches):
+        if not isinstance(m, dict):
+            continue
+        mbattles = m.get("battles", []) or []
+        mwinner = str(m.get("match_winner", "") or "pending")
+        try:
+            rec_a, w_a = vault_pkg.load_brain(m.get("alpha_path", ""))
+            rec_b, w_b = vault_pkg.load_brain(m.get("beta_path", ""))
+            m_brain_a = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
+            m_brain_b = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
+        except Exception as e:
+            print(f"[Server] round {round_id} match {mi}: brain load "
+                  f"failed: {e}", flush=True)
+            sock.sendto(json.dumps({"status": "error",
+                                    "error": "round_report: brain load "
+                                             f"failed: {e}"}
+                                   ).encode("utf-8"), client_addr)
+            return
+        # Fresh base records from this load (pre-round vault state -
+        # each brain fights exactly once per round, so matches never
+        # share fighters and no cross-match accumulation is needed).
+        ra = deepcopy(rec_a)
+        rb = deepcopy(rec_b)
+        schemes_a = normalize_mapping(
+            ((rec_a or {}).get("generator_params", {}) or {}).get("mapping", None))
+        schemes_b = normalize_mapping(
+            ((rec_b or {}).get("generator_params", {}) or {}).get("mapping", None))
+        legacy_a = is_legacy_record(rec_a)
+        legacy_b = is_legacy_record(rec_b)
+        _emit_progress(sock, client_addr, round_id,
+                       "match %d load" % (mi + 1))
+        bechoes = []
+        for bi, b in enumerate(mbattles):
+            if not isinstance(b, dict):
+                continue
+            bstats_a = b.get("stats_a", {}) or {}
+            bstats_b = b.get("stats_b", {}) or {}
+            bverdict = b.get("verdict", {}) or {}
+            if not isinstance(bverdict, dict):
+                bverdict = {}
+            bdraw = bool(b.get("draw", False))
+            bdraw_penalty = bool(b.get("draw_penalty", False))
+            bend = str(b.get("end_reason", "") or "")
+            winner, fit_a, fit_b = evo_mgr.evaluate_match(
+                bstats_a, bstats_b, rec_a=ra, rec_b=rb)
+            _forced = str(bverdict.get("winner_slot", "") or "")
+            if not bdraw and _forced in ("alpha", "beta"):
+                winner = _forced
+            ko_win = bool(bstats_a.get("kills") or bstats_b.get("kills"))
+            pulse = 1.0 if ko_win else 0.5
+            dopamine_rl.lr = base_lr * tournament_lr_scale
+            try:
+                _emit_progress(sock, client_addr, round_id,
+                               "match %d battle %d" % (mi + 1, bi + 1))
+                _apply_round_learning(
+                    dopamine_rl, m_brain_a, m_brain_b, winner,
+                    b.get("sens_a", {}) or {}, b.get("sens_b", {}) or {},
+                    b.get("ctrl_a", {}) or {}, b.get("ctrl_b", {}) or {},
+                    pulse, schemes_a, schemes_b, legacy_a, legacy_b,
+                    arena_draw=bdraw)
+            finally:
+                dopamine_rl.lr = base_lr
+            out_a = "draw" if bdraw else ("win" if winner == "alpha" else "loss")
+            out_b = "draw" if bdraw else ("loss" if winner == "alpha" else "win")
+            vault_pkg.record_battle_result(ra, out_a)
+            vault_pkg.record_battle_result(rb, out_b)
+            if not bdraw and bend == "ko" and winner == "alpha":
+                ra["record"]["ko"] = int(ra["record"].get("ko", 0)) + 1
+            if not bdraw and bend == "ko" and winner == "beta":
+                rb["record"]["ko"] = int(rb["record"].get("ko", 0)) + 1
+            if bdraw:
+                da = float(bstats_a.get("center_drift", 0.0) or 0.0)
+                db = float(bstats_b.get("center_drift", 0.0) or 0.0)
+                if da >= vault_pkg.WANDER_MARK_M:
+                    ra["record"]["wander"] = int(
+                        ra["record"].get("wander", 0)) + 1
+                if db >= vault_pkg.WANDER_MARK_M:
+                    rb["record"]["wander"] = int(
+                        rb["record"].get("wander", 0)) + 1
+            if not bdraw:
+                vault_pkg.log_training_session(
+                    ra, 0, {"lr_scale": tournament_lr_scale,
+                            "pulse": pulse,
+                            "outcome": out_a},
+                    f"tournament battle {out_a} ({tourney_note()})")
+                vault_pkg.log_training_session(
+                    rb, 0, {"lr_scale": tournament_lr_scale,
+                            "pulse": -0.8 * pulse,
+                            "outcome": out_b},
+                    f"tournament battle {out_b} ({tourney_note()})")
+            vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_BATTLE)
+            if bdraw and bdraw_penalty:
+                vault_pkg.apply_draw3_penalty(ra, rb)
+            bechoes.append({"battle_id": str(b.get("battle_id", "")),
+                            "battle_winner": ("draw" if bdraw else winner)})
+        # Match bank (skipped for pending flush strays): counters +
+        # K_MATCH ELO on this match's copies.
+        if mwinner in ("alpha", "beta", "draw"):
+            out_a = ("win" if mwinner == "alpha"
+                     else "loss" if mwinner == "beta" else "draw")
+            vault_pkg.record_match_result(ra, out_a)
+            vault_pkg.record_match_result(rb, "draw" if mwinner == "draw"
+                                          else ("loss" if mwinner == "alpha"
+                                                else "win"))
+            vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_MATCH)
+        echoes.append({"match_id": str(m.get("match_id", "")),
+                       "match_winner": mwinner, "battles": bechoes})
+        for side, rec, brain in (("alpha", ra, m_brain_a),
+                                 ("beta", rb, m_brain_b)):
+            final_records.append({"side": side, "record": rec,
+                                  "weights_unchanged": True})
+            final_weights[str(rec.get("id", ""))] = brain.weights
+    fit_a, fit_b = _sanitize_fit(fit_a), _sanitize_fit(fit_b)
+    print(f"[Server] Round report banked {mlabel}-{round_id} "
+          f"({tourney_note()}): {len(echoes)} matches, "
+          f"dopamine+records {time.perf_counter() - t_start:.1f}s "
+          f"(vault save next)", flush=True)
+    resp = {
+        "status": "round_banked",
+        "battle_id": round_id,
+        "tournament_id": tid,
+        "match": mlabel,
+        "matches": echoes,
+        "report": (f"round banked: {len(echoes)} matches"),
+    }
+    _t_journal = time.perf_counter()
+    _emit_progress(sock, client_addr, round_id, "journal")
+    _write_pending_battle(round_key, resp, final_records, {})
+    _t_weights = time.perf_counter()
+    _emit_progress(sock, client_addr, round_id, "weights")
+    for entry in final_records:
+        rec = entry["record"]
+        bid = str(rec.get("id", ""))
+        if bid in final_weights:
+            vault_pkg.save_brain(rec, final_weights[bid],
+                                 backup=False, fast=False)
+            del final_weights[bid]
+    _t_recover = time.perf_counter()
+    _emit_progress(sock, client_addr, round_id, "recover")
+    _recover_pending_battle((tourney_a, tourney_b))
+    print(f"[Server] round {round_id}: journal "
+          f"{_t_weights - _t_journal:.1f}s + weights "
+          f"{_t_recover - _t_weights:.1f}s + recover+verdict "
+          f"{time.perf_counter() - _t_recover:.1f}s", flush=True)
+    try:
+        sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+    except OSError as e:
+        print(f"[Server] send round_banked failed "
+              f"(kept verdict): {e}", flush=True)
+
+
 def _norm_experiment(value):
     """Canonical wiring key: None for base, else a sorted tuple of names
     (additive mixes; see experimental_wiring.normalize_experiment)."""
@@ -1601,6 +1804,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     "tournament_id": tourney_tag.get("tournament_id", ""),
                     "match": tourney_tag.get("match", ""),
                 }).encode("utf-8"), client_addr)
+
+            elif msg_type == "round_report":
+                # ONE bank per round: matches replay in order (per-match
+                # vault reload, battles in order, ELO chains, records),
+                # then one journal + one save set. The arena overlaps
+                # the bank with the next round's intermission; loads gate
+                # on the ack.
+                _handle_round_report(
+                    sock, client_addr, msg, tourney_a, tourney_b,
+                    tourney_tag, tournament_lr_scale, tournament_mode,
+                    evo_mgr, dopamine_rl, base_lr, tourney_note,
+                    csr, pops, struct_cache)
+                continue
 
             elif msg_type == "tournament_match":
                 # Match verdict: bump match counters + match ELO on both

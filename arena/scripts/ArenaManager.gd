@@ -261,12 +261,23 @@ var _preload_ready := false
 # one save pair server-side). Between battles only the ms match_reset
 # runs, so battles flow back-to-back on identical weights.
 var _match_battle_cache: Array = []
-var _tourney_awaiting_matchbank := false
-var _seq_match_id := ""
-var _seq_last_match_report: Dictionary = {}
-var _seq_forgive_matchbank: Dictionary = {}
 var _last_match_winner := ""
 var _last_match_score := ""
+# Round-batch reporting: completed matches append here; ONE round_report
+# banks the whole round at the round boundary (round nonce, one journal,
+# one save set server-side). Between matches only the ms match_reset
+# runs, so best-of series flow back-to-back on identical pre-round
+# weights. Battles AND matches fight on the same weights all round.
+var _round_match_cache: Array = []
+var _round_bank_pending := false
+var _tourney_awaiting_roundbank := false
+var _seq_round_id := ""
+var _seq_last_round_report: Dictionary = {}
+var _seq_forgive_roundbank: Dictionary = {}
+var _pending_roundbank_resend := false
+var _load_gated_on_bank := false
+var _pending_advance: Dictionary = {}
+var _pending_final_ev: Dictionary = {}
 # Last-step sensorimotor context (the dopamine replay's inputs): the
 # sens refs land at send time, the ctrl refs at motor-reply time -
 # exactly what the server used to capture per battle.
@@ -366,7 +377,6 @@ var _server_reloads := 0
 # state mid-bank (restart), the reload restores brains, then the STORED
 # report (same nonce, idempotent) goes out again instead of starting a
 # round. Set on the free-mode error, consumed in _on_brains_loaded.
-var _pending_matchbank_resend := false
 # A supervisor reload is in flight: errors/state replies arriving now
 # are attributed but never re-trigger (the refusal that MOTIVATED the
 # recovery can land after it armed; brains_loaded consumes it).
@@ -552,9 +562,9 @@ func _ready() -> void:
 	brain_client.merged.connect(_on_merged)
 	brain_client.restarted.connect(_on_restarted)
 	brain_client.tournament_battle_received.connect(_on_tournament_battle)
-	brain_client.match_banked_received.connect(_on_match_banked)
 	brain_client.server_state_received.connect(_on_server_state)
 	brain_client.battle_progress_received.connect(_on_battle_progress)
+	brain_client.round_banked_received.connect(_on_round_banked)
 	var _edir := _director()
 	if _edir != null:
 		_edir.async_done.connect(_on_evo_async)
@@ -1056,33 +1066,51 @@ func _on_bracket_toggle() -> void:
 		_wait_bracket = false
 		_show_arena_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name])
 
-func _flush_match_report() -> void:
-	# Best-effort: quitting mid-match banks the cached battles (the
-	# match nonce makes the report idempotent; a later full report of
-	# the same match re-banks nothing). Partial = battles only, the
-	# match result stays undecided. Fire-and-forget - the scene dies
-	# right after; a server restart here loses the batch (the accepted
-	# tradeoff: today every battle banks immediately).
-	if _match_battle_cache.is_empty() or not tournament_active:
+func _flush_round_report() -> void:
+	# Best-effort: quitting mid-round banks the cached matches (the
+	# round nonce makes the report idempotent; a later full report of
+	# the same round re-banks nothing). Partial = battles banked, match
+	# results undecided. Fire-and-forget - the scene dies right after;
+	# a server restart here loses the batch (the accepted tradeoff).
+	if (_match_battle_cache.is_empty() and _round_match_cache.is_empty()) \
+			or not tournament_active:
 		return
-	var n := _match_battle_cache.size()
-	brain_client.request_match_report("pending", _tourney_id(),
-		tourney_match_label, "%s-MATCH-%d-%d" % [tourney_match_label,
+	var extra := 0
+	if not _match_battle_cache.is_empty():
+		_round_match_cache.append(_current_match_entry("pending"))
+		extra = _match_battle_cache.size()
+		_match_battle_cache.clear()
+	var n := _round_match_cache.size()
+	brain_client.request_round_report(
+		"%s-RND-%d-%d" % [tourney_match_label,
 			Time.get_ticks_msec(), randi() % 100000],
-		_match_battle_cache, true)
-	_match_battle_cache.clear()
-	print("[Arena] Flushed %d cached battles before quit." % n)
+		_tourney_id(), tourney_match_label,
+		_round_match_cache)
+	_round_match_cache.clear()
+	print("[Arena] Flushed %d cached matches (%d stray battles) before quit." % [n, extra])
 
 
 func _on_quit_to_menu() -> void:
 	_restore_timescale()
-	_flush_match_report()
+	_flush_round_report()
 	var director := _director()
 	if director != null:
 		director.hold_spawns = false
 		director.quit_to_menu()
 
-func _request_current_battle_load() -> void:
+func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
+	# Bank gate: next-round brains must load post-bank weights, and the
+	# vault files turn post-round only when the bank's saves land (atomic
+	# replaces: old-or-new, never torn - but old is STALE for the next
+	# round). While a round bank is owed, loads park on a banking wait;
+	# the ack fires the parked load. Recovery reloads bypass (they
+	# re-establish server state for a resend, not a fight).
+	if _round_bank_pending and not bypass_bank_gate:
+		_load_gated_on_bank = true
+		if is_instance_valid(status_label):
+			status_label.text = "BANKING ROUND - loading %s on the ack..." % expand_match_label(tourney_match_label)
+		print("[Arena] Load parked: round bank %s still owed." % _seq_round_id)
+		return
 	_restore_timescale()
 	var director := _director()
 	if director == null:
@@ -1229,25 +1257,24 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 	# report (same nonce, idempotent) and resend: the fresh server
 	# banks it, or answers from disk if the old server finished the
 	# bank before dying.
-	if _pending_matchbank_resend and not _seq_last_match_report.is_empty():
-		_pending_matchbank_resend = false
-		var mr := _seq_last_match_report
-		_tourney_awaiting_matchbank = true
-		_seq_match_id = str(mr.get("match_id", ""))
-		_seq_forgive_matchbank = {"tournament_id": str(mr.get("tournament_id", "")),
-			"match": str(mr.get("match", "")), "battle": _seq_match_id}
+	if _pending_roundbank_resend and not _seq_last_round_report.is_empty():
+		_pending_roundbank_resend = false
+		var rr := _seq_last_round_report
+		_tourney_awaiting_roundbank = true
+		_seq_round_id = str(rr.get("round_nonce", ""))
+		_seq_forgive_roundbank = {"tournament_id": str(rr.get("tournament_id", "")),
+			"match": str(rr.get("match", "")), "battle": _seq_round_id}
 		_hide_wait_bracket()
 		_hide_loading()
-		brain_client.request_match_report(
-			str(mr.get("match_winner", "")), str(mr.get("tournament_id", "")),
-			str(mr.get("match", "")), _seq_match_id,
-			(mr.get("battles", []) as Array), bool(mr.get("partial", false)))
-		_arm_seq("matchbank")
-		print("[Arena] Resent stored match report %s after reload." % _seq_match_id)
+		brain_client.request_round_report(_seq_round_id,
+			str(rr.get("tournament_id", "")), str(rr.get("match", "")),
+			(rr.get("matches", []) as Array))
+		_arm_seq("roundbank")
+		print("[Arena] Resent stored round report %s after reload." % _seq_round_id)
 		var rhead := _verdict_headline()
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
 			_set_wait_header(str(rhead.get("text", "")),
-				str(rhead.get("sub", "")) + "\nbanking the match (resend)...",
+				str(rhead.get("sub", "")) + "\nbanking the round (resend)...",
 				rhead.get("color", Color(0.85, 0.85, 0.9)))
 		return
 	_hide_wait_bracket()
@@ -1320,24 +1347,18 @@ func _on_server_error(error: String) -> void:
 		# still bank at match over.
 		if _recover_server_state("server brain loss"):
 			return
-	# Same self-heal for a bank interrupted by a restart: the fresh
-	# server refuses the report (FREE mode) with nothing banked. Reload
-	# the finished match, then resend the STORED report (same nonce) on
-	# brains_loaded - a new nonce here would risk double-banking the
-	# battles if the old server actually finished before dying.
-	# Idempotent via the pending flag (a state-poll recovery may have
-	# armed it already).
-	if err_context == "matchbank" and tournament_active \
-			and error.begins_with("match_report while in FREE mode") \
-			and not _seq_last_match_report.is_empty() \
-			and not _pending_matchbank_resend:
-		# Reload the finished match, then resend the STORED report
-		# (same nonce) on brains_loaded - a new nonce here would risk
-		# double-banking the battles if the old server actually
-		# finished before dying. Flag set only when the reload armed
-		# (a capped recovery leaves it clean for the fail-loud).
-		if _recover_server_state("bank interrupted"):
-			_pending_matchbank_resend = true
+	# Same self-heal for a round bank interrupted by a restart: the
+	# fresh server refuses the report (FREE mode) with nothing banked.
+	# Reload, then resend the STORED report (same nonce) on
+	# brains_loaded - a new nonce here would risk double-banking if the
+	# old server actually finished before dying. Flag set only when the
+	# reload armed (a capped recovery leaves it clean for the fail-loud).
+	if err_context == "roundbank" and tournament_active \
+			and error.begins_with("round_report while in FREE mode") \
+			and not _seq_last_round_report.is_empty() \
+			and not _pending_roundbank_resend:
+		if _recover_server_state("round bank interrupted"):
+			_pending_roundbank_resend = true
 			return
 	# A recovery load is already in flight (the state poll or a prior
 	# error armed it): the refusal that motivated it can arrive now -
@@ -1806,7 +1827,7 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 func _seq_timeout_for(context: String) -> int:
 	# The match bank replays every battle in order (dopamine per battle
 	# + one save pair): same cost class as a single long battle report.
-	if context == "battle" or context == "matchbank":
+	if context == "battle" or context == "roundbank":
 		return SEQ_BATTLE_TIMEOUT_MSEC
 	return SEQ_TIMEOUT_MSEC
 
@@ -1880,25 +1901,23 @@ func _check_seq_watchdog() -> void:
 	if not _seq_retried:
 		_seq_retried = true
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for(_seq_context)
-		if _seq_context == "matchbank" and not _seq_last_match_report.is_empty():
-			# Same match nonce, idempotent: the server answers repeats
-			# from the stored match verdict, never double-banks.
-			var mr := _seq_last_match_report
-			print("[Arena] Retrying match report id=", _seq_match_id,
+		if _seq_context == "roundbank" and not _seq_last_round_report.is_empty():
+			# Same round nonce, idempotent: the server answers repeats
+			# from the stored round verdict, never double-banks.
+			var mr := _seq_last_round_report
+			print("[Arena] Retrying round report id=", _seq_round_id,
 				" (same id, idempotent)")
 			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-				_set_wait_header("STALLED - RETRYING MATCH BANK",
-					"No confirmation for match %s yet. Re-sending the SAME report id "
-					% expand_match_label(tourney_match_label)
+				_set_wait_header("STALLED - RETRYING ROUND BANK",
+					"No confirmation for the round yet. Re-sending the SAME report id "
 					+ "(the server answers repeats from its stored verdict, no double count)...",
 					Color(0.85, 0.85, 0.9))
 			if is_instance_valid(status_label):
-				status_label.text = "STALLED - RETRYING MATCH BANK %s ..." % expand_match_label(tourney_match_label)
+				status_label.text = "STALLED - RETRYING ROUND BANK ..."
 			brain_client.reconnect()
-			brain_client.request_match_report(
-				str(mr.get("match_winner", "")), str(mr.get("tournament_id", "")),
-				str(mr.get("match", "")), str(mr.get("match_id", "")),
-				(mr.get("battles", []) as Array), bool(mr.get("partial", false)))
+			brain_client.request_round_report(
+				str(mr.get("round_nonce", "")), str(mr.get("tournament_id", "")),
+				str(mr.get("match", "")), (mr.get("matches", []) as Array))
 			return
 		if _seq_context == "load" and not _seq_last_load.is_empty():
 			var p := _seq_last_load
@@ -1925,7 +1944,7 @@ func _check_seq_watchdog() -> void:
 			brain_client.request_match_reset(tourney_match_label)
 		return
 	# Second expiry: the quit+resume recipe runs in place before
-	# anything parks loud (a wedged load/reset/matchbank un-wedges with
+	# anything parks loud (a wedged load/reset/roundbank un-wedges with
 	# a fresh seq/socket + re-issued load; a late reply can never
 	# silently start a round behind the recovery). Only a persistently
 	# broken server (cap exhausted) lands the fail-loud screen.
@@ -4488,8 +4507,9 @@ func _end_round() -> void:
 	print("[Arena] Round concluded! Sending battle stats to evolution engine...")
 	if tournament_active:
 		# Batched match reporting: cache this battle and run the
-		# post-battle sequence locally - the whole match banks once at
-		# match over (_send_match_report). No per-battle bank wait.
+		# post-battle sequence locally - matches accumulate into the
+		# round cache, and the whole round banks once at the round
+		# boundary. No per-battle bank wait.
 		_battle_done_local(false)
 		return
 	var fa := _flight_summary(flight_alpha, fly_alpha)
@@ -4524,14 +4544,14 @@ func _on_battle_progress(battle_id: String) -> void:
 	# Server proof-of-life while banking: extend the deadline a full
 	# window from each heartbeat instead of firing a duplicate report
 	# that doubles the server's work. Stray ids never move it. In
-	# matchbank context the server heartbeats the MATCH nonce (per
-	# battle stage) - matched against _seq_match_id, not battle ids.
+	# roundbank context the server heartbeats the ROUND nonce (per
+	# match stage) - matched against _seq_round_id, not battle ids.
 	if _seq_context == "battle" and battle_id != "" \
 			and battle_id == _seq_battle_id:
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("battle")
-	elif _seq_context == "matchbank" and battle_id != "" \
-			and battle_id == _seq_match_id:
-		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("matchbank")
+	elif _seq_context == "roundbank" and battle_id != "" \
+			and battle_id == _seq_round_id:
+		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("roundbank")
 
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
@@ -4677,121 +4697,157 @@ func _battle_post_sequence(battle_winner: String) -> void:
 		_arm_seq("reset")
 
 func _on_match_over(match_winner: String, score: String) -> void:
-	# Batched match reporting: ONE match_report carries every cached
-	# battle; the bank (~15-30 s, heartbeats) shows on the wait bracket;
-	# the advance + 6 s review + next load follow the ack
-	# (_on_match_banked). Quick battles ride the same flow (1 battle).
+	# Round-batch reporting: this match's battles join the round cache
+	# (no server send); the bracket advances LOCALLY right away; only a
+	# round boundary sends the ONE round_report, and the next round
+	# overlaps the bank (intermission first, loads gate on the ack).
 	# A drawn split (group play) banks no title-side slot: the batch
 	# carries the draw ELO, no match winner is credited.
 	_last_match_winner = match_winner
 	_last_match_score = score
-	_send_match_report(match_winner)
-
-
-func _send_match_report(match_winner: String, partial: bool = false) -> void:
-	# ONE bank per match: every cached battle rides one message; the
-	# server replays them in order (dopamine per battle with the cached
-	# sens/ctrl context, K_BATTLE ELO chain, records) then banks the
-	# match (K_MATCH + counters) - one journal, one save pair for the
-	# whole match. The wait bracket shows the deciding verdict while
-	# the bank runs (battle_progress heartbeats extend the deadline).
-	_seq_match_id = "%s-MATCH-%d-%d" % [tourney_match_label,
-		Time.get_ticks_msec(), randi() % 100000]
-	_tourney_awaiting_matchbank = true
-	_pending_matchbank_resend = false
-	_seq_forgive_matchbank = {"tournament_id": _tourney_id(),
-		"match": tourney_match_label, "battle": _seq_match_id}
-	_seq_last_match_report = {"match_winner": match_winner,
-		"tournament_id": _tourney_id(), "match": tourney_match_label,
-		"match_id": _seq_match_id, "partial": partial,
-		"battles": _match_battle_cache.duplicate(true)}
-	var head := _verdict_headline()
-	brain_client.request_match_report(match_winner, _tourney_id(),
-		tourney_match_label, _seq_match_id, _match_battle_cache, partial)
-	_match_battle_cache.clear()
-	_arm_seq("matchbank")
-	# Proactive desync poll: a restarted (FREE-mode) server is caught
-	# by the state reply BEFORE the 240 s watchdog cycle would.
-	brain_client.request_server_state()
-	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-		_set_wait_header(str(head.get("text", "")),
-			str(head.get("sub", "")) + "\nbanking the match...",
-			head.get("color", Color(0.85, 0.85, 0.9)))
-	else:
-		_show_loading(str(head.get("text", "")),
-			str(head.get("sub", "")) + "\nbanking the match...",
-			head.get("color", Color(0.85, 0.85, 0.9)))
-
-
-func _forgivable_matchbank(match_id: String) -> bool:
-	# Match-level twin of _forgivable_reply: a post-fail-loud bank ack
-	# applies only for the still-owed match (same nonce id, same
-	# tournament file, same match label, still in a tournament).
-	# Pure (unit-tested).
-	if _seq_forgive_matchbank.is_empty():
-		return false
-	if match_id != str(_seq_forgive_matchbank.get("battle", "")):
-		return false
-	if str(_seq_forgive_matchbank.get("tournament_id", "")) != _tourney_id():
-		return false
-	if str(_seq_forgive_matchbank.get("match", "")) != tourney_match_label:
-		return false
-	return tournament_active
-
-
-func _on_match_banked(match_echo: String, _fit_a: float, _fit_b: float,
-		_match_id: String) -> void:
-	# The server banked the whole match (dopamine, records, weights,
-	# match ELO). Guards mirror the per-battle reply; the advance
-	# follows the ack (the final match's crown-by-id vault load needs
-	# the banked weights/records).
-	if not _tourney_awaiting_matchbank:
-		if _match_id != "" and _forgivable_matchbank(_match_id):
-			print("[Arena] Forgiving late match_banked (id=",
-				_match_id, "): banked but unconfirmed, applying now.")
-		else:
-			print("[Arena] Ignoring late/duplicate match_banked (id=",
-				_match_id, ")")
-			return
-	var bdirector := _director()
-	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
-		bdirector.call("invalidate_brains_cache")
-	if _match_id != "" and _seq_match_id != "" and _match_id != _seq_match_id:
-		print("[Arena] Ignoring match_banked id mismatch: got ", _match_id,
-			" want ", _seq_match_id)
-		return
-	_tourney_awaiting_matchbank = false
-	_clear_seq()
-	# Consuming the owed ack closes the forgive window.
-	_seq_forgive_matchbank = {}
-	_pending_matchbank_resend = false
-	_hide_wait_bracket()
-	_hide_loading()
 	var director := _director()
 	if director == null:
 		return
-	# Advance synchronously BEFORE the review await: advance_after_match
+	var round_before := int(director.tourney.get("current_round", 0))
+	_round_match_cache.append(_current_match_entry(match_winner))
+	_match_battle_cache.clear()
+	var adv: Dictionary = director.advance_after_match()
+	var round_after := int(director.tourney.get("current_round", 0))
+	# Advance synchronously BEFORE the overlay wait: advance_after_match
 	# is pure logic + save, while the 6 s await below dies with the scene
 	# if the user quits to menu mid-overlay - which used to swallow the
 	# title request (and the evo chain) after the match was already
 	# banked. Banking requests are fire-and-forget; only the ack display
 	# below is allowed to depend on the wait.
-	var adv: Dictionary = director.advance_after_match()
-	# Preload during the 6 s review: after advance, the director points
-	# at the next match - its load hides under the review, so the next
-	# battle's official load becomes an O(1) activation.
 	_preload_next_match()
 	# The bracket overlay carries the result: gold connectors show the
 	# path, the loser is grayed out, next lineup is visible. A drawn
 	# split announces the shared point instead of a winner.
-	var match_name := tourney_a_name if _last_match_winner == "alpha" else tourney_b_name
-	if _last_match_winner == "draw":
-		_show_arena_bracket("%s DRAW %s  (point split)" % [expand_match_label(tourney_match_label), _last_match_score])
+	if match_winner == "draw":
+		_show_arena_bracket("%s DRAW %s  (point split)" % [expand_match_label(tourney_match_label), score])
 	else:
-		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), _last_match_score])
+		var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
+		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), score])
 	await get_tree().create_timer(6.0).timeout
 	_hide_arena_bracket()
+	# Round boundary: the current round's index moved, or the file
+	# completed (group_complete / tournament_end). Mid-round matches
+	# just flow to the next load; the bank waits for the boundary.
+	var round_ended := round_after != round_before \
+		or str(adv.get("action", "")) != "next_match"
+	if round_ended:
+		_send_round_report()
 	_handle_advance_result(adv)
+
+
+func _current_match_entry(match_winner: String) -> Dictionary:
+	# One round-cache entry for the just-finished (or in-progress)
+	# match: winner (or "pending" for the quit-flush strays), fighter
+	# ids + vault paths for the round-end reloads, and the cached
+	# battles. Read BEFORE advance_after_match (current position is
+	# still this match).
+	var director := _director()
+	var cm: Dictionary = director.current_match() if director != null else {}
+	var aid := str(cm.get("a_id", ""))
+	var bid := str(cm.get("b_id", ""))
+	return {"match_id": _current_match_nonce(),
+		"match_winner": match_winner,
+		"alpha_id": aid, "beta_id": bid,
+		"alpha_path": director.brain_path(aid) if director != null else "",
+		"beta_path": director.brain_path(bid) if director != null else "",
+		"battles": _match_battle_cache.duplicate(true)}
+
+
+func _current_match_nonce() -> String:
+	# Unique id per reported match (fresh nonce per report; retries
+	# resend the STORED round nonce, never a new one).
+	return "%s-M%d-%d" % [tourney_match_label,
+		Time.get_ticks_msec(), randi() % 100000]
+
+
+func _send_round_report() -> void:
+	# ONE bank per round: every cached match rides one message; the
+	# server replays matches in order (per-match vault reload, battles in
+	# order, ELO chains, records), then journals once + saves each brain
+	# once. The bank runs UNDER the intermission/review (pipelined);
+	# loads gate on the ack, never on the send.
+	if _round_match_cache.is_empty():
+		return
+	_seq_round_id = "RND-%d-%d" % [Time.get_ticks_msec(), randi() % 100000]
+	_tourney_awaiting_roundbank = true
+	_round_bank_pending = true
+	_seq_forgive_roundbank = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "battle": _seq_round_id}
+	_seq_last_round_report = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "round_nonce": _seq_round_id,
+		"matches": _round_match_cache.duplicate(true)}
+	brain_client.request_round_report(_seq_round_id, _tourney_id(),
+		tourney_match_label, _round_match_cache)
+	_round_match_cache.clear()
+	_arm_seq("roundbank")
+
+
+func _forgivable_roundbank(round_nonce: String) -> bool:
+	# Round-level twin of _forgivable_reply: a post-fail-loud bank ack
+	# applies only for the still-owed round (same nonce id, same
+	# tournament file, still in a tournament). Pure (unit-tested).
+	if _seq_forgive_roundbank.is_empty():
+		return false
+	if round_nonce != str(_seq_forgive_roundbank.get("battle", "")):
+		return false
+	if str(_seq_forgive_roundbank.get("tournament_id", "")) != _tourney_id():
+		return false
+	return tournament_active
+
+
+func _on_round_banked(round_nonce: String, tid: String, match_label: String) -> void:
+	# The server banked the whole round (replays, records, weights, one
+	# save set). Guards mirror the per-battle reply; then: clear the
+	# pending flag, refresh the roster cache, fire any load parked on
+	# the gate, run a deferred final-build, and run a deferred
+	# tournament-end chain.
+	if not _tourney_awaiting_roundbank:
+		if round_nonce != "" and _forgivable_roundbank(round_nonce):
+			print("[Arena] Forgiving late round_banked (id=",
+				round_nonce, "): banked but unconfirmed, applying now.")
+		else:
+			print("[Arena] Ignoring late/duplicate round_banked (id=",
+				round_nonce, ")")
+			return
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
+	if round_nonce != "" and _seq_round_id != "" and round_nonce != _seq_round_id:
+		print("[Arena] Ignoring round_banked id mismatch: got ", round_nonce,
+			" want ", _seq_round_id)
+		return
+	_tourney_awaiting_roundbank = false
+	_round_bank_pending = false
+	_clear_seq()
+	# Consuming the owed ack closes the forgive window.
+	_seq_forgive_roundbank = {}
+	_hide_wait_bracket()
+	_hide_loading()
+	if not _pending_advance.is_empty():
+		# Stashed tournament-end chain (review already shown pre-ack):
+		# the crown + handoff need the banked vault, available now.
+		var pa := _pending_advance
+		_pending_advance = {}
+		_handle_advance_result(pa)
+	if not _pending_final_ev.is_empty():
+		var fev := _pending_final_ev
+		_pending_final_ev = {}
+		print("[Arena] Banked - building the queued final now.")
+		if _event_build_final(fev):
+			_event_gallery_update()
+		_show_arena_bracket("EVENT %s · FINAL" % str(fev.get("id", "")))
+	if not _pending_advance.is_empty():
+		var pa := _pending_advance
+		_pending_advance = {}
+		_handle_advance_result(pa)
+	if _load_gated_on_bank:
+		_load_gated_on_bank = false
+		_request_current_battle_load()
 
 
 func _battle_count() -> int:
@@ -4819,6 +4875,34 @@ func _handle_advance_result(res: Dictionary) -> void:
 				Color(1.0, 0.85, 0.3), "EXHIBITION COMPLETE", "MENU", false)
 			await get_tree().create_timer(5.0).timeout
 			director.quit_to_menu()
+			return
+		if _round_bank_pending:
+			# Bank still running: review NOW (display-only bracket),
+			# crown + handoff proceed on the ack (_on_round_banked
+			# re-dispatches the stashed chain). The crown loads the
+			# champion BY ID from the vault, which turns post-round only
+			# when the bank's saves land.
+			_pending_advance = res.duplicate(true)
+			_hide_wait_bracket()
+			_hide_loading()
+			winner_overlay.visible = false
+			_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET (banking round...)" % director.champion_name())
+			if is_instance_valid(status_label):
+				status_label.text = "TOURNAMENT COMPLETE - banking round, crown follows..."
+			return
+		if _round_bank_pending:
+			# Bank still running: review NOW (display-only bracket), crown
+			# + handoff proceed on the ack (_on_round_banked re-dispatches
+			# the stashed chain). The crown loads the champion BY ID from
+			# the vault, which turns post-round only when the bank's saves
+			# land.
+			_pending_advance = res.duplicate(true)
+			_hide_wait_bracket()
+			_hide_loading()
+			winner_overlay.visible = false
+			_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET (banking round...)" % director.champion_name())
+			if is_instance_valid(status_label):
+				status_label.text = "TOURNAMENT COMPLETE - banking round, crown follows..."
 			return
 		var champ_slot := _slot_of(champ_id)
 		_tourney_close_ack = false
@@ -5432,17 +5516,32 @@ func _event_group_done(res: Dictionary) -> void:
 	if nxt == "":
 		_evo_abort("event chain broken after group " + group)
 		return
-	var built := _event_build_final(ev) if nxt == "final" else _event_switch_group(ev, nxt)
-	if not built:
-		return
 	var title := "EVENT %s · %s" % [eid, "FINAL" if nxt == "final" else "GROUP " + nxt]
-	# Gallery primed before the wait (the intermission renders it):
-	# upcoming bracket's fighters in both cases, final included.
-	_event_gallery_update()
+	var sub := _event_preview_sub(nxt)
 	var wait_secs := EVENT_FINAL_SECS if nxt == "final" else EVENT_INTERMISSION_SECS
-	if not await _event_intermission(title, _event_preview_sub(nxt), wait_secs, true):
-		director.quit_to_menu()
-		return
+	if _round_bank_pending:
+		print("[Arena] Bank %s still owed at intermission - countdown runs under it; loads gate on the ack." % _seq_round_id)
+	if nxt == "final" and _round_bank_pending:
+		# Bank still running: the final's player ELO snapshots must come
+		# post-bank. Stash the build for the ack; the intermission shows
+		# the completed group + banking status now, and the ack builds
+		# the final and refreshes the view (countdown keeps running).
+		_pending_final_ev = ev.duplicate(true)
+		title += " (banking round...)"
+		_event_gallery_update()
+		if not await _event_intermission(title, sub, wait_secs, true):
+			director.quit_to_menu()
+			return
+	else:
+		var built := _event_build_final(ev) if nxt == "final" else _event_switch_group(ev, nxt)
+		if not built:
+			return
+		# Gallery primed before the wait (the intermission renders it):
+		# upcoming bracket's fighters in both cases, final included.
+		_event_gallery_update()
+		if not await _event_intermission(title, sub, wait_secs, true):
+			director.quit_to_menu()
+			return
 	_request_current_battle_load()
 
 
@@ -5529,9 +5628,9 @@ func _recover_server_state(reason: String) -> bool:
 	_clear_seq()
 	tourney_awaiting_load = false
 	_tourney_awaiting_battle = false
-	_tourney_awaiting_matchbank = false
+	_tourney_awaiting_roundbank = false
 	_seq_forgive_match = {}
-	_seq_forgive_matchbank = {}
+	_seq_forgive_roundbank = {}
 	_hide_wait_bracket()
 	_hide_loading()
 	brain_client.reconnect()
@@ -5555,16 +5654,16 @@ func _on_server_state(mode: bool, tid: String, match_label: String) -> void:
 		mode, tid, match_label, _seq_context])
 	_arena_log("server state poll: mode=%s tourney=%s match=%s (awaiting %s)" % [
 		mode, tid, match_label, _seq_context])
-	if _seq_context == "matchbank" and not mode and tournament_active \
-			and not _recover_in_flight and not _pending_matchbank_resend \
-			and not _seq_last_match_report.is_empty():
+	if _seq_context == "roundbank" and not mode and tournament_active \
+			and not _recover_in_flight and not _pending_roundbank_resend \
+			and not _seq_last_round_report.is_empty():
 		# FREE-mode server while a bank is owed: it restarted mid-bank.
 		# Arm the stored-report resend and reload NOW - the in-flight
 		# report is about to be refused anyway, and this skips the whole
 		# 240 s watchdog cycle. (The refusal error that follows is
 		# attributed silently: recovery already in flight.)
-		if _recover_server_state("bank interrupted (state poll)"):
-			_pending_matchbank_resend = true
+		if _recover_server_state("round bank interrupted (state poll)"):
+			_pending_roundbank_resend = true
 
 
 func _show_handoff_failure(title: String, reason: String) -> void:

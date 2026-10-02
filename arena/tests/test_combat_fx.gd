@@ -384,55 +384,96 @@ func test_load_fail_loud_clears_latch() -> void:
 	_check(not arena.tourney_awaiting_load, "fail-loud clears the load latch")
 
 
-func test_match_over_sends_report() -> void:
-	# ONE bank per match: match over stamps the nonce, flushes the
-	# cache into the report, arms the matchbank watchdog (no
-	# per-battle sends happened).
+func test_round_match_over_advances() -> void:
+	# Round-batch: match over appends the match (ids + battles) to the
+	# round cache, clears the battle cache, and advances LOCALLY - no
+	# server send until the round boundary (mid-round: nothing armed).
+	var d = arena._director()
+	if d == null:
+		_check(true, "round advance skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_roundadv"
+	DirAccess.make_dir_recursive_absolute("user://test_roundadv")
+	d.tourney = {"id": "TR", "status": "running",
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1", "a_name": "A",
+			"b_name": "B"},
+			{"a_id": "c1", "b_id": "d1", "a_name": "C",
+			"b_name": "D"}]]}
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
 	arena._match_battle_cache = [{"battle_id": "R1M1-B1-1-1", "draw": false,
 		"verdict": {"winner_slot": "alpha"}}]
+	arena._on_match_over("alpha", "1 - 0")
+	_check((arena._round_match_cache as Array).size() == 1,
+		"match cached for the round")
+	_check((arena._match_battle_cache as Array).is_empty(),
+		"battle cache cleared")
+	_check(int(d.tourney.get("current_match", -1)) == 1,
+		"bracket advanced locally")
+	_check(not arena._tourney_awaiting_roundbank,
+		"mid-round arms no bank")
+	_check(str(arena._seq_round_id) == "", "mid-round mints no nonce")
+	arena._round_match_cache.clear()
+	arena._hide_arena_bracket()
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_roundadv"):
+		for f in DirAccess.get_files_at("user://test_roundadv"):
+			DirAccess.remove_absolute("user://test_roundadv".path_join(f))
+		DirAccess.remove_absolute("user://test_roundadv")
+
+
+func test_round_report_send() -> void:
+	# ONE bank per round: round end stamps the nonce, flushes the round
+	# cache into the report, arms the roundbank watchdog.
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._round_match_cache = [{"match_id": "R1M1-M1-1-1",
+		"match_winner": "alpha", "battles": []}]
 	arena._last_verdict = {"end_reason": "ko", "winner_slot": "alpha",
 		"blow_source": "thorax", "blow_amount": 80.0,
 		"loser_slot": "beta", "line": "X"}
-	arena._on_match_over("alpha", "1 - 0")
-	_check(arena._last_match_winner == "alpha", "match winner stored")
-	_check(arena._last_match_score == "1 - 0", "match score stored")
-	_check(str(arena._seq_match_id) != "", "match nonce stamped")
-	_check((arena._match_battle_cache as Array).is_empty(),
-		"cache flushed into the report")
-	_check(arena._tourney_awaiting_matchbank, "match bank awaited")
-	_check(str(arena._seq_context) == "matchbank", "matchbank watchdog armed")
+	arena._send_round_report()
+	_check(str(arena._seq_round_id) != "", "round nonce stamped")
+	_check((arena._round_match_cache as Array).is_empty(),
+		"round cache flushed into the report")
+	_check(arena._tourney_awaiting_roundbank, "round bank awaited")
+	_check(arena._round_bank_pending, "bank flag set")
+	_check(str(arena._seq_context) == "roundbank", "roundbank watchdog armed")
+	_check(not (arena._seq_last_round_report as Dictionary).is_empty(),
+		"stored report kept for retry")
 
 
-func test_forgivable_matchbank() -> void:
-	# Post-fail-loud bank acks apply only for the still-owed match.
+func test_forgivable_roundbank() -> void:
+	# Post-fail-loud bank acks apply only for the still-owed round.
 	arena.tournament_active = true
-	arena.tourney_match_label = "R1M1"
-	arena._seq_forgive_matchbank = {}
-	_check(not arena._forgivable_matchbank("X"), "nothing owed, nothing forgiven")
-	arena._seq_forgive_matchbank = {"tournament_id": arena._tourney_id(),
-		"match": "R1M1", "battle": "M1"}
-	_check(arena._forgivable_matchbank("M1"), "owed ack forgiven")
-	_check(not arena._forgivable_matchbank("M2"), "other ack dropped")
-	arena._tourney_awaiting_matchbank = false
-	arena._seq_forgive_matchbank = {}
-	arena._on_match_banked("alpha", 0.0, 0.0, "X")
-	_check(not arena._tourney_awaiting_matchbank, "stray bank ack drops clean")
+	arena._seq_forgive_roundbank = {}
+	_check(not arena._forgivable_roundbank("X"), "nothing owed, nothing forgiven")
+	arena._seq_forgive_roundbank = {"tournament_id": arena._tourney_id(),
+		"match": "", "battle": "R1"}
+	_check(arena._forgivable_roundbank("R1"), "owed ack forgiven")
+	_check(not arena._forgivable_roundbank("R2"), "other ack dropped")
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_forgive_roundbank = {}
+	arena._on_round_banked("X", "", "")
+	_check(not arena._tourney_awaiting_roundbank, "stray bank ack drops clean")
 
 
-func test_matchbank_retry() -> void:
-	# The matchbank watchdog resends the SAME nonce once (idempotent),
+func test_roundbank_retry() -> void:
+	# The roundbank watchdog resends the SAME nonce once (idempotent),
 	# then the fail-loud takes its normal path.
 	arena.tournament_active = true
-	arena._seq_context = "matchbank"
+	arena._seq_context = "roundbank"
 	arena._seq_retried = false
 	arena._seq_deadline_msec = 1
-	arena._seq_last_match_report = {"match_winner": "alpha",
-		"tournament_id": "T1", "match": "R1M1", "match_id": "R1M1-MATCH-1-2",
-		"partial": false, "battles": []}
+	arena._seq_last_round_report = {"tournament_id": "T1",
+		"match": "R1M1", "round_nonce": "RND-1-2",
+		"matches": []}
 	arena._check_seq_watchdog()
-	_check(arena._seq_retried, "matchbank retry fires once")
+	_check(arena._seq_retried, "roundbank retry fires once")
 
 
 func test_server_brain_loss_reloads() -> void:
@@ -508,38 +549,38 @@ func test_motors_slot() -> void:
 		"trace hides outside MOTORS")
 
 
-func test_matchbank_brain_loss_resends() -> void:
-	# Server restart killed the bank: the free-mode error arms a
+func test_roundbank_brain_loss_resends() -> void:
+	# Server restart killed the round bank: the free-mode error arms a
 	# stored-report resend (supervisor reload, capped); the reload
-	# landing resends WITHOUT starting a round (the match is over).
+	# landing resends WITHOUT starting a round (rounds are over).
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
-	arena._seq_context = "matchbank"
+	arena._seq_context = "roundbank"
 	arena._server_reloads = 0
-	arena._pending_matchbank_resend = false
+	arena._pending_roundbank_resend = false
 	arena._recover_in_flight = false
-	arena._seq_last_match_report = {"match_winner": "alpha",
-		"tournament_id": "T1", "match": "R1M1", "match_id": "M1",
-		"partial": false, "battles": []}
+	arena._seq_last_round_report = {"tournament_id": "T1",
+		"match": "R1M1", "round_nonce": "RND-1", "matches": []}
 	arena._on_server_error(
-		"match_report while in FREE mode - QUIT TO MENU + RESUME")
-	_check(arena._pending_matchbank_resend, "bank-loss error arms resend")
+		"round_report while in FREE mode - QUIT TO MENU + RESUME")
+	_check(arena._pending_roundbank_resend, "bank-loss error arms resend")
 	_check(arena._server_reloads == 1, "bank-loss reload counted")
 	# Reload landing: re-arms the bank from the stored report, no round.
 	arena._seq_context = "load"
 	arena.tourney_awaiting_load = true
 	arena.is_round_active = false
 	arena._on_brains_loaded({}, {})
-	_check(not arena._pending_matchbank_resend, "resend flag consumed")
-	_check(arena._tourney_awaiting_matchbank, "bank re-armed after reload")
-	_check(str(arena._seq_context) == "matchbank", "matchbank watchdog back")
+	_check(not arena._pending_roundbank_resend, "resend flag consumed")
+	_check(arena._tourney_awaiting_roundbank, "bank re-armed after reload")
+	_check(str(arena._seq_context) == "roundbank", "roundbank watchdog back")
 	_check(not arena.is_round_active, "reload landing starts no round")
 	# Cap: past-max errors land loud, flag stays down.
 	arena._server_reloads = 2
-	arena._seq_context = "matchbank"
+	arena._seq_context = "roundbank"
+	arena._recover_in_flight = false
 	arena._on_server_error(
-		"match_report while in FREE mode - QUIT TO MENU + RESUME")
-	_check(not arena._pending_matchbank_resend, "capped bank error no resend")
+		"round_report while in FREE mode - QUIT TO MENU + RESUME")
+	_check(not arena._pending_roundbank_resend, "capped bank error no resend")
 	_check(str(arena.status_label.text).begins_with("SERVER ERROR"),
 		"capped bank error still lands loud")
 
@@ -656,6 +697,12 @@ func test_auto_recover_supervisor() -> void:
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
 	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._round_bank_pending = false
+	arena._load_gated_on_bank = false
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_round_id = ""
+	arena._pending_roundbank_resend = false
 	arena._seq_context = "battle"
 	arena._tourney_awaiting_battle = true
 	arena.tourney_awaiting_load = true
@@ -795,11 +842,11 @@ func _process(_delta: float) -> bool:
 	test_server_error_routing()
 	test_brains_loaded_accept()
 	test_load_fail_loud_clears_latch()
-	test_match_over_sends_report()
-	test_forgivable_matchbank()
-	test_matchbank_retry()
-	test_server_brain_loss_reloads()
-	test_matchbank_brain_loss_resends()
+	test_round_match_over_advances()
+	test_round_report_send()
+	test_forgivable_roundbank()
+	test_roundbank_retry()
+	test_roundbank_brain_loss_resends()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()

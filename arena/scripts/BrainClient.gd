@@ -8,6 +8,7 @@ signal restarted(round_winner: String)
 signal tournament_battle_received(battle_winner: String, fitness_alpha: float, fitness_beta: float, battle_id: String)
 signal battle_progress_received(battle_id: String)
 signal match_banked_received(match_winner: String, fitness_alpha: float, fitness_beta: float, match_id: String)
+signal round_banked_received(round_nonce: String, tournament_id: String, match_label: String)
 signal brains_loaded_received(alpha_info: Dictionary, beta_info: Dictionary, tournament_id: String, match_label: String)
 signal prepared_received(tournament_id: String, match_label: String)
 signal match_ready_received()
@@ -174,6 +175,23 @@ func request_match_reset(match_label: String = "") -> void:
 		return
 	_send_dict({"type": "match_reset", "match": match_label})
 
+func request_round_report(round_nonce: String, tournament_id: String,
+		match_label: String, matches: Array) -> void:
+	# ONE bank per round: every completed match rides one message; the
+	# server replays matches in order, then journals once + saves each
+	# brain once. Between matches/rounds only loads flow - the bank
+	# hides under the intermission while the next round overlaps it.
+	if not is_connected_server:
+		return
+	_send_dict({
+		"type": "round_report",
+		"round_nonce": round_nonce,
+		"tournament_id": tournament_id,
+		"match": match_label,
+		"matches": matches
+	})
+
+
 func request_free_mode() -> void:
 	if not is_connected_server:
 		return
@@ -234,6 +252,11 @@ func _handle_server_response(data: Dictionary) -> void:
 			float(data.get("fitness_alpha", 0.0)),
 			float(data.get("fitness_beta", 0.0)),
 			str(data.get("battle_id", "")))
+	elif status == "round_banked":
+		round_banked_received.emit(
+			str(data.get("round_nonce", "")),
+			str(data.get("tournament_id", "")),
+			str(data.get("match", "")))
 	elif status == "tournament_match_battled":
 		match_banked_received.emit(
 			data.get("match_winner", "draw"),

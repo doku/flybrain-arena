@@ -5968,6 +5968,18 @@ class TestGodotArenaHeadless(unittest.TestCase):
                 self.fail(f"Godot reported shader error:\n{line}\n--- full output ---\n{out}")
 
 
+_ROUND_FIX = {}
+
+
+def _round_csr_pops():
+    # Real connectome + populations, loaded once per session: round
+    # replay binds brains by arity, so synthetic small weights fail.
+    if "csr" not in _ROUND_FIX:
+        _ROUND_FIX["csr"] = load_or_build_csr()
+        _ROUND_FIX["pops"] = load_or_extract_populations()
+    return _ROUND_FIX["csr"], _ROUND_FIX["pops"]
+
+
 class TestBattleTransaction(unittest.TestCase):
     """Isolated battle persistence: draw learning skip + journaled saves.
 
@@ -6419,6 +6431,187 @@ class TestBattleTransaction(unittest.TestCase):
             _FakeEvo(), _FakeRL(), 1.0, sta["brain"], stb["brain"],
             lambda: "tourney T match MP")
         la, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual((la["record"]["battles"], la["record"]["losses"]), (1, 1))
+        self.assertEqual(la["record"]["matches"], 0)
+
+    def _round_fighters(self, names, wbasis):
+        # Real-arity experiment-wired brains in the temp vault (the
+        # round replay binds by arity - synthetic 32-elem weights would
+        # fail). Ids de-collided like _two_fighters.
+        import time
+        recs = []
+        for name in names:
+            rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                              "mapping": None})
+            while any(r["id"] == rec["id"] for r in recs):
+                time.sleep(0.002)
+                rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                                  "mapping": None})
+            vault_pkg.save_brain(rec, np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy()))
+            recs.append(rec)
+        return recs
+
+
+    def _round_fighters(self, names, wbasis):
+        import time
+        recs = []
+        for name in names:
+            rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                              "mapping": None})
+            while any(r["id"] == rec["id"] for r in recs):
+                time.sleep(0.002)
+                rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                                  "mapping": None})
+            vault_pkg.save_brain(rec, np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy()))
+            recs.append(rec)
+        return recs
+
+
+    def test_handle_round_report_batches_round(self):
+        # Round-batch: two matches bank in one message (replay in
+        # order, one journal, one save set); per-battle + per-match
+        # echoes; verdict keyed by round nonce; journal gone after.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        _rec_a, _rec_b, _rec_c, _rec_d = self._round_fighters(
+            ["RndA", "RndB", "RndC", "RndD"], wbasis)
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def __init__(self):
+                self.calls = []
+            def begin_episode(self, brain):
+                self.calls.append(("begin",))
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                self.calls.append(("plastic", sig))
+            def pin_gains(self, brain, legacy=False):
+                self.calls.append(("pin", legacy))
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+
+        def _battle(bid, draw, winner):
+            return {"battle_id": bid, "draw": draw, "draw_penalty": False,
+                    "end_reason": "" if draw else "ko",
+                    "verdict": {"winner_slot": "" if draw else winner,
+                                "blow_source": "thorax", "blow_amount": 80.0,
+                                "loser_slot": "beta"},
+                    "stats_a": {"kills": 0 if draw else 1},
+                    "stats_b": {"kills": 0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl}
+
+        def _match(mid, winner, ra, rb):
+            return {"match_id": mid, "match_winner": winner,
+                    "alpha_id": ra["id"], "beta_id": rb["id"],
+                    "alpha_path": vault_pkg.package_path(ra),
+                    "beta_path": vault_pkg.package_path(rb),
+                    "battles": [_battle(mid + "-B1", False, winner)]}
+
+        msg = {"round_nonce": "RND-1", "tournament_id": "T", "match": "R1M1",
+               "matches": [_match("M1", "alpha", _rec_a, _rec_b),
+                           _match("M2", "beta", _rec_c, _rec_d)]}
+        rl = _FakeRL()
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": "T", "match": "R1M1"},
+            0.5, True, _FakeEvo(), rl, 1.0, lambda: "tourney T match M1",
+            csr, pops, {})
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "round_banked")
+        self.assertEqual(len(body["matches"]), 2)
+        self.assertEqual(body["matches"][0]["match_winner"], "alpha")
+        self.assertEqual(
+            body["matches"][0]["battles"][0]["battle_winner"], "alpha")
+        self.assertEqual(body["matches"][1]["match_winner"], "beta")
+        # Dopamine replayed per non-draw battle (begin per brain).
+        self.assertEqual(rl.calls.count(("begin",)), 4)
+        self.assertIn(("plastic", 1.0), rl.calls)
+        self.assertIn(("pin", False), rl.calls)
+        la, _ = vault_pkg.load_brain(_rec_a["id"])
+        lb, _ = vault_pkg.load_brain(_rec_b["id"])
+        lc, _ = vault_pkg.load_brain(_rec_c["id"])
+        self.assertEqual(
+            (la["record"]["battles"], la["record"]["wins"]), (1, 1))
+        self.assertEqual(
+            (lb["record"]["battles"], lb["record"]["losses"]), (1, 1))
+        self.assertEqual(
+            (lc["record"]["battles"], lc["record"]["losses"]), (1, 1))
+        self.assertEqual((la["record"]["matches"], la["record"]["matches_won"]), (1, 1))
+        self.assertNotEqual(la["record"]["elo"], lb["record"]["elo"])
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["battle_id"], "RND-1")
+        self.assertEqual(len(stored["result"]["matches"]), 2)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+        # Exact resend (same nonce): resend, no re-bank.
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": "T", "match": "R1M1"},
+            0.5, True, _FakeEvo(), _FakeRL(), 1.0, lambda: "tourney T match M1",
+            csr, pops, {})
+        la2, _ = vault_pkg.load_brain(_rec_a["id"])
+        self.assertEqual(la2["record"]["battles"], 1)
+        self.assertEqual(la2["record"]["matches"], 1)
+
+    def test_handle_round_report_partial(self):
+        # Quit-flush: a pending match banks battles only, no match
+        # counters; decided matches bank fully in the same report.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        _rec_a, _rec_b = self._round_fighters(
+            ["RndP", "RndQ"], wbasis)
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("beta", 5.0, 4.0)
+
+        msg = {"round_nonce": "RND-P", "tournament_id": "T", "match": "MP",
+               "matches": [
+                   {"match_id": "MP1", "match_winner": "pending",
+                    "alpha_id": _rec_a["id"], "beta_id": _rec_b["id"],
+                    "alpha_path": vault_pkg.package_path(_rec_a),
+                    "beta_path": vault_pkg.package_path(_rec_b),
+                    "battles": [
+                        {"battle_id": "MP1-B1", "draw": False,
+                         "draw_penalty": False, "end_reason": "time",
+                         "verdict": {"winner_slot": "beta", "dmg_a": 80.0,
+                                     "dmg_b": 90.0},
+                         "stats_a": {"kills": 0}, "stats_b": {"kills": 0},
+                         "sens_a": {}, "sens_b": {},
+                         "ctrl_a": {}, "ctrl_b": {}}]}]}
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": "T", "match": "MP"},
+            0.5, True, _FakeEvo(), _FakeRL(), 1.0, lambda: "tourney T match MP",
+            csr, pops, {})
+        la, _ = vault_pkg.load_brain(_rec_a["id"])
         self.assertEqual((la["record"]["battles"], la["record"]["losses"]), (1, 1))
         self.assertEqual(la["record"]["matches"], 0)
 
