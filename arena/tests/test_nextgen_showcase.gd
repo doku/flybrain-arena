@@ -124,6 +124,21 @@ func test_showcase_asterisk() -> void:
 				leftover += 1
 	_check(leftover == 0, "clear hides every star")
 	B.free()
+	# Regression (live crash): quadrant standings rows register for the
+	# cyan name paint but carry NO asterisk meta (fixture rows own
+	# those Labels). Showcasing such a key must paint the name and
+	# skip the marker - never error on the missing meta.
+	var S = load("res://scripts/TournamentBracket.gd").new()
+	var bare := Label.new()
+	S.call("_register_show", "stand123", bare)
+	S.call("set_showcase", "stand123")
+	_check(S.call("showcase_applied") == "stand123", "bare row showcases")
+	_check(bare.get_theme_color("font_color").is_equal_approx(
+		Color(0.35, 0.85, 1.0)), "bare row paints cyan")
+	S.call("clear_showcase")
+	_check(S.call("showcase_applied") == "", "bare row clears")
+	bare.free()
+	S.free()
 	var L = load("res://scripts/TournamentBracket.gd").new()
 	L.call("render_bracket", preview, 0, 0)
 	var live_card: PanelContainer = (L.get("_spot_cards") as Dictionary).get("abc12345")

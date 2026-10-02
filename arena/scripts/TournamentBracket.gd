@@ -320,8 +320,19 @@ func set_showcase(key: String) -> void:
 		return
 	showcase_key = key
 	for nm in (_show_rows[key] as Array):
-		(nm as Label).add_theme_color_override("font_color", COL_SHOWCASE)
-		var st = (nm as Label).get_meta("asterisk", null)
+		# Standings-table rows register for the cyan name paint but
+		# carry no asterisk marker (fixture rows own those Labels):
+		# has_meta first, because get_meta on a missing key errors on
+		# some builds despite the default arg. Same guard as
+		# clear_showcase below; freed rows from a prior render are
+		# skipped the same way.
+		var lbl := nm as Label
+		if not is_instance_valid(lbl):
+			continue
+		lbl.add_theme_color_override("font_color", COL_SHOWCASE)
+		if not lbl.has_meta("asterisk"):
+			continue
+		var st = lbl.get_meta("asterisk")
 		if st is Label and is_instance_valid(st):
 			(st as Label).visible = true
 	for kid in _show_kids:
