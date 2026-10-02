@@ -29,6 +29,11 @@ var sound_sfx: CheckButton
 var sound_voice_pick: OptionButton
 var sound_palette_pick: OptionButton
 var _sound_voice_ids: Array = []
+# Full display names, index-aligned with _sound_voice_ids: the picker
+# shows shortened labels (OptionButton minimums grow to the widest
+# item and clip_text does NOT cap them - the Oct 2026 right-edge
+# overflow), so the tooltip reads the full name from here.
+var _sound_voice_names: Array = []
 # Preloaded for the same reason as ArenaManager.SfxSynthLib (fresh
 # scripts have no global class cache entry yet).
 const SfxSynthLib = preload("res://scripts/SfxSynth.gd")
@@ -356,6 +361,13 @@ func _build_sound_row() -> HBoxContainer:
 	vl.text = "voice"
 	row.add_child(vl)
 	sound_voice_pick = OptionButton.new()
+	# Live Windows voice names run ~50 chars; OptionButton minimums
+	# grow to the widest item (clip_text does NOT cap them), which
+	# stretched this row to 1035px and past the window's right edge.
+	# _short_voice_label bounds the items; the full name rides the
+	# tooltip (_sound_voice_tooltip).
+	sound_voice_pick.clip_text = true
+	sound_voice_pick.custom_minimum_size = Vector2(200, 0)
 	sound_voice_pick.tooltip_text = "Announcer voice (OS default first). Applies on next arena launch."
 	_sound_fill_voices()
 	sound_voice_pick.item_selected.connect(_push_sound_settings)
@@ -381,14 +393,21 @@ func _build_sound_row() -> HBoxContainer:
 
 
 func _sound_fill_voices() -> void:
+	_fill_voice_picker(DisplayServer.tts_get_voices_for_language("en"))
+
+
+func _fill_voice_picker(voices: Array) -> void:
 	# OS default first (empty id = engine picks), then installed
 	# English voices. Empty list (headless / no TTS) leaves just the
-	# default entry - the picker never errors.
+	# default entry - the picker never errors. Splits from the OS
+	# call so tests can drive live-length voice lists directly.
 	_sound_voice_ids = [""]
+	_sound_voice_names = ["OS default"]
+	sound_voice_pick.clear()
 	sound_voice_pick.add_item("OS default")
 	var stored := TournamentDirector.audio_voice_get()
 	var sel := 0
-	for v in DisplayServer.tts_get_voices_for_language("en"):
+	for v in voices:
 		# Backend-dependent shape: some platforms return {id, name}
 		# dicts, others (Windows SAPI) return bare voice-id strings -
 		# and this engine build types the loop variable as String, so
@@ -401,10 +420,33 @@ func _sound_fill_voices() -> void:
 		if vid == "":
 			continue
 		_sound_voice_ids.append(vid)
-		sound_voice_pick.add_item(vname)
+		_sound_voice_names.append(vname)
+		sound_voice_pick.add_item(_short_voice_label(vname))
 		if vid == stored:
 			sel = _sound_voice_ids.size() - 1
 	sound_voice_pick.selected = sel
+	_sound_voice_tooltip()
+
+
+func _short_voice_label(vname: String) -> String:
+	# OptionButton minimums grow to the widest ITEM, and clip_text
+	# does not cap them (measured: 50-char SAPI names stretched the
+	# SOUND row to 1035px, past the window edge). Shortened labels
+	# keep the row bounded; the given name (Hazel/David/...) sits
+	# early in SAPI names, so entries stay distinguishable. The full
+	# name rides the tooltip (_sound_voice_tooltip).
+	if vname.length() <= 24:
+		return vname
+	return vname.substr(0, 23) + "..."
+
+
+func _sound_voice_tooltip() -> void:
+	# The picker shows shortened labels; the tooltip carries the
+	# selected voice's full name from the parallel names array.
+	var idx := sound_voice_pick.selected
+	if idx >= 0 and idx < _sound_voice_names.size():
+		sound_voice_pick.tooltip_text = "%s\nAnnouncer voice (OS default first). Applies on next arena launch." \
+			% str(_sound_voice_names[idx])
 
 
 func _sound_voice_id_name(v: Variant) -> Array:
@@ -425,6 +467,7 @@ func _push_sound_settings(_arg = null) -> void:
 	var idx := sound_voice_pick.selected
 	if idx >= 0 and idx < _sound_voice_ids.size():
 		TournamentDirector.audio_voice_set(str(_sound_voice_ids[idx]))
+	_sound_voice_tooltip()
 	TournamentDirector.audio_opt_set("sfx_palette",
 		str(SfxSynthLib.PALETTES[sound_palette_pick.selected]))
 

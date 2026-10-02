@@ -66,6 +66,26 @@ func _process(_delta: float) -> bool:
 	# Persistent footer: settings + launch bar outside the pages.
 	_check(menu.bv_enable != null and menu.perf_pip != null
 		and menu.sound_voice != null, "settings rows persist")
+	# Oct 2026 right-edge overflow regression: live-length SAPI voice
+	# names once stretched the SOUND row to 1035px, past the window
+	# edge (headless hides it - no voices there). Shortened labels
+	# bound the row; the full name rides the tooltip.
+	menu._fill_voice_picker(["Microsoft Hazel Desktop - English (Great Britain)",
+		"Microsoft David Desktop - English (United States)"])
+	var srow: Control = menu.sound_voice_pick.get_parent()
+	_check(srow.get_combined_minimum_size().x <= 900.0,
+		"live-length voices keep the SOUND row under 900px")
+	_check(menu.sound_voice_pick.get_item_text(1)
+		== "Microsoft Hazel Desktop...", "voice labels shortened for display")
+	_check(str(menu._sound_voice_names[1])
+		== "Microsoft Hazel Desktop - English (Great Britain)",
+		"full voice name kept for tooltip")
+	menu.sound_voice_pick.selected = 1
+	menu._sound_voice_tooltip()
+	_check(menu.sound_voice_pick.tooltip_text.begins_with("Microsoft Hazel"),
+		"tooltip carries the full name")
+	_check(menu._short_voice_label("Zira") == "Zira",
+		"short labels unchanged")
 	if failures == 0:
 		print("ALL MENU-PAGE TESTS PASSED")
 	else:
