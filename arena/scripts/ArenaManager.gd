@@ -4961,6 +4961,19 @@ func _on_match_over(match_winner: String, score: String) -> void:
 	var round_ended := round_after != round_before \
 		or str(adv.get("action", "")) != "next_match"
 	if round_ended:
+		# Review FIRST: the finished round's bracket goes up before
+		# any banking or loading, and the bank runs under it.
+		# Wait-bracket ownership carries the sequence: the bank ack
+		# auto-hides the review, then the parked load shows its own
+		# LOADING view - no moment shows an empty arena, no moment
+		# banks or loads unseen.
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("ROUND COMPLETE - REVIEWING BRACKET",
+				"banking the finished round - next round loads on the ack...",
+				Color(0.85, 0.85, 0.9))
+		else:
+			_show_loading("ROUND COMPLETE - REVIEWING BRACKET",
+				"banking the finished round...")
 		_send_round_report()
 	_handle_advance_result(adv)
 
