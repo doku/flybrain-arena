@@ -505,6 +505,64 @@ func test_server_brain_loss_reloads() -> void:
 	arena._recover_in_flight = false
 
 
+func test_step_pacing_gate() -> void:
+	# Stop-and-wait: at most one step reply outstanding. The gate is
+	# pure (timer + flag + link), so every branch is pinnable.
+	arena.brain_tick_timer = 1.0
+	arena._step_in_flight = false
+	arena.brain_client.is_connected_server = true
+	_check(arena._should_send_step(), "due + free + connected sends")
+	arena._step_in_flight = true
+	_check(not arena._should_send_step(), "in-flight blocks second send")
+	arena._step_in_flight = false
+	arena.brain_tick_timer = 0.0
+	_check(not arena._should_send_step(), "timer ceiling holds below tick")
+	arena.brain_tick_timer = 1.0
+	arena.brain_client.is_connected_server = false
+	_check(not arena._should_send_step(), "disconnected never flags a drop")
+	arena.brain_client.is_connected_server = true
+	arena._step_in_flight = false
+
+
+func test_step_reply_clears_and_counts() -> void:
+	# A reply frees the link and counts the applied pair; the HUD
+	# shows n/srv so lost replies read as a gap.
+	arena._step_in_flight = true
+	arena._step_timeouts = 3
+	var n0: int = arena._ctrl_n
+	arena._on_motor_controls({}, {},
+		1, {"step_seq": 41, "alpha": {"spikes": 1}, "beta": {"spikes": 1}})
+	_check(not arena._step_in_flight, "reply clears in-flight")
+	_check(arena._step_timeouts == 0, "reply resets timeout streak")
+	_check(arena._ctrl_n == n0 + 1, "applied pair counted")
+	_check(arena._ctrl_srv_seq == 41, "server seq recorded")
+	arena._update_ctrl_label()
+	_check(("n=%d" % (n0 + 1)) in arena.ctrl_label.text, "HUD shows applied n")
+	_check("srv=41" in arena.ctrl_label.text, "HUD shows server srv")
+
+
+func test_step_watchdog_recovers_silently() -> void:
+	# Lost reply: the flag clears so the next tick sends fresh state -
+	# no modal, no wait-bracket, only a log line. Five in a row earns
+	# status text (still non-blocking).
+	arena.is_round_active = true
+	arena._step_in_flight = true
+	arena._step_deadline_msec = 1
+	arena._step_timeouts = 0
+	arena._check_step_watchdog()
+	_check(not arena._step_in_flight, "expired step frees the link")
+	_check(arena._step_timeouts == 1, "expiry counted")
+	arena._step_in_flight = true
+	arena._step_deadline_msec = 1
+	arena._step_timeouts = 4
+	arena._check_step_watchdog()
+	_check(arena._step_timeouts == 5, "streak reaches five")
+	_check("CONTROL LINK SLOW" in arena.status_label.text, "slow link named, not modal")
+	arena._step_in_flight = true
+	arena.is_round_active = false
+	arena._check_step_watchdog()
+	_check(not arena._step_in_flight, "round end disarms the flag")
+
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
@@ -847,6 +905,9 @@ func _process(_delta: float) -> bool:
 	test_forgivable_roundbank()
 	test_roundbank_retry()
 	test_roundbank_brain_loss_resends()
+	test_step_pacing_gate()
+	test_step_reply_clears_and_counts()
+	test_step_watchdog_recovers_silently()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()

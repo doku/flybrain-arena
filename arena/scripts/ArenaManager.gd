@@ -75,6 +75,26 @@ var bv_last_reply: float = -1.0
 var bv_cad_n: int = 0
 var bv_cad_dt_sum: float = 0.0
 var bv_cad_tau_sum: float = 0.0
+# Lockstep proof (HUD n/srv): control pairs applied vs server steps
+# integrated. Session-cumulative to match the server's cumulative
+# step_count - do NOT reset per round (see _on_motor_controls).
+var _ctrl_n: int = 0
+var _ctrl_srv_seq: int = 0
+
+# Control-link pacing (stop-and-wait): at most one step reply may be
+# outstanding. TUNING:
+# - STEP_TIMEOUT_MSEC (below): how long to wait for a reply before
+#   assuming it lost and sending fresh state. Raise it if the HUD's
+#   srv-n gap grows on huge brains (server step cost is printed in
+#   server_log.txt every 50 steps: "step ~Nms"); lower it (min ~500)
+#   if flies go limp too long on a genuinely dead link. Rule of
+#   thumb: 7-10x the worst observed single-step ms.
+# - BRAIN_TICK_DT (below) stays the *request ceiling* (20 Hz):
+#   pacing can only slow sends below it, never above.
+const STEP_TIMEOUT_MSEC := 2000
+var _step_in_flight := false
+var _step_deadline_msec := 0
+var _step_timeouts := 0 # consecutive expiries; >=5 shows link-slow text
 
 # Brain-view L0 pool-rate bars (key, short label, bar-full count).
 # Updated on every motor reply (~5 Hz) with EMA smoothing; always-on
@@ -1988,6 +2008,11 @@ func _reset_round() -> void:
 	bv_cad_dt_sum = 0.0
 	bv_cad_tau_sum = 0.0
 	bv_last_reply = -1.0
+	# A lost final reply must not wedge the next round's first send;
+	# the in-flight flag dies with the round (_ctrl_n stays
+	# cumulative - see its declaration).
+	_step_in_flight = false
+	_step_timeouts = 0
 	bv_stream_alpha.clear()
 	bv_stream_beta.clear()
 	if is_instance_valid(bv_raster_alpha):
@@ -2023,6 +2048,7 @@ func _physics_process(delta: float) -> void:
 	# Watchdog runs even between rounds: that limbo is exactly where a
 	# lost server reply would wedge the game.
 	_check_seq_watchdog()
+	_check_step_watchdog()
 	if not is_round_active:
 		return
 
@@ -2059,9 +2085,11 @@ func _physics_process(delta: float) -> void:
 		stats_beta["tail_time_s"] += delta
 
 	brain_tick_timer += delta
-	if brain_tick_timer >= BRAIN_TICK_DT:
+	if _should_send_step():
 		brain_tick_timer = 0.0
 		brain_client.send_sensory_step(sens_a, sens_b)
+		_step_in_flight = true
+		_step_deadline_msec = Time.get_ticks_msec() + STEP_TIMEOUT_MSEC
 		# Dopamine-replay inputs: the sens refs land at send time (the
 		# dicts are fresh per step, so this is the last-sent context).
 		_last_sens_a = sens_a
@@ -2093,6 +2121,44 @@ func _physics_process(delta: float) -> void:
 			_end_reason = "time"
 			_time_winner = decision
 			_end_round()
+
+func _should_send_step() -> bool:
+	# Fires at most every BRAIN_TICK_DT of physics time AND only when
+	# no reply is outstanding. The is_connected_server conjunct is
+	# load-bearing: send_sensory_step drops silently when disconnected,
+	# and flagging a dropped packet would wedge stepping until the
+	# step watchdog fires. If stepping ever wedges (no sends and no
+	# replies), check _step_in_flight/_step_deadline_msec here first.
+	return brain_tick_timer >= BRAIN_TICK_DT \
+		and not _step_in_flight \
+		and brain_client.is_connected_server
+
+
+func _check_step_watchdog() -> void:
+	# Lost-reply recovery for paced steps. Deliberately SILENT (no
+	# wait-bracket/modal): a missed step is routine and the next tick
+	# sends fresh state. We clear the flag rather than resend because
+	# fresh sensory state is strictly better than stale. Escalation
+	# policy lives here too: only 5+ consecutive timeouts (~10 s with
+	# zero control) earns status text, never a modal. To make step
+	# loss fail LOUD instead, hook _step_timeouts here.
+	if not _step_in_flight:
+		return
+	if not is_round_active:
+		_step_in_flight = false
+		return
+	if Time.get_ticks_msec() < _step_deadline_msec:
+		return
+	_step_in_flight = false
+	_step_timeouts += 1
+	# Heal a poisoned UDP socket before the next send: the lost reply
+	# may be chasing a dead port already (same pattern as the seq
+	# retries).
+	brain_client.reconnect()
+	print("[Arena] Step watchdog: no control reply within %d ms (consecutive=%d)." % [STEP_TIMEOUT_MSEC, _step_timeouts])
+	_arena_log("step watchdog fired: consecutive=%d" % _step_timeouts)
+	if _step_timeouts >= 5 and is_instance_valid(status_label):
+		status_label.text = "CONTROL LINK SLOW - reflex holding..."
 
 const PIP_TICK_EVERY := 6
 func _make_pip_stats(parent: Node, left_side: bool) -> Label:
@@ -4225,10 +4291,27 @@ func _update_ctrl_label() -> void:
 	var hz := 0.0
 	if bv_reply_ema > 0.001:
 		hz = 1.0 / bv_reply_ema
-	ctrl_label.text = "CTRL %.1fHz t%.2f" % [hz, bv_shared_tau]
+	# HUD shows applied pairs (n) vs server-integrated steps (srv):
+	# srv - n == replies lost in flight. To shorten this label, drop
+	# srv (keep n + t); srv stays in the flight log line regardless.
+	ctrl_label.text = "CTRL %.1fHz n=%d srv=%d t%.2f" % [hz, _ctrl_n, _ctrl_srv_seq, bv_shared_tau]
 
 
 func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int, stats: Dictionary = {}) -> void:
+	# A reply landed: the link is free for the next step. Cleared
+	# first (before any application below) so a slow frame can never
+	# leave the flag set past the reply that frees it.
+	_step_in_flight = false
+	_step_timeouts = 0
+	# Cumulative control pairs applied (both sides per reply, by
+	# construction - a single reply carries both dicts, so per-side
+	# counters could never diverge; what CAN diverge is applied (n)
+	# vs server-integrated (srv) when a reply is lost). Reset policy:
+	# cumulative per session to match the server's cumulative
+	# step_count; do NOT reset per round or srv-n drifts by the
+	# round's step count.
+	_ctrl_n += 1
+	_ctrl_srv_seq = int(stats.get("step_seq", 0))
 	# Shared cadence tracking: reply interval EMA -> shared hold tau
 	# (0.75x, clamped 0.10-0.40), set identically on both flies.
 	var now := Time.get_ticks_msec() / 1000.0
@@ -4329,13 +4412,15 @@ func _flight_summary(acc: Dictionary, fly: CharacterBody3D) -> Dictionary:
 func _print_flight_line(slot: String, f: Dictionary) -> void:
 	if f.is_empty() or int(f.get("samples", 0)) == 0:
 		return
-	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples) ctrl %.1fHz t%.3f" % [
+	# n/srv are session link totals (not per-round): the post-hoc
+	# link-quality record for this battle's control pairing.
+	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples) ctrl %.1fHz t%.3f n=%d srv=%d" % [
 		slot, float(f.get("alt_mean", 0.0)), float(f.get("alt_min", 0.0)),
 		float(f.get("alt_max", 0.0)), float(f.get("thrust_mean", 0.0)),
 		float(f.get("pitch_mean", 0.0)), float(f.get("yaw_abs_mean", 0.0)),
 		100.0 * float(f.get("evade_frac", 0.0)), 100.0 * float(f.get("ram_frac", 0.0)),
 		float(f.get("spear_max", 0.0)), int(f.get("lunges", 0)), int(f.get("samples", 0)),
-		float(f.get("ctrl_hz", 0.0)), float(f.get("tau", 0.0))])
+		float(f.get("ctrl_hz", 0.0)), float(f.get("tau", 0.0)), _ctrl_n, _ctrl_srv_seq])
 
 
 func _on_strike_landed(attacker_id: String, target_part: String) -> void:
@@ -4502,6 +4587,10 @@ func _close_round_for_wait() -> void:
 
 func _end_round() -> void:
 	is_round_active = false
+	# Paced stepping ends with the round: a late reply after this
+	# clears an already-false flag (harmless), and the next round
+	# re-arms from clean state in _reset_round.
+	_step_in_flight = false
 	_set_combat(false)
 	_check_speed_violations()
 	print("[Arena] Round concluded! Sending battle stats to evolution engine...")

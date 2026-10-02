@@ -1992,6 +1992,22 @@ class TestTournamentProtocol(unittest.TestCase):
         f = self._rpc({"type": "free_mode"})
         self.assertEqual(f.get("status"), "free_ready")
 
+    def test_step_seq_monotonic(self):
+        # Lockstep proof for the HUD (n/srv): every step reply carries
+        # the session-cumulative steps integrated, strictly increasing
+        # across consecutive steps.
+        f = self._rpc({"type": "free_mode"})
+        self.assertEqual(f.get("status"), "free_ready")
+        s1 = self._rpc({"type": "step", "alpha": {}, "beta": {}})
+        self.assertEqual(s1.get("status"), "ok")
+        s2 = self._rpc({"type": "step", "alpha": {}, "beta": {}})
+        self.assertEqual(s2.get("status"), "ok")
+        q1 = (s1.get("stats") or {}).get("step_seq")
+        q2 = (s2.get("stats") or {}).get("step_seq")
+        self.assertIsInstance(q1, int)
+        self.assertIsInstance(q2, int)
+        self.assertLess(q1, q2)
+
     def test_tournament_flow(self):
         res = self._rpc({"type": "tournament_load", "alpha_path": self.path_a,
                          "beta_path": self.path_b, "tournament_id": "UT",

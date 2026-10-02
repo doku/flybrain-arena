@@ -1431,6 +1431,14 @@ def run_brain_server(host="127.0.0.1", port=9999):
                         "beta": stats_b,
                         "wiring": {"alpha": wire_a, "beta": wire_b},
                         "mapping": {"alpha": map_a, "beta": map_b},
+                        # Lockstep proof for the arena HUD (see
+                        # ArenaManager _update_ctrl_label): session-
+                        # cumulative steps integrated. The arena
+                        # displays n (pairs applied) vs srv (this
+                        # number); srv - n == replies lost in flight.
+                        # Never reset this counter mid-session or the
+                        # HUD gap becomes meaningless.
+                        "step_seq": step_count,
                     },
                 }
                 sock.sendto(json.dumps(response).encode("utf-8"), client_addr)
