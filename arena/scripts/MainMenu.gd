@@ -213,7 +213,7 @@ func _build_layout() -> void:
 		tb.pressed.connect(_show_menu_page.bind(i))
 		tabs.add_child(tb)
 		_page_buttons.append(tb)
-		var page: VBoxContainer = built[i]
+		var page: Control = built[i]
 		page.visible = i == 0
 		vbox.add_child(page)
 		_menu_pages.append(page)
@@ -500,8 +500,14 @@ func _col(title_text: String) -> VBoxContainer:
 	return c
 
 
-func _build_vault_column() -> VBoxContainer:
-	var c := _col("MY BRAINS")
+func _build_vault_column() -> HBoxContainer:
+	# Two columns (roster | details + Hall of Shame) so the page fits
+	# the 720px window vertically - the single column demanded 505px
+	# against ~420px available.
+	var page := HBoxContainer.new()
+	page.add_theme_constant_override("separation", 16)
+	page.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var c := _col("VAULT")
 	brain_list = ItemList.new()
 	brain_list.custom_minimum_size = Vector2(280, 260)
 	brain_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -519,17 +525,23 @@ func _build_vault_column() -> VBoxContainer:
 	imp.text = "Import .npz"
 	imp.pressed.connect(_on_import_dialog)
 	row.add_child(imp)
+	var d := _col("DETAILS + ARCHIVE")
+	detail_label = Label.new()
+	detail_label.add_theme_font_size_override("font_size", 13)
+	detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	detail_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	d.add_child(detail_label)
 	var arch_head := Label.new()
 	arch_head.text = "HALL OF SHAME (archived losers)"
 	arch_head.add_theme_font_size_override("font_size", 13)
-	c.add_child(arch_head)
+	d.add_child(arch_head)
 	archive_list_view = ItemList.new()
 	archive_list_view.custom_minimum_size = Vector2(280, 90)
 	archive_list_view.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
-	c.add_child(archive_list_view)
+	d.add_child(archive_list_view)
 	var arch_row := HBoxContainer.new()
 	arch_row.add_theme_constant_override("separation", 6)
-	c.add_child(arch_row)
+	d.add_child(arch_row)
 	var restore_b := Button.new()
 	restore_b.text = "Bring back"
 	restore_b.tooltip_text = "Restore the selected archived brain to the vault roster."
@@ -540,12 +552,9 @@ func _build_vault_column() -> VBoxContainer:
 	del_b.tooltip_text = "Permanently delete the selected archived brain and free its disk space. Cannot be undone."
 	del_b.pressed.connect(_on_archive_delete)
 	arch_row.add_child(del_b)
-	detail_label = Label.new()
-	detail_label.add_theme_font_size_override("font_size", 13)
-	detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	detail_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	c.add_child(detail_label)
-	return c
+	page.add_child(c)
+	page.add_child(d)
+	return page
 
 
 func _spin(label_text: String, parent: VBoxContainer, minv: float, maxv: float, step: float, value: float, tip: String = "") -> SpinBox:
@@ -569,8 +578,15 @@ func _spin(label_text: String, parent: VBoxContainer, minv: float, maxv: float, 
 	return s
 
 
-func _build_gen_column() -> VBoxContainer:
-	var c := _col("GENERATE / TRAIN")
+func _build_gen_column() -> HBoxContainer:
+	# Two columns (generate form | training + scoring queues) so the
+	# page fits the 720px window vertically - the single column
+	# demanded 691px against ~420px available. Queue lists trim to
+	# 70px minimums (they expand to fill whatever the window gives).
+	var page := HBoxContainer.new()
+	page.add_theme_constant_override("separation", 16)
+	page.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var c := _col("GENERATE")
 	var nrow := HBoxContainer.new()
 	var nl := Label.new()
 	nl.text = "Name"
@@ -626,28 +642,33 @@ func _build_gen_column() -> VBoxContainer:
 	train_school.tooltip_text = "ON = retrain through flight-school scenarios (camp/mover/duel) with scores stamped. OFF = legacy encounters."
 	train_school.button_pressed = false
 	grow.add_child(train_school)
+	var q := _col("TRAINING QUEUES")
+	# Tight separation: this column packs 12 rows and must hold its
+	# minimum under the ~420px the window leaves for a page.
+	q.add_theme_constant_override("separation", 4)
 	job_bar = ProgressBar.new()
 	job_bar.min_value = 0
 	job_bar.max_value = 100
-	job_bar.custom_minimum_size = Vector2(0, 18)
+	job_bar.custom_minimum_size = Vector2(0, 15)
 	job_bar.show_percentage = true
-	c.add_child(job_bar)
+	q.add_child(job_bar)
 	job_label = Label.new()
 	job_label.add_theme_font_size_override("font_size", 13)
-	c.add_child(job_label)
+	q.add_child(job_label)
 	# Training queue: what's running shows above (job bar/label);
 	# everything waiting is listed here with remove/clear controls.
 	queue_label = Label.new()
 	queue_label.text = "TRAINING QUEUE (0)"
 	queue_label.add_theme_font_size_override("font_size", 13)
-	c.add_child(queue_label)
+	q.add_child(queue_label)
 	queue_list = ItemList.new()
-	queue_list.custom_minimum_size = Vector2(0, 84)
+	queue_list.custom_minimum_size = Vector2(0, 60)
 	queue_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	c.add_child(queue_list)
+	queue_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	q.add_child(queue_list)
 	var qrow := HBoxContainer.new()
 	qrow.add_theme_constant_override("separation", 6)
-	c.add_child(qrow)
+	q.add_child(qrow)
 	var qrm := Button.new()
 	qrm.text = "REMOVE SELECTED"
 	qrm.pressed.connect(_on_queue_remove)
@@ -661,7 +682,7 @@ func _build_gen_column() -> VBoxContainer:
 	# training uses its own worker; cancellable like the train queue.
 	var srow := HBoxContainer.new()
 	srow.add_theme_constant_override("separation", 6)
-	c.add_child(srow)
+	q.add_child(srow)
 	var scb := Button.new()
 	scb.text = "SCORE SELECTED"
 	scb.tooltip_text = "Queue the selected brain for a 6-episode eval scoring probe."
@@ -675,23 +696,24 @@ func _build_gen_column() -> VBoxContainer:
 	score_bar = ProgressBar.new()
 	score_bar.min_value = 0
 	score_bar.max_value = 100
-	score_bar.custom_minimum_size = Vector2(0, 18)
+	score_bar.custom_minimum_size = Vector2(0, 15)
 	score_bar.show_percentage = true
-	c.add_child(score_bar)
+	q.add_child(score_bar)
 	score_label = Label.new()
 	score_label.add_theme_font_size_override("font_size", 13)
-	c.add_child(score_label)
+	q.add_child(score_label)
 	score_queue_label = Label.new()
 	score_queue_label.text = "SCORING QUEUE (0)"
 	score_queue_label.add_theme_font_size_override("font_size", 13)
-	c.add_child(score_queue_label)
+	q.add_child(score_queue_label)
 	score_list = ItemList.new()
-	score_list.custom_minimum_size = Vector2(0, 84)
+	score_list.custom_minimum_size = Vector2(0, 60)
 	score_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	c.add_child(score_list)
+	score_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	q.add_child(score_list)
 	var sqrow := HBoxContainer.new()
 	sqrow.add_theme_constant_override("separation", 6)
-	c.add_child(sqrow)
+	q.add_child(sqrow)
 	var sqrm := Button.new()
 	sqrm.text = "REMOVE SELECTED"
 	sqrm.pressed.connect(_on_score_queue_remove)
@@ -700,7 +722,9 @@ func _build_gen_column() -> VBoxContainer:
 	sqclr.text = "CLEAR QUEUE"
 	sqclr.pressed.connect(_on_score_queue_clear)
 	sqrow.add_child(sqclr)
-	return c
+	page.add_child(c)
+	page.add_child(q)
+	return page
 
 
 # Brain configurator dialog: additive wiring multi-select, stackable
@@ -900,8 +924,19 @@ static func _mix_text(v) -> String:
 	return s
 
 
-func _build_tourney_column() -> VBoxContainer:
-	var c := _col("TOURNAMENT (single elimination)")
+func _build_tourney_column() -> HBoxContainer:
+	# Two columns (settings + fighters | evolution + bracket) so the
+	# page fits the 720px window vertically - the single column
+	# demanded 913px against ~420px available. The participants list
+	# and bracket scroll trim their minimums (both expand to fill
+	# whatever the window gives).
+	var page := HBoxContainer.new()
+	page.add_theme_constant_override("separation", 16)
+	page.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var c := _col("SETTINGS + FIGHTERS")
+	# Tight separation: this column packs 10 rows + the participants
+	# list and must hold its minimum under the ~420px page budget.
+	c.add_theme_constant_override("separation", 4)
 	tourney_size = OptionButton.new()
 	for s in TournamentDirector.size_options():
 		tourney_size.add_item(str(s))
@@ -930,13 +965,13 @@ func _build_tourney_column() -> VBoxContainer:
 	pl.add_theme_font_size_override("font_size", 13)
 	c.add_child(pl)
 	player_list = ItemList.new()
-	player_list.custom_minimum_size = Vector2(320, 150)
+	player_list.custom_minimum_size = Vector2(320, 90)
 	player_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	player_list.select_mode = ItemList.SELECT_MULTI
 	player_list.allow_rmb_select = true
 	c.add_child(player_list)
 	# Two rows of two: one four-button row (~690px) overflows its
-	# ~416px column share and gets cut off at the window edge.
+	# column share and gets cut off at the window edge.
 	var srow := HBoxContainer.new()
 	srow.add_theme_constant_override("separation", 6)
 	c.add_child(srow)
@@ -965,22 +1000,25 @@ func _build_tourney_column() -> VBoxContainer:
 	evo_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	evo_button.pressed.connect(_on_start_evolution)
 	srow2.add_child(evo_button)
+	var r := _col("EVOLUTION + BRACKET")
+	# Tight separation: same ~420px page budget as the left column.
+	r.add_theme_constant_override("separation", 4)
 	evo_mutate_traits = CheckButton.new()
 	evo_mutate_traits.text = "Mutate kin traits"
 	evo_mutate_traits.tooltip_text = "ON = each generation's winner-clone re-rolls one random trait (learning rate, dist gain, evasion, yaw bias) alongside genome structural mutation. OFF = exact hyperparameter copy."
 	evo_mutate_traits.button_pressed = true
-	c.add_child(evo_mutate_traits)
-	evo_min_matches = _spin("Evo demote: min matches", c, 1.0, 12.0, 1.0, 10.0,
+	r.add_child(evo_mutate_traits)
+	evo_min_matches = _spin("Evo demote: min matches", r, 1.0, 12.0, 1.0, 10.0,
 		"Career ring experience required before a brain can be demoted to archives: only fighters with at least this many vault-record matches AND below the ELO line are evaluated at generation end. Green brains are never demoted.")
-	evo_elo_cutoff = _spin("Evo demote: ELO below", c, 0.0, 2000.0, 25.0, 0.0,
+	evo_elo_cutoff = _spin("Evo demote: ELO below", r, 0.0, 2000.0, 25.0, 0.0,
 		"Demotion line: among experienced fighters, only those rated below this ELO are archived (0 = off, lowest-ELO pair goes regardless).")
 	bracket_status = Label.new()
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	c.add_child(bracket_status)
+	r.add_child(bracket_status)
 	var brow := HBoxContainer.new()
 	brow.add_theme_constant_override("separation", 6)
-	c.add_child(brow)
+	r.add_child(brow)
 	var bgroup := ButtonGroup.new()
 	bracket_main_btn = Button.new()
 	bracket_main_btn.text = "Main bracket"
@@ -999,14 +1037,16 @@ func _build_tourney_column() -> VBoxContainer:
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	scroll.custom_minimum_size = Vector2(0, 280)
+	scroll.custom_minimum_size = Vector2(0, 210)
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-	c.add_child(scroll)
+	r.add_child(scroll)
 	bracket_view = BracketView.new()
 	bracket_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	bracket_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.add_child(bracket_view)
-	return c
+	page.add_child(c)
+	page.add_child(r)
+	return page
 
 
 func _on_bracket_view(losers: bool) -> void:

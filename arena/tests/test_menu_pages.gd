@@ -53,6 +53,20 @@ func _process(_delta: float) -> bool:
 	_check(_is_on_page(menu.resume_button, 2), "resume on tournament page")
 	_check(_is_on_page(menu.quick_button, 2), "quick battle on tournament page")
 	_check(_is_on_page(menu.bracket_view, 2), "bracket on tournament page")
+	# Two columns per page (vertical fit rework): page = HBox holding
+	# two VBox columns.
+	for i in 3:
+		var pg: Control = menu._menu_pages[i]
+		_check(pg is HBoxContainer and pg.get_child_count() == 2,
+			"page %d holds two columns" % i)
+	# Vertical-fit regression: every page's minimum height must fit
+	# the window's page budget. Budget = 720 window - 24 margins -
+	# 201 persistent rows - 56 separations (7 gaps x 8, hidden pages
+	# take no separation) = 439. Headless probes once measured
+	# 505/691/913 and the pages overflowed off-screen.
+	for i in 3:
+		var h: float = (menu._menu_pages[i] as Control).get_combined_minimum_size().y
+		_check(h <= 439.0, "page %d fits vertically (%.0fpx)" % [i, h])
 	# Tab switch flips visibility, keeps widgets.
 	menu._show_menu_page(2)
 	_check((menu._menu_pages[2] as Control).visible
