@@ -3700,15 +3700,18 @@ const TTS_RATE := 1.1 # sports-caster pace; 1.0 = voice default. Raise
 const TTS_PITCH := 1.0 # 0.5 deep .. 2.0 chipmunk. Voices vary widely;
 	# retune per installed voice if the picker changes character.
 const TTS_VOLUME := 80 # 0-100, voice channel only (SFX use SFX_GAIN_DB).
-const SFX_RATE := 22050 # synth sample rate; covers every effect below
-	# at half the memory of 44100. Raise only for brighter tops.
 const SFX_POOL := 4 # overlapping one-shot players (strike + KO +
 	# beeps can coincide). Raise to 6 if fast exchanges audibly cut
 	# each other; lower to 2 on thin audio drivers.
 const SFX_GAIN_DB := -6.0 # master trim for all effects; per-effect
-	# balance lives in the synth recipes below, not here.
+	# balance lives in the SfxSynth recipes, not here.
+# Preloaded (not class_name-referenced): a fresh script has no global
+# class cache entry yet, and cache state varies per machine - preload
+# resolves deterministically everywhere, including headless suites.
+const SfxSynthLib = preload("res://scripts/SfxSynth.gd")
 var _voice_on := true
 var _sfx_on := true
+var _sfx_palette := "classic" # SfxSynth.PALETTES; persisted [audio].
 var _tts_ok := false
 var _voice_id := ""
 var _sfx_players: Array = []
@@ -3723,6 +3726,8 @@ func _init_sound() -> void:
 	if director != null and director.has_method("perf_get"):
 		_voice_on = bool(director.call("perf_get", "voice"))
 		_sfx_on = bool(director.call("perf_get", "sfx"))
+	if director != null and director.has_method("audio_opt_get"):
+		_sfx_palette = str(director.call("audio_opt_get", "sfx_palette", "classic"))
 	if director != null and director.has_method("audio_voice_get"):
 		_voice_id = str(director.call("audio_voice_get"))
 	# Suites must never speak: every headless run is mute by
@@ -3757,50 +3762,16 @@ func _announce(text: String) -> void:
 	DisplayServer.tts_speak(text, _voice_id, TTS_VOLUME, TTS_PITCH, TTS_RATE, 0, false)
 
 
-func _wav_from_floats(samples: PackedFloat32Array) -> AudioStreamWAV:
-	# 16-bit packing is LOAD-BEARING: AudioStreamWAV defaults to
-	# FORMAT_8_BITS (signed), which would play these buffers as
-	# garbage. mix_rate must equal SFX_RATE or pitch shifts.
-	var stream := AudioStreamWAV.new()
-	stream.format = AudioStreamWAV.FORMAT_16_BITS
-	stream.mix_rate = SFX_RATE
-	stream.stereo = false
-	var bytes := PackedByteArray()
-	bytes.resize(samples.size() * 2)
-	for i in samples.size():
-		bytes.encode_s16(i * 2, int(clampf(samples[i], -1.0, 1.0) * 32767.0))
-	stream.data = bytes
-	return stream
-
-
-func _synth_tone(freq: float, secs: float, decay: float, noise_amt: float = 0.0, freq_end: float = 0.0) -> AudioStreamWAV:
-	# One workhorse for all effects: sine (sweeping freq -> freq_end
-	# when given) under exp decay, plus white-noise wash. The
-	# per-effect recipe table lives in _build_sfx; retune there.
-	var n := int(SFX_RATE * secs)
-	var samples := PackedFloat32Array()
-	samples.resize(n)
-	var phase := 0.0
-	for i in n:
-		var t := float(i) / SFX_RATE
-		var f := freq if freq_end <= 0.0 else lerpf(freq, freq_end, float(i) / maxf(n - 1.0, 1.0))
-		phase += TAU * f / SFX_RATE
-		var env := exp(-t * decay)
-		samples[i] = (sin(phase) * (1.0 - noise_amt) + (randf() * 2.0 - 1.0) * noise_amt) * env
-	return _wav_from_floats(samples)
-
-
 func _build_sfx() -> void:
-	# Effect recipes (freq, secs, decay, noise, sweep): thump = body
-	# hit, clash = metallic tick, tear = wing rip, boom = KO cannon,
-	# beep/fight = countdown blips. Balance against each other via
-	# decay/noise here; master trim is SFX_GAIN_DB.
-	_sfx_streams["thump"] = _synth_tone(90.0, 0.18, 22.0, 0.45)
-	_sfx_streams["clash"] = _synth_tone(1560.0, 0.12, 30.0, 0.25, 1180.0)
-	_sfx_streams["tear"] = _synth_tone(800.0, 0.35, 9.0, 0.6, 200.0)
-	_sfx_streams["boom"] = _synth_tone(55.0, 0.7, 6.0, 0.35)
-	_sfx_streams["beep"] = _synth_tone(880.0, 0.09, 28.0)
-	_sfx_streams["fight"] = _synth_tone(1320.0, 0.25, 14.0)
+	# (Re)builds every effect buffer from the active SfxSynth palette
+	# plus a fresh player pool. Idempotent: frees the old pool first
+	# so palette switches and test rebuilds never stack players.
+	for p in _sfx_players:
+		if is_instance_valid(p):
+			(p as AudioStreamPlayer).stop()
+			(p as Node).queue_free()
+	_sfx_players.clear()
+	_sfx_streams = SfxSynthLib.build(_sfx_palette)
 	for i in SFX_POOL:
 		var p := AudioStreamPlayer.new()
 		p.volume_db = SFX_GAIN_DB

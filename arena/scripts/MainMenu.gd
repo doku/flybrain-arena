@@ -27,7 +27,11 @@ var perf_shadows: CheckButton
 var sound_voice: CheckButton
 var sound_sfx: CheckButton
 var sound_voice_pick: OptionButton
+var sound_palette_pick: OptionButton
 var _sound_voice_ids: Array = []
+# Preloaded for the same reason as ArenaManager.SfxSynthLib (fresh
+# scripts have no global class cache entry yet).
+const SfxSynthLib = preload("res://scripts/SfxSynth.gd")
 var gen_yaw_bias: SpinBox
 var gen_yaw_random: CheckButton
 var gen_genome_check: CheckButton
@@ -325,6 +329,23 @@ func _build_sound_row() -> HBoxContainer:
 	_sound_fill_voices()
 	sound_voice_pick.item_selected.connect(_push_sound_settings)
 	row.add_child(sound_voice_pick)
+	var pl := Label.new()
+	pl.text = "palette"
+	row.add_child(pl)
+	sound_palette_pick = OptionButton.new()
+	sound_palette_pick.tooltip_text = "Battle-sound character. Applies on next arena launch; Preview plays it now."
+	for pal in SfxSynthLib.PALETTES:
+		sound_palette_pick.add_item(pal)
+	var cur := TournamentDirector.audio_opt_get("sfx_palette", "classic")
+	var idx := SfxSynthLib.PALETTES.find(cur)
+	sound_palette_pick.selected = idx if idx >= 0 else 0
+	sound_palette_pick.item_selected.connect(_push_sound_settings)
+	row.add_child(sound_palette_pick)
+	var prev := Button.new()
+	prev.text = "Preview"
+	prev.tooltip_text = "Plays all six effects of the selected palette."
+	prev.pressed.connect(_preview_palette)
+	row.add_child(prev)
 	return row
 
 
@@ -373,6 +394,24 @@ func _push_sound_settings(_arg = null) -> void:
 	var idx := sound_voice_pick.selected
 	if idx >= 0 and idx < _sound_voice_ids.size():
 		TournamentDirector.audio_voice_set(str(_sound_voice_ids[idx]))
+	TournamentDirector.audio_opt_set("sfx_palette",
+		str(SfxSynthLib.PALETTES[sound_palette_pick.selected]))
+
+
+func _preview_palette() -> void:
+	# Judge by ear: builds the selected palette fresh (same builder
+	# the arena uses) and plays all six effects in order on a temp
+	# player. Fire-and-forget; overlapping previews just overlap.
+	var pal := str(SfxSynthLib.PALETTES[sound_palette_pick.selected])
+	var streams := SfxSynthLib.build(pal)
+	var p := AudioStreamPlayer.new()
+	p.volume_db = -6.0
+	add_child(p)
+	for effect in SfxSynthLib.EFFECTS:
+		p.stream = streams[effect]
+		p.play()
+		await get_tree().create_timer(0.45).timeout
+	p.queue_free()
 
 
 func _col(title_text: String) -> VBoxContainer:

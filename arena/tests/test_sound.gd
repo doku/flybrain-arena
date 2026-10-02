@@ -7,6 +7,9 @@ extends SceneTree
 var failures := 0
 var arena = null
 var _done := false
+# Preloaded: SfxSynth is a fresh script with no global class cache
+# entry yet (see ArenaManager.SfxSynthLib).
+const Synth = preload("res://scripts/SfxSynth.gd")
 
 
 func _check(cond: bool, label: String) -> void:
@@ -96,6 +99,31 @@ func test_hit_sfx_routing() -> void:
 	_check(true, "hit feedback sounds without error")
 
 
+func test_palettes_build() -> void:
+	# Every palette builds all six effects valid (16-bit, boot rate,
+	# non-empty); unknown names fall back to classic; rebuilding
+	# never stacks players.
+	for pal in ["classic", "punchy", "bright"]:
+		var streams := Synth.build(pal)
+		_check(streams.size() == 6, "palette complete: " + pal)
+		for effect in Synth.EFFECTS:
+			var st: AudioStreamWAV = streams[effect]
+			_check(st.format == AudioStreamWAV.FORMAT_16_BITS
+				and st.mix_rate == Synth.RATE
+				and st.data.size() > 100, "valid stream: " + pal + "/" + effect)
+	var fallback := Synth.build("nope")
+	_check((fallback["boom"] as AudioStreamWAV).data.size()
+		== (Synth.build("classic")["boom"] as AudioStreamWAV).data.size(),
+		"unknown palette falls back to classic")
+	arena._sfx_palette = "punchy"
+	arena._build_sfx()
+	arena._build_sfx()
+	_check(arena._sfx_players.size() == 4, "rebuild never stacks players")
+	_check(arena._sfx_streams.size() == 6, "rebuild keeps all streams")
+	arena._sfx_palette = "classic"
+	arena._build_sfx()
+
+
 func _process(_delta: float) -> bool:
 	if _done:
 		return false
@@ -106,6 +134,7 @@ func _process(_delta: float) -> bool:
 	test_announce_guards()
 	test_spoken_score()
 	test_hit_sfx_routing()
+	test_palettes_build()
 	if failures == 0:
 		print("ALL SOUND TESTS PASSED")
 	else:

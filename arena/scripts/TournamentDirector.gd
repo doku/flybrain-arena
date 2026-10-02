@@ -62,16 +62,27 @@ func audio_voice_get() -> String:
 	# TTS voice id for the announcer. Separate [audio] section on
 	# purpose: perf_set coerces bool(value), which would corrupt a
 	# voice-id string into "true". Empty = OS default voice.
-	var cfg := ConfigFile.new()
-	if cfg.load(PERF_PATH) != OK:
-		return ""
-	return str(cfg.get_value("audio", "voice_id", ""))
+	return audio_opt_get("voice_id", "")
 
 
 func audio_voice_set(voice_id: String) -> void:
+	audio_opt_set("voice_id", voice_id)
+
+
+func audio_opt_get(key: String, default: String = "") -> String:
+	# Generic [audio]-section string option (voice_id, sfx_palette,
+	# ...): the perf_* functions only speak bool, so string options
+	# live here. Never route strings through perf_set.
+	var cfg := ConfigFile.new()
+	if cfg.load(PERF_PATH) != OK:
+		return default
+	return str(cfg.get_value("audio", key, default))
+
+
+func audio_opt_set(key: String, value: String) -> void:
 	var cfg := ConfigFile.new()
 	cfg.load(PERF_PATH)
-	cfg.set_value("audio", "voice_id", voice_id)
+	cfg.set_value("audio", key, value)
 	cfg.save(PERF_PATH)
 
 # Tournament state (empty dict = inactive).
