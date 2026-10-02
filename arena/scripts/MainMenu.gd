@@ -337,8 +337,15 @@ func _sound_fill_voices() -> void:
 	var stored := TournamentDirector.audio_voice_get()
 	var sel := 0
 	for v in DisplayServer.tts_get_voices_for_language("en"):
-		var vid := str((v as Dictionary).get("id", ""))
-		var vname := str((v as Dictionary).get("name", vid))
+		# Backend-dependent shape: some platforms return {id, name}
+		# dicts, others (Windows SAPI) return bare voice-id strings -
+		# and this engine build types the loop variable as String, so
+		# NO type tests or .get() calls may touch it here (both are
+		# parse-time breaks). The Variant-typed helper below is the
+		# only place allowed to branch on the shape.
+		var pair: Array = _sound_voice_id_name(v)
+		var vid := str(pair[0])
+		var vname := str(pair[1])
 		if vid == "":
 			continue
 		_sound_voice_ids.append(vid)
@@ -346,6 +353,18 @@ func _sound_fill_voices() -> void:
 		if vid == stored:
 			sel = _sound_voice_ids.size() - 1
 	sound_voice_pick.selected = sel
+
+
+func _sound_voice_id_name(v: Variant) -> Array:
+	# Voice-list element normalizer -> [id, display name]. The caller
+	# passes the loop element into this Variant parameter precisely so
+	# shape-branching lives here: `is` checks and .get() on a Variant
+	# are always legal, while the same code on the caller's statically
+	# typed loop variable is a parse error on String-typing builds.
+	if v is Dictionary:
+		var vid := str((v as Dictionary).get("id", ""))
+		return [vid, str((v as Dictionary).get("name", vid))]
+	return [str(v), str(v)]
 
 
 func _push_sound_settings(_arg = null) -> void:

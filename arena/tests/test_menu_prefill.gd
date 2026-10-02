@@ -17,7 +17,16 @@ func _check(cond: bool, label: String) -> void:
 
 
 func test_prefill_num_null_falls_back() -> void:
-	var m = load("res://scripts/MainMenu.gd").new()
+	# Load guard first: a script with a parse error makes load()
+	# return null, and calling .new() on null aborts this function
+	# WITHOUT failing - the suite would print PASSED while testing
+	# nothing (this exact blind spot once hid a broken voice-picker
+	# cast in MainMenu).
+	var scr = load("res://scripts/MainMenu.gd")
+	_check(scr != null and scr.can_instantiate(), "menu script loads")
+	if scr == null:
+		return
+	var m = scr.new()
 	_check(m._prefill_num(null, 9.0) == 9.0, "null yaw_bias falls back to 9.0")
 	_check(m._prefill_num(null, 0.008) == 0.008, "null rate falls back")
 	_check(m._prefill_num(3, 1.0) == 3.0, "int converts")
