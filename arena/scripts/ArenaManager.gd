@@ -3737,14 +3737,24 @@ func _init_sound() -> void:
 func _announce(text: String) -> void:
 	# Single announcer entry point: every big moment speaks through
 	# here, never DisplayServer directly (keeps the guards + tuning in
-	# one place). Latest wins via interrupt=true - a KO 2 s after a
-	# winner line cuts it off; stale news never queues. Errors and
-	# stalls are visual-only by policy: never _announce them. To
-	# silence a single call site, delete its _announce call (never add
-	# per-site flags).
+	# one place). Hang-proofing is LOAD-BEARING (Oct 2026 freeze: the
+	# window went fully unresponsive right after the first battle, no
+	# bracket, force-quit required): a new line NEVER interrupts one
+	# in flight. SAPI purge-before-speak on a busy voice can deadlock
+	# the main thread, and a dropped line beats a dead game. Big
+	# moments arrive seconds apart so the voice is almost always free;
+	# the dropped case is two moments colliding inside one utterance
+	# (~2 s). Every attempt is arena-logged so the log shows exactly
+	# which line was last spoken or dropped. Errors and stalls stay
+	# visual-only by policy: never _announce them. To silence a single
+	# call site, delete its _announce call (never add per-site flags).
 	if not _voice_on or not _tts_ok or text == "":
 		return
-	DisplayServer.tts_speak(text, _voice_id, TTS_VOLUME, TTS_PITCH, TTS_RATE, 0, true)
+	if DisplayServer.tts_is_speaking():
+		_arena_log("announce dropped (voice busy): %s" % text)
+		return
+	_arena_log("announce: %s" % text)
+	DisplayServer.tts_speak(text, _voice_id, TTS_VOLUME, TTS_PITCH, TTS_RATE, 0, false)
 
 
 func _wav_from_floats(samples: PackedFloat32Array) -> AudioStreamWAV:
