@@ -24,6 +24,10 @@ var bv_replay: CheckButton
 var perf_pip: CheckButton
 var perf_glow: CheckButton
 var perf_shadows: CheckButton
+var sound_voice: CheckButton
+var sound_sfx: CheckButton
+var sound_voice_pick: OptionButton
+var _sound_voice_ids: Array = []
 var gen_yaw_bias: SpinBox
 var gen_yaw_random: CheckButton
 var gen_genome_check: CheckButton
@@ -183,6 +187,7 @@ func _build_layout() -> void:
 	cols.add_child(_build_tourney_column())
 	vbox.add_child(_build_brainview_row())
 	vbox.add_child(_build_perf_row())
+	vbox.add_child(_build_sound_row())
 
 	var bottom := HBoxContainer.new()
 	bottom.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -286,6 +291,69 @@ func _push_perf_settings(_arg = null) -> void:
 	TournamentDirector.perf_set("pip", perf_pip.button_pressed)
 	TournamentDirector.perf_set("glow", perf_glow.button_pressed)
 	TournamentDirector.perf_set("shadows", perf_shadows.button_pressed)
+
+
+func _build_sound_row() -> HBoxContainer:
+	# Announcer + battle SFX switches (persisted user://perf.cfg,
+	# applied at arena boot): TTS voice announcements, procedural
+	# battle sounds, and the voice picker. Changes take effect on the
+	# next arena launch (the arena reads them once at boot).
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 10)
+	var h := Label.new()
+	h.text = "SOUND"
+	h.add_theme_font_size_override("font_size", 15)
+	row.add_child(h)
+	sound_voice = CheckButton.new()
+	sound_voice.text = "announcer"
+	sound_voice.tooltip_text = "ON = spoken KO / battle / champion lines. OFF = silent."
+	sound_voice.button_pressed = TournamentDirector.perf_get("voice")
+	sound_voice.toggled.connect(_push_sound_settings)
+	row.add_child(sound_voice)
+	sound_sfx = CheckButton.new()
+	sound_sfx.text = "battle sounds"
+	sound_sfx.tooltip_text = "ON = strike / KO / countdown effects. OFF = silent."
+	sound_sfx.button_pressed = TournamentDirector.perf_get("sfx")
+	sound_sfx.toggled.connect(_push_sound_settings)
+	row.add_child(sound_sfx)
+	var vl := Label.new()
+	vl.text = "voice"
+	row.add_child(vl)
+	sound_voice_pick = OptionButton.new()
+	sound_voice_pick.tooltip_text = "Announcer voice (OS default first). Applies on next arena launch."
+	_sound_fill_voices()
+	sound_voice_pick.item_selected.connect(_push_sound_settings)
+	row.add_child(sound_voice_pick)
+	return row
+
+
+func _sound_fill_voices() -> void:
+	# OS default first (empty id = engine picks), then installed
+	# English voices. Empty list (headless / no TTS) leaves just the
+	# default entry - the picker never errors.
+	_sound_voice_ids = [""]
+	sound_voice_pick.add_item("OS default")
+	var stored := TournamentDirector.audio_voice_get()
+	var sel := 0
+	for v in DisplayServer.tts_get_voices_for_language("en"):
+		var vid := str((v as Dictionary).get("id", ""))
+		var vname := str((v as Dictionary).get("name", vid))
+		if vid == "":
+			continue
+		_sound_voice_ids.append(vid)
+		sound_voice_pick.add_item(vname)
+		if vid == stored:
+			sel = _sound_voice_ids.size() - 1
+	sound_voice_pick.selected = sel
+
+
+func _push_sound_settings(_arg = null) -> void:
+	TournamentDirector.perf_set("voice", sound_voice.button_pressed)
+	TournamentDirector.perf_set("sfx", sound_sfx.button_pressed)
+	var idx := sound_voice_pick.selected
+	if idx >= 0 and idx < _sound_voice_ids.size():
+		TournamentDirector.audio_voice_set(str(_sound_voice_ids[idx]))
 
 
 func _col(title_text: String) -> VBoxContainer:

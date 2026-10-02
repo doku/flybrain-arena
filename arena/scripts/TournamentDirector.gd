@@ -30,9 +30,10 @@ var brainview_replay: bool = false
 
 # Performance settings (menu -> arena bus, persisted user://perf.cfg):
 # pip = eye-view PiPs on/off, glow = bloom chain, shadows = sun shadow
-# pass. Arena reads them at boot; all default true (current look).
+# pass, voice = TTS announcements, sfx = battle sound effects. Arena
+# reads them at boot; all default true (current look + new sound on).
 const PERF_PATH := "user://perf.cfg"
-const PERF_KEYS := ["pip", "glow", "shadows"]
+const PERF_KEYS := ["pip", "glow", "shadows", "voice", "sfx"]
 var _perf_cache := {}
 
 
@@ -54,6 +55,23 @@ func perf_set(key: String, value: bool) -> void:
 	var cfg := ConfigFile.new()
 	cfg.load(PERF_PATH)
 	cfg.set_value("video", key, bool(value))
+	cfg.save(PERF_PATH)
+
+
+func audio_voice_get() -> String:
+	# TTS voice id for the announcer. Separate [audio] section on
+	# purpose: perf_set coerces bool(value), which would corrupt a
+	# voice-id string into "true". Empty = OS default voice.
+	var cfg := ConfigFile.new()
+	if cfg.load(PERF_PATH) != OK:
+		return ""
+	return str(cfg.get_value("audio", "voice_id", ""))
+
+
+func audio_voice_set(voice_id: String) -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(PERF_PATH)
+	cfg.set_value("audio", "voice_id", voice_id)
 	cfg.save(PERF_PATH)
 
 # Tournament state (empty dict = inactive).

@@ -641,6 +641,7 @@ func _apply_beauty_pass() -> void:
 		perf_pip = bool(director.call("perf_get", "pip"))
 		perf_glow = bool(director.call("perf_get", "glow"))
 		perf_shadows = bool(director.call("perf_get", "shadows"))
+	_init_sound()
 	var wenv := get_node_or_null("WorldEnvironment") as WorldEnvironment
 	var env: Environment = wenv.environment if wenv != null else null
 	if env != null:
@@ -3430,6 +3431,10 @@ func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void
 				+ _slot_name(victim_id) + " spike each other!"
 		else:
 			status_label.text = _slot_name(attacker_id) + " STRIKES " + _slot_name(victim_id) + " (" + part + ")!"
+	# Sound the blow: clash tick, wing-tear rip, everything else a
+	# body thump (unknown parts fall through to thump - callers need
+	# no audio awareness).
+	_play_sfx("clash" if part == "spike_clash" else ("tear" if part == "wing_tear" else "thump"))
 
 
 
@@ -3684,6 +3689,144 @@ func _hide_loading() -> void:
 func _show_winner_and_countdown(title: String, title_color: Color, sub: String, countdown_prefix: String) -> void:
 	_show_callout(title, title_color, sub, countdown_prefix, true)
 
+# -- Sound: TTS announcer + procedural battle SFX ------------------
+# No audio assets ship with the game: the announcer is the OS speech
+# engine (DisplayServer.tts_speak, Windows SAPI backend) and every
+# effect is synthesized once at boot into AudioStreamWAV buffers.
+# Render path untouched: buffers build once, playback engine-mixed,
+# zero per-frame GDScript cost.
+const TTS_RATE := 1.1 # sports-caster pace; 1.0 = voice default. Raise
+	# to 1.25 for rapid-fire tournaments, lower to 0.9 for gravitas.
+const TTS_PITCH := 1.0 # 0.5 deep .. 2.0 chipmunk. Voices vary widely;
+	# retune per installed voice if the picker changes character.
+const TTS_VOLUME := 80 # 0-100, voice channel only (SFX use SFX_GAIN_DB).
+const SFX_RATE := 22050 # synth sample rate; covers every effect below
+	# at half the memory of 44100. Raise only for brighter tops.
+const SFX_POOL := 4 # overlapping one-shot players (strike + KO +
+	# beeps can coincide). Raise to 6 if fast exchanges audibly cut
+	# each other; lower to 2 on thin audio drivers.
+const SFX_GAIN_DB := -6.0 # master trim for all effects; per-effect
+	# balance lives in the synth recipes below, not here.
+var _voice_on := true
+var _sfx_on := true
+var _tts_ok := false
+var _voice_id := ""
+var _sfx_players: Array = []
+var _sfx_streams := {}
+
+
+func _init_sound() -> void:
+	# Boot wiring (called from _apply_beauty_pass, same place perf
+	# video flags load). Order matters: toggles first (menu
+	# persisted), then TTS probe (needs no voice), then synth.
+	var director := _director()
+	if director != null and director.has_method("perf_get"):
+		_voice_on = bool(director.call("perf_get", "voice"))
+		_sfx_on = bool(director.call("perf_get", "sfx"))
+	if director != null and director.has_method("audio_voice_get"):
+		_voice_id = str(director.call("audio_voice_get"))
+	# Suites must never speak: every headless run is mute by
+	# construction, and test_mute covers any windowed harness.
+	if DisplayServer.get_name() == "headless" or BrainClient.test_mute:
+		_tts_ok = false
+	else:
+		_tts_ok = DisplayServer.tts_get_voices().size() > 0
+	_build_sfx()
+
+
+func _announce(text: String) -> void:
+	# Single announcer entry point: every big moment speaks through
+	# here, never DisplayServer directly (keeps the guards + tuning in
+	# one place). Latest wins via interrupt=true - a KO 2 s after a
+	# winner line cuts it off; stale news never queues. Errors and
+	# stalls are visual-only by policy: never _announce them. To
+	# silence a single call site, delete its _announce call (never add
+	# per-site flags).
+	if not _voice_on or not _tts_ok or text == "":
+		return
+	DisplayServer.tts_speak(text, _voice_id, TTS_VOLUME, TTS_PITCH, TTS_RATE, 0, true)
+
+
+func _wav_from_floats(samples: PackedFloat32Array) -> AudioStreamWAV:
+	# 16-bit packing is LOAD-BEARING: AudioStreamWAV defaults to
+	# FORMAT_8_BITS (signed), which would play these buffers as
+	# garbage. mix_rate must equal SFX_RATE or pitch shifts.
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = SFX_RATE
+	stream.stereo = false
+	var bytes := PackedByteArray()
+	bytes.resize(samples.size() * 2)
+	for i in samples.size():
+		bytes.encode_s16(i * 2, int(clampf(samples[i], -1.0, 1.0) * 32767.0))
+	stream.data = bytes
+	return stream
+
+
+func _synth_tone(freq: float, secs: float, decay: float, noise_amt: float = 0.0, freq_end: float = 0.0) -> AudioStreamWAV:
+	# One workhorse for all effects: sine (sweeping freq -> freq_end
+	# when given) under exp decay, plus white-noise wash. The
+	# per-effect recipe table lives in _build_sfx; retune there.
+	var n := int(SFX_RATE * secs)
+	var samples := PackedFloat32Array()
+	samples.resize(n)
+	var phase := 0.0
+	for i in n:
+		var t := float(i) / SFX_RATE
+		var f := freq if freq_end <= 0.0 else lerpf(freq, freq_end, float(i) / maxf(n - 1.0, 1.0))
+		phase += TAU * f / SFX_RATE
+		var env := exp(-t * decay)
+		samples[i] = (sin(phase) * (1.0 - noise_amt) + (randf() * 2.0 - 1.0) * noise_amt) * env
+	return _wav_from_floats(samples)
+
+
+func _build_sfx() -> void:
+	# Effect recipes (freq, secs, decay, noise, sweep): thump = body
+	# hit, clash = metallic tick, tear = wing rip, boom = KO cannon,
+	# beep/fight = countdown blips. Balance against each other via
+	# decay/noise here; master trim is SFX_GAIN_DB.
+	_sfx_streams["thump"] = _synth_tone(90.0, 0.18, 22.0, 0.45)
+	_sfx_streams["clash"] = _synth_tone(1560.0, 0.12, 30.0, 0.25, 1180.0)
+	_sfx_streams["tear"] = _synth_tone(800.0, 0.35, 9.0, 0.6, 200.0)
+	_sfx_streams["boom"] = _synth_tone(55.0, 0.7, 6.0, 0.35)
+	_sfx_streams["beep"] = _synth_tone(880.0, 0.09, 28.0)
+	_sfx_streams["fight"] = _synth_tone(1320.0, 0.25, 14.0)
+	for i in SFX_POOL:
+		var p := AudioStreamPlayer.new()
+		p.volume_db = SFX_GAIN_DB
+		add_child(p)
+		_sfx_players.append(p)
+
+
+func _play_sfx(sfx_name: String) -> void:
+	# First free player wins; all busy = drop (a dropped blip beats a
+	# cut-off boom). Unknown names no-op - callers need no guards.
+	if not _sfx_on or not _sfx_streams.has(sfx_name):
+		return
+	var stream: AudioStreamWAV = _sfx_streams[sfx_name]
+	for p in _sfx_players:
+		if not (p as AudioStreamPlayer).playing:
+			(p as AudioStreamPlayer).stream = stream
+			(p as AudioStreamPlayer).play()
+			return
+
+
+func _spoken_score(score: String) -> String:
+	# "3 - 1" -> "three to one": SAPI reads bare digits as "three
+	# minus one". 0-9 word map; anything else passes through raw.
+	const WORDS := ["zero", "one", "two", "three", "four",
+		"five", "six", "seven", "eight", "nine"]
+	var bits := score.split("-", false)
+	if bits.size() != 2:
+		return score
+	var out: Array = []
+	for b in bits:
+		var t := (b as String).strip_edges()
+		out.append(WORDS[int(t)] if t.is_valid_int()
+			and int(t) >= 0 and int(t) < WORDS.size() else t)
+	return " to ".join(out)
+
+
 func _show_callout(title: String, title_color: Color, sub: String, countdown_prefix: String, auto_reset: bool) -> void:
 	# Centered callout (win, draw, restart) with a 3-2-1 countdown. When
 	# auto_reset is false the caller sequences the next step itself
@@ -3712,10 +3855,12 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 		for i in range(3, 0, -1):
 			if is_instance_valid(countdown_label):
 				countdown_label.text = "%s IN %d..." % [countdown_prefix, i]
+			_play_sfx("beep")
 			await get_tree().create_timer(1.0).timeout
 
 		if is_instance_valid(countdown_label):
 			countdown_label.text = "FIGHT!"
+		_play_sfx("fight")
 		await get_tree().create_timer(0.8).timeout
 	else:
 		await get_tree().create_timer(0.8).timeout
@@ -4478,6 +4623,11 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 		stats_alpha["kills"] += 1
 		if is_instance_valid(status_label):
 			status_label.text = _ko_text("alpha")
+	# Sound the finish before the landing ceremony unfolds behind the
+	# banner: cannon boom + the winner's name. Spoken line is short on
+	# purpose - the battle callout follows seconds later.
+	_play_sfx("boom")
+	_announce("Knockout! %s" % _slot_name("beta" if victim_id == "alpha" else "alpha"))
 
 	# Landing ceremony instead of a frozen frame: loser drops
 	# belly-up, winner lowers onto its feet (runs behind the banner).
@@ -4775,6 +4925,7 @@ func _battle_post_sequence(battle_winner: String) -> void:
 		_show_callout("%s TAKES BATTLE (%s)" % [winner_name, score],
 			Color(1.0, 0.55, 0.3) if battle_winner == "alpha" else Color(0.4, 0.75, 1.0),
 			sub, "NEXT BATTLE", false)
+		_announce("%s takes the battle, %s" % [winner_name, _spoken_score(score)])
 		await get_tree().create_timer(5.0).timeout
 		_update_tourney_status("BATTLE %d" % (_battle_count() + 1))
 		var whead := _verdict_headline()
@@ -4817,6 +4968,10 @@ func _on_match_over(match_winner: String, score: String) -> void:
 	else:
 		var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
 		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), score])
+		# Decisive matches get the voice; drawn splits stay silent
+		# (no winner to name - the bracket shows the shared point).
+		_announce("%s takes %s, %s" % [match_name,
+			expand_match_label(tourney_match_label), _spoken_score(score)])
 	await get_tree().create_timer(6.0).timeout
 	_hide_arena_bracket()
 	# Round boundary: the current round's index moved, or the file
@@ -4962,6 +5117,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 			var quick_name: String = director.champion_name()
 			_show_callout("%s WINS THE QUICK BATTLE" % quick_name,
 				Color(1.0, 0.85, 0.3), "EXHIBITION COMPLETE", "MENU", false)
+			_announce("%s wins the exhibition" % quick_name)
 			await get_tree().create_timer(5.0).timeout
 			director.quit_to_menu()
 			return
@@ -5020,6 +5176,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 		_save_bracket_record(true)
 		if is_instance_valid(status_label):
 			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s - review, then QUIT TO MENU" % [champ_name, last_line]
+		_announce("Tournament champion, %s" % champ_name)
 		# Wait for the server's title write in the background (no leaving
 		# until it lands, so the menu never shows a stale pre-title vault).
 		# Bounded so a dead server can never hang the game here.
@@ -5785,6 +5942,7 @@ func _run_event_handoff() -> void:
 	_show_arena_bracket("EVENT %s - BUILDING NEXT EVENT" % eid)
 	_show_callout("EVENT %s CHAMPION: %s" % [eid, director.champion_name()],
 		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false)
+	_announce("Event %s champion, %s" % [eid, director.champion_name()])
 	_event_drain_done_to_pool()
 	var ev0: Dictionary = director.event_load(eid)
 	var st0: Dictionary = ev0.get("settings", {})
@@ -6636,6 +6794,7 @@ func _run_evo_generation() -> void:
 	var champ_name: String = director.champion_name()
 	_show_callout("CONTINUOUS GEN %d CHAMPION: %s" % [gen, champ_name],
 		Color(1.0, 0.85, 0.3), "BREEDING NEXT GENERATION", "", false)
+	_announce("Generation %d champion, %s" % [gen, champ_name])
 	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
 		"Champion %s - ranking bottom two..." % champ_name)
 	if is_instance_valid(status_label):
