@@ -93,6 +93,12 @@ var busy_spinner: Label
 var busy_frames: Array = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 var busy_tick: float = 0.0
 var busy_frame: int = 0
+# Menu pages (tabs): one former column per page, full width. Pages
+# only switch visibility - every widget builds once at startup, so
+# background refreshes and job progress keep working while another
+# page shows.
+var _menu_pages: Array = []
+var _page_buttons: Array = []
 
 
 func _ready() -> void:
@@ -182,13 +188,31 @@ func _build_layout() -> void:
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	vbox.add_child(title)
 
-	var cols := HBoxContainer.new()
-	cols.add_theme_constant_override("separation", 16)
-	cols.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	vbox.add_child(cols)
-	cols.add_child(_build_vault_column())
-	cols.add_child(_build_gen_column())
-	cols.add_child(_build_tourney_column())
+	# Three pages instead of three squeezed columns: vault, training,
+	# tournament. Tabs pick the visible page (the rest collapse);
+	# the display/sound rows and the launch bar below stay persistent
+	# (global settings + actions on every page).
+	var tabs := HBoxContainer.new()
+	tabs.alignment = BoxContainer.ALIGNMENT_CENTER
+	tabs.add_theme_constant_override("separation", 10)
+	vbox.add_child(tabs)
+	var tab_group := ButtonGroup.new()
+	var built := [_build_vault_column(), _build_gen_column(),
+		_build_tourney_column()]
+	var names := ["MY FLY BRAINS", "TRAINING", "TOURNAMENT"]
+	for i in 3:
+		var tb := Button.new()
+		tb.text = names[i]
+		tb.toggle_mode = true
+		tb.button_group = tab_group
+		tb.pressed.connect(_show_menu_page.bind(i))
+		tabs.add_child(tb)
+		_page_buttons.append(tb)
+		var page: VBoxContainer = built[i]
+		page.visible = i == 0
+		vbox.add_child(page)
+		_menu_pages.append(page)
+	(_page_buttons[0] as Button).button_pressed = true
 	vbox.add_child(_build_brainview_row())
 	vbox.add_child(_build_perf_row())
 	vbox.add_child(_build_sound_row())
@@ -251,6 +275,13 @@ func _build_brainview_row() -> HBoxContainer:
 	row.add_child(bv_replay)
 	_push_brainview_settings()
 	return row
+
+
+func _show_menu_page(idx: int) -> void:
+	# Tab switch: exactly one page visible. Widget state (selections,
+	# job bars, bracket) lives on, so background work is unaffected.
+	for i in _menu_pages.size():
+		(_menu_pages[i] as Control).visible = i == idx
 
 
 func _push_brainview_settings(_arg = null) -> void:

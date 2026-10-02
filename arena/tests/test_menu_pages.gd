@@ -1,0 +1,74 @@
+extends SceneTree
+## Headless menu-page tests: the menu opens on three tabbed pages (fly
+## brains / training / tournament) with exactly one visible, tabs
+## switch visibility without rebuilding, and every former column
+## widget still exists exactly once. _build_layout is pure widgets
+## (no vault I/O), so a tree-less instance suffices - _ready never runs.
+## Run: godot --headless --path arena -s tests/test_menu_pages.gd
+## Exit code = failure count (0 = all green).
+
+var failures := 0
+var menu = null
+
+
+func _check(cond: bool, label: String) -> void:
+	if cond:
+		print("PASS: ", label)
+	else:
+		failures += 1
+		printerr("FAIL: ", label)
+
+
+func _initialize() -> void:
+	var scr = load("res://scripts/MainMenu.gd")
+	if scr == null or not scr.can_instantiate():
+		printerr("FAIL: menu script loads")
+		failures += 1
+		quit(failures)
+		return
+	menu = scr.new()
+	menu._build_layout()
+
+
+func _is_on_page(node: Control, page_idx: int) -> bool:
+	var p: Control = menu._menu_pages[page_idx]
+	return p.is_ancestor_of(node)
+
+
+func _process(_delta: float) -> bool:
+	_check(menu._menu_pages.size() == 3, "three pages")
+	_check(menu._page_buttons.size() == 3, "three tab buttons")
+	_check((menu._menu_pages[0] as Control).visible
+		and not (menu._menu_pages[1] as Control).visible
+		and not (menu._menu_pages[2] as Control).visible,
+		"first page visible at boot")
+	# Every former column landed on its page exactly once.
+	_check(_is_on_page(menu.brain_list, 0), "vault list on brains page")
+	_check(_is_on_page(menu.archive_list_view, 0), "archive on brains page")
+	_check(_is_on_page(menu.detail_label, 0), "detail on brains page")
+	_check(_is_on_page(menu.queue_list, 1), "train queue on training page")
+	_check(_is_on_page(menu.score_list, 1), "score queue on training page")
+	_check(_is_on_page(menu.gen_name, 1), "generate form on training page")
+	_check(_is_on_page(menu.player_list, 2), "participants on tournament page")
+	_check(_is_on_page(menu.resume_button, 2), "resume on tournament page")
+	_check(_is_on_page(menu.quick_button, 2), "quick battle on tournament page")
+	_check(_is_on_page(menu.bracket_view, 2), "bracket on tournament page")
+	# Tab switch flips visibility, keeps widgets.
+	menu._show_menu_page(2)
+	_check((menu._menu_pages[2] as Control).visible
+		and not (menu._menu_pages[0] as Control).visible,
+		"tournament tab shows")
+	_check(_is_on_page(menu.brain_list, 0), "vault list survives switch")
+	menu._show_menu_page(1)
+	_check((menu._menu_pages[1] as Control).visible
+		and not (menu._menu_pages[2] as Control).visible,
+		"training tab shows")
+	# Persistent footer: settings + launch bar outside the pages.
+	_check(menu.bv_enable != null and menu.perf_pip != null
+		and menu.sound_voice != null, "settings rows persist")
+	if failures == 0:
+		print("ALL MENU-PAGE TESTS PASSED")
+	else:
+		printerr("MENU-PAGE TESTS: %d FAILURES" % failures)
+	quit(failures)
+	return true
