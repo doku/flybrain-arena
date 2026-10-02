@@ -563,6 +563,22 @@ func test_step_watchdog_recovers_silently() -> void:
 	arena._check_step_watchdog()
 	_check(not arena._step_in_flight, "round end disarms the flag")
 
+func test_gallery_star() -> void:
+	# The gallery names its showcased fighter exactly like the
+	# bracket rows: cyan name + red star. Star shows whenever the
+	# card carries a bracket key (the showcase condition), hides
+	# otherwise - the two can never disagree. Overlay builds on
+	# tournament entry, so build it here like the pip tests do.
+	arena._build_bracket_overlay()
+	arena._render_gallery_card({"title": "Dodger", "elo": "1312",
+		"rows": "Titles 1", "key": "abc12345"})
+	_check(arena.gallery_star.visible, "keyed card shows the star")
+	_check(arena.gallery_star.get_theme_color("font_color").is_equal_approx(
+		Color(1.0, 0.38, 0.3)), "star is marker red")
+	arena._render_gallery_card({"title": "?", "elo": "--",
+		"rows": "", "key": ""})
+	_check(not arena.gallery_star.visible, "keyless card hides the star")
+
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
@@ -908,6 +924,7 @@ func _process(_delta: float) -> bool:
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()
 	test_step_watchdog_recovers_silently()
+	test_gallery_star()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()

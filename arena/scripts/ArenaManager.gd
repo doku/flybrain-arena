@@ -316,6 +316,7 @@ var _wait_bracket := false
 # rotating fighter gallery + training strip, sharing the overlay above.
 var gallery_box: VBoxContainer
 var gallery_title: Label
+var gallery_star: Label
 var gallery_elo: Label
 var gallery_rows: Label
 var strip_box: HBoxContainer
@@ -918,13 +919,28 @@ func _build_bracket_overlay() -> void:
 	gallery_box.visible = false
 	brow.add_child(gallery_box)
 	# Showcased name in the shared cyan accent (same color as the
-	# bracket rows); the card keeps its original dark look.
+	# bracket rows) plus the same red "*" marker the bracket rows
+	# carry, so the gallery names its showcased fighter exactly the
+	# way the bracket does. Title + star ride a centered row so the
+	# star sits right after the name; the card keeps its dark look.
+	var title_row := HBoxContainer.new()
+	title_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	title_row.add_theme_constant_override("separation", 6)
+	gallery_box.add_child(title_row)
 	gallery_title = Label.new()
 	gallery_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	gallery_title.add_theme_font_size_override("font_size", 20)
 	gallery_title.add_theme_color_override("font_color",
 		BracketView.COL_SHOWCASE)
-	gallery_box.add_child(gallery_title)
+	title_row.add_child(gallery_title)
+	gallery_star = Label.new()
+	gallery_star.text = "*"
+	gallery_star.add_theme_font_size_override("font_size", 20)
+	gallery_star.add_theme_color_override("font_color",
+		BracketView.COL_MARKER)
+	gallery_star.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	gallery_star.visible = false
+	title_row.add_child(gallery_star)
 	gallery_elo = Label.new()
 	gallery_elo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	gallery_elo.add_theme_font_size_override("font_size", 28)
@@ -7365,6 +7381,12 @@ func _build_gallery_entries(players: Array) -> void:
 func _render_gallery_card(entry: Dictionary) -> void:
 	if is_instance_valid(gallery_title):
 		gallery_title.text = str(entry.get("title", "?"))
+	# Same marker as the bracket rows: the gallery's own showcased
+	# name carries the red star whenever the card names a fighter -
+	# the exact key condition that showcases the bracket below, so
+	# the two can never disagree.
+	if is_instance_valid(gallery_star):
+		gallery_star.visible = str(entry.get("key", "")) != ""
 	if is_instance_valid(gallery_elo):
 		gallery_elo.text = "ELO " + str(entry.get("elo", "--"))
 	if is_instance_valid(gallery_rows):
