@@ -2142,7 +2142,10 @@ func _make_pip_stats(parent: Node, left_side: bool) -> Label:
 		l.offset_right = -16.0
 	l.offset_top = 38.0
 	l.offset_bottom = 320.0
-	l.add_theme_font_size_override("font_size", 13)
+	l.add_theme_font_size_override("font_size", 12)
+	# Tight rows: the stat card carries ~14 rows in 282 px, several
+	# wrapping to two lines - default line spacing clipped the tail.
+	l.add_theme_constant_override("line_spacing", 1)
 	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	l.visible = false
