@@ -69,24 +69,25 @@ func test_play_guards() -> void:
 	arena._sfx_on = true
 
 
-func test_announce_guards() -> void:
-	# Headless suite: TTS probe fails by construction, so announcing
-	# is a silent no-op (never an error, never speech).
-	_check(not arena._tts_ok, "headless has no TTS")
-	arena._announce("Knockout! Alpha")
-	arena._announce("")
-	_check(true, "announce no-ops without error")
-
-
-func test_spoken_score() -> void:
-	_check(arena._spoken_score("3 - 1") == "three to one",
-		"digits verbalized with to")
-	_check(arena._spoken_score("0 - 0") == "zero to zero",
-		"zero handled")
-	_check(arena._spoken_score("12 - 0") == "12 to zero",
-		"off-map passes through raw")
-	_check(arena._spoken_score("junk") == "junk",
-		"garbage passes through")
+func test_announce_clips() -> void:
+	# Fixed-phrase clip pack: every key in VOICE_CLIPS resolves to a
+	# loaded stream (proves the file exists on disk); unknown keys
+	# and a disabled toggle no-op without error. Headless playback
+	# runs on the dummy driver (silent).
+	_check(arena._voice_clips.size() == arena.VOICE_CLIPS.size(),
+		"whole clip pack loaded (%d)" % arena.VOICE_CLIPS.size())
+	for key in arena.VOICE_CLIPS:
+		_check(arena._voice_clips.has(key), "clip resolves: " + str(key))
+		var st: AudioStreamWAV = arena._voice_clips[key]
+		_check(st.data.size() > 1000, "clip non-empty: " + str(key))
+	arena._announce_clip("knockout_orange")
+	arena._announce_clip("nope")
+	_check(true, "known + unknown clips no-op without error")
+	arena._voice_on = false
+	arena._voice_player.stop()
+	arena._announce_clip("knockout_orange")
+	_check(not arena._voice_player.playing, "disabled voice plays nothing")
+	arena._voice_on = true
 
 
 func test_hit_sfx_routing() -> void:
@@ -131,8 +132,7 @@ func _process(_delta: float) -> bool:
 	test_synth_buffers()
 	test_player_pool()
 	test_play_guards()
-	test_announce_guards()
-	test_spoken_score()
+	test_announce_clips()
 	test_hit_sfx_routing()
 	test_palettes_build()
 	if failures == 0:

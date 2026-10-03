@@ -59,6 +59,19 @@ confirmed the game "runs better now" after pulling the fix.
    timestamp correlation. All future OS-blocking calls must leave a
    before/after trace in a persisted log.
 
+## Addendum: SAPI removed entirely (clip-pack announcer)
+
+The SAPI voice was disliked, so instead of tuning the engine it is
+gone: 14 fixed orange/blue phrases (no names, no scores) were
+synthesized once with local Kokoro (sid 0) and ship as 22050 Hz mono
+WAVs under `arena/audio/voice` (~1 MB). The game only plays local
+files - no runtime synthesis, no network, no picker, no deadlock
+class. Scores and names stay visual-only; the voice picker UI and all
+TTS code paths were deleted. Re-voicing = replacing the WAVs (same
+names), zero code. The Kokoro GDExtension integration was cancelled as
+unnecessary (generation happened outside the game; models live in TEMP,
+never in git).
+
 ## Follow-ups
 
 - Audio quality review (user dislikes SAPI voice + synth SFX): see

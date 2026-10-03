@@ -58,17 +58,6 @@ func perf_set(key: String, value: bool) -> void:
 	cfg.save(PERF_PATH)
 
 
-func audio_voice_get() -> String:
-	# TTS voice id for the announcer. Separate [audio] section on
-	# purpose: perf_set coerces bool(value), which would corrupt a
-	# voice-id string into "true". Empty = OS default voice.
-	return audio_opt_get("voice_id", "")
-
-
-func audio_voice_set(voice_id: String) -> void:
-	audio_opt_set("voice_id", voice_id)
-
-
 func audio_opt_get(key: String, default: String = "") -> String:
 	# Generic [audio]-section string option (voice_id, sfx_palette,
 	# ...): the perf_* functions only speak bool, so string options
