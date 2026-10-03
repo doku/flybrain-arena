@@ -579,6 +579,66 @@ func test_gallery_star() -> void:
 		"rows": "", "key": ""})
 	_check(not arena.gallery_star.visible, "keyless card hides the star")
 
+func test_idle_parks_loud() -> void:
+	# Oct 2026 group-D phantom loop: a director that cannot place the
+	# battle (tournament complete here) must park LOUD - no cache, no
+	# session tally, no reset re-arm - instead of looping 0-0 battles.
+	# Drives the legacy server-reply entry with an explicit idle res.
+	arena._build_bracket_overlay()
+	var n0: int = arena._match_battle_cache.size()
+	var w0: int = arena.wins_alpha + arena.wins_beta
+	arena._battle_post_sequence("alpha", {"action": "idle"})
+	_check(arena._match_battle_cache.size() == n0, "idle caches nothing")
+	_check(arena.wins_alpha + arena.wins_beta == w0, "idle counts no win")
+	_check(arena._seq_context != "reset", "idle arms no reset")
+	_check(arena.bracket_overlay.visible, "idle parks on the bracket")
+	_check("QUIT TO MENU" in arena.status_label.text, "idle names the recipe")
+	arena._hide_arena_bracket()
+
+
+func test_idle_not_cached() -> void:
+	# Same guard one level up: _battle_done_local consults the
+	# director BEFORE caching, so a phantom never reaches the match
+	# cache (banking one later would corrupt records). Past-end shell
+	# mimics the completed group file; status complete alone suffices
+	# (tournament_active() is status-gated).
+	var d = arena._director()
+	var old_tourney: Dictionary = (d.tourney as Dictionary).duplicate(true)
+	d.tourney = {"id": "UT", "status": "complete", "format": "groups",
+		"rounds": [[{"a_name": "A", "b_name": "B", "winner_id": "x"}]],
+		"current_round": 0, "current_match": 0}
+	var n0: int = arena._match_battle_cache.size()
+	arena._last_sens_a = {}
+	arena._last_sens_b = {}
+	arena._last_ctrl_a = {}
+	arena._last_ctrl_b = {}
+	arena._battle_done_local(false)
+	_check(arena._match_battle_cache.size() == n0, "phantom never cached")
+	_check(arena._seq_context != "reset", "phantom arms no reset")
+	_check("QUIT TO MENU" in arena.status_label.text, "phantom parks loud")
+	d.tourney = old_tourney
+
+
+func test_match_ready_refuses_ghosts() -> void:
+	# A reset ack arriving after the director moved past the battle
+	# must not start a ghost round (the phantom loop's suspected
+	# seed): refused + parked loud instead.
+	var d = arena._director()
+	var old_tourney: Dictionary = (d.tourney as Dictionary).duplicate(true)
+	var tact: bool = arena.tournament_active
+	d.tourney = {"id": "UT", "status": "complete", "format": "groups",
+		"rounds": [[{"a_name": "A", "b_name": "B", "winner_id": "x"}]],
+		"current_round": 0, "current_match": 0}
+	arena.tournament_active = true
+	arena.is_round_active = false
+	arena._seq_context = "reset"
+	arena._on_match_ready()
+	_check(not arena.is_round_active, "ghost reset starts no round")
+	_check("QUIT TO MENU" in arena.status_label.text, "refusal parks loud")
+	arena._seq_context = ""
+	arena.tournament_active = tact
+	d.tourney = old_tourney
+
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
@@ -926,6 +986,9 @@ func _process(_delta: float) -> bool:
 	test_step_reply_clears_and_counts()
 	test_step_watchdog_recovers_silently()
 	test_gallery_star()
+	test_idle_parks_loud()
+	test_idle_not_cached()
+	test_match_ready_refuses_ghosts()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()

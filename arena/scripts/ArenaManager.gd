@@ -1324,6 +1324,16 @@ func _on_match_ready() -> void:
 		return
 	if _seq_context != "reset":
 		return
+	# Stale-ack guard (Oct 2026 group-D phantom loop): a reset ack that
+	# arrives after the director moved past the battle (complete/OOB)
+	# must not start a ghost round. The director, not the seq context,
+	# has the final say - a refused ack parks loud instead of fighting.
+	var rdirector := _director()
+	if rdirector == null or (rdirector.current_match() as Dictionary).is_empty():
+		_arena_log("match_ready refused: director cannot place a battle (stale ack?) - parking loud")
+		_clear_seq()
+		_park_unplaceable_battle("", "stale-reset")
+		return
 	_clear_seq()
 	_hide_wait_bracket()
 	_hide_loading()
@@ -4812,6 +4822,40 @@ func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, 
 	_battle_post_sequence(battle_winner)
 
 
+func _battle_accepted(res: Dictionary) -> bool:
+	# Only these director actions advance a battle. Anything else
+	# (idle = unplaceable, broken, unknown) must park loud, never
+	# loop: feeding idle into match_reset spun ~300 phantom battles
+	# across 5 hours once (Oct 2026 group-D: every idle response
+	# reads 0-0 and re-arms the next reset).
+	return str(res.get("action", "")) in ["next_battle", "replay", "match_over"]
+
+
+func _log_battle(winner: String, res: Dictionary) -> void:
+	# One arena-log line per battle (action + score + label): the
+	# signature the group-D investigation was missing - an idle loop
+	# reads as repeated 0-0s here and diagnoses in minutes.
+	_arena_log("battle: winner=%s action=%s score=%d-%d (%s)" % [winner,
+		str(res.get("action", "?")), int(res.get("score_a", 0)),
+		int(res.get("score_b", 0)), expand_match_label(tourney_match_label)])
+
+
+func _park_unplaceable_battle(battle_winner: String, action: String) -> void:
+	# A finished battle the director cannot place (tournament
+	# complete, pointer past end, desync): drop it - never cache,
+	# never count, never reset - and park LOUD on the bracket. Only
+	# a human decision (QUIT TO MENU + RESUME) is safe from here;
+	# anything automatic risks the phantom loop.
+	_arena_log("phantom battle dropped: winner=%s action=%s (%s)" % [
+		battle_winner, action, expand_match_label(tourney_match_label)])
+	print("[Arena] STALLED - battle unplaceable (director %s); phantom dropped, no reset sent." % action)
+	_hide_loading()
+	_show_arena_bracket("STALLED - BATTLE UNPLACEABLE (director %s)" % action)
+	if is_instance_valid(status_label):
+		status_label.text = "STALLED - %s result unplaceable (director %s) - QUIT TO MENU + RESUME" % [
+			expand_match_label(tourney_match_label), action]
+
+
 func _battle_done_local(draw: bool, draw_penalty: bool = false) -> void:
 	# Batched match reporting, battle-end choke point: cache the
 	# battle's sync payload (the whole match banks once at match over)
@@ -4819,7 +4863,25 @@ func _battle_done_local(draw: bool, draw_penalty: bool = false) -> void:
 	# outcome (KO victim, health-timeout, draws), so no server round
 	# trip is needed between battles. Between battles only the ms
 	# match_reset runs; battles flow back-to-back on identical weights.
+	# The director is consulted BEFORE caching: an unplaceable battle
+	# (idle) is dropped + parked here, never cached (banking a phantom
+	# later would corrupt records), never counted, never reset.
 	_last_verdict = _compose_verdict(draw)
+	var wslot := str(_last_verdict.get("winner_slot", ""))
+	var winner := "draw" if draw else (wslot if (wslot == "alpha" or wslot == "beta") else "alpha")
+	var director := _director()
+	var res := {}
+	if not draw and director != null:
+		res = director.on_battle_result(winner,
+			_flight_summary(flight_alpha, fly_alpha),
+			_flight_summary(flight_beta, fly_beta),
+			_bv_stream_packet(),
+			int((stats_alpha as Dictionary).get("kills", 0)),
+			int((stats_beta as Dictionary).get("kills", 0)))
+		_log_battle(winner, res)
+		if not _battle_accepted(res):
+			_park_unplaceable_battle(winner, str(res.get("action", "idle")))
+			return
 	_match_battle_cache.append({
 		"battle_id": _current_battle_id(),
 		"draw": draw, "draw_penalty": draw_penalty,
@@ -4828,18 +4890,26 @@ func _battle_done_local(draw: bool, draw_penalty: bool = false) -> void:
 		"stats_a": stats_alpha.duplicate(), "stats_b": stats_beta.duplicate(),
 		"sens_a": _last_sens_a.duplicate(), "sens_b": _last_sens_b.duplicate(),
 		"ctrl_a": _last_ctrl_a.duplicate(), "ctrl_b": _last_ctrl_b.duplicate()})
-	var wslot := str(_last_verdict.get("winner_slot", ""))
-	var winner := "draw" if draw else (wslot if (wslot == "alpha" or wslot == "beta") else "alpha")
+	# Tripwire bound: a real match never exceeds single-digit battles.
+	# An unbounded cache means phantom flow - cap it LOUD instead of
+	# growing memory and a future giant bank replay.
+	while _match_battle_cache.size() > 200:
+		_match_battle_cache.pop_front()
+		_arena_log("match cache over 200 - dropping oldest battle (phantom flow?)")
 	print("[Arena] Battle cached for match bank: %s (%d cached)" % [
 		str(_last_verdict.get("line", "")), _match_battle_cache.size()])
-	_battle_post_sequence(winner)
+	_battle_post_sequence(winner, res)
 
 
-func _battle_post_sequence(battle_winner: String) -> void:
+func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
 	# The post-battle sequence, run locally at battle end in batch mode
 	# (and by any accepted battle reply): clears the wait, tallies the
 	# win, shows the verdict callout, advances the bracket, and queues
 	# the next battle (ms match_reset) or the match report.
+	# res rides along from _battle_done_local (single director consult
+	# per battle); the legacy server-reply entry passes none and it is
+	# computed below. Either way only an ACCEPTED response proceeds -
+	# idle parks loud via the same guard as the cache path.
 	_tourney_awaiting_battle = false
 	_clear_seq()
 	_seq_forgive_match = {}
@@ -4850,11 +4920,6 @@ func _battle_post_sequence(battle_winner: String) -> void:
 	if director == null:
 		return
 	_update_health_hud()
-	# Session wins tally: _record_win previously only ran on the
-	# free-battle paths, so tournament/quick battle wins never moved the
-	# WINS label. Draws record nothing (no winner).
-	if battle_winner == "alpha" or battle_winner == "beta":
-		_record_win(battle_winner)
 	if battle_winner == "draw":
 		var draw_title := _draw_title()
 		if is_instance_valid(status_label):
@@ -4888,9 +4953,13 @@ func _battle_post_sequence(battle_winner: String) -> void:
 			float((stats_beta as Dictionary).get("center_drift", -1.0)))
 		# Third draw resolves the match outright (higher ELO advances)
 		# instead of replaying forever.
+		_log_battle("draw", draw_adv)
 		if str(draw_adv.get("action", "")) == "match_over":
 			var draw_score := "%d - %d" % [int(draw_adv.get("score_a", 0)), int(draw_adv.get("score_b", 0))]
 			_on_match_over(str(draw_adv.get("match_winner", "alpha")), draw_score)
+			return
+		if not _battle_accepted(draw_adv):
+			_park_unplaceable_battle("draw", str(draw_adv.get("action", "idle")))
 			return
 		var rhead := _verdict_headline()
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
@@ -4901,18 +4970,32 @@ func _battle_post_sequence(battle_winner: String) -> void:
 		_arm_seq("reset")
 		return
 	var winner_name := tourney_a_name if battle_winner == "alpha" else tourney_b_name
-	var res: Dictionary = director.on_battle_result(battle_winner,
-		_flight_summary(flight_alpha, fly_alpha),
-		_flight_summary(flight_beta, fly_beta),
-		_bv_stream_packet(),
-		int((stats_alpha as Dictionary).get("kills", 0)),
-		int((stats_beta as Dictionary).get("kills", 0)))
-	var action := str(res.get("action", "next_battle"))
+	# Legacy server-reply entry passes no response: consult once here
+	# (the _battle_done_local entry already did and passes it in).
+	# Either way the response is validated before anything advances.
+	var res_here := res
+	if res_here.is_empty() and battle_winner != "draw":
+		res_here = director.on_battle_result(battle_winner,
+			_flight_summary(flight_alpha, fly_alpha),
+			_flight_summary(flight_beta, fly_beta),
+			_bv_stream_packet(),
+			int((stats_alpha as Dictionary).get("kills", 0)),
+			int((stats_beta as Dictionary).get("kills", 0)))
+		_log_battle(battle_winner, res_here)
+	if not _battle_accepted(res_here):
+		_park_unplaceable_battle(battle_winner, str(res_here.get("action", "idle")))
+		return
+	# Session wins tally: tournament/quick battle wins move the WINS
+	# label, but ONLY for director-accepted battles - phantom wins
+	# once inflated it for hours. Draws record nothing (no winner).
+	if battle_winner == "alpha" or battle_winner == "beta":
+		_record_win(battle_winner)
+	var action := str(res_here.get("action", "next_battle"))
 	print("[Arena] Battle result: winner=", battle_winner, " action=", action,
 		" verdict=", str(_last_verdict.get("line", "")))
-	var score := "%d - %d" % [int(res.get("score_a", 0)), int(res.get("score_b", 0))]
+	var score := "%d - %d" % [int(res_here.get("score_a", 0)), int(res_here.get("score_b", 0))]
 	if action == "match_over":
-		var match_winner := str(res.get("match_winner", battle_winner))
+		var match_winner := str(res_here.get("match_winner", battle_winner))
 		_on_match_over(match_winner, score)
 	else:
 		var sub := "%s  BATTLE %d" % [expand_match_label(tourney_match_label), _battle_count() + 1]
