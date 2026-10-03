@@ -1650,6 +1650,31 @@ class TestBrainVault(unittest.TestCase):
         self.assertTrue(np.allclose(w, w2))
         self.assertEqual(rec2["generator_params"]["seed"], 11)
 
+    def test_scan_vault_cleans_stale_tmp(self):
+        # Crashed-save leftovers die in scan_vault: a fresh zero-size
+        # package tmp (died at create) and aged nonzero tmps (both
+        # package-suffix and index-prefix shapes). A fresh nonzero tmp
+        # (in-flight save shape) survives the scan untouched.
+        live = os.path.join(self.tmp, "tmpLIVE12.tmp")
+        with open(live, "wb") as f:
+            f.write(b"z" * 16)
+        empty = os.path.join(self.tmp, "tmpEMPTY34.tmp")
+        open(empty, "wb").close()
+        aged = os.path.join(self.tmp, "tmpAGED567.tmp")
+        with open(aged, "wb") as f:
+            f.write(b"y" * 16)
+        idx = os.path.join(self.tmp, ".tmp-zz.json")
+        with open(idx, "w") as f:
+            f.write("{}")
+        ancient = time.time() - 700.0
+        os.utime(aged, (ancient, ancient))
+        os.utime(idx, (ancient, ancient))
+        vault_pkg.scan_vault(silent=True)
+        self.assertTrue(os.path.exists(live))
+        self.assertFalse(os.path.exists(empty))
+        self.assertFalse(os.path.exists(aged))
+        self.assertFalse(os.path.exists(idx))
+
     def test_normalize_names_apply(self):
         # Dry run changes nothing; apply renames G/kin-stack names,
         # backfills lineage base/kin/jr, and resolves collisions by

@@ -1,3 +1,11 @@
+import os
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BRAIN_ENGINE_DIR = os.path.join(PROJECT_ROOT, "brain_engine")
+if BRAIN_ENGINE_DIR not in sys.path:
+    sys.path.insert(0, BRAIN_ENGINE_DIR)
+
 import numpy as np
 from lif_brain import FlyBrain
 from connectome_loader import load_or_build_csr, load_or_extract_populations
@@ -6,7 +14,8 @@ from sensory_motor import SensoryEncoder, MotorDecoder
 csr = load_or_build_csr()
 pops = load_or_extract_populations()
 
-chk = np.load('../checkpoints/trained_homing_A.npz')
+chk_path = os.path.join(PROJECT_ROOT, "checkpoints", "trained_homing_A.npz")
+chk = np.load(chk_path)
 brain = FlyBrain(csr.indptr, csr.indices, chk['weights'])
 encoder = SensoryEncoder(pops)
 decoder = MotorDecoder(pops)

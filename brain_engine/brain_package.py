@@ -252,6 +252,23 @@ def _resolve(path_or_id):
 def scan_vault(silent=False):
     """Scans brains/*.flybrain, rebuilds the index, quarantines corrupt files."""
     os.makedirs(VAULT_DIR, exist_ok=True)
+    # Stale-save cleanup: crashed saves leave .tmp package bodies
+    # (mkstemp suffix ".tmp") and .tmp-*.json index bodies behind.
+    # Platform note: the zero-size rule is safe here ONLY because
+    # Windows refuses os.remove on a file another handle holds open
+    # (raises, caught below) - so an in-flight save can never match.
+    # On POSIX the same rule could unlink a live writer's tmp and
+    # break its atomic rename; do NOT port this rule as-is.
+    now = time.time()
+    for fn in os.listdir(VAULT_DIR):
+        if fn.endswith(".tmp") or fn.startswith(".tmp-"):
+            tp = os.path.join(VAULT_DIR, fn)
+            try:
+                st = os.stat(tp)
+                if st.st_size == 0 or (now - st.st_mtime) > 600:
+                    os.remove(tp)
+            except OSError:
+                pass
     records = []
     for fname in sorted(os.listdir(VAULT_DIR)):
         if not fname.endswith(PACKAGE_EXT):
