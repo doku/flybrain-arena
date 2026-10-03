@@ -1289,7 +1289,7 @@ func _fighter_rows_a(A) -> PackedStringArray:
 		"experiment": "retina_wide"}
 	var lin := {"parent_ids": ["p1"], "source": "clone:x",
 		"kin": 3, "jr": 0}
-	var tr := {"episodes": 150}
+	var tr := {"episodes": 150, "avg_score": 4.5}
 	return A._format_fighter_rows(rec, gp, lin, tr, {"p1": "Kestrel"},
 		{"spd": 4.2, "thr": 0.4, "hp": 82.0, "drift": 5.2},
 		{"kills": 1}, 0)
@@ -1301,7 +1301,7 @@ func test_fighter_rows() -> void:
 	var A = load("res://scripts/ArenaManager.gd").new()
 	var rows: PackedStringArray = _fighter_rows_a(A)
 	var text := "\n".join(rows)
-	for want in ["ELO 1350", "Battles: 12 (Wins 7, Losses 4)",
+	for want in ["ELO 1350 | Training score 4.50/ep", "Battles: 12 (Wins 7, Losses 4)",
 			"Did not finish: 1", "Knockouts: 3 (1 this match)",
 			"Matches: 4 (Won 3), Titles: 1", "Schooling: 150 episodes",
 			"Pedigree: clone of Kestrel (kin 3)",
@@ -1330,6 +1330,8 @@ func test_fighter_rows() -> void:
 	_check(heads == heads_b, "both flies same row order")
 	var text_b := "\n".join(rows_b)
 	_check(text_b.contains("Pedigree: wild"), "wild pedigree reads clean")
+	_check(text_b.contains("Training score 0.00/ep"),
+		"unschooled brain shows zero score")
 	A.free()
 
 
