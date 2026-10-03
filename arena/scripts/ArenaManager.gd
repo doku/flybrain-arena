@@ -5145,20 +5145,6 @@ func _handle_advance_result(res: Dictionary) -> void:
 			if is_instance_valid(status_label):
 				status_label.text = "TOURNAMENT COMPLETE - banking round, crown follows..."
 			return
-		if _round_bank_pending:
-			# Bank still running: review NOW (display-only bracket), crown
-			# + handoff proceed on the ack (_on_round_banked re-dispatches
-			# the stashed chain). The crown loads the champion BY ID from
-			# the vault, which turns post-round only when the bank's saves
-			# land.
-			_pending_advance = res.duplicate(true)
-			_hide_wait_bracket()
-			_hide_loading()
-			winner_overlay.visible = false
-			_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET (banking round...)" % director.champion_name())
-			if is_instance_valid(status_label):
-				status_label.text = "TOURNAMENT COMPLETE - banking round, crown follows..."
-			return
 		var champ_slot := _slot_of(champ_id)
 		_tourney_close_ack = false
 		brain_client.request_tournament_end(champ_slot, champ_id)

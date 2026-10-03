@@ -1022,8 +1022,16 @@ func test_match_batch_flow() -> void:
 	_check(not bool(A.get("_tourney_awaiting_battle")),
 		"no battle await armed")
 	_check(str(A.get("_seq_context")) == "", "no battle watchdog armed")
-	_check(not bool(A.call("_forgivable_matchbank", "M1")),
-		"empty match forgive map")
+	_check(not bool(A.call("_forgivable_roundbank", "RND-1")),
+		"empty round forgive map")
+	# Bare instance has no director, so its tournament id is "" - the
+	# forgive map matches on the same empty id plus the owed nonce.
+	A.set("_seq_forgive_roundbank", {"tournament_id": "", "match": "R1M1",
+		"battle": "RND-1"})
+	_check(bool(A.call("_forgivable_roundbank", "RND-1")),
+		"owed round nonce forgives")
+	_check(not bool(A.call("_forgivable_roundbank", "RND-2")),
+		"other nonce does not forgive")
 	A.free()
 
 

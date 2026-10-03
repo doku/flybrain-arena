@@ -813,26 +813,27 @@ func test_auto_recover_supervisor() -> void:
 
 
 func test_state_poll() -> void:
-	# Proactive desync catch: a FREE-mode server while a match bank is
+	# Proactive desync catch: a FREE-mode server while a round bank is
 	# owed arms the stored-report resend immediately (no 240 s cycle).
 	arena.tournament_active = true
-	arena._seq_context = "matchbank"
-	arena._tourney_awaiting_matchbank = true
-	arena._pending_matchbank_resend = false
-	arena._seq_last_match_report = {"match_winner": "alpha",
-		"tournament_id": "T1", "match": "R1M1", "match_id": "M1",
-		"partial": false, "battles": []}
+	arena._seq_context = "roundbank"
+	arena._tourney_awaiting_roundbank = true
+	arena._pending_roundbank_resend = false
+	arena._seq_last_round_report = {"tournament_id": "T1",
+		"match": "R1M1", "round_nonce": "RND-1", "matches": []}
 	arena._server_reloads = 0
 	arena._recover_in_flight = false
 	arena._on_server_state(false, "", "")
-	_check(arena._pending_matchbank_resend, "FREE-mode poll arms resend")
+	_check(arena._pending_roundbank_resend, "FREE-mode poll arms resend")
 	_check(arena._server_reloads == 1, "poll recovery counted")
-	# Tournament-mode reply: attribution only, no recovery.
-	arena._pending_matchbank_resend = false
+	# Tournament-mode reply with the bank still owed: attribution
+	# only, no recovery (mode - not the cleared context - decides).
+	arena._seq_context = "roundbank"
+	arena._pending_roundbank_resend = false
 	arena._server_reloads = 0
 	arena._recover_in_flight = false
 	arena._on_server_state(true, "T1", "R1M1")
-	_check(not arena._pending_matchbank_resend, "healthy poll is inert")
+	_check(not arena._pending_roundbank_resend, "healthy poll is inert")
 	_check(arena._server_reloads == 0, "healthy poll counts nothing")
 	arena._seq_context = ""
 
