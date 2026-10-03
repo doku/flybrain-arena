@@ -2385,11 +2385,13 @@ func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
 	# figures ride the bracket snapshot (frozen at build, refreshed per
 	# match load); live figures update on change.
 	var lines := PackedStringArray()
-	# Training score rides the ELO row (per-episode average, comparable
-	# across brains with different episode counts; 0.00 = never
-	# schooled - the Schooling row below carries the episode count).
+	# Training score rides the ELO row: recent form (mean over the
+	# last RECENT_EPISODES training episodes), so post-training
+	# improvement shows instead of the lifetime average. 0.00 = no
+	# stamped recent form yet (pre-ring brains populate on their next
+	# training stamp); the Schooling row below carries context.
 	lines.append("ELO %d | Training score %.2f/ep" % [
-		int(rec.get("elo", 1200.0)), float(tr.get("avg_score", 0.0))])
+		int(rec.get("elo", 1200.0)), float(tr.get("recent_avg", 0.0))])
 	lines.append("Battles: %d (Wins %d, Losses %d)" % [
 		int(rec.get("battles", 0)), int(rec.get("wins", 0)),
 		int(rec.get("losses", 0))])

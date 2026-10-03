@@ -677,6 +677,31 @@ class TestSensoryMotor(unittest.TestCase):
         self.assertAlmostEqual(merged["score"], 200.0)
         self.assertAlmostEqual(merged["avg_score"], 4.0)
 
+    def test_stamp_recent_form(self):
+        # Recent form = exact mean over the last RECENT_EPISODES banked
+        # episodes. Filling each banked episode with its session mean
+        # keeps the window sum exact at session granularity.
+        import train_job
+        import brain_package as vault
+        r = vault.new_record("RecentTest")
+        vault.log_training_session(r, 25, {}, "s1")
+        train_job.stamp_train_score(r, {"score": 50.0, "episodes": 25})
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 2.0)
+        vault.log_training_session(r, 25, {}, "s2")
+        train_job.stamp_train_score(r, {"score": 150.0, "episodes": 25})
+        # Window (20) holds only the second session: all 6.0.
+        self.assertEqual(len(r["training"]["recent"]), 20)
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 6.0)
+        # A short hot session blends with the tail of the last one:
+        # 10x6.0 + 10x10.0 over the 20-ep window = 8.0.
+        vault.log_training_session(r, 10, {}, "s3")
+        train_job.stamp_train_score(r, {"score": 100.0, "episodes": 10})
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 8.0)
+        # Degenerate stamp leaves the ring alone.
+        train_job.stamp_train_score(r, {"score": 5.0, "episodes": 0})
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 8.0)
+        self.assertEqual(len(r["training"]["recent"]), 20)
+
     def test_odor_habituation(self):
         # Sustained strong odor adapts the drive down (bounded by the
         # floor); clean air recovers slowly; the floor zone never adapts.

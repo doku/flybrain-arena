@@ -238,7 +238,8 @@ def stamp_scenario_scores(record, by_scenario):
 def stamp_train_score(record, summary):
     """Banks the pre-training score on the record: score accumulates
     across training sessions (like episodes), avg_score is recomputed
-    over cumulative episodes, and per-scenario cells accumulate into
+    over cumulative episodes, recent form tracks the last
+    RECENT_EPISODES episodes, and per-scenario cells accumulate into
     training["scenario_scores"] when the summary carries them.
     Pre-score records (no score key) tolerate missing summaries (score
     unchanged). Returns the record."""
@@ -249,8 +250,31 @@ def stamp_train_score(record, summary):
     training["score"] = float(training.get("score", 0.0)) + gained
     episodes = int(training.get("episodes", 0))
     training["avg_score"] = (float(training["score"]) / max(episodes, 1))
+    session_eps = int(summary.get("episodes", 0) or 0)
+    if session_eps > 0:
+        _roll_recent_form(training, session_eps,
+                          gained / max(session_eps, 1))
     stamp_scenario_scores(record, summary.get("by_scenario"))
     return record
+
+
+RECENT_EPISODES = 20  # recent-form window: mean over the last N eps.
+
+
+def _roll_recent_form(training, session_episodes, session_avg):
+    # Exact window mean: filling each banked episode with its session
+    # mean keeps the window sum exact (within-session variance is
+    # invisible at this granularity - the stamping layer only ever
+    # sees session totals). Degenerate sessions (0 eps) never reach
+    # here; legacy rings self-heal to a list below.
+    ring = training.get("recent")
+    if not isinstance(ring, list):
+        ring = []
+    ring.extend([float(session_avg)] * int(session_episodes))
+    del ring[:-RECENT_EPISODES]
+    training["recent"] = ring
+    if ring:
+        training["recent_avg"] = sum(ring) / len(ring)
 
 
 def generate_and_train(name, episodes, params=None, progress_cb=None):

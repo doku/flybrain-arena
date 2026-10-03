@@ -1289,7 +1289,7 @@ func _fighter_rows_a(A) -> PackedStringArray:
 		"experiment": "retina_wide"}
 	var lin := {"parent_ids": ["p1"], "source": "clone:x",
 		"kin": 3, "jr": 0}
-	var tr := {"episodes": 150, "avg_score": 4.5}
+	var tr := {"episodes": 150, "avg_score": 4.5, "recent_avg": 5.0}
 	return A._format_fighter_rows(rec, gp, lin, tr, {"p1": "Kestrel"},
 		{"spd": 4.2, "thr": 0.4, "hp": 82.0, "drift": 5.2},
 		{"kills": 1}, 0)
@@ -1301,7 +1301,7 @@ func test_fighter_rows() -> void:
 	var A = load("res://scripts/ArenaManager.gd").new()
 	var rows: PackedStringArray = _fighter_rows_a(A)
 	var text := "\n".join(rows)
-	for want in ["ELO 1350 | Training score 4.50/ep", "Battles: 12 (Wins 7, Losses 4)",
+	for want in ["ELO 1350 | Training score 5.00/ep", "Battles: 12 (Wins 7, Losses 4)",
 			"Did not finish: 1", "Knockouts: 3 (1 this match)",
 			"Matches: 4 (Won 3), Titles: 1", "Schooling: 150 episodes",
 			"Pedigree: clone of Kestrel (kin 3)",

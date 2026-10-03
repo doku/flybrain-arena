@@ -299,7 +299,7 @@ def cmd_score(a):
             _np.asarray(weights, dtype=_np.float32)))
     except Exception:
         same_weights = False
-    stamp_train_score(cur_rec, {"score": gained,
+    stamp_train_score(cur_rec, {"score": gained, "episodes": eps,
                                 "by_scenario": summary.get("by_scenario",
                                                            {})})
     tr = cur_rec.setdefault("training", {})

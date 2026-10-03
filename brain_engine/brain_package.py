@@ -86,7 +86,7 @@ def new_record(name, params=None):
                  "matches": 0, "matches_won": 0, "matches_lost": 0,
                  "tournaments_won": 0, "elo": ELO_DEFAULT},
         "training": {"episodes": 0, "sessions": [], "score": 0.0,
-                     "avg_score": 0.0},
+                     "avg_score": 0.0, "recent": [], "recent_avg": 0.0},
         "lineage": {"parent_ids": [], "source": "generated"},
     }
 
