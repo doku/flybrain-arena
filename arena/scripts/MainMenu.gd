@@ -7,6 +7,11 @@ const BracketView = preload("res://scripts/TournamentBracket.gd")
 
 var brains: Array = []
 var selected_brain: Dictionary = {}
+# Second roster view (training page picker): same brains index space
+# as brain_list, so one selection handler serves both. Guarded sync
+# keeps the two visuals mirrors without handler recursion.
+var train_brain_list: ItemList
+var _syncing_selection := false
 
 var brain_list: ItemList
 var detail_label: Label
@@ -495,6 +500,17 @@ func _build_gen_column() -> HBoxContainer:
 	page.add_theme_constant_override("separation", 16)
 	page.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	var c := _col("GENERATE")
+	# Brain picker: the training page needs its own roster view -
+	# without it nothing can be selected for GENERATE+TRAIN below.
+	# Same order as the vault list (shared index space, one handler).
+	var pick_head := Label.new()
+	pick_head.text = "Brain to train:"
+	pick_head.add_theme_font_size_override("font_size", 13)
+	c.add_child(pick_head)
+	train_brain_list = ItemList.new()
+	train_brain_list.custom_minimum_size = Vector2(0, 90)
+	train_brain_list.item_selected.connect(_on_brain_selected)
+	c.add_child(train_brain_list)
 	var nrow := HBoxContainer.new()
 	var nl := Label.new()
 	nl.text = "Name"
@@ -1024,7 +1040,19 @@ func refresh_vault(force: bool = false) -> void:
 		return
 	_refresh_pending = false
 	brains = TournamentDirector.list_brains_cached()
+	_fill_brain_lists()
+	_refresh_archive()
+	_update_bracket_preview()
+
+
+func _fill_brain_lists() -> void:
+	# Roster views off the shared brains array: vault list (full
+	# detail lines), training-page picker (compact lines, same order
+	# so both lists share the selection index space), tournament
+	# participants. Selection restores by brain id (a refresh must not
+	# lose the user's pick); first brain only when nothing was picked.
 	brain_list.clear()
+	train_brain_list.clear()
 	player_list.clear()
 	for b in brains:
 		var r: Dictionary = b.get("record", {})
@@ -1036,14 +1064,26 @@ func refresh_vault(force: bool = false) -> void:
 			int(r.get("elo", 1200.0)), score]
 
 		brain_list.add_item(line)
+		train_brain_list.add_item("%s  [elo %d]" % [str(b.get("name", "?")),
+			int(r.get("elo", 1200.0))])
 		var brec: Dictionary = b.get("record", {})
 		player_list.add_item("%s  [elo %d]" % [str(b.get("name", "?")),
 			int(brec.get("elo", 1200.0))])
-	if not brains.is_empty() and selected_brain.is_empty():
-		brain_list.select(0)
-		_on_brain_selected(0)
-	_refresh_archive()
-	_update_bracket_preview()
+	var sel := -1
+	if not selected_brain.is_empty():
+		var sid := str(selected_brain.get("id", ""))
+		for i in brains.size():
+			if str((brains[i] as Dictionary).get("id", "")) == sid:
+				sel = i
+				break
+	if sel < 0 and not brains.is_empty():
+		sel = 0
+	if sel >= 0:
+		_syncing_selection = true
+		brain_list.select(sel)
+		train_brain_list.select(sel)
+		_syncing_selection = false
+		_on_brain_selected(sel)
 
 
 func _archive_tooltip(e: Dictionary) -> String:
@@ -1134,6 +1174,8 @@ func _on_archive_delete_confirmed(arch_id: String, arch_name: String) -> void:
 
 
 func _on_brain_selected(idx: int) -> void:
+	if _syncing_selection:
+		return
 	if idx < 0 or idx >= brains.size():
 		return
 	selected_brain = brains[idx]
@@ -1170,6 +1212,14 @@ func _on_brain_selected(idx: int) -> void:
 		"mp": mv_text,
 		"lin": str(selected_brain.get("lineage", {}).get("source", "?"))})
 	_prefill_train_widgets(p)
+	# Mirror the pick in both roster lists (vault page + training
+	# page picker share the brains index space).
+	_syncing_selection = true
+	if is_instance_valid(brain_list):
+		brain_list.select(idx)
+	if is_instance_valid(train_brain_list):
+		train_brain_list.select(idx)
+	_syncing_selection = false
 
 
 func _gen_params() -> Dictionary:

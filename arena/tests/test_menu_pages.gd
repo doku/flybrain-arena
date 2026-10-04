@@ -88,9 +88,55 @@ func _process(_delta: float) -> bool:
 	var srow: Control = menu.sound_palette_pick.get_parent()
 	_check(srow.get_combined_minimum_size().x <= 900.0,
 		"SOUND row stays bounded without voice names")
+	test_train_picker()
 	if failures == 0:
 		print("ALL MENU-PAGE TESTS PASSED")
 	else:
 		printerr("MENU-PAGE TESTS: %d FAILURES" % failures)
 	quit(failures)
 	return true
+
+
+func _fake_brains() -> Array:
+	return [{"id": "a1", "name": "Alpha",
+			"record": {"matches": 3, "matches_won": 2, "matches_lost": 1,
+				"tournaments_won": 0, "elo": 1300.0},
+			"training": {"recent_avg": 4.0},
+			"generator_params": {}},
+		{"id": "b2", "name": "Beta",
+			"record": {"matches": 1, "matches_won": 0, "matches_lost": 1,
+				"tournaments_won": 0, "elo": 1200.0},
+			"training": {"recent_avg": 0.0},
+			"generator_params": {}}]
+
+
+func test_train_picker() -> void:
+	# Training page roster: same brains, same order as the vault list
+	# (shared index space, one handler); picking in either list shows
+	# in both; refills follow the brain id, never the row.
+	menu.brains = _fake_brains()
+	menu.selected_brain = {}
+	menu._fill_brain_lists()
+	_check(menu.train_brain_list.item_count == 2, "picker fills with vault")
+	_check(menu.brain_list.item_count == 2, "vault list fills")
+	_check(str(menu.selected_brain.get("id", "")) == "a1",
+		"first brain auto-selected")
+	_check(Array(menu.train_brain_list.get_selected_items()) == [0]
+		and Array(menu.brain_list.get_selected_items()) == [0],
+		"both lists show the pick")
+	menu._on_brain_selected(1)
+	_check(str(menu.selected_brain.get("id", "")) == "b2",
+		"picker index selects the brain")
+	_check(Array(menu.train_brain_list.get_selected_items()) == [1]
+		and Array(menu.brain_list.get_selected_items()) == [1],
+		"vault list mirrors the picker")
+	# Refill with the pick moved: visual follows the id, not the row.
+	menu.brains = [_fake_brains()[1], _fake_brains()[0]]
+	menu._fill_brain_lists()
+	_check(str(menu.selected_brain.get("id", "")) == "b2",
+		"selection survives refill")
+	_check(Array(menu.train_brain_list.get_selected_items()) == [0]
+		and Array(menu.brain_list.get_selected_items()) == [0],
+		"visuals follow the id")
+	var h: float = (menu._menu_pages[1] as Control).get_combined_minimum_size().y
+	_check(h <= 439.0, "training page still fits (%.0fpx)" % h)
