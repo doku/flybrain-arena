@@ -369,7 +369,7 @@ def score_correlation_rows(records, min_battles=5, min_eps=4,
     overall = _pearson(
         [float((b.get("record", {}) or {}).get("elo", vault.ELO_DEFAULT))
          for b in brains],
-        [float((b.get("training", {}) or {}).get("avg_score", 0.0))
+        [float((b.get("training", {}) or {}).get("recent_avg", 0.0))
          for b in brains])
     return rows, overall, len(brains)
 
@@ -389,7 +389,7 @@ def cmd_score_correlations(a):
     for row in rows:
         text += ("  %(family)-8s n=%(n)3d r=%(pearson_vs_elo)+.3f "
                  "mult=%(suggested_mult).2f\n") % row
-    text += "overall avg_score vs elo r=%+.3f over %d brains" % (
+    text += "overall recent_avg vs elo r=%+.3f over %d brains" % (
         overall, n)
     print(text, flush=True)
     return out({"ok": True, "rows": rows, "overall_r": round(overall, 3),

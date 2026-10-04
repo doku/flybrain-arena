@@ -7355,8 +7355,8 @@ func _gallery_card(pid: String, pname: String) -> Dictionary:
 		int(r.get("matches", 0)), int(r.get("matches_won", 0)),
 		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
 		int(r.get("wander", 0))]
-	var schooled := "Episodes %d · Avg %.2f/ep (total %.1f)" % [
-		teps, float(t.get("avg_score", 0.0)), tscore]
+	var schooled := "Episodes %d · Recent %.2f/ep (total %.1f)" % [
+		teps, float(t.get("recent_avg", 0.0)), tscore]
 	var rows := "%s\n%s\n%s\n%s\n%s" % [fights, schooled, wiring,
 		traits, _inheritance_line(rec)]
 	var rear := _rearing_line(rec)

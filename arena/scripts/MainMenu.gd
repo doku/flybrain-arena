@@ -1029,8 +1029,8 @@ func refresh_vault(force: bool = false) -> void:
 	for b in brains:
 		var r: Dictionary = b.get("record", {})
 		var t: Dictionary = b.get("training", {})
-		var score: float = float(t.get("score", 0.0))
-		var line := "%s  (M%d W%d/L%d T%d) [elo %d] [score %.0f]" % [str(b.get("name", "?")),
+		var score: float = float(t.get("recent_avg", 0.0))
+		var line := "%s  (M%d W%d/L%d T%d) [elo %d] [form %.1f]" % [str(b.get("name", "?")),
 			int(r.get("matches", 0)), int(r.get("matches_won", 0)),
 			int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
 			int(r.get("elo", 1200.0)), score]
@@ -1149,10 +1149,10 @@ func _on_brain_selected(idx: int) -> void:
 	var gid := str(p.get("genome_id", ""))
 	var gtext := "genome " + gid if gid != "" else _mix_text(p.get("experiment", "base"))
 	var score: float = float(t.get("score", 0.0))
-	var avg: float = float(t.get("avg_score", 0.0))
+	var avg: float = float(t.get("recent_avg", 0.0))
 	detail_label.text = ("{name}  [{id}]\nBattles {b} (W{l} L{lo} D{d}) | " + \
 		"Matches {m} (W{mw} L{ml}) | Titles {t} | ELO {elo}\nEpisodes {e} in {s} sessions | " + \
-		"pre-train score {sc} (avg {asc}/ep)\n" + \
+		"pre-train score {sc} (recent {asc}/ep)\n" + \
 		"variant {v} seed {sd} lr {lr} gain {g} ev {ev} wiring {x} map {mp} yb {yb}\nlineage: {lin}").format({
 		"name": str(selected_brain.get("name", "?")), "id": str(selected_brain.get("id", "?")),
 		"b": int(r.get("battles", 0)), "l": int(r.get("wins", 0)),

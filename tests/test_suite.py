@@ -633,7 +633,7 @@ class TestSensoryMotor(unittest.TestCase):
             recs.append({"id": "b%d" % i, "name": "B%d" % i,
                          "record": {"elo": elo, "battles": 10},
                          "training": {"episodes": 50, "score": 100.0,
-                                      "avg_score": 2.0,
+                                      "avg_score": 2.0, "recent_avg": 2.0,
                                       "scenario_scores": {
                                           "DUEL": {"score": 4.0 * (i + 1),
                                                    "episodes": 10},
