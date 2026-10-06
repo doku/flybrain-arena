@@ -542,8 +542,13 @@ func _make_last_place_card(last_name: String, tourney: Dictionary) -> PanelConta
 	vb.add_child(head)
 	var nm := Label.new()
 	nm.text = last_name
-	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	# Left-aligned in a card-bounded rect: long names clip the tail
+	# (prefix survives, like match rows). Centered text would overdraw
+	# the card edge on both sides and lose both ends of the name.
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	nm.clip_text = true
+	nm.custom_minimum_size = Vector2(CARD_W - 16.0, 0.0)
+	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nm.add_theme_font_size_override("font_size", FS_BIG_NAME)
 	nm.add_theme_color_override("font_color", COL_LOSER if decided else COL_TBD)
 	vb.add_child(nm)
@@ -772,8 +777,12 @@ func _make_champ_card(champ_name: String, tourney: Dictionary) -> PanelContainer
 	vb.add_child(head)
 	var nm := Label.new()
 	nm.text = champ_name
-	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	# Same card-bounded left-aligned rule as the last-place card:
+	# centered long names overdraw the border and read clipped.
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	nm.clip_text = true
+	nm.custom_minimum_size = Vector2(CARD_W - 16.0, 0.0)
+	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nm.add_theme_font_size_override("font_size", FS_BIG_NAME)
 	nm.add_theme_color_override("font_color", COL_CHAMP if decided else COL_TBD)
 	vb.add_child(nm)

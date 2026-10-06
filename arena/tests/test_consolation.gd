@@ -354,6 +354,54 @@ func test_review_shows_main_only() -> void:
 	R.queue_free()
 
 
+func test_champ_name_card_bounded() -> void:
+	# Long champion names must read prefix-first inside the card:
+	# left-aligned in a card-bounded rect (centered text overdraws the
+	# card edge and clips away both ends of the name).
+	var R = load("res://scripts/TournamentBracket.gd").new()
+	var D = _new_director()
+	var brains := [_fake("f-long-champion-name-that-overflows-the-card"),
+		_fake("f2"), _fake("f3"), _fake("f4")]
+	D.build_bracket(_ids(brains), 4, 1, 0.5, 40.0, false, brains)
+	# Rig the long name to the title: whoever holds its slot wins.
+	var guard := 0
+	while guard < 20:
+		guard += 1
+		var m: Dictionary = D.current_match()
+		if m.is_empty():
+			break
+		if str(m.get("winner_id", "")) == "" \
+				and not bool(m.get("bye", false)) \
+				and not bool(m.get("vacant", false)):
+			var slot := "alpha" if str(m.get("a_id", "")) == "f-long-champion-name-that-overflows-the-card" else "beta"
+			_fight_current(D, slot)
+		var adv = D.advance_after_match()
+		if str((adv as Dictionary).get("action", "")) == "tournament_end":
+			break
+	_check(str(D.tourney.get("champion_id", "")) == "f-long-champion-name-that-overflows-the-card",
+		"rigged final crowns the long name")
+	R.render_bracket(D.tourney, -1, -1)
+	var found := false
+	for c in R.get_children():
+		if not (c is PanelContainer):
+			continue
+		var vb = (c as PanelContainer).get_child(0)
+		var labels: Array = []
+		for k in vb.get_children():
+			if k is Label:
+				labels.append(k)
+		if labels.size() == 2 and str((labels[0] as Label).text) == "CHAMPION":
+			found = true
+			var nm := labels[1] as Label
+			_check((nm as Label).horizontal_alignment == HORIZONTAL_ALIGNMENT_LEFT,
+				"champion name left-aligned (prefix survives)")
+			_check((nm as Label).clip_text, "champion name clips inside the card")
+			_check((nm as Label).custom_minimum_size.x <= R.CARD_W - 16.0 + 0.01,
+				"champion name rect fits the card width")
+	_check(found, "champion card present in review render")
+	R.queue_free()
+
+
 func _cleanup() -> void:
 	if DirAccess.dir_exists_absolute("user://test_consolation"):
 		for f in DirAccess.get_files_at("user://test_consolation"):
@@ -384,6 +432,7 @@ func _initialize() -> void:
 	test_focus_losers()
 	test_bracket_views()
 	test_review_shows_main_only()
+	test_champ_name_card_bounded()
 	_cleanup()
 	if failures == 0:
 		print("ALL CONSOLATION TESTS PASSED")
