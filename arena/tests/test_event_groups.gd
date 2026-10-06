@@ -1361,6 +1361,24 @@ func test_fighter_rows_pedigrees() -> void:
 	A.free()
 
 
+func test_preview_group_row() -> void:
+	# Intermission header roster: all fighters side-by-side in ONE
+	# row (never stacked), unknown ids raw, empty group empty.
+	var A = load("res://scripts/ArenaManager.gd").new()
+	var row: String = A._preview_group_row(
+		["a", "b", "c", "d"],
+		{"a": "Alpha (1300)", "b": "Beta (1250)",
+			"c": "Gamma (1190)", "d": "Delta (1310)"})
+	_check(not row.contains("\n"), "roster is one row")
+	for want in ["Alpha (1300)", "Beta (1250)", "Gamma (1190)",
+			"Delta (1310)"]:
+		_check(row.contains(want), "row names: " + want)
+	_check(A._preview_group_row(["zz"], {}) == "zz",
+		"unknown id passes through raw")
+	_check(A._preview_group_row([], {}) == "", "empty group empty row")
+	A.free()
+
+
 func test_wander_dock() -> void:
 	# Overtime dock: 4 HP per drift meter, cap 50, floor zero.
 	var A = load("res://scripts/ArenaManager.gd").new()
@@ -1463,6 +1481,7 @@ func _initialize() -> void:
 	test_showcase_overview()
 	test_fighter_rows()
 	test_fighter_rows_pedigrees()
+	test_preview_group_row()
 	test_wander_dock()
 	test_timeout_winner()
 	_cleanup()

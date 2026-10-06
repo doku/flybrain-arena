@@ -876,6 +876,13 @@ func _build_bracket_overlay() -> void:
 	intermission_label = Label.new()
 	intermission_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	intermission_label.add_theme_font_size_override("font_size", 16)
+	# Dedicated top-margin band for the preview row: wraps (the
+	# side-by-side names must fold, never run off-edge) with a fixed
+	# two-row floor, so the per-second countdown rewrites never resize
+	# or reflow the bracket below. Same minimum-size-rows pattern as
+	# the wait header above.
+	intermission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	intermission_label.custom_minimum_size = Vector2(0, 52)
 	intermission_row.add_child(intermission_label)
 	var skip_btn := Button.new()
 	skip_btn.text = "SKIP WAIT"
@@ -5759,6 +5766,9 @@ func _event_build_final(ev: Dictionary) -> bool:
 
 func _event_preview_sub(upcoming: String) -> String:
 	# One glance at what's next: group card or final QF pairs + bench.
+	# Group fighters render side-by-side in one row (a vertical stack
+	# squeezed the bracket); final QF pairings keep one line per pair
+	# (short, structured).
 	var director := _director()
 	if director == null:
 		return ""
@@ -5782,10 +5792,22 @@ func _event_preview_sub(upcoming: String) -> String:
 			var bd := b as Dictionary
 			by_id[str(bd.get("id", ""))] = "%s (%d)" % [str(bd.get("name", "?")),
 				int((bd.get("record", {}) as Dictionary).get("elo", 1200.0))]
-		for pid in (g.get("players", []) as Array):
-			lines.append(str(by_id.get(str(pid), str(pid))))
+		var row := _preview_group_row(
+			(g.get("players", []) as Array), by_id)
+		if row != "":
+			lines.append(row)
 	lines.append(_pool_text(ev))
 	return "\n".join(lines)
+
+
+static func _preview_group_row(players: Array, by_id: Dictionary) -> String:
+	# One horizontal roster row for the intermission header: every
+	# fighter side-by-side ("Name (elo) | ..."), never stacked. Pure
+	# (unit-tested); unknown ids pass through raw like before.
+	var row := PackedStringArray()
+	for pid in players:
+		row.append(str(by_id.get(str(pid), str(pid))))
+	return " | ".join(row)
 
 
 func _event_is_fresh() -> bool:

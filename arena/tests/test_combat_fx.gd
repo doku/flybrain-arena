@@ -659,6 +659,17 @@ func test_stats_survive_perf_off() -> void:
 	_check(arena.pip_stats_alpha.visible, "stats restore when renders return")
 	_check(arena._pip_hidden == false, "hidden latch clears on return")
 
+func test_intermission_header_band() -> void:
+	# Dedicated top-margin band for the preview row: wraps (long rows
+	# fold, never run off-edge) with a fixed floor, so per-second
+	# countdown rewrites never resize the bracket below.
+	arena._build_bracket_overlay()
+	_check(arena.intermission_label.autowrap_mode != TextServer.AUTOWRAP_OFF,
+		"header wraps")
+	_check(arena.intermission_label.custom_minimum_size.y >= 50.0,
+		"header band has a fixed floor")
+	_check(not arena.intermission_row.visible, "header hidden until used")
+
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
@@ -1010,6 +1021,7 @@ func _process(_delta: float) -> bool:
 	test_idle_not_cached()
 	test_match_ready_refuses_ghosts()
 	test_stats_survive_perf_off()
+	test_intermission_header_band()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()
