@@ -6631,6 +6631,331 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(la2["record"]["battles"], 1)
         self.assertEqual(la2["record"]["matches"], 1)
 
+    def _group_reset(self):
+        self.srv._group_pinned.clear()
+        self.srv._group_pinned.update({"tournament_id": "", "brains": {}})
+        for f in (self.srv._pending_group_path(),):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    def _group_isolate(self):
+        # Hermetic tournaments dir per test: group journals/verdicts
+        # must never touch the live dir (a running server recovers
+        # foreign journals on every message - a TOCTOU race that flaked
+        # these tests). Runs even on failure via addCleanup.
+        import tempfile
+        import shutil
+        self._real_tourn = self.srv.TOURNAMENTS_DIR
+        self._group_tmp = tempfile.mkdtemp(prefix="group_txn_")
+        self.srv.TOURNAMENTS_DIR = self._group_tmp
+        self._group_reset()
+        self.addCleanup(self._group_unisolate)
+
+    def _group_unisolate(self):
+        import shutil
+        self._group_reset()
+        self.srv.TOURNAMENTS_DIR = self._real_tourn
+        shutil.rmtree(self._group_tmp, ignore_errors=True)
+
+    def _group_fakes(self):
+        class _FakeSock:
+            def __init__(self):
+                self.sent = {}
+            def sendto(self, data, addr):
+                self.sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+        return _FakeSock(), _FakeRL(), _FakeEvo()
+
+    def _group_battle(self, bid, winner):
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+        return {"battle_id": bid, "draw": False, "draw_penalty": False,
+                "end_reason": "ko",
+                "verdict": {"winner_slot": winner, "blow_source": "thorax",
+                            "blow_amount": 80.0, "loser_slot": "beta"},
+                "stats_a": {"kills": 1}, "stats_b": {"kills": 0},
+                "sens_a": sens, "sens_b": sens,
+                "ctrl_a": ctrl, "ctrl_b": ctrl}
+
+    def _group_match(self, mid, winner, ra, rb, nb=1):
+        return {"match_id": mid, "match_winner": winner,
+                "alpha_id": ra["id"], "beta_id": rb["id"],
+                "alpha_path": vault_pkg.package_path(ra),
+                "beta_path": vault_pkg.package_path(rb),
+                "battles": [self._group_battle(
+                    "%s-B%d" % (mid, i + 1), winner)
+                    for i in range(nb)]}
+
+    def _group_round(self, srv, sock, rl, evo, csr, pops, nonce, tid,
+                     match, matches):
+        msg = {"round_nonce": nonce, "tournament_id": tid, "match": match,
+               "matches": matches, "group": True}
+        srv._handle_round_report(
+            sock, ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": tid, "match": match},
+            0.5, True, evo, rl, 1.0, lambda: "tourney T match",
+            csr, pops, {}, None)
+        return json.loads(sock.sent["data"].decode("utf-8"))
+
+    def test_handle_group_round_pins_without_saving(self):
+        # Group rounds pin brains in RAM and journal records-only: the
+        # ack flows, vault weight files stay untouched, records bank.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpA", "GrpB", "GrpC", "GrpD"], wbasis)
+        before = {}
+        for r in (ra, rb, rc, rd):
+            p = vault_pkg.package_path(r)
+            with open(p, "rb") as f:
+                before[r["id"]] = (os.path.getmtime(p), f.read())
+        sock, rl, evo = self._group_fakes()
+        body = self._group_round(
+            self.srv, sock, rl, evo, csr, pops, "RND-G1", "TG", "R1M1",
+            [self._group_match("M1", "alpha", ra, rb),
+             self._group_match("M2", "beta", rc, rd)])
+        self.assertEqual(body["status"], "round_banked")
+        self.assertEqual(len(body["matches"]), 2)
+        # No weight save: package bytes + mtimes identical.
+        for r in (ra, rb, rc, rd):
+            p = vault_pkg.package_path(r)
+            with open(p, "rb") as f:
+                self.assertEqual(
+                    (os.path.getmtime(p), f.read()), before[r["id"]])
+        # Records banked via the cheap record flush.
+        la, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(
+            (la["record"]["battles"], la["record"]["wins"]), (1, 1))
+        # Session pinned all four; inputs journal holds the round.
+        self.assertEqual(self.srv._group_pinned["tournament_id"], "TG")
+        self.assertEqual(len(self.srv._group_pinned["brains"]), 4)
+        doc = self.srv._group_inputs_read()
+        self.assertEqual(doc["tournament_id"], "TG")
+        self.assertEqual(len(doc["rounds"]), 1)
+        self.assertEqual(len(doc["pregroup"]), 4)
+        # Verdict slot holds this round (retry contract intact).
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["battle_id"], "RND-G1")
+        self._group_reset()
+
+    def test_handle_group_round_resend_dedup(self):
+        # Same round twice: second is a stored resend (records never
+        # double-bank); a second round accumulates onto pinned state.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpE", "GrpF", "GrpG", "GrpH"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        mk = lambda: [self._group_match("M1", "alpha", ra, rb),
+                      self._group_match("M2", "beta", rc, rd)]
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G2", "TG", "R2M1", mk())
+        la, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la["record"]["battles"], 2)
+        self.assertEqual(len(self.srv._group_inputs_read()["rounds"]), 2)
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        la2, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la2["record"]["battles"], 2)
+        self._group_reset()
+
+    def test_handle_group_report_seals_once(self):
+        # Group seal: one save set (weights land), journal removed,
+        # session cleared, verdict keyed by group nonce; resend replays
+        # nothing.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpI", "GrpJ", "GrpK", "GrpL"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        mk = lambda: [self._group_match("M1", "alpha", ra, rb),
+                      self._group_match("M2", "beta", rc, rd)]
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+
+        class _Sock2:
+            def __init__(self):
+                self.sent = {}
+            def sendto(self, data, addr):
+                self.sent["data"] = data
+        sock2 = _Sock2()
+        self.srv._handle_group_report(
+            sock2, ("127.0.0.1", 1),
+            {"group_nonce": "GRP-1", "tournament_id": "TG",
+             "group": "D"},
+            {"rec": None}, {"rec": None},
+            {"tournament_id": "TG", "match": "R1M1"}, 0.5, evo, rl,
+            1.0, lambda: "tourney T match", csr, pops, {}, None)
+        body = json.loads(sock2.sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "group_banked")
+        self.assertEqual(body["fighters"], 4)
+        self.assertFalse(os.path.exists(self.srv._pending_group_path()))
+        self.assertEqual(self.srv._group_pinned["brains"], {})
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["battle_id"], "GRP-1")
+        mtimes = {}
+        for r in (ra, rb, rc, rd):
+            mtimes[r["id"]] = os.path.getmtime(
+                vault_pkg.package_path(r))
+        self.srv._handle_group_report(
+            sock2, ("127.0.0.1", 1),
+            {"group_nonce": "GRP-1", "tournament_id": "TG",
+             "group": "D"},
+            {"rec": None}, {"rec": None},
+            {"tournament_id": "TG", "match": "R1M1"}, 0.5, evo, rl,
+            1.0, lambda: "tourney T match", csr, pops, {}, None)
+        for r in (ra, rb, rc, rd):
+            self.assertEqual(mtimes[r["id"]],
+                             os.path.getmtime(vault_pkg.package_path(r)))
+        self._group_reset()
+
+    def test_handle_group_rebuild_after_restart(self):
+        # Restart mid-group (session wiped, journal survives): the next
+        # round rebuilds deterministically, then processes normally; a
+        # stale pre-restart round resends stored instead of replaying.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpM", "GrpN", "GrpO", "GrpP"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        mk = lambda: [self._group_match("M1", "alpha", ra, rb),
+                      self._group_match("M2", "beta", rc, rd)]
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        # Simulated restart: RAM session gone, files persist.
+        self.srv._group_pinned.clear()
+        self.srv._group_pinned.update({"tournament_id": "", "brains": {}})
+        body = self._group_round(
+            self.srv, sock, rl, evo, csr, pops, "RND-G2", "TG", "R2M1",
+            mk())
+        self.assertEqual(body["status"], "round_banked")
+        la, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la["record"]["battles"], 2)
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        la2, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la2["record"]["battles"], 2)
+        self._group_reset()
+
+    def test_group_matches_round_banking(self):
+        # Equivalence: pinned group banking == per-round banking.
+        # Same scripted rounds, same initial weights, REAL dopamine +
+        # ELO: final weights identical per fighter, records identical.
+        from dopamine_learning import DopamineReinforcement
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ga, gb, gc, gd = self._round_fighters(
+            ["EqA", "EqB", "EqC", "EqD"], wbasis)
+        ca, cb, cc, cd = self._round_fighters(
+            ["EqW", "EqX", "EqY", "EqZ"], wbasis)
+        sock, _, evo = self._group_fakes()
+        note = lambda: "tourney T match"
+        rl_g = DopamineReinforcement(pops)
+
+        def _run(nonce, tid, match, pairs, rl, group):
+            msg = {"round_nonce": nonce, "tournament_id": tid,
+                   "match": match, "matches": [
+                       self._group_match(mid, w, ra, rb)
+                       for mid, w, ra, rb in pairs]}
+            if group:
+                msg["group"] = True
+            self.srv._handle_round_report(
+                sock, ("127.0.0.1", 1), msg, {"rec": None},
+                {"rec": None}, {"tournament_id": tid, "match": match},
+                0.5, True, evo, rl, 1.0, note, csr, pops, {}, None)
+            return json.loads(sock.sent["data"].decode("utf-8"))
+
+        pairs_g = [("M1", "alpha", ga, gb), ("M2", "beta", gc, gd)]
+        pairs_c = [("M1", "alpha", ca, cb), ("M2", "beta", cc, cd)]
+        for nonce, match in (("RND-G1", "R1M1"), ("RND-G2", "R2M1")):
+            b = _run(nonce, "TG", match, pairs_g, rl_g, True)
+            self.assertEqual(b["status"], "round_banked")
+        # Group path saved nothing mid-group: weight files untouched.
+        for r in (ga, gb, gc, gd):
+            la, wa = vault_pkg.load_brain(r["id"])
+            np.testing.assert_array_equal(
+                wa, np.ascontiguousarray(np.asarray(wbasis, dtype=np.float32)))
+        rl_c = DopamineReinforcement(pops)
+        for nonce, match in (("RND-C1", "R1M1"), ("RND-C2", "R2M1")):
+            b = _run(nonce, "TC", match, pairs_c, rl_c, False)
+            self.assertEqual(b["status"], "round_banked")
+
+        class _S2:
+            def __init__(self):
+                self.sent = {}
+            def sendto(self, data, addr):
+                self.sent["data"] = data
+        s2 = _S2()
+        self.srv._handle_group_report(
+            s2, ("127.0.0.1", 1),
+            {"group_nonce": "GRP-1", "tournament_id": "TG", "group": "D"},
+            {"rec": None}, {"rec": None},
+            {"tournament_id": "TG", "match": "R2M1"}, 0.5, evo, rl_g,
+            1.0, note, csr, pops, {}, None)
+        gbod = json.loads(s2.sent["data"].decode("utf-8"))
+        self.assertEqual(gbod["status"], "group_banked")
+        for rg, rc in ((ga, ca), (gb, cb), (gc, cc), (gd, cd)):
+            lg, wg = vault_pkg.load_brain(rg["id"])
+            lc, wc = vault_pkg.load_brain(rc["id"])
+            np.testing.assert_array_equal(wg, wc)
+            for f in ("battles", "wins", "losses", "matches",
+                      "matches_won", "matches_lost", "elo", "ko"):
+                self.assertEqual(lg["record"][f], lc["record"][f],
+                                 (rg["name"], f))
+        self._group_reset()
+
+    def test_handle_group_pin_cap(self):
+        # Oversized groups refuse to pin (loud error, nothing banked)
+        # instead of eating unbounded RAM.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb = self._round_fighters(["CapA", "CapB"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        old = self.srv.GROUP_PIN_MAX
+        self.srv.GROUP_PIN_MAX = 1
+        try:
+            body = self._group_round(
+                self.srv, sock, rl, evo, csr, pops, "RND-G1", "TG",
+                "R1M1", [self._group_match("M1", "alpha", ra, rb)])
+            self.assertEqual(body["status"], "error")
+            self.assertIn("pin cap", body["error"])
+        finally:
+            self.srv.GROUP_PIN_MAX = old
+        self._group_reset()
+
     def test_handle_round_report_partial(self):
         # Quit-flush: a pending match banks battles only, no match
         # counters; decided matches bank fully in the same report.

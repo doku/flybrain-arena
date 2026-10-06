@@ -602,22 +602,315 @@ def _handle_match_report(sock, client_addr, msg, tourney_a, tourney_b,
               f"(kept verdict): {e}", flush=True)
 
 
+class _ResolveError(Exception):
+    """Match-state resolver failure carrying the arena-facing error
+    string. The handler sends it and returns; nothing banks."""
+    def __init__(self, error):
+        super().__init__(error)
+        self.error = error
+
+
+def _replay_round_match(mi, m, ctx, resolve):
+    """Replays ONE round-report match onto resolved brain state: battles
+    in order (evaluate, dopamine+pin with shipped sens/ctrl, K_BATTLE
+    ELO chain, records/ko/wander/sessions) plus the match bank, then
+    collects absolute snapshots for the journal. The ONLY per-path
+    difference is resolve() (fresh vault load vs pinned group brains);
+    every arithmetic line below runs identically in both, so group and
+    per-round banking agree by construction. Returns the match winner
+    string ("alpha"/"beta"/"draw"/"pending")."""
+    import brain_package as vault_pkg
+    mbattles = m.get("battles", []) or []
+    mwinner = str(m.get("match_winner", "") or "pending")
+    ra, rb, m_brain_a, m_brain_b, schemes_a, schemes_b, legacy_a, \
+        legacy_b = resolve(mi, m, ctx)
+    evo_mgr = ctx["evo_mgr"]
+    dopamine_rl = ctx["dopamine_rl"]
+    base_lr = ctx["base_lr"]
+    tournament_lr_scale = ctx["tournament_lr_scale"]
+    tourney_note = ctx["tourney_note"]
+    sock, client_addr, round_id = ctx["sock"], ctx["client_addr"], \
+        ctx["round_id"]
+    bechoes = []
+    for bi, b in enumerate(mbattles):
+        if not isinstance(b, dict):
+            continue
+        bstats_a = b.get("stats_a", {}) or {}
+        bstats_b = b.get("stats_b", {}) or {}
+        bverdict = b.get("verdict", {}) or {}
+        if not isinstance(bverdict, dict):
+            bverdict = {}
+        bdraw = bool(b.get("draw", False))
+        bdraw_penalty = bool(b.get("draw_penalty", False))
+        bend = str(b.get("end_reason", "") or "")
+        winner, _fit_a, _fit_b = evo_mgr.evaluate_match(
+            bstats_a, bstats_b, rec_a=ra, rec_b=rb)
+        _forced = str(bverdict.get("winner_slot", "") or "")
+        if not bdraw and _forced in ("alpha", "beta"):
+            winner = _forced
+        ko_win = bool(bstats_a.get("kills") or bstats_b.get("kills"))
+        pulse = 1.0 if ko_win else 0.5
+        dopamine_rl.lr = base_lr * tournament_lr_scale
+        try:
+            _emit_progress(sock, client_addr, round_id,
+                           "match %d battle %d" % (mi + 1, bi + 1))
+            _apply_round_learning(
+                dopamine_rl, m_brain_a, m_brain_b, winner,
+                b.get("sens_a", {}) or {}, b.get("sens_b", {}) or {},
+                b.get("ctrl_a", {}) or {}, b.get("ctrl_b", {}) or {},
+                pulse, schemes_a, schemes_b, legacy_a, legacy_b,
+                arena_draw=bdraw)
+        finally:
+            dopamine_rl.lr = base_lr
+        out_a = "draw" if bdraw else ("win" if winner == "alpha" else "loss")
+        out_b = "draw" if bdraw else ("loss" if winner == "alpha" else "win")
+        vault_pkg.record_battle_result(ra, out_a)
+        vault_pkg.record_battle_result(rb, out_b)
+        if not bdraw and bend == "ko" and winner == "alpha":
+            ra["record"]["ko"] = int(ra["record"].get("ko", 0)) + 1
+        if not bdraw and bend == "ko" and winner == "beta":
+            rb["record"]["ko"] = int(rb["record"].get("ko", 0)) + 1
+        if bdraw:
+            da = float(bstats_a.get("center_drift", 0.0) or 0.0)
+            db = float(bstats_b.get("center_drift", 0.0) or 0.0)
+            if da >= vault_pkg.WANDER_MARK_M:
+                ra["record"]["wander"] = int(
+                    ra["record"].get("wander", 0)) + 1
+            if db >= vault_pkg.WANDER_MARK_M:
+                rb["record"]["wander"] = int(
+                    rb["record"].get("wander", 0)) + 1
+        if not bdraw:
+            vault_pkg.log_training_session(
+                ra, 0, {"lr_scale": tournament_lr_scale,
+                        "pulse": pulse,
+                        "outcome": out_a},
+                f"tournament battle {out_a} ({tourney_note()})")
+            vault_pkg.log_training_session(
+                rb, 0, {"lr_scale": tournament_lr_scale,
+                        "pulse": -0.8 * pulse,
+                        "outcome": out_b},
+                f"tournament battle {out_b} ({tourney_note()})")
+        vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_BATTLE)
+        if bdraw and bdraw_penalty:
+            vault_pkg.apply_draw3_penalty(ra, rb)
+        bechoes.append({"battle_id": str(b.get("battle_id", "")),
+                        "battle_winner": ("draw" if bdraw else winner)})
+    # Match bank (skipped for pending flush strays): counters +
+    # K_MATCH ELO on this match's copies.
+    if mwinner in ("alpha", "beta", "draw"):
+        out_a = ("win" if mwinner == "alpha"
+                 else "loss" if mwinner == "beta" else "draw")
+        vault_pkg.record_match_result(ra, out_a)
+        vault_pkg.record_match_result(rb, "draw" if mwinner == "draw"
+                                      else ("loss" if mwinner == "alpha"
+                                            else "win"))
+        vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_MATCH)
+    ctx["echoes"].append({"match_id": str(m.get("match_id", "")),
+                         "match_winner": mwinner, "battles": bechoes})
+    for side, rec, brain in (("alpha", ra, m_brain_a),
+                             ("beta", rb, m_brain_b)):
+        ctx["final_records"].append({"side": side, "record": rec,
+                                    "weights_unchanged": True})
+        ctx["final_weights"][str(rec.get("id", ""))] = brain.weights
+    return mwinner
+
+
+def _resolve_fresh(mi, m, ctx):
+    """Pre-round vault state per match (the classic path): full disk
+    load + bind per side, fresh record copies. Brain files on disk are
+    the previous round's post-bank state, so matches never share
+    fighters and no cross-match accumulation is needed."""
+    import brain_package as vault_pkg
+    try:
+        rec_a, w_a = vault_pkg.load_brain(m.get("alpha_path", ""))
+        rec_b, w_b = vault_pkg.load_brain(m.get("beta_path", ""))
+        m_brain_a = _bind_brain(rec_a, w_a, ctx["csr"], ctx["pops"],
+                                ctx["struct_cache"])
+        m_brain_b = _bind_brain(rec_b, w_b, ctx["csr"], ctx["pops"],
+                                ctx["struct_cache"])
+    except Exception as e:
+        print(f"[Server] round {ctx['round_id']} match {mi}: brain load "
+              f"failed: {e}", flush=True)
+        raise _ResolveError("round_report: brain load failed: %s" % e)
+    ra = deepcopy(rec_a)
+    rb = deepcopy(rec_b)
+    schemes_a = normalize_mapping(
+        ((rec_a or {}).get("generator_params", {}) or {}).get("mapping", None))
+    schemes_b = normalize_mapping(
+        ((rec_b or {}).get("generator_params", {}) or {}).get("mapping", None))
+    legacy_a = is_legacy_record(rec_a)
+    legacy_b = is_legacy_record(rec_b)
+    return ra, rb, m_brain_a, m_brain_b, schemes_a, schemes_b, \
+        legacy_a, legacy_b
+
+
+def _group_pin_brain(bid, path, ctx):
+    """Full load + bind + pin for one group fighter (first sighting
+    only), snapshotting its vault record as the pre-group base. The
+    pre-group snapshot is ALWAYS exact: vault records mutate only for
+    fighters, and a fighter pins on its first fight - at which point
+    its vault state is untouched by this group. Enforces GROUP_PIN_MAX
+    instead of eating unbounded RAM."""
+    import brain_package as vault_pkg
+    pinned = _group_pinned["brains"]
+    if len(pinned) >= GROUP_PIN_MAX and bid not in pinned:
+        raise _ResolveError(
+            "group pin cap exceeded (%d brains)" % GROUP_PIN_MAX)
+    try:
+        rec, w = vault_pkg.load_brain(path)
+        brain = _bind_brain(rec, w, ctx["csr"], ctx["pops"],
+                            ctx["struct_cache"])
+        enc, dec = _bind_codecs(rec, ctx["pops"], ctx["codec_cache"])
+    except Exception as e:
+        raise _ResolveError("group pin load failed: %s" % e)
+    gp = (rec.get("generator_params", {}) or {})
+    pinned[bid] = {
+        "rec": deepcopy(rec),
+        "brain": brain, "enc": enc, "dec": dec,
+        "schemes": normalize_mapping(gp.get("mapping", None)),
+        "legacy": is_legacy_record(rec),
+        "wiring": mix_label(gp.get("experiment", None)),
+        "mapping": list(normalize_mapping(gp.get("mapping", None))),
+        "pregroup": deepcopy(rec),
+    }
+    return pinned[bid]
+
+
+def _group_resolve(mi, m, ctx):
+    """Pinned group brains per match: record-only vault reads resolve
+    ids, bound objects + working records come from the pin (RAM-only,
+    accumulating across rounds). First sighting full-loads + pins."""
+    import brain_package as vault_pkg
+    out = {}
+    for side, path in (("alpha", m.get("alpha_path", "")),
+                       ("beta", m.get("beta_path", ""))):
+        try:
+            rec0 = vault_pkg.load_brain_record(path)
+        except Exception as e:
+            raise _ResolveError("group record lookup failed: %s" % e)
+        bid = str((rec0 or {}).get("id", ""))
+        if not bid:
+            raise _ResolveError("group record lookup failed: no id")
+        ent = _group_pinned["brains"].get(bid)
+        if ent is None:
+            try:
+                ent = _group_pin_brain(bid, path, ctx)
+            except _ResolveError:
+                raise
+            except Exception as e:
+                raise _ResolveError("group pin load failed: %s" % e)
+        out[side] = ent
+    ea, eb = out["alpha"], out["beta"]
+    return (ea["rec"], eb["rec"], ea["brain"], eb["brain"],
+            ea["schemes"], eb["schemes"], ea["legacy"], eb["legacy"])
+
+
+def _rebuild_group_session(ctx):
+    """Restart-mid-group recovery: the pinned dict is gone but the
+    inputs journal holds pre-group records + every banked round's
+    deterministic replay inputs. Full vault loads (weights are
+    pre-group: no mid-group saves exist), restore pre-group records,
+    then replay all journaled rounds in order. evo-side counters
+    (history/pool novelty) are snapshotted around the replay so the
+    rebuild is side-effect-free there too. Returns True when a session
+    was rebuilt (caller then processes the new round normally)."""
+    import brain_package as vault_pkg
+    doc = _group_inputs_read()
+    if doc is None:
+        return False
+    # Restore exact-resend coverage too: without the banked round
+    # resps, a post-restart stale retry would replay instead of
+    # resending (double-bank). The journal carries every ack.
+    _group_pinned["round_resps"] = {
+        str(r.get("nonce", "")): r.get("resp", {})
+        for r in doc.get("rounds", []) if isinstance(r, dict)}
+    evo_mgr = ctx["evo_mgr"]
+    saved_history = list(getattr(evo_mgr, "history", []))
+    saved_pools = dict(getattr(evo_mgr, "pool_counts", {}))
+    try:
+        for bid, prec in (doc.get("pregroup", {}) or {}).items():
+            rec, w = vault_pkg.load_brain(
+                vault_pkg.package_path(prec.get("filename", "")))
+            brain = _bind_brain(rec, w, ctx["csr"], ctx["pops"],
+                                ctx["struct_cache"])
+            enc, dec = _bind_codecs(rec, ctx["pops"], ctx["codec_cache"])
+            gp = (rec.get("generator_params", {}) or {})
+            _group_pinned["brains"][str(bid)] = {
+                "rec": deepcopy(prec),
+                "brain": brain, "enc": enc, "dec": dec,
+                "schemes": normalize_mapping(gp.get("mapping", None)),
+                "legacy": is_legacy_record(rec),
+                "wiring": mix_label(gp.get("experiment", None)),
+                "mapping": list(normalize_mapping(gp.get("mapping", None))),
+                "pregroup": deepcopy(prec),
+            }
+        for rnd in doc.get("rounds", []):
+            # Scratch collections: the rebuild must not pollute the
+            # live round's echoes/snapshots (same helper, throwaway ctx).
+            re_ctx = dict(ctx)
+            re_ctx["echoes"] = []
+            re_ctx["final_records"] = []
+            re_ctx["final_weights"] = {}
+            for mi, m in enumerate(rnd.get("matches", [])):
+                if not isinstance(m, dict):
+                    continue
+                _replay_round_match(mi, m, re_ctx, _group_resolve_quiet)
+        return True
+    finally:
+        try:
+            evo_mgr.history = saved_history
+            evo_mgr.pool_counts = saved_pools
+            evo_mgr._save_pool_counts()
+        except Exception:
+            pass
+
+
+def _group_resolve_quiet(mi, m, ctx):
+    """Rebuild-path resolver: identical to _group_resolve but the pins
+    are guaranteed present (pregroup pass just created them), so a
+    miss is a corrupt journal, not a load."""
+    bid_a = bid_b = ""
+    import brain_package as vault_pkg
+    for side, path in (("alpha", m.get("alpha_path", "")),
+                       ("beta", m.get("beta_path", ""))):
+        rec0 = vault_pkg.load_brain_record(path)
+        if side == "alpha":
+            bid_a = str((rec0 or {}).get("id", ""))
+        else:
+            bid_b = str((rec0 or {}).get("id", ""))
+    try:
+        ea = _group_pinned["brains"][bid_a]
+        eb = _group_pinned["brains"][bid_b]
+    except KeyError as e:
+        raise _ResolveError("group rebuild pin miss: %s" % e)
+    return (ea["rec"], eb["rec"], ea["brain"], eb["brain"],
+            ea["schemes"], eb["schemes"], ea["legacy"], eb["legacy"])
+
+
 def _handle_round_report(sock, client_addr, msg, tourney_a, tourney_b,
                          tourney_tag, tournament_lr_scale, tournament_mode,
                          evo_mgr, dopamine_rl, base_lr, tourney_note,
-                         csr, pops, struct_cache):
-    """ONE bank per round: each match reloads its brains from vault
-    (pre-round weights - nothing saves mid-round), replays its battles
-    in order (evaluate, dopamine+pin with shipped sens/ctrl, K_BATTLE
-    ELO chain, records/ko/wander/sessions), then ONE journal (absolute
-    final snapshots) + ONE save set (each brain fought once, saved
-    once). Crash windows match the per-battle protocol exactly
+                         csr, pops, struct_cache, codec_cache=None):
+    """ONE bank per round: matches replay in order (evaluate,
+    dopamine+pin with shipped sens/ctrl, K_BATTLE ELO chain,
+    records/ko/wander/sessions), then ONE journal (absolute final
+    snapshots) + ONE save set (each brain fought once, saved once).
+    Crash windows match the per-battle protocol exactly
     (journal-first, atomic replace, preamble recover, exact-nonce
     dedup), so retries never double-bank. Pending matches (quit-flush
     strays) bank battles only. NOTE: transient RAM holds all replayed
     weight arrays (~100 MB per brain) until the save loop frees them;
-    the tradeoff for journal-first crash safety."""
+    the tradeoff for journal-first crash safety.
+    GROUP MODE (msg group=true, group files only): brains stay pinned
+    in RAM across rounds (no vault reloads, no weight saves); each
+    round replays onto pinned state, journals records-only, recovers
+    (cheap record flushes), and appends deterministic replay inputs
+    to the group-inputs journal. The group bank (group_report) seals
+    once. Crash windows: pre-group drive state + inputs journal =
+    exact rebuild (see _rebuild_group_session); same nonce contract."""
     import brain_package as vault_pkg
+    if codec_cache is None:
+        codec_cache = {}
     matches = msg.get("matches", [])
     if not isinstance(matches, list) or not matches:
         sock.sendto(json.dumps({"status": "error",
@@ -647,6 +940,13 @@ def _handle_round_report(sock, client_addr, msg, tourney_a, tourney_b,
                                          "- QUIT TO MENU + RESUME"
                                }).encode("utf-8"), client_addr)
         return
+    if bool(msg.get("group", False)):
+        _handle_group_round(sock, client_addr, msg, round_id, tid, mlabel,
+                            round_key, matches, tourney_a, tourney_b,
+                            tourney_tag, tournament_lr_scale, evo_mgr,
+                            dopamine_rl, base_lr, tourney_note,
+                            csr, pops, struct_cache, codec_cache)
+        return
     t_start = time.perf_counter()
     # Final absolute record snapshots (one entry per fighter) + final
     # weight refs (freed progressively by the save loop below).
@@ -654,118 +954,22 @@ def _handle_round_report(sock, client_addr, msg, tourney_a, tourney_b,
     final_weights = {}
     echoes = []
     fit_a, fit_b = 0.0, 0.0
+    ctx = {"evo_mgr": evo_mgr, "dopamine_rl": dopamine_rl,
+           "base_lr": base_lr, "tournament_lr_scale": tournament_lr_scale,
+           "tourney_note": tourney_note, "sock": sock,
+           "client_addr": client_addr, "round_id": round_id,
+           "echoes": echoes, "final_records": final_records,
+           "final_weights": final_weights, "csr": csr, "pops": pops,
+           "struct_cache": struct_cache}
     for mi, m in enumerate(matches):
         if not isinstance(m, dict):
             continue
-        mbattles = m.get("battles", []) or []
-        mwinner = str(m.get("match_winner", "") or "pending")
         try:
-            rec_a, w_a = vault_pkg.load_brain(m.get("alpha_path", ""))
-            rec_b, w_b = vault_pkg.load_brain(m.get("beta_path", ""))
-            m_brain_a = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
-            m_brain_b = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
-        except Exception as e:
-            print(f"[Server] round {round_id} match {mi}: brain load "
-                  f"failed: {e}", flush=True)
-            sock.sendto(json.dumps({"status": "error",
-                                    "error": "round_report: brain load "
-                                             f"failed: {e}"}
+            _replay_round_match(mi, m, ctx, _resolve_fresh)
+        except _ResolveError as e:
+            sock.sendto(json.dumps({"status": "error", "error": e.error}
                                    ).encode("utf-8"), client_addr)
             return
-        # Fresh base records from this load (pre-round vault state -
-        # each brain fights exactly once per round, so matches never
-        # share fighters and no cross-match accumulation is needed).
-        ra = deepcopy(rec_a)
-        rb = deepcopy(rec_b)
-        schemes_a = normalize_mapping(
-            ((rec_a or {}).get("generator_params", {}) or {}).get("mapping", None))
-        schemes_b = normalize_mapping(
-            ((rec_b or {}).get("generator_params", {}) or {}).get("mapping", None))
-        legacy_a = is_legacy_record(rec_a)
-        legacy_b = is_legacy_record(rec_b)
-        _emit_progress(sock, client_addr, round_id,
-                       "match %d load" % (mi + 1))
-        bechoes = []
-        for bi, b in enumerate(mbattles):
-            if not isinstance(b, dict):
-                continue
-            bstats_a = b.get("stats_a", {}) or {}
-            bstats_b = b.get("stats_b", {}) or {}
-            bverdict = b.get("verdict", {}) or {}
-            if not isinstance(bverdict, dict):
-                bverdict = {}
-            bdraw = bool(b.get("draw", False))
-            bdraw_penalty = bool(b.get("draw_penalty", False))
-            bend = str(b.get("end_reason", "") or "")
-            winner, fit_a, fit_b = evo_mgr.evaluate_match(
-                bstats_a, bstats_b, rec_a=ra, rec_b=rb)
-            _forced = str(bverdict.get("winner_slot", "") or "")
-            if not bdraw and _forced in ("alpha", "beta"):
-                winner = _forced
-            ko_win = bool(bstats_a.get("kills") or bstats_b.get("kills"))
-            pulse = 1.0 if ko_win else 0.5
-            dopamine_rl.lr = base_lr * tournament_lr_scale
-            try:
-                _emit_progress(sock, client_addr, round_id,
-                               "match %d battle %d" % (mi + 1, bi + 1))
-                _apply_round_learning(
-                    dopamine_rl, m_brain_a, m_brain_b, winner,
-                    b.get("sens_a", {}) or {}, b.get("sens_b", {}) or {},
-                    b.get("ctrl_a", {}) or {}, b.get("ctrl_b", {}) or {},
-                    pulse, schemes_a, schemes_b, legacy_a, legacy_b,
-                    arena_draw=bdraw)
-            finally:
-                dopamine_rl.lr = base_lr
-            out_a = "draw" if bdraw else ("win" if winner == "alpha" else "loss")
-            out_b = "draw" if bdraw else ("loss" if winner == "alpha" else "win")
-            vault_pkg.record_battle_result(ra, out_a)
-            vault_pkg.record_battle_result(rb, out_b)
-            if not bdraw and bend == "ko" and winner == "alpha":
-                ra["record"]["ko"] = int(ra["record"].get("ko", 0)) + 1
-            if not bdraw and bend == "ko" and winner == "beta":
-                rb["record"]["ko"] = int(rb["record"].get("ko", 0)) + 1
-            if bdraw:
-                da = float(bstats_a.get("center_drift", 0.0) or 0.0)
-                db = float(bstats_b.get("center_drift", 0.0) or 0.0)
-                if da >= vault_pkg.WANDER_MARK_M:
-                    ra["record"]["wander"] = int(
-                        ra["record"].get("wander", 0)) + 1
-                if db >= vault_pkg.WANDER_MARK_M:
-                    rb["record"]["wander"] = int(
-                        rb["record"].get("wander", 0)) + 1
-            if not bdraw:
-                vault_pkg.log_training_session(
-                    ra, 0, {"lr_scale": tournament_lr_scale,
-                            "pulse": pulse,
-                            "outcome": out_a},
-                    f"tournament battle {out_a} ({tourney_note()})")
-                vault_pkg.log_training_session(
-                    rb, 0, {"lr_scale": tournament_lr_scale,
-                            "pulse": -0.8 * pulse,
-                            "outcome": out_b},
-                    f"tournament battle {out_b} ({tourney_note()})")
-            vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_BATTLE)
-            if bdraw and bdraw_penalty:
-                vault_pkg.apply_draw3_penalty(ra, rb)
-            bechoes.append({"battle_id": str(b.get("battle_id", "")),
-                            "battle_winner": ("draw" if bdraw else winner)})
-        # Match bank (skipped for pending flush strays): counters +
-        # K_MATCH ELO on this match's copies.
-        if mwinner in ("alpha", "beta", "draw"):
-            out_a = ("win" if mwinner == "alpha"
-                     else "loss" if mwinner == "beta" else "draw")
-            vault_pkg.record_match_result(ra, out_a)
-            vault_pkg.record_match_result(rb, "draw" if mwinner == "draw"
-                                          else ("loss" if mwinner == "alpha"
-                                                else "win"))
-            vault_pkg.apply_elo(ra, rb, out_a, vault_pkg.ELO_K_MATCH)
-        echoes.append({"match_id": str(m.get("match_id", "")),
-                       "match_winner": mwinner, "battles": bechoes})
-        for side, rec, brain in (("alpha", ra, m_brain_a),
-                                 ("beta", rb, m_brain_b)):
-            final_records.append({"side": side, "record": rec,
-                                  "weights_unchanged": True})
-            final_weights[str(rec.get("id", ""))] = brain.weights
     fit_a, fit_b = _sanitize_fit(fit_a), _sanitize_fit(fit_b)
     print(f"[Server] Round report banked {mlabel}-{round_id} "
           f"({tourney_note()}): {len(echoes)} matches, "
@@ -802,6 +1006,241 @@ def _handle_round_report(sock, client_addr, msg, tourney_a, tourney_b,
         sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
     except OSError as e:
         print(f"[Server] send round_banked failed "
+              f"(kept verdict): {e}", flush=True)
+
+
+def _handle_group_round(sock, client_addr, msg, round_id, tid, mlabel,
+                        round_key, matches, tourney_a, tourney_b,
+                        tourney_tag, tournament_lr_scale, evo_mgr,
+                        dopamine_rl, base_lr, tourney_note,
+                        csr, pops, struct_cache, codec_cache):
+    """Group-mode round: pinned brains replay in order (same arithmetic
+    as the classic path, zero vault reloads), journal records-only +
+    recover (cheap record flushes, verdict slot for the retry
+    contract), append deterministic replay inputs to the group-inputs
+    journal, ack fast. NO weight saves - those wait for group_report.
+    Crash windows: the inputs journal + pre-group records rebuild the
+    session exactly (see _rebuild_group_session); same-nonce resends
+    replay nothing (session banked-set + stored resps, journal-backed
+    across restarts)."""
+    import brain_package as vault_pkg
+    if _group_pinned["tournament_id"] not in ("", tid):
+        _group_session_start(tid)
+    elif _group_pinned["tournament_id"] == "":
+        _group_session_start(tid)
+    # Stale round after a banked group (same file, e.g. late retry):
+    # the group verdict owns this file now - refuse loudly instead of
+    # replaying onto banked state.
+    stored_v = _read_last_verdict()
+    if stored_v is not None \
+            and stored_v.get("key", {}).get("tournament_id") == tid \
+            and stored_v.get("result", {}).get("status") == "group_banked":
+        print(f"[Server] Stale round {mlabel}-{round_id} for banked "
+              f"group {tid}: refused.", flush=True)
+        sock.sendto(json.dumps({"status": "error",
+                                "error": "round_report: group already "
+                                         "banked - QUIT TO MENU + RESUME"}
+                               ).encode("utf-8"), client_addr)
+        return
+    # Empty session with journaled rounds = restart mid-group:
+    # rebuild deterministically FIRST (it also restores exact-resend
+    # coverage), so a stale retry arriving as the first post-restart
+    # message resends stored instead of replaying.
+    if not _group_pinned["brains"]:
+        doc = _group_inputs_read()
+        if doc is not None and doc.get("tournament_id", "") == tid:
+            t_start = time.perf_counter()
+            ctx0 = {"evo_mgr": evo_mgr, "dopamine_rl": dopamine_rl,
+                    "base_lr": base_lr,
+                    "tournament_lr_scale": tournament_lr_scale,
+                    "tourney_note": tourney_note, "sock": sock,
+                    "client_addr": client_addr, "round_id": round_id,
+                    "echoes": [], "final_records": [],
+                    "final_weights": {},
+                    "csr": csr, "pops": pops,
+                    "struct_cache": struct_cache,
+                    "codec_cache": codec_cache}
+            if _rebuild_group_session(ctx0):
+                print(f"[Server] Rebuilt group session {tid} from "
+                      f"journal in {time.perf_counter() - t_start:.1f}s.",
+                      flush=True)
+    banked = _group_pinned.get("round_resps", {})
+    if round_id in banked:
+        print(f"[Server] Duplicate group round {mlabel}-{round_id}: "
+              f"resending stored result, no re-bank.", flush=True)
+        try:
+            sock.sendto(json.dumps(banked[round_id]).encode("utf-8"),
+                        client_addr)
+        except OSError as e:
+            print(f"[Server] resend failed: {e}", flush=True)
+        return
+    t_start = time.perf_counter()
+    echoes = []
+    final_records = []
+    final_weights = {}
+    ctx = {"evo_mgr": evo_mgr, "dopamine_rl": dopamine_rl,
+           "base_lr": base_lr, "tournament_lr_scale": tournament_lr_scale,
+           "tourney_note": tourney_note, "sock": sock,
+           "client_addr": client_addr, "round_id": round_id,
+           "echoes": echoes, "final_records": final_records,
+           "final_weights": final_weights, "csr": csr, "pops": pops,
+           "struct_cache": struct_cache, "codec_cache": codec_cache}
+    for mi, m in enumerate(matches):
+        if not isinstance(m, dict):
+            continue
+        try:
+            _replay_round_match(mi, m, ctx, _group_resolve)
+        except _ResolveError as e:
+            sock.sendto(json.dumps({"status": "error", "error": e.error}
+                                   ).encode("utf-8"), client_addr)
+            return
+    print(f"[Server] Group round banked (pinned, no save) "
+          f"{mlabel}-{round_id} ({tourney_note()}): {len(echoes)} "
+          f"matches, dopamine+records "
+          f"{time.perf_counter() - t_start:.1f}s.", flush=True)
+    resp = {
+        "status": "round_banked",
+        "battle_id": round_id,
+        "tournament_id": tid,
+        "match": mlabel,
+        "matches": echoes,
+        "report": (f"round banked: {len(echoes)} matches"),
+    }
+    _t_journal = time.perf_counter()
+    _emit_progress(sock, client_addr, round_id, "journal")
+    _write_pending_battle(round_key, resp, final_records, {})
+    _t_recover = time.perf_counter()
+    _emit_progress(sock, client_addr, round_id, "recover")
+    pinned_states = [{"rec": ent["rec"], "brain": ent["brain"]}
+                     for ent in _group_pinned["brains"].values()]
+    _recover_pending_battle(pinned_states)
+    banked[round_id] = resp
+    _group_pinned["round_resps"] = banked
+    # Append deterministic replay inputs (full battle payloads) +
+    # pre-group record bases for any fighter pinned this round.
+    doc = _group_inputs_read()
+    if doc is None or doc.get("tournament_id", "") != tid:
+        doc = {"tournament_id": tid, "pregroup": {}, "rounds": []}
+    for bid, ent in _group_pinned["brains"].items():
+        if bid not in doc["pregroup"]:
+            doc["pregroup"][bid] = deepcopy(ent["pregroup"])
+    doc["rounds"].append({"nonce": round_id, "resp": resp,
+                          "matches": matches})
+    _group_inputs_write(doc)
+    print(f"[Server] group round {round_id}: journal "
+          f"{_t_recover - _t_journal:.1f}s + recover "
+          f"{time.perf_counter() - _t_recover:.1f}s (no weight save).",
+          flush=True)
+    try:
+        sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+    except OSError as e:
+        print(f"[Server] send round_banked failed "
+              f"(kept verdict): {e}", flush=True)
+
+
+def _handle_group_report(sock, client_addr, msg, tourney_a, tourney_b,
+                         tourney_tag, tournament_lr_scale, evo_mgr,
+                         dopamine_rl, base_lr, tourney_note,
+                         csr, pops, struct_cache, codec_cache):
+    """ONE bank per group: seal the group verdict, save each pinned
+    brain exactly once (weights land here and only here), flush
+    records, remove the inputs journal, unpin. Same nonce/verdict
+    contract as every other bank (exact resend, quarantine on torn
+    journal). Crash mid-saves accepts the same window as round
+    banking (records+verdict exact, weights best-effort across the
+    sequential saves). A group verdict already banked for this file
+    resends stored (never replays)."""
+    import brain_package as vault_pkg
+    group_id = str(msg.get("group_nonce", ""))
+    tid = str(msg.get("tournament_id", "")
+              or tourney_tag.get("tournament_id") or "")
+    if not group_id:
+        sock.sendto(json.dumps({"status": "error",
+                                "error": "group_report: no group_nonce"}
+                               ).encode("utf-8"), client_addr)
+        return
+    group_key = {"tournament_id": tid, "match": "group",
+                 "battle_id": group_id}
+    stored = _read_last_verdict()
+    if stored is not None and stored.get("key") == group_key:
+        print(f"[Server] Duplicate group report {tid}-{group_id}: "
+              f"resending stored result, no re-bank.", flush=True)
+        try:
+            sock.sendto(json.dumps(stored["result"]).encode("utf-8"),
+                        client_addr)
+        except OSError as e:
+            print(f"[Server] resend failed: {e}", flush=True)
+        return
+    t_start = time.perf_counter()
+    # Session gone (e.g. retry after a restart): rebuild from the
+    # inputs journal when one exists for this file, then seal
+    # normally. Truly nothing to bank (no journal) refuses loudly.
+    if _group_pinned["tournament_id"] != tid \
+            or not _group_pinned["brains"]:
+        _group_session_start(tid)
+        doc = _group_inputs_read()
+        if doc is None or doc.get("tournament_id", "") != tid:
+            print(f"[Server] ERROR: group_report {tid}-{group_id} with no "
+                  f"pinned session. Refused.", flush=True)
+            sock.sendto(json.dumps({"status": "error",
+                                    "error": "group_report: no pinned group "
+                                             "session - QUIT TO MENU + RESUME"}
+                                   ).encode("utf-8"), client_addr)
+            return
+        ctx0 = {"evo_mgr": evo_mgr, "dopamine_rl": dopamine_rl,
+                "base_lr": base_lr,
+                "tournament_lr_scale": tournament_lr_scale,
+                "tourney_note": tourney_note, "sock": sock,
+                "client_addr": client_addr, "round_id": group_id,
+                "echoes": [], "final_records": [],
+                "final_weights": {},
+                "csr": csr, "pops": pops,
+                "struct_cache": struct_cache,
+                "codec_cache": codec_cache}
+        if not _rebuild_group_session(ctx0):
+            print(f"[Server] ERROR: group_report {tid}-{group_id}: "
+                  f"rebuild failed. Refused.", flush=True)
+            sock.sendto(json.dumps({"status": "error",
+                                    "error": "group_report: rebuild failed "
+                                             "- QUIT TO MENU + RESUME"}
+                                   ).encode("utf-8"), client_addr)
+            return
+    final_records = []
+    final_weights = {}
+    for bid, ent in _group_pinned["brains"].items():
+        final_records.append({"side": "pinned", "record": ent["rec"],
+                              "weights_unchanged": True})
+        final_weights[bid] = ent["brain"].weights
+    print(f"[Server] Group report sealing {tid}-{group_id}: "
+          f"{len(final_records)} fighters banked.", flush=True)
+    resp = {
+        "status": "group_banked",
+        "battle_id": group_id,
+        "tournament_id": tid,
+        "match": "group",
+        "fighters": len(final_records),
+        "report": (f"group banked: {len(final_records)} fighters"),
+    }
+    _write_pending_battle(group_key, resp, final_records, {})
+    _t_save = time.perf_counter()
+    for entry in final_records:
+        rec = entry["record"]
+        bid = str(rec.get("id", ""))
+        if bid in final_weights:
+            _emit_progress(sock, client_addr, group_id, "save %s" % bid[:8])
+            vault_pkg.save_brain(rec, final_weights[bid],
+                                 backup=False, fast=False)
+            del final_weights[bid]
+    pinned_states = [{"rec": ent["rec"], "brain": ent["brain"]}
+                     for ent in _group_pinned["brains"].values()]
+    _recover_pending_battle(pinned_states)
+    _group_session_end("group %s banked" % group_id)
+    print(f"[Server] group {group_id}: sealed in "
+          f"{time.perf_counter() - t_start:.1f}s.", flush=True)
+    try:
+        sock.sendto(json.dumps(resp).encode("utf-8"), client_addr)
+    except OSError as e:
+        print(f"[Server] send group_banked failed "
               f"(kept verdict): {e}", flush=True)
 
 
@@ -969,15 +1408,87 @@ def _same_battle_slot(stored_key, battle_key):
 
 
 def _prepared_slot_matches(prepare_a, prepare_b, prepare_tag, msg):
-    """True when the prepare slot holds THIS load (same tournament,
+    """True when the prepare slot holds THIS match (same tournament,
     match label, both paths): activation swaps it in O(1) instead of
     the full disk load. A server restart empties the slot - the
-    official load path stays the fallback. Pure (unit-tested)."""
+    official path stays the fallback. Pure (unit-tested)."""
     return (prepare_a.get("brain") is not None
             and prepare_tag.get("tournament_id") == str(msg.get("tournament_id", ""))
             and prepare_tag.get("match") == str(msg.get("match", ""))
             and prepare_a.get("path") == str(msg.get("alpha_path", ""))
             and prepare_b.get("path") == str(msg.get("beta_path", "")))
+
+
+# Pinned group session (group-bank mode): brains stay bound in RAM for
+# the whole group - no vault reloads between rounds, no weight saves
+# until the group bank. RAM-only: crash recovery rebuilds it from the
+# group-inputs journal (pre-group records + deterministic replay), so
+# this dict is NEVER the durability story. Keyed by tournament file;
+# a new file abandons the old session (logged).
+_group_pinned = {"tournament_id": "", "brains": {}}
+
+# Oversized-group tripwire: 8 pinned fighters x ~100 MB is fine; beyond
+# this the session refuses to pin (loud error, arena falls back to
+# per-round banking) instead of eating unbounded RAM.
+GROUP_PIN_MAX = 8
+
+
+def _pending_group_path():
+    return os.path.join(TOURNAMENTS_DIR, "_pending_group.json")
+
+
+def _group_session_start(tid):
+    """(Re)starts the pinned session for a tournament file, abandoning
+    any unbanked predecessor loudly (its battle records already
+    flushed per round; only its unbanked weight deltas are lost -
+    same exposure as a quit-flushed partial round)."""
+    if _group_pinned["tournament_id"] not in ("", tid) \
+            and _group_inputs_read() is not None:
+        print(f"[Server] Group session { _group_pinned['tournament_id']} "
+              f"abandoned with unbanked rounds for {tid}.", flush=True)
+    _group_pinned.clear()
+    _group_pinned.update({"tournament_id": tid, "brains": {}})
+
+
+def _group_session_end(reason):
+    if _group_pinned["tournament_id"] == "" \
+            and not _group_pinned["brains"]:
+        return
+    _group_pinned.clear()
+    _group_pinned.update({"tournament_id": "", "brains": {}})
+    try:
+        p = _pending_group_path()
+        if os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+    print(f"[Server] Group session ended ({reason}).", flush=True)
+
+
+def _group_inputs_write(doc):
+    """Atomically replaces the group-inputs journal: pre-group records
+    + every banked round's full battle payloads (deterministic replay
+    inputs) and ack responses (exact resends). Small (KBs per round)."""
+    import brain_package as _vp
+    path = _pending_group_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _group_inputs_read():
+    try:
+        with open(_pending_group_path()) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("rounds"), list):
+            return d
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _reset_needs_brains(msg, tournament_mode, rec_a, rec_b):
@@ -1049,7 +1560,8 @@ def _recover_pending_battle(states=()):
             payload = {}
             for entry in transaction["records"]:
                 if not isinstance(entry, dict) \
-                        or entry.get("side") not in ("alpha", "beta") \
+                        or entry.get("side") not in ("alpha", "beta",
+                                                     "pinned") \
                         or not isinstance(entry.get("record"), dict):
                     raise ValueError("pending battle journal has bad entry")
                 if entry.get("weights_unchanged"):
@@ -1106,7 +1618,15 @@ def _recover_pending_battle(states=()):
     # real verdict and reopen it to double-banking.
     if transaction.get("key") is not None:
         _write_last_verdict(transaction["key"], transaction["result"])
-    os.remove(path)
+    # A concurrent recover (live server vs test debris in a shared dir)
+    # may have replayed + removed this journal first - then the work is
+    # done and there is nothing to remove. A *different* journal cannot
+    # appear here: a new write is refused while one exists, so absence
+    # always means already-recovered, never lost.
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def _apply_round_learning(dopamine_rl, brain_alpha, brain_beta, winner,
@@ -1629,7 +2149,40 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # fallback.
                 want_a = str(msg.get("alpha_path", ""))
                 want_b = str(msg.get("beta_path", ""))
-                if _prepared_slot_matches(prepare_a, prepare_b, prepare_tag, msg):
+                # New tournament file abandons any pinned group session
+                # (its rounds never banked as a group; per-round records
+                # already flushed). The new file pins fresh on demand.
+                load_tid = str(msg.get("tournament_id", "") or "")
+                if load_tid != "" and _group_pinned["tournament_id"] \
+                        not in ("", load_tid):
+                    _group_session_start(load_tid)
+                # Pinned-group activation: both fighters already bound in
+                # RAM with current weights - point the live slots at them
+                # (O(1), no disk, fights track banked learning). Falls
+                # through to prepare/disk on any miss.
+                pinned_hit = False
+                if _group_pinned["brains"]:
+                    try:
+                        rec_wa = vault_pkg.load_brain_record(want_a)
+                        rec_wb = vault_pkg.load_brain_record(want_b)
+                        ent_a = _group_pinned["brains"].get(
+                            str((rec_wa or {}).get("id", "")))
+                        ent_b = _group_pinned["brains"].get(
+                            str((rec_wb or {}).get("id", "")))
+                        if ent_a is not None and ent_b is not None:
+                            brain_alpha = ent_a["brain"]
+                            brain_beta = ent_b["brain"]
+                            rec_a, rec_b = ent_a["rec"], ent_b["rec"]
+                            enc_a, dec_a = ent_a["enc"], ent_a["dec"]
+                            enc_b, dec_b = ent_b["enc"], ent_b["dec"]
+                            pinned_hit = True
+                            print("[Server] Pinned group brains activated "
+                                  "(no disk load).", flush=True)
+                    except Exception as e:
+                        print(f"[Server] pinned activation failed ({e}), "
+                              f"falling through.", flush=True)
+                if not pinned_hit and _prepared_slot_matches(
+                        prepare_a, prepare_b, prepare_tag, msg):
                     brain_alpha = prepare_a["brain"]
                     brain_beta = prepare_b["brain"]
                     rec_a, rec_b = prepare_a["rec"], prepare_b["rec"]
@@ -1702,21 +2255,66 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # ~5-20 s disk+binding load hides under the wait. NEVER
                 # touches the live pair - a mid-battle load would clobber
                 # the live fight and bank the wrong identities.
+                # Pinned-group shortcut: the brains are already bound -
+                # point the prepare slot at them (instant, no disk).
                 import brain_package as vault_pkg
-                try:
-                    rec_a, w_a = vault_pkg.load_brain(msg["alpha_path"])
-                    rec_b, w_b = vault_pkg.load_brain(msg["beta_path"])
-                    new_alpha = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
-                    new_beta = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
-                    enc_a, dec_a = _bind_codecs(rec_a, pops, codec_cache)
-                    enc_b, dec_b = _bind_codecs(rec_b, pops, codec_cache)
-                except Exception as e:
-                    print(f"[Server] prepare failed: {e}", flush=True)
-                    sock.sendto(json.dumps(
-                        {"status": "error",
-                         "error": f"tournament_prepare: {e}"}).encode("utf-8"),
-                        client_addr)
-                    continue
+                pinned_prep = False
+                if _group_pinned["brains"]:
+                    try:
+                        rec_pa = vault_pkg.load_brain_record(
+                            msg["alpha_path"])
+                        rec_pb = vault_pkg.load_brain_record(
+                            msg["beta_path"])
+                        ent_pa = _group_pinned["brains"].get(
+                            str((rec_pa or {}).get("id", "")))
+                        ent_pb = _group_pinned["brains"].get(
+                            str((rec_pb or {}).get("id", "")))
+                        if ent_pa is not None and ent_pb is not None:
+                            prepare_a.update(
+                                rec=ent_pa["rec"],
+                                path=str(msg.get("alpha_path", "")),
+                                brain=ent_pa["brain"],
+                                enc=ent_pa["enc"], dec=ent_pa["dec"])
+                            prepare_b.update(
+                                rec=ent_pb["rec"],
+                                path=str(msg.get("beta_path", "")),
+                                brain=ent_pb["brain"],
+                                enc=ent_pb["enc"], dec=ent_pb["dec"])
+                            prepare_tag["tournament_id"] = str(
+                                msg.get("tournament_id", ""))
+                            prepare_tag["match"] = str(msg.get("match", ""))
+                            pinned_prep = True
+                            print("[Server] Prepared next match "
+                                  f"{prepare_tag['match']} (pinned, no "
+                                  f"disk load).", flush=True)
+                            sock.sendto(json.dumps({
+                                "status": "prepared",
+                                "alpha": {"name": ent_pa["rec"].get("name"),
+                                          "id": ent_pa["rec"].get("id")},
+                                "beta": {"name": ent_pb["rec"].get("name"),
+                                         "id": ent_pb["rec"].get("id")},
+                                "tournament_id": prepare_tag["tournament_id"],
+                                "match": prepare_tag["match"],
+                            }).encode("utf-8"), client_addr)
+                            continue
+                    except Exception as e:
+                        print(f"[Server] pinned prepare failed ({e}), "
+                              f"falling through.", flush=True)
+                if not pinned_prep:
+                    try:
+                        rec_a, w_a = vault_pkg.load_brain(msg["alpha_path"])
+                        rec_b, w_b = vault_pkg.load_brain(msg["beta_path"])
+                        new_alpha = _bind_brain(rec_a, w_a, csr, pops, struct_cache)
+                        new_beta = _bind_brain(rec_b, w_b, csr, pops, struct_cache)
+                        enc_a, dec_a = _bind_codecs(rec_a, pops, codec_cache)
+                        enc_b, dec_b = _bind_codecs(rec_b, pops, codec_cache)
+                    except Exception as e:
+                        print(f"[Server] prepare failed: {e}", flush=True)
+                        sock.sendto(json.dumps({
+                            "status": "error",
+                            "error": f"tournament_prepare: {e}"}).encode("utf-8"),
+                            client_addr)
+                        continue
                 prepare_a.update(rec=rec_a, path=str(msg.get("alpha_path", "")),
                                  brain=new_alpha, enc=enc_a, dec=dec_a)
                 prepare_b.update(rec=rec_b, path=str(msg.get("beta_path", "")),
@@ -1785,6 +2383,10 @@ def run_brain_server(host="127.0.0.1", port=9999):
                                      enc=encoder, dec=decoder)
                     tourney_b.update(rec=None, path=None, brain=brain_beta,
                                      enc=encoder, dec=decoder)
+                    # Leaving a tournament abandons any pinned group
+                    # (its rounds never bank as a group; per-round
+                    # battle records already flushed).
+                    _group_session_end("free mode")
                 brain_alpha.reset_state()
                 brain_beta.reset_state()
                 sock.sendto(json.dumps({"status": "free_ready"}).encode("utf-8"), client_addr)
@@ -1823,7 +2425,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     sock, client_addr, msg, tourney_a, tourney_b,
                     tourney_tag, tournament_lr_scale, tournament_mode,
                     evo_mgr, dopamine_rl, base_lr, tourney_note,
-                    csr, pops, struct_cache)
+                    csr, pops, struct_cache, codec_cache)
+                continue
+
+            elif msg_type == "group_report":
+                # ONE bank per group (groups only): seal the journal,
+                # save each pinned brain once. The arena overlaps it
+                # with the group-to-final intermission; final loads
+                # gate on the ack.
+                _handle_group_report(
+                    sock, client_addr, msg, tourney_a, tourney_b,
+                    tourney_tag, tournament_lr_scale, evo_mgr,
+                    dopamine_rl, base_lr, tourney_note,
+                    csr, pops, struct_cache, codec_cache)
                 continue
 
             elif msg_type == "tournament_match":
@@ -1872,6 +2486,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 else:
                     print(f"[Server] Crown {tkey[0]} {champ}: no record "
                           f"bound, title skipped.", flush=True)
+                # A tournament close ends any pinned group session (its
+                # rounds either banked as a group already or never will).
+                _group_session_end("tournament end")
                 sock.sendto(json.dumps({"status": "tournament_closed"}).encode("utf-8"), client_addr)
 
             elif msg_type == "tournament_weights":

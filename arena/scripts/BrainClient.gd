@@ -9,6 +9,7 @@ signal tournament_battle_received(battle_winner: String, fitness_alpha: float, f
 signal battle_progress_received(battle_id: String)
 signal match_banked_received(match_winner: String, fitness_alpha: float, fitness_beta: float, match_id: String)
 signal round_banked_received(round_nonce: String, tournament_id: String, match_label: String)
+signal group_banked_received(group_nonce: String, tournament_id: String)
 signal brains_loaded_received(alpha_info: Dictionary, beta_info: Dictionary, tournament_id: String, match_label: String)
 signal prepared_received(tournament_id: String, match_label: String)
 signal match_ready_received()
@@ -176,11 +177,13 @@ func request_match_reset(match_label: String = "") -> void:
 	_send_dict({"type": "match_reset", "match": match_label})
 
 func request_round_report(round_nonce: String, tournament_id: String,
-		match_label: String, matches: Array) -> void:
+		match_label: String, matches: Array, group: bool = false) -> void:
 	# ONE bank per round: every completed match rides one message; the
 	# server replays matches in order, then journals once + saves each
 	# brain once. Between matches/rounds only loads flow - the bank
 	# hides under the intermission while the next round overlaps it.
+	# Group files pass group=true: the server pins brains in RAM and
+	# journals without saving; the group bank lands separately.
 	if not is_connected_server:
 		return
 	_send_dict({
@@ -188,7 +191,23 @@ func request_round_report(round_nonce: String, tournament_id: String,
 		"round_nonce": round_nonce,
 		"tournament_id": tournament_id,
 		"match": match_label,
-		"matches": matches
+		"matches": matches,
+		"group": group
+	})
+
+
+func request_group_report(group_nonce: String, tournament_id: String,
+		group_label: String) -> void:
+	# ONE bank per group (group files only): the server seals the
+	# journal and saves each pinned brain once. Sent at group
+	# completion; final loads gate on the ack.
+	if not is_connected_server:
+		return
+	_send_dict({
+		"type": "group_report",
+		"group_nonce": group_nonce,
+		"tournament_id": tournament_id,
+		"group": group_label
 	})
 
 
@@ -257,6 +276,10 @@ func _handle_server_response(data: Dictionary) -> void:
 			str(data.get("round_nonce", "")),
 			str(data.get("tournament_id", "")),
 			str(data.get("match", "")))
+	elif status == "group_banked":
+		group_banked_received.emit(
+			str(data.get("battle_id", "")),
+			str(data.get("tournament_id", "")))
 	elif status == "tournament_match_battled":
 		match_banked_received.emit(
 			data.get("match_winner", "draw"),

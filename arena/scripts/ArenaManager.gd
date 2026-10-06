@@ -295,6 +295,16 @@ var _seq_round_id := ""
 var _seq_last_round_report: Dictionary = {}
 var _seq_forgive_roundbank: Dictionary = {}
 var _pending_roundbank_resend := false
+# Group-bank twins (group files only): the rounds journal fast; the
+# group seal saves once. Same nonce/verdict contract, separate state
+# so round acks never consume group waits.
+var _group_bank_pending := false
+var _tourney_awaiting_groupbank := false
+var _seq_group_id := ""
+var _seq_last_group_report: Dictionary = {}
+var _seq_forgive_groupbank: Dictionary = {}
+var _pending_groupbank_resend := false
+var _pending_final_group: Dictionary = {}
 var _load_gated_on_bank := false
 var _pending_advance: Dictionary = {}
 var _pending_final_ev: Dictionary = {}
@@ -586,6 +596,7 @@ func _ready() -> void:
 	brain_client.server_state_received.connect(_on_server_state)
 	brain_client.battle_progress_received.connect(_on_battle_progress)
 	brain_client.round_banked_received.connect(_on_round_banked)
+	brain_client.group_banked_received.connect(_on_group_banked)
 	var _edir := _director()
 	if _edir != null:
 		_edir.async_done.connect(_on_evo_async)
@@ -1159,10 +1170,10 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	# Bank gate: next-round brains must load post-bank weights, and the
 	# vault files turn post-round only when the bank's saves land (atomic
 	# replaces: old-or-new, never torn - but old is STALE for the next
-	# round). While a round bank is owed, loads park on a banking wait;
-	# the ack fires the parked load. Recovery reloads bypass (they
-	# re-establish server state for a resend, not a fight).
-	if _round_bank_pending and not bypass_bank_gate:
+	# round). While a round OR group bank is owed, loads park on a
+	# banking wait; the ack fires the parked load. Recovery reloads
+	# bypass (they re-establish server state for a resend, not a fight).
+	if (_round_bank_pending or _group_bank_pending) and not bypass_bank_gate:
 		_load_gated_on_bank = true
 		if is_instance_valid(status_label):
 			status_label.text = "BANKING ROUND - loading %s on the ack..." % expand_match_label(tourney_match_label)
@@ -1325,7 +1336,7 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 		_hide_loading()
 		brain_client.request_round_report(_seq_round_id,
 			str(rr.get("tournament_id", "")), str(rr.get("match", "")),
-			(rr.get("matches", []) as Array))
+			(rr.get("matches", []) as Array), bool(rr.get("group", false)))
 		_arm_seq("roundbank")
 		print("[Arena] Resent stored round report %s after reload." % _seq_round_id)
 		var rhead := _verdict_headline()
@@ -1333,11 +1344,42 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 			_set_wait_header(str(rhead.get("text", "")),
 				str(rhead.get("sub", "")) + "\nbanking the round (resend)...",
 				rhead.get("color", Color(0.85, 0.85, 0.9)))
+		# A group seal may be owed on top of the round: resend it after
+		# the round (the round rebuilds the session the seal needs).
+		# Either resend suppresses the normal round start below.
+		_resend_stored_group_report()
+		return
+	if _resend_stored_group_report():
 		return
 	_hide_wait_bracket()
 	_hide_loading()
 	_update_tourney_status("READY")
 	_reset_round()
+
+
+func _resend_stored_group_report() -> bool:
+	# Recovery reload after a restart killed the group bank: re-arm
+	# from the STORED report (same nonce, idempotent) and resend: the
+	# fresh server rebuilds from the inputs journal and seals, or
+	# answers from disk if the old server finished before dying.
+	# Returns true when it acted (caller must not start a round).
+	if _pending_groupbank_resend and not _seq_last_group_report.is_empty():
+		_pending_groupbank_resend = false
+		var gr := _seq_last_group_report
+		_tourney_awaiting_groupbank = true
+		_seq_group_id = str(gr.get("group_nonce", ""))
+		_seq_forgive_groupbank = {"tournament_id": str(gr.get("tournament_id", "")),
+			"match": str(gr.get("match", "")), "battle": _seq_group_id}
+		_hide_wait_bracket()
+		_hide_loading()
+		brain_client.request_group_report(_seq_group_id,
+			str(gr.get("tournament_id", "")), str(gr.get("match", "")))
+		_arm_seq("groupbank")
+		print("[Arena] Resent stored group report %s after reload." % _seq_group_id)
+		if is_instance_valid(status_label):
+			status_label.text = "STALLED - RETRYING GROUP BANK ..."
+		return true
+	return false
 
 func _on_match_ready() -> void:
 	if not tournament_active:
@@ -1420,12 +1462,33 @@ func _on_server_error(error: String) -> void:
 	# brains_loaded - a new nonce here would risk double-banking if the
 	# old server actually finished before dying. Flag set only when the
 	# reload armed (a capped recovery leaves it clean for the fail-loud).
+	# A round retry that lands after its group already sealed: the
+	# round's learning is inside the group bank, so the round is
+	# CONFIRMED, not lost - stand the latches down with no resend and
+	# no recovery cycle.
+	if error.begins_with("round_report: group already banked") \
+			and tournament_active:
+		print("[Arena] Round overtaken by its group bank - round confirmed, standing down.")
+		_arena_log("round overtaken by group bank - confirmed, no resend")
+		_tourney_awaiting_roundbank = false
+		_round_bank_pending = false
+		if _seq_context == "roundbank":
+			_clear_seq()
+		_seq_forgive_roundbank = {}
+		return
 	if err_context == "roundbank" and tournament_active \
 			and error.begins_with("round_report while in FREE mode") \
 			and not _seq_last_round_report.is_empty() \
 			and not _pending_roundbank_resend:
 		if _recover_server_state("round bank interrupted"):
 			_pending_roundbank_resend = true
+			return
+	if err_context == "groupbank" and tournament_active \
+			and error.begins_with("group_report: no pinned group session") \
+			and not _seq_last_group_report.is_empty() \
+			and not _pending_groupbank_resend:
+		if _recover_server_state("group bank interrupted"):
+			_pending_groupbank_resend = true
 			return
 	# A recovery load is already in flight (the state poll or a prior
 	# error armed it): the refusal that motivated it can arrive now -
@@ -1894,7 +1957,9 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 func _seq_timeout_for(context: String) -> int:
 	# The match bank replays every battle in order (dopamine per battle
 	# + one save pair): same cost class as a single long battle report.
-	if context == "battle" or context == "roundbank":
+	# The group bank seals + saves every pinned brain: same class.
+	if context == "battle" or context == "roundbank" \
+			or context == "groupbank":
 		return SEQ_BATTLE_TIMEOUT_MSEC
 	return SEQ_TIMEOUT_MSEC
 
@@ -1984,7 +2049,26 @@ func _check_seq_watchdog() -> void:
 			brain_client.reconnect()
 			brain_client.request_round_report(
 				str(mr.get("round_nonce", "")), str(mr.get("tournament_id", "")),
-				str(mr.get("match", "")), (mr.get("matches", []) as Array))
+				str(mr.get("match", "")), (mr.get("matches", []) as Array),
+				bool(mr.get("group", false)))
+			return
+		if _seq_context == "groupbank" and not _seq_last_group_report.is_empty():
+			# Same group nonce, idempotent: the server answers repeats
+			# from the stored group verdict, never double-banks.
+			var gr := _seq_last_group_report
+			print("[Arena] Retrying group report id=", _seq_group_id,
+				" (same id, idempotent)")
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RETRYING GROUP BANK",
+					"No confirmation for the group yet. Re-sending the SAME report id "
+					+ "(the server answers repeats from its stored verdict, no double count)...",
+					Color(0.85, 0.85, 0.9))
+			if is_instance_valid(status_label):
+				status_label.text = "STALLED - RETRYING GROUP BANK ..."
+			brain_client.reconnect()
+			brain_client.request_group_report(
+				str(gr.get("group_nonce", "")), str(gr.get("tournament_id", "")),
+				str(gr.get("match", "")))
 			return
 		if _seq_context == "load" and not _seq_last_load.is_empty():
 			var p := _seq_last_load
@@ -4860,12 +4944,16 @@ func _on_battle_progress(battle_id: String) -> void:
 	# that doubles the server's work. Stray ids never move it. In
 	# roundbank context the server heartbeats the ROUND nonce (per
 	# match stage) - matched against _seq_round_id, not battle ids.
+	# Group banks heartbeat the GROUP nonce the same way.
 	if _seq_context == "battle" and battle_id != "" \
 			and battle_id == _seq_battle_id:
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("battle")
 	elif _seq_context == "roundbank" and battle_id != "" \
 			and battle_id == _seq_round_id:
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("roundbank")
+	elif _seq_context == "groupbank" and battle_id != "" \
+			and battle_id == _seq_group_id:
+		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("groupbank")
 
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
@@ -5174,7 +5262,9 @@ func _send_round_report() -> void:
 	# server replays matches in order (per-match vault reload, battles in
 	# order, ELO chains, records), then journals once + saves each brain
 	# once. The bank runs UNDER the intermission/review (pipelined);
-	# loads gate on the ack, never on the send.
+	# loads gate on the ack, never on the send. Group files flag the
+	# report: the server pins brains in RAM and journals without
+	# saving (the group seal saves once at group completion).
 	if _round_match_cache.is_empty():
 		return
 	_seq_round_id = "RND-%d-%d" % [Time.get_ticks_msec(), randi() % 100000]
@@ -5182,13 +5272,56 @@ func _send_round_report() -> void:
 	_round_bank_pending = true
 	_seq_forgive_roundbank = {"tournament_id": _tourney_id(),
 		"match": tourney_match_label, "battle": _seq_round_id}
+	var group_mode := _tourney_is_group()
 	_seq_last_round_report = {"tournament_id": _tourney_id(),
 		"match": tourney_match_label, "round_nonce": _seq_round_id,
-		"matches": _round_match_cache.duplicate(true)}
+		"matches": _round_match_cache.duplicate(true),
+		"group": group_mode}
 	brain_client.request_round_report(_seq_round_id, _tourney_id(),
-		tourney_match_label, _round_match_cache)
+		tourney_match_label, _round_match_cache, group_mode)
 	_round_match_cache.clear()
 	_arm_seq("roundbank")
+
+
+func _tourney_is_group() -> bool:
+	# True when the live tournament file runs group round-robin (the
+	# only format that banks per group instead of per round).
+	var director := _director()
+	if director == null:
+		return false
+	return str(director.tourney.get("format", "bracket")) == "groups"
+
+
+func _send_group_report() -> void:
+	# ONE bank per group (group files only): the server seals the
+	# journal and saves each pinned brain once. Sent at group
+	# completion; runs UNDER the group-to-final intermission while
+	# final loads gate on the ack. Same nonce/verdict contract as
+	# round reports (exact resend, forgive window, watchdog).
+	_seq_group_id = "GRP-%d-%d" % [Time.get_ticks_msec(), randi() % 100000]
+	_tourney_awaiting_groupbank = true
+	_group_bank_pending = true
+	_seq_forgive_groupbank = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "battle": _seq_group_id}
+	_seq_last_group_report = {"tournament_id": _tourney_id(),
+		"group_nonce": _seq_group_id, "match": tourney_match_label}
+	brain_client.request_group_report(_seq_group_id, _tourney_id(),
+		tourney_match_label)
+	_arm_seq("groupbank")
+	_arena_log("group report sent: %s (%s)" % [_seq_group_id, tourney_match_label])
+
+
+func _forgivable_groupbank(group_nonce: String) -> bool:
+	# Group-level twin of _forgivable_roundbank: a post-fail-loud bank
+	# ack applies only for the still-owed group (same nonce id, same
+	# tournament file, still in a tournament). Pure (unit-tested).
+	if _seq_forgive_groupbank.is_empty():
+		return false
+	if group_nonce != str(_seq_forgive_groupbank.get("battle", "")):
+		return false
+	if str(_seq_forgive_groupbank.get("tournament_id", "")) != _tourney_id():
+		return false
+	return tournament_active
 
 
 func _forgivable_roundbank(round_nonce: String) -> bool:
@@ -5202,6 +5335,46 @@ func _forgivable_roundbank(round_nonce: String) -> bool:
 	if str(_seq_forgive_roundbank.get("tournament_id", "")) != _tourney_id():
 		return false
 	return tournament_active
+
+
+func _on_group_banked(group_nonce: String, tid: String) -> void:
+	# The server sealed the whole group (journal sealed, every pinned
+	# brain saved once, records flushed). Guards mirror the round
+	# reply; then: clear the pending flag, refresh the roster cache,
+	# fire any load parked on the gate, and run a deferred final
+	# build. Round acks never touch group waits (separate state).
+	if not _tourney_awaiting_groupbank:
+		if group_nonce != "" and _forgivable_groupbank(group_nonce):
+			print("[Arena] Forgiving late group_banked (id=",
+				group_nonce, "): banked but unconfirmed, applying now.")
+		else:
+			print("[Arena] Ignoring late/duplicate group_banked (id=",
+				group_nonce, ")")
+			return
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
+	if group_nonce != "" and _seq_group_id != "" and group_nonce != _seq_group_id:
+		print("[Arena] Ignoring group_banked id mismatch: got ", group_nonce,
+			" want ", _seq_group_id)
+		return
+	_tourney_awaiting_groupbank = false
+	_group_bank_pending = false
+	_clear_seq()
+	# Consuming the owed ack closes the forgive window.
+	_seq_forgive_groupbank = {}
+	_hide_wait_bracket()
+	_hide_loading()
+	if not _pending_final_group.is_empty():
+		var fgev := _pending_final_group
+		_pending_final_group = {}
+		print("[Arena] Group banked - building the queued final now.")
+		if _event_build_final(fgev):
+			_event_gallery_update()
+		_show_arena_bracket("EVENT %s · FINAL" % str(fgev.get("id", "")))
+	if _load_gated_on_bank:
+		_load_gated_on_bank = false
+		_request_current_battle_load()
 
 
 func _on_round_banked(round_nonce: String, tid: String, match_label: String) -> void:
@@ -5929,14 +6102,19 @@ func _event_group_done(res: Dictionary) -> void:
 	var title := "EVENT %s · %s" % [eid, "FINAL" if nxt == "final" else "GROUP " + nxt]
 	var sub := _event_preview_sub(nxt)
 	var wait_secs := EVENT_FINAL_SECS if nxt == "final" else EVENT_INTERMISSION_SECS
+	# Group seal first: it runs UNDER the intermission while final
+	# loads gate on its ack (vault files turn post-group only when
+	# the seal's saves land). Round reports already acked fast (they
+	# only journal); the seal carries the weights.
+	_send_group_report()
 	if _round_bank_pending:
 		print("[Arena] Bank %s still owed at intermission - countdown runs under it; loads gate on the ack." % _seq_round_id)
-	if nxt == "final" and _round_bank_pending:
-		# Bank still running: the final's player ELO snapshots must come
-		# post-bank. Stash the build for the ack; the intermission shows
-		# the completed group + banking status now, and the ack builds
-		# the final and refreshes the view (countdown keeps running).
-		_pending_final_ev = ev.duplicate(true)
+	# The final's player ELO snapshots must come post-bank: stash the
+	# build while EITHER bank is owed and let the group ack build it.
+	# (Round acks never consume this stash - only _on_group_banked.
+	# Separate var from _pending_final_ev for exactly that reason.)
+	if nxt == "final" and (_round_bank_pending or _group_bank_pending):
+		_pending_final_group = ev.duplicate(true)
 		title += " (banking round...)"
 		_event_gallery_update()
 		if not await _event_intermission(title, sub, wait_secs, true):

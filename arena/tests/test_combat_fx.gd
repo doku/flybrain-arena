@@ -672,6 +672,86 @@ func test_intermission_header_band() -> void:
 	_check(arena.intermission_label.size_flags_horizontal == Control.SIZE_EXPAND_FILL,
 		"header label takes leftover row width (never 1px soup)")
 
+func test_group_report_send() -> void:
+	# Group seal: minted GRP nonce, groupbank context armed, forgive
+	# map stamped. State only (test_mute drops the packet).
+	arena._send_group_report()
+	_check(arena._tourney_awaiting_groupbank, "group bank awaited")
+	_check(arena._group_bank_pending, "group bank pending")
+	_check(str(arena._seq_group_id).begins_with("GRP-"), "GRP nonce minted")
+	_check(arena._seq_context == "groupbank", "groupbank context armed")
+	_check(not arena._seq_forgive_groupbank.is_empty(), "forgive map stamped")
+	arena._tourney_awaiting_groupbank = false
+	arena._group_bank_pending = false
+	arena._seq_group_id = ""
+	arena._seq_forgive_groupbank = {}
+	arena._seq_last_group_report = {}
+	arena._seq_context = ""
+
+
+func test_group_banked_applies() -> void:
+	# Group ack clears the wait; a foreign id without forgive data is
+	# ignored, never applied.
+	arena._tourney_awaiting_groupbank = true
+	arena._group_bank_pending = true
+	arena._seq_group_id = "GRP-1"
+	arena._seq_forgive_groupbank = {"tournament_id": "", "match": "R3M2",
+		"battle": "GRP-1"}
+	arena._on_group_banked("GRP-9", "T")
+	_check(arena._tourney_awaiting_groupbank, "mismatch keeps the wait")
+	arena._on_group_banked("GRP-1", "T")
+	_check(not arena._tourney_awaiting_groupbank, "ack clears awaiting")
+	_check(not arena._group_bank_pending, "ack clears pending")
+	_check(arena._seq_forgive_groupbank.is_empty(), "ack closes forgive")
+	arena._seq_group_id = ""
+	arena._seq_context = ""
+
+
+func test_group_forgive_map() -> void:
+	# Same-nonce post-fail-loud ack forgives; anything else does not.
+	# Director file tag drives the tournament match (bare scene has
+	# none, so stub it like the state-poll test does).
+	var d = arena._director()
+	var old_tourney: Dictionary = (d.tourney as Dictionary).duplicate(true)
+	arena.tournament_active = true
+	arena._seq_forgive_groupbank = {}
+	_check(not arena._forgivable_groupbank("GRP-7"), "empty map refuses")
+	d.tourney = {"id": "T1"}
+	arena._seq_forgive_groupbank = {"tournament_id": "T1",
+		"match": "R1M1", "battle": "GRP-7"}
+	_check(arena._forgivable_groupbank("GRP-7"), "owed nonce forgives")
+	_check(not arena._forgivable_groupbank("GRP-8"), "other nonce refuses")
+	arena._seq_forgive_groupbank = {"tournament_id": "T2",
+		"match": "R1M1", "battle": "GRP-7"}
+	_check(not arena._forgivable_groupbank("GRP-7"), "other file refuses")
+	arena._seq_forgive_groupbank = {}
+	d.tourney = old_tourney
+
+
+func test_round_report_group_flag() -> void:
+	# Round reports out of group files carry group=true (server pins
+	# instead of reloading); bracket files carry false.
+	var d = arena._director()
+	var old_tourney: Dictionary = (d.tourney as Dictionary).duplicate(true)
+	d.tourney = {"id": "UT", "format": "groups"}
+	arena._round_match_cache = [{"match_id": "M1"}]
+	arena._send_round_report()
+	_check(bool(arena._seq_last_round_report.get("group", false)),
+		"group file flags its rounds")
+	d.tourney = {"id": "UT", "format": "bracket"}
+	arena._round_match_cache = [{"match_id": "M1"}]
+	arena._send_round_report()
+	_check(not bool(arena._seq_last_round_report.get("group", true)),
+		"bracket file flags false")
+	d.tourney = old_tourney
+	arena._round_match_cache = []
+	arena._tourney_awaiting_roundbank = false
+	arena._round_bank_pending = false
+	arena._seq_round_id = ""
+	arena._seq_forgive_roundbank = {}
+	arena._seq_last_round_report = {}
+	arena._seq_context = ""
+
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
@@ -1023,7 +1103,10 @@ func _process(_delta: float) -> bool:
 	test_idle_not_cached()
 	test_match_ready_refuses_ghosts()
 	test_stats_survive_perf_off()
-	test_intermission_header_band()
+	test_group_report_send()
+	test_group_banked_applies()
+	test_group_forgive_map()
+	test_round_report_group_flag()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()
