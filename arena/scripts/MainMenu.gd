@@ -77,6 +77,7 @@ var tourney_consolation: CheckButton
 var evo_mutate_traits: CheckButton
 var evo_min_matches: SpinBox
 var evo_elo_cutoff: SpinBox
+var evo_pool_threshold: SpinBox
 var tourney_lr: SpinBox
 var tourney_round_time: SpinBox
 var player_list: ItemList
@@ -884,12 +885,17 @@ func _build_tourney_column() -> HBoxContainer:
 	tourney_consolation.tooltip_text = "After the final, round-0 losers play their own bracket (needs 2/4/8); the last two skip the final and go straight to archives."
 	tourney_consolation.button_pressed = true
 	c.add_child(tourney_consolation)
+	# Pool threshold lives in this column (not with the evo spins on
+	# the right) for one reason: the right column is already at the
+	# page's vertical budget, and this column has ~35px of slack.
+	evo_pool_threshold = _spin("Pool threshold", c, 0.0, 200.0, 1.0, 25.0,
+		"Smart pool: new wilds/breed-kins queue only while the vault roster sits below this (0 = legacy always-breed). Battles keep cycling established fighters; archiving grinds the pool down until replacements breed.")
 	var pl := Label.new()
 	pl.text = "Participants (Ctrl+click multi-select):"
 	pl.add_theme_font_size_override("font_size", 13)
 	c.add_child(pl)
 	player_list = ItemList.new()
-	player_list.custom_minimum_size = Vector2(320, 90)
+	player_list.custom_minimum_size = Vector2(320, 64)
 	player_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	player_list.select_mode = ItemList.SELECT_MULTI
 	player_list.allow_rmb_select = true
@@ -1681,7 +1687,8 @@ func _on_start_evolution() -> void:
 	TournamentDirector.tourney["evo"] = {"active": true, "generation": 1,
 		"episodes": 50,
 		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
-			and evo_mutate_traits.button_pressed else 0}
+			and evo_mutate_traits.button_pressed else 0,
+		"pool_threshold": int(evo_pool_threshold.value) if is_instance_valid(evo_pool_threshold) else 25}
 	TournamentDirector.save_state()
 	bracket_status.text = "CONTINUOUS gen 1 ready (%s)." % str(res.get("tournament_id", ""))
 	_render_bracket()

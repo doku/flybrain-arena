@@ -64,6 +64,35 @@ func test_wild_mode_rotation() -> void:
 	a.queue_free()
 
 
+func test_pool_gate_truth_table() -> void:
+	# Smart-pool gate: strictly below threshold breeds, at/above
+	# plays on, threshold <= 0 disables (legacy always-breed).
+	var a = _new_arena()
+	_check(a._evo_pool_wants_breeding(24, 25), "below threshold breeds")
+	_check(not a._evo_pool_wants_breeding(25, 25), "at threshold plays on")
+	_check(not a._evo_pool_wants_breeding(82, 25), "full pool plays on")
+	_check(a._evo_pool_wants_breeding(82, 0), "threshold 0 disables gate")
+	_check(a._evo_pool_wants_breeding(0, 25), "empty pool breeds")
+	_check(a._evo_pool_threshold() == 25, "no director defaults 25")
+	a.queue_free()
+
+
+func test_pool_fill_best_first() -> void:
+	# Bracket completion drafts established fighters first: the
+	# ranking arrives worst-first (evo_ranking's contract), so the
+	# fill walks it backwards, skipping fighters and fresh losers.
+	var a = _new_arena()
+	var filled: Array = a._evo_pool_fill_ranked(
+		["s1", "s2"], ["gone1"], 5, ["w1", "w2", "gone1", "best"])
+	_check(filled == ["s1", "s2", "best", "w2", "w1"],
+		"best-first fill skips fighting and gone")
+	var full: Array = a._evo_pool_fill_ranked(["s1"], [], 1, ["w1"])
+	_check(full == ["s1"], "full roster untouched")
+	var empty: Array = a._evo_pool_fill_ranked([], [], 2, [])
+	_check(empty.is_empty(), "empty ranking fills nothing")
+	a.queue_free()
+
+
 func test_pip_throttle() -> void:
 	var a = _new_arena()
 	a.perf_pip = false
@@ -91,6 +120,8 @@ func _initialize() -> void:
 	test_dead_worker_blocks_nothing()
 	test_wild_mode_rotation()
 	test_pip_throttle()
+	test_pool_gate_truth_table()
+	test_pool_fill_best_first()
 	test_perf_defaults()
 	if failures == 0:
 		print("ALL EVO-QUEUE TESTS PASSED")

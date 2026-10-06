@@ -6709,19 +6709,93 @@ func _evo_wild_mode(target_gen: int) -> String:
 	return WILD_MODE_CYCLE[(maxi(target_gen, 1) - 1) % WILD_MODE_CYCLE.size()]
 
 
+func _evo_pool_threshold() -> int:
+	# Smart-pool threshold: new wilds/breed-kins queue only while the
+	# pool (whole vault roster) sits below this. Menu-settable
+	# (tournament page, default 25); <= 0 disables the gate (legacy
+	# always-breed). Carried across generations in the evo dict.
+	var director := _director()
+	if director == null:
+		return 25
+	return int((director.tourney.get("evo", {}) as Dictionary).get("pool_threshold", 25))
+
+
+func _evo_pool_size() -> int:
+	# The pool is the whole vault roster: everyone eligible to fight.
+	var director := _director()
+	if director == null:
+		return 0
+	return (director.list_brains_cached() as Array).size()
+
+
+func _evo_breeding_wanted() -> bool:
+	# Instance wrapper: pool size and threshold off the live director.
+	var director := _director()
+	var threshold := 25
+	var pool := 0
+	if director != null:
+		threshold = int((director.tourney.get("evo", {}) as Dictionary).get("pool_threshold", 25))
+		pool = (director.list_brains_cached() as Array).size()
+	return _evo_pool_wants_breeding(pool, threshold)
+
+
+static func _evo_pool_wants_breeding(pool_size: int, threshold: int) -> bool:
+	# Central gate (pure, unit-tested): every present and future queue
+	# site inherits it. Strictly below threshold breeds; at/above
+	# fights the pool as-is; threshold <= 0 disables the gate (legacy
+	# always-breed).
+	if threshold <= 0:
+		return true
+	return pool_size < threshold
+
+
 func _evo_queue_wild(target_gen: int, mode: String = "") -> void:
 	# Random needs nothing but a generation: name "" lets Python
 	# christen it deterministically (wild_name from seed).
 	if _evo_has_kind("wild"):
+		return
+	if not _evo_breeding_wanted():
+		print("[Arena] Pool %d/%d - wild breed skipped (pool at threshold)." % [
+			_evo_pool_size(), _evo_pool_threshold()])
 		return
 	if mode == "":
 		mode = _evo_wild_mode(target_gen)
 	_evo_queue_spec("wild", "", "", randi(), target_gen, mode)
 
 
+func _evo_pool_fill(roster: Array, gone: Array, size: int) -> Array:
+	# Complete a short bracket from the pool (established fighters
+	# first). Pure roster math (no breeding, no saves) - the caller
+	# builds the bracket from the result.
+	var director := _director()
+	if director == null or not director.has_method("evo_ranking"):
+		return roster
+	return _evo_pool_fill_ranked(roster, gone, size,
+		director.evo_ranking())
+
+
+static func _evo_pool_fill_ranked(roster: Array, gone: Array, size: int,
+		ranking: Array) -> Array:
+	# ranking arrives worst-first (evo_ranking's order): draft from
+	# the best end so brackets fill with proven fighters. Skips ids
+	# already fighting and freshly archived losers.
+	var filled: Array = roster.duplicate()
+	for i in range(ranking.size() - 1, -1, -1):
+		if filled.size() >= size:
+			break
+		var id := str(ranking[i])
+		if id != "" and not (id in filled) and not (id in gone):
+			filled.append(id)
+	return filled
+
+
 func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String,
 		parent2_id: String = "") -> void:
 	if champ_id == "" or _evo_has_kind("clone"):
+		return
+	if not _evo_breeding_wanted():
+		print("[Arena] Pool %d/%d - kin breed skipped (pool at threshold)." % [
+			_evo_pool_size(), _evo_pool_threshold()])
 		return
 	# Spec carries the pedigree BASE for display; the worker appends
 	# -kin/-jr with the lineage counters at banking (counters are
@@ -7002,7 +7076,14 @@ func _run_evo_generation() -> void:
 	_refresh_nextgen_preview()
 	var id1 := _evo_done_id("clone")
 	var id2 := _evo_done_id("wild")
-	# Queue missing specs (watcher will launch them when the slot is free)
+	# Queue missing specs under the pool gate (watcher will launch
+	# them when the slot is free); a full pool skips breeding
+	# entirely and the bracket refills from established fighters.
+	# _evo_queue_* no-op internally when the gate is shut.
+	var want_breed := _evo_breeding_wanted()
+	if not want_breed:
+		print("[Arena] Pool %d/%d - generation %d breeds no replacements." % [
+			_evo_pool_size(), _evo_pool_threshold(), target_gen])
 	if id1 == "" and not _evo_has_kind("clone"):
 		_evo_queue_clone(target_gen, champ_id, champ_name,
 			_evo_clone_parent2(target_gen, champ_id))
@@ -7048,10 +7129,16 @@ func _run_evo_generation() -> void:
 	# consolation, so the shortness would self-perpetuate).
 	if not _evo_active():
 		return
-	if id1 == "" or id2 == "":
+	# Offspring required only when the gate bred (or found) them: a
+	# full pool plays on without replacements instead of aborting on
+	# young it never asked for.
+	if want_breed and (id1 == "" or id2 == ""):
 		_evo_abort("missing offspring - refusing a short bracket")
 		return
 	# --- Rebuild bracket at constant roster size ---
+	# Survivors plus adopted offspring (if the gate bred any); a full
+	# pool completes from established fighters by ranking instead of
+	# breeding newcomers for the slot.
 	var size := int(director.tourney.get("size", 8))
 	var gone := [last_id, second_id]
 	var present: Array = director.evo_vault_ids()
@@ -7060,11 +7147,15 @@ func _run_evo_generation() -> void:
 		var pid := str((p as Dictionary).get("id", ""))
 		if pid != "" and not (pid in gone) and pid in present:
 			roster.append(pid)
-	roster.append(id1)
-	roster.append(id2)
-	# Self-heal for pre-fix short rosters (a survivor whose vault file
-	# vanished mid-event): breed wild top-ups until the bracket is full.
-	# Bounded; failure aborts instead of a TBA bracket.
+	for oid in [id1, id2]:
+		if str(oid) != "" and not (str(oid) in roster):
+			roster.append(str(oid))
+	roster = _evo_pool_fill(roster, gone, size)
+	# Self-heal for short rosters the pool cannot fill (weird configs
+	# like bracket size above pool size, or a vanished vault file):
+	# breed wild top-ups until the bracket is full. Bounded; failure
+	# aborts instead of a TBA bracket. This is necessity breeding,
+	# not pipeline breeding - the threshold gate yields to it.
 	var topups := 0
 	while roster.size() < size and topups < 2 and _evo_active():
 		var tkind := "topup%d" % topups
@@ -7101,16 +7192,23 @@ func _run_evo_generation() -> void:
 	if not bool(res.get("ok", false)):
 		_evo_abort("next bracket failed: %s" % str(res.get("error", "?")))
 		return
+	# The evo dict rebuilds from scratch each generation: carry the
+	# pool threshold forward or the gate silently resets to default.
+	var carried := director.tourney.get("evo", {}) as Dictionary
 	director.tourney["evo"] = {"active": true, "generation": gen + 1,
 		"episodes": EVO_EPISODES,
-		"mutate_traits": int((director.tourney.get("evo", {}) as Dictionary).get("mutate_traits", 1))}
+		"pool_threshold": int(carried.get("pool_threshold", 25)),
+		"mutate_traits": int(carried.get("mutate_traits", 1))}
 	director.save_state()
 	# Pipeline: kick off the next generation's wild breed immediately
+	# (gated: a full pool skips it and plays on).
 	_evo_queue_wild(gen + 2)
 	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
-		"Roster ready (%d fighters) - loading first battle..." % roster.size())
+		"Roster ready (%d fighters, pool %d/%d) - loading first battle..." % [
+			roster.size(), _evo_pool_size(), _evo_pool_threshold()])
 	if is_instance_valid(status_label):
-		status_label.text = "CONTINUOUS gen %d ready (%d fighters)." % [gen + 1, roster.size()]
+		status_label.text = "CONTINUOUS gen %d ready (%d fighters, pool %d/%d)." % [
+			gen + 1, roster.size(), _evo_pool_size(), _evo_pool_threshold()]
 	await get_tree().create_timer(2.0).timeout
 	_hide_nextgen()
 	_hide_evo_phase()

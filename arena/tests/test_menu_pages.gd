@@ -88,6 +88,11 @@ func _process(_delta: float) -> bool:
 	var srow: Control = menu.sound_palette_pick.get_parent()
 	_check(srow.get_combined_minimum_size().x <= 900.0,
 		"SOUND row stays bounded without voice names")
+	_check(menu.evo_pool_threshold != null, "pool threshold spin exists")
+	_check(int(menu.evo_pool_threshold.min_value) == 0
+		and int(menu.evo_pool_threshold.max_value) == 200
+		and int(menu.evo_pool_threshold.value) == 25,
+		"pool threshold 0-200, default 25")
 	test_train_picker()
 	if failures == 0:
 		print("ALL MENU-PAGE TESTS PASSED")
