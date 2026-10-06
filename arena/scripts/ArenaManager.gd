@@ -2509,10 +2509,14 @@ func _apply_pip_slot() -> void:
 	for n in [pip_alpha_label, pip_beta_label, pip_alpha_feat, pip_beta_feat]:
 		if is_instance_valid(n):
 			(n as Control).visible = perf_pip and eyes
+	# STATS/MOTORS cards, name rows, and motor widgets are cheap
+	# labels/canvas - they follow the slot mode even when eye renders
+	# are disabled (render saver, not stats killer). Only the viewport
+	# boxes and eye labels follow perf_pip.
 	if is_instance_valid(pip_stats_alpha):
-		pip_stats_alpha.visible = perf_pip and not eyes and (pip_slot_mode == "STATS" or motors)
+		pip_stats_alpha.visible = not eyes and (pip_slot_mode == "STATS" or motors)
 	if is_instance_valid(pip_stats_beta):
-		pip_stats_beta.visible = perf_pip and not eyes and (pip_slot_mode == "STATS" or motors)
+		pip_stats_beta.visible = not eyes and (pip_slot_mode == "STATS" or motors)
 	if is_instance_valid(pip_name_alpha):
 		pip_name_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
 	if is_instance_valid(pip_name_beta):
@@ -2529,15 +2533,15 @@ func _apply_pip_slot() -> void:
 		_make_pip_motors(pip_beta_box.get_parent(), false)
 	for bar in pip_motor_bars_alpha + pip_motor_bars_beta:
 		if is_instance_valid(bar):
-			(bar as Control).visible = perf_pip and motors
+			(bar as Control).visible = motors
 	if is_instance_valid(pip_motor_trace_alpha):
-		pip_motor_trace_alpha.visible = perf_pip and motors
+		pip_motor_trace_alpha.visible = motors
 	if is_instance_valid(pip_motor_trace_beta):
-		pip_motor_trace_beta.visible = perf_pip and motors
+		pip_motor_trace_beta.visible = motors
 	if is_instance_valid(pip_motor_scope_alpha):
-		pip_motor_scope_alpha.visible = perf_pip and motors
+		pip_motor_scope_alpha.visible = motors
 	if is_instance_valid(pip_motor_scope_beta):
-		pip_motor_scope_beta.visible = perf_pip and motors
+		pip_motor_scope_beta.visible = motors
 	if eyes:
 		if is_instance_valid(pip_alpha_label):
 			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
@@ -2675,39 +2679,51 @@ func _update_motor_cards() -> void:
 			trace.queue_redraw()
 
 
+func _refresh_pip_cards() -> void:
+	# Cheap label pump shared by the perf-on tick and the perf-off
+	# path: stat/motor cards stay live even when eye renders are
+	# disabled. Render updates live with the callers, never here.
+	if pip_slot_mode == "STATS":
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+		if is_instance_valid(pip_stats_alpha):
+			pip_stats_alpha.text = _pip_stats_text("alpha")
+		if is_instance_valid(pip_stats_beta):
+			pip_stats_beta.text = _pip_stats_text("beta")
+		if is_instance_valid(pip_name_alpha):
+			pip_name_alpha.text = _slot_name("alpha")
+		if is_instance_valid(pip_name_beta):
+			pip_name_beta.text = _slot_name("beta")
+	elif pip_slot_mode == "MOTORS":
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+		_update_motor_cards()
+
+
 func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
 	# Eye views re-render the whole forest per viewport (scene + shadow
 	# maps, twice): throttle to every 6th physics tick (~10 Hz, plenty
-	# for eye views), or hide outright when disabled.
+	# for eye views). Renders-off hides the heavy nodes once; the label
+	# cards keep refreshing on their normal schedule either way.
 	_pip_tick += 1
 	if not perf_pip:
 		if not _pip_hidden:
 			_pip_hidden = true
 			for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
-					pip_beta_label, pip_alpha_feat, pip_beta_feat,
-					pip_stats_alpha, pip_stats_beta,
-					pip_name_alpha, pip_name_beta,
-					pip_flash_alpha, pip_flash_beta]:
+					pip_beta_label, pip_alpha_feat, pip_beta_feat]:
 				if is_instance_valid(n):
 					(n as Control).visible = false
+		if _pip_tick % PIP_TICK_EVERY == 0:
+			_refresh_pip_cards()
 		return
 	if _pip_hidden:
 		_pip_hidden = false
 		_apply_pip_slot()
 	if _pip_tick % PIP_TICK_EVERY == 0:
-		if pip_slot_mode == "STATS":
-			# Stat cards instead of viewports: keep renders off, refresh text.
-			for v in [pip_alpha_view, pip_beta_view]:
-				if is_instance_valid(v):
-					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
-			if is_instance_valid(pip_stats_alpha):
-				pip_stats_alpha.text = _pip_stats_text("alpha")
-			if is_instance_valid(pip_stats_beta):
-				pip_stats_beta.text = _pip_stats_text("beta")
-			if is_instance_valid(pip_name_alpha):
-				pip_name_alpha.text = _slot_name("alpha")
-			if is_instance_valid(pip_name_beta):
-				pip_name_beta.text = _slot_name("beta")
+		if pip_slot_mode == "STATS" or pip_slot_mode == "MOTORS":
+			_refresh_pip_cards()
 		elif pip_slot_mode == "BRAIN":
 			for v in [pip_alpha_view, pip_beta_view]:
 				if is_instance_valid(v):

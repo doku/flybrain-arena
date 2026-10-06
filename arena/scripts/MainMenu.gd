@@ -306,7 +306,7 @@ func _build_perf_row() -> HBoxContainer:
 	row.add_child(h)
 	perf_pip = CheckButton.new()
 	perf_pip.text = "eye views"
-	perf_pip.tooltip_text = "ON = fly eye-view PiPs render (throttled). OFF = hides them for max fps."
+	perf_pip.tooltip_text = "ON = fly eye-view PiPs render (throttled). OFF = hides eye renders for max fps (stat cards stay on)."
 	perf_pip.button_pressed = TournamentDirector.perf_get("pip")
 	perf_pip.toggled.connect(_push_perf_settings)
 	row.add_child(perf_pip)

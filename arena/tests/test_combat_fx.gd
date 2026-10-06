@@ -639,6 +639,26 @@ func test_match_ready_refuses_ghosts() -> void:
 	arena.tournament_active = tact
 	d.tourney = old_tourney
 
+func test_stats_survive_perf_off() -> void:
+	# Eye-views OFF is a render saver, not a stats killer (Oct 2026:
+	# a flipped eye-views toggle hid the whole PiP HUD including the
+	# free stat cards). Cards stay visible with live text; viewports
+	# stay hidden; everything restores when renders return.
+	arena.pip_slot_mode = "STATS"
+	arena.perf_pip = false
+	arena._apply_pip_slot()
+	_check(arena.pip_stats_alpha.visible, "stats card visible with renders off")
+	_check(arena.pip_name_alpha.visible, "name row visible with renders off")
+	_check(not arena.pip_alpha_box.visible, "viewport stays hidden with renders off")
+	# Force the 1-in-6 refresh tick (throttle is intended behavior).
+	arena._pip_tick = 5
+	arena._update_pip_throttled({}, {})
+	_check(str(arena.pip_stats_alpha.text) != "", "stats text refreshes with renders off")
+	arena.perf_pip = true
+	arena._update_pip_throttled({}, {})
+	_check(arena.pip_stats_alpha.visible, "stats restore when renders return")
+	_check(arena._pip_hidden == false, "hidden latch clears on return")
+
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
 	# refresh from the last command; the silence badge flips on a
@@ -989,6 +1009,7 @@ func _process(_delta: float) -> bool:
 	test_idle_parks_loud()
 	test_idle_not_cached()
 	test_match_ready_refuses_ghosts()
+	test_stats_survive_perf_off()
 	test_auto_recover_supervisor()
 	test_state_poll()
 	test_motors_slot()
