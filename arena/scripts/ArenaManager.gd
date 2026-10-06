@@ -876,6 +876,11 @@ func _build_bracket_overlay() -> void:
 	intermission_label = Label.new()
 	intermission_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	intermission_label.add_theme_font_size_override("font_size", 16)
+	# EXPAND_FILL is load-bearing: without it the label renders at its
+	# ~1px minimum inside this button row and every line wraps into
+	# vertical soup (measured 73 lines for a 3-line text). With it the
+	# label takes all leftover row width and the roster reads.
+	intermission_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	# Dedicated top-margin band for the preview row: wraps (the
 	# side-by-side names must fold, never run off-edge) with a fixed
 	# two-row floor, so the per-second countdown rewrites never resize

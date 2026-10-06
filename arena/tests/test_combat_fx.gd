@@ -669,6 +669,8 @@ func test_intermission_header_band() -> void:
 	_check(arena.intermission_label.custom_minimum_size.y >= 50.0,
 		"header band has a fixed floor")
 	_check(not arena.intermission_row.visible, "header hidden until used")
+	_check(arena.intermission_label.size_flags_horizontal == Control.SIZE_EXPAND_FILL,
+		"header label takes leftover row width (never 1px soup)")
 
 func test_motors_slot() -> void:
 	# MOTORS PiP slot: debug widgets show, eye views hide; the cards
