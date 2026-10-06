@@ -90,6 +90,38 @@ func test_announce_clips() -> void:
 	arena._voice_on = true
 
 
+func test_mute_key() -> void:
+	# M key + MUTE button: master mute cuts voice and SFX now,
+	# preserves the individual toggles underneath, restores on
+	# second press. Held-key echo must not stutter the toggle.
+	var ev := InputEventKey.new()
+	ev.keycode = KEY_M
+	ev.pressed = true
+	ev.echo = false
+	arena._voice_on = true
+	arena._sfx_on = true
+	arena._unhandled_input(ev)
+	_check(arena._sound_muted, "M mutes")
+	_check(arena._voice_on and arena._sfx_on, "toggles preserved under mute")
+	arena._play_sfx("boom")
+	var busy := 0
+	for p in arena._sfx_players:
+		if (p as AudioStreamPlayer).playing:
+			busy += 1
+	_check(busy == 0, "muted sfx plays nothing")
+	var ev_echo := InputEventKey.new()
+	ev_echo.keycode = KEY_M
+	ev_echo.pressed = true
+	ev_echo.echo = true
+	arena._unhandled_input(ev_echo)
+	_check(arena._sound_muted, "held key does not stutter the toggle")
+	arena._unhandled_input(ev)
+	_check(not arena._sound_muted, "M again unmutes")
+	if is_instance_valid(arena.mute_button):
+		_check(arena.mute_button.text == "MUTE", "button text follows")
+	_check("SOUND" in arena.status_label.text, "status names sound state")
+
+
 func test_hit_sfx_routing() -> void:
 	# Part-keyed routing: clash tick, tear rip, body thump. Muted
 	# playback is asserted via toggle-off (no headless audio).
@@ -102,9 +134,9 @@ func test_hit_sfx_routing() -> void:
 
 func test_palettes_build() -> void:
 	# Every palette builds all six effects valid (16-bit, boot rate,
-	# non-empty); unknown names fall back to classic; rebuilding
-	# never stacks players.
-	for pal in ["classic", "punchy", "bright"]:
+	# non-empty) - procedural and sampled alike; unknown names fall
+	# back to classic; rebuilding never stacks players.
+	for pal in Synth.PALETTES:
 		var streams := Synth.build(pal)
 		_check(streams.size() == 6, "palette complete: " + pal)
 		for effect in Synth.EFFECTS:
@@ -132,6 +164,7 @@ func _process(_delta: float) -> bool:
 	test_synth_buffers()
 	test_player_pool()
 	test_play_guards()
+	test_mute_key()
 	test_announce_clips()
 	test_hit_sfx_routing()
 	test_palettes_build()

@@ -745,6 +745,9 @@ func _build_menu_bar(tournament: bool) -> void:
 		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
+		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
+		mute_button.pressed.connect(_on_mute_button)
+		bar.add_child(mute_button)
 		var evo_stop_b := _menu_bar_button("STOP CONTINUOUS", "Stop the continuous tournament loop (keeps current bracket).")
 		evo_stop_b.pressed.connect(_on_evo_stop)
 		bar.add_child(evo_stop_b)
@@ -762,6 +765,9 @@ func _build_menu_bar(tournament: bool) -> void:
 		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
+		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
+		mute_button.pressed.connect(_on_mute_button)
+		bar.add_child(mute_button)
 
 
 const BV_LAYERS := ["bars", "flow", "raster", "brain3d"]
@@ -772,6 +778,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			_toggle_brainview()
 		elif (event as InputEventKey).keycode == KEY_N:
 			_cycle_bv_layer()
+		elif (event as InputEventKey).keycode == KEY_M:
+			_set_muted(not _sound_muted)
 
 
 func _cycle_bv_layer() -> void:
@@ -3767,6 +3775,12 @@ const SfxSynthLib = preload("res://scripts/SfxSynth.gd")
 var _voice_on := true
 var _sfx_on := true
 var _sfx_palette := "classic" # SfxSynth.PALETTES; persisted [audio].
+# Master mute (M key / MUTE button): overrides both toggles without
+# destroying them - unmute restores voice/sfx exactly. Session-only,
+# never persisted: boot always starts from the menu toggles, so a
+# forgotten mute cannot mysteriously survive a restart.
+var _sound_muted := false
+var mute_button: Button
 var _sfx_players: Array = []
 var _sfx_streams := {}
 var _voice_player: AudioStreamPlayer
@@ -3785,6 +3799,26 @@ func _init_sound() -> void:
 		_sfx_palette = str(director.call("audio_opt_get", "sfx_palette", "classic"))
 	_build_voice()
 	_build_sfx()
+
+
+func _set_muted(muted: bool) -> void:
+	# Master mute flip: stops every player NOW (the current boom/line
+	# cuts, not just future ones), updates the button, posts status.
+	_sound_muted = muted
+	if muted:
+		for p in _sfx_players:
+			if is_instance_valid(p):
+				(p as AudioStreamPlayer).stop()
+		if is_instance_valid(_voice_player):
+			_voice_player.stop()
+	if is_instance_valid(mute_button):
+		mute_button.text = "UNMUTE" if muted else "MUTE"
+	if is_instance_valid(status_label):
+		status_label.text = "SOUND MUTED (M to unmute)" if muted else "SOUND ON"
+
+
+func _on_mute_button() -> void:
+	_set_muted(not _sound_muted)
 
 
 func _build_voice() -> void:
@@ -3812,7 +3846,7 @@ func _announce_clip(clip: String) -> void:
 	# skips, never crashes. Errors and stalls stay visual-only by
 	# policy: never announce them. To silence a single call site,
 	# delete its call (never add per-site flags).
-	if not _voice_on:
+	if not _voice_on or _sound_muted:
 		return
 	if not _voice_clips.has(clip):
 		_arena_log("announce clip missing: %s" % clip)
@@ -3844,7 +3878,8 @@ func _build_sfx() -> void:
 func _play_sfx(sfx_name: String) -> void:
 	# First free player wins; all busy = drop (a dropped blip beats a
 	# cut-off boom). Unknown names no-op - callers need no guards.
-	if not _sfx_on or not _sfx_streams.has(sfx_name):
+	# Master mute silences here (toggle state untouched underneath).
+	if not _sfx_on or _sound_muted or not _sfx_streams.has(sfx_name):
 		return
 	var stream: AudioStreamWAV = _sfx_streams[sfx_name]
 	for p in _sfx_players:
