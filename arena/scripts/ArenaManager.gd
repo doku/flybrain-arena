@@ -753,7 +753,7 @@ func _build_menu_bar(tournament: bool) -> void:
 		bracket_button = _menu_bar_button("BRACKET", "Show/hide the tournament bracket.")
 		bracket_button.pressed.connect(_on_bracket_toggle)
 		bar.add_child(bracket_button)
-		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
+		var brain_b := _menu_bar_button("STATS VIEW", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
 		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
@@ -773,7 +773,7 @@ func _build_menu_bar(tournament: bool) -> void:
 		var restart_b := _menu_bar_button("RESTART", "Restart the round (banks rewards).")
 		restart_b.pressed.connect(_on_restart_pressed)
 		bar.add_child(restart_b)
-		var brain_b := _menu_bar_button("BRAIN", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
+		var brain_b := _menu_bar_button("STATS VIEW", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
 		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
@@ -3310,7 +3310,7 @@ static func pip_slot_next(cur: String) -> String:
 
 
 func _on_brain_button() -> void:
-	# BRAIN button cycles every representation (bars/flow/raster/3D)
+	# STATS VIEW button cycles every representation (bars/flow/raster/3D)
 	# so the views are discoverable without knowing the keys; B
 	# still toggles visibility outright.
 	var any_hidden := false
@@ -3332,7 +3332,7 @@ func _on_brain_button() -> void:
 		pip_slot_mode = pip_slot_next(pip_slot_mode)
 		_apply_pip_slot()
 		if is_instance_valid(status_label):
-			status_label.text = "PiP slot: %s (BRAIN cycles, N diagrams)" % pip_slot_mode
+			status_label.text = "PiP slot: %s (STATS VIEW cycles, N diagrams)" % pip_slot_mode
 
 
 func _toggle_brainview() -> void:
