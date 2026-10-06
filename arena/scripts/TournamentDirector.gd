@@ -2211,36 +2211,100 @@ func event_pool_qualified(event_id: String, min_train: int = 50, elo_floor: floa
 	return {"ok": true, "qualified": qualified}
 
 
-func event_draw_candidates(event_id: String, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+static func schooled_ids(roster: Array, cards: Dictionary, min_train: int = 50, elo_floor: float = 0.0, exclude := {}) -> Array:
+	# Schooled-gate filter shared by the top-up draw and the fresh-roster
+	# draw: ids with train >= min_train and ELO >= floor, minus the
+	# exclude set. Pure (no files), so the menu can draw before any
+	# event file exists.
+	var out: Array = []
+	for b in roster:
+		var pid := str((b as Dictionary).get("id", ""))
+		if pid == "" or exclude.has(pid) or not cards.has(pid):
+			continue
+		var card: Dictionary = cards[pid]
+		if int(card.get("train", 0)) >= min_train \
+				and float(card.get("elo", 0.0)) >= elo_floor:
+			out.append(pid)
+	return out
+
+
+static func draw_green_picks(qualified: Array, cards: Dictionary, n: int) -> Array:
+	# Green-weighted random draw: one weighted pass per slot with weight
+	# 1/(1+matches), so debutants surface first while veterans stay
+	# possible. Pure apart from the RNG; short bags just draw short
+	# (callers gate on the count).
+	var drawn: Array = []
+	var bag: Array = qualified.duplicate()
+	for _i in range(n):
+		if bag.is_empty():
+			break
+		var total := 0.0
+		for pid in bag:
+			total += 1.0 / (1.0 + float((cards.get(str(pid), {}) as Dictionary).get("matches", 0)))
+		var roll := randf() * total
+		var pick := str(bag[bag.size() - 1])
+		for pid in bag:
+			roll -= 1.0 / (1.0 + float((cards.get(str(pid), {}) as Dictionary).get("matches", 0)))
+			if roll <= 0.0:
+				pick = str(pid)
+				break
+		drawn.append(pick)
+		bag.erase(pick)
+	return drawn
+
+
+func event_draw_candidates(event_id: String, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = [], include_participants: bool = false) -> Dictionary:
 	# Promotion pool: the ENTIRE vault, not the bench — every schooled
 	# brain (train >= min_train, ELO >= floor) outside the current
 	# event's players. Archived brains are absent from the vault, so
 	# they can never draw. Current-event players are excluded (they
 	# advance or eliminate on their own path; survivors re-enter via
-	# the roster, never the draw). Pure readout; the draw consumes.
+	# the roster, never the draw) unless include_participants rides
+	# along for a full fresh-roster draw. Pure readout; the draw
+	# consumes.
 	var ev := event_load_cached(event_id)
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
 	var participants := {}
-	for g in (ev.get("group_order", []) as Array):
-		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
-		for pid in (gd.get("players", []) as Array):
-			participants[str(pid)] = true
+	if not include_participants:
+		for g in (ev.get("group_order", []) as Array):
+			var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				participants[str(pid)] = true
 	var roster: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
 	var cards := _event_live_cards(live_override)
-	var qualified: Array = []
-	for b in roster:
-		var pid := str((b as Dictionary).get("id", ""))
-		if pid == "" or participants.has(pid) or not cards.has(pid):
-			continue
-		var card: Dictionary = cards[pid]
-		if int(card.get("train", 0)) >= min_train \
-				and float(card.get("elo", 0.0)) >= elo_floor:
-			qualified.append(pid)
+	var qualified := schooled_ids(roster, cards, min_train, elo_floor, participants)
 	return {"ok": true, "qualified": qualified}
 
 
-func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+func event_draw_roster(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+	# Full fresh roster for redraw mode: same schooled gate and green
+	# weighting as the top-up draw, but NOBODY is excluded (last
+	# iteration's fighters may re-qualify — that is the point of a new
+	# random draw). Drawn ids still leave the bench pool when present
+	# there: ring fighters must not also sit on the bench.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var q := event_draw_candidates(event_id, min_train, elo_floor,
+		live_override, brains_override, true)
+	if not bool(q.get("ok", false)):
+		return q
+	var qualified: Array = q.get("qualified", [])
+	if qualified.size() < n:
+		return {"ok": false, "error": "roster short (%d/%d schooled)" % [qualified.size(), n]}
+	var cards := _event_live_cards(live_override)
+	var drawn := draw_green_picks(qualified, cards, n)
+	var pool: Array = ev.get("pool", [])
+	for pid in drawn:
+		pool.erase(str(pid))
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}
+
+
+func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = [], include_participants: bool = false) -> Dictionary:
 	# Random draw weighted toward the least-experienced qualifiers
 	# (weight 1/(1+matches)): every schooled vault brain cycles into
 	# the ring over time instead of the top-ELO pair hogging every
@@ -2249,28 +2313,14 @@ func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: f
 	if ev.is_empty():
 		return {"ok": false, "error": "no such event"}
 	var q := event_draw_candidates(event_id, min_train, elo_floor,
-		live_override, brains_override)
+		live_override, brains_override, include_participants)
 	if not bool(q.get("ok", false)):
 		return q
 	var qualified: Array = q.get("qualified", [])
 	if qualified.size() < n:
 		return {"ok": false, "error": "pool short (%d/%d qualified)" % [qualified.size(), n]}
 	var cards := _event_live_cards(live_override)
-	var drawn: Array = []
-	var bag: Array = qualified.duplicate()
-	for _i in range(n):
-		var total := 0.0
-		for pid in bag:
-			total += 1.0 / (1.0 + float((cards[pid] as Dictionary).get("matches", 0)))
-		var roll := randf() * total
-		var pick := str(bag[bag.size() - 1])
-		for pid in bag:
-			roll -= 1.0 / (1.0 + float((cards[pid] as Dictionary).get("matches", 0)))
-			if roll <= 0.0:
-				pick = str(pid)
-				break
-		drawn.append(pick)
-		bag.erase(pick)
+	var drawn := draw_green_picks(qualified, cards, n)
 	var pool: Array = ev.get("pool", [])
 	for pid in drawn:
 		pool.erase(str(pid))

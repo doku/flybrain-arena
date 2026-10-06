@@ -6143,9 +6143,11 @@ func _event_group_done(res: Dictionary) -> void:
 	_request_current_battle_load()
 
 
-func _event_pool_ready_count() -> int:
+func _event_pool_ready_count(include_current: bool = false) -> int:
 	# Promotion-ready brains vault-wide (schooled + above the demotion
 	# line, outside the current event): the draw pool, not the bench.
+	# Redraw mode counts the current roster too (nobody is excluded
+	# from a fresh draw).
 	var director := _director()
 	if director == null:
 		return 0
@@ -6154,11 +6156,11 @@ func _event_pool_ready_count() -> int:
 		return 0
 	var st: Dictionary = ev.get("settings", {})
 	var q: Dictionary = director.event_draw_candidates(_event_id(),
-		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)), {}, [], include_current)
 	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
 
 
-func _event_pool_wait() -> String:
+func _event_pool_wait(need: int = EVENT_POOL_TARGET, include_current: bool = false) -> String:
 	# Rare fallback: bench short at handoff. Waits on the FINAL review
 	# screen (bracket visible, queue status live) while the background
 	# queue works - never a bare progress bar. STOP aborts. Returns ""
@@ -6169,7 +6171,7 @@ func _event_pool_wait() -> String:
 		return "no director"
 	_close_round_for_wait()
 	_show_arena_bracket("FINAL REVIEW - PROMOTION READY (%d/%d qualified)" % [
-		_event_pool_ready_count(), EVENT_POOL_TARGET])
+		_event_pool_ready_count(include_current), need])
 	var waited := 0.0
 	while _evo_active() and waited < EVO_AWAIT_TIMEOUT:
 		await get_tree().create_timer(5.0).timeout
@@ -6177,10 +6179,10 @@ func _event_pool_wait() -> String:
 		_evo_adopt_finished()
 		_event_drain_done_to_pool()
 		_event_maintain_pool()
-		var ready := _event_pool_ready_count()
+		var ready := _event_pool_ready_count(include_current)
 		if is_instance_valid(status_label):
-			status_label.text = "Promotion-ready %d/%d - queue breeding..." % [ready, EVENT_POOL_TARGET]
-		if ready >= EVENT_POOL_TARGET:
+			status_label.text = "Promotion-ready %d/%d - queue breeding..." % [ready, need]
+		if ready >= need:
 			_hide_arena_bracket()
 			return ""
 	# Failure paths leave FINAL REVIEW up for the caller's failure
@@ -6338,8 +6340,12 @@ func _run_event_handoff() -> void:
 	if not _evo_has_kind("wild"):
 		_evo_queue_wild(gen + 1)
 	_event_drain_done_to_pool()
-	if _event_pool_ready_count() < EVENT_POOL_TARGET:
-		var why := await _event_pool_wait()
+	# Redraw mode needs a full 16 schooled brains (roster included);
+	# survivor mode only needs the top-up pair.
+	var redraw := bool(st0.get("redraw_roster", false))
+	var pool_need := 16 if redraw else EVENT_POOL_TARGET
+	if _event_pool_ready_count(redraw) < pool_need:
+		var why := await _event_pool_wait(pool_need, redraw)
 		if why != "":
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid, why)
 			await get_tree().create_timer(8.0).timeout
@@ -6355,32 +6361,49 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	var eid := str(ev_old.get("id", ""))
 	var gen := int(ev_old.get("generation", 1)) + 1
 	var st: Dictionary = ev_old.get("settings", {})
-	var survivors: Array = []
-	for g in (ev_old.get("group_order", []) as Array):
-		var gd: Dictionary = (ev_old.get("groups", {}) as Dictionary).get(str(g), {})
-		for pid in (gd.get("players", []) as Array):
-			if not (str(pid) in gone) and not (str(pid) in survivors):
-				survivors.append(str(pid))
-	# Normally 14 (16 minus 2 eliminated); a waived elimination leaves
-	# 15-16 and the draw shrinks to fit - the roster still lands on 16.
-	# Anything else is a corrupt manifest, not a stall: show it, quit.
-	var need := 16 - survivors.size()
-	if need < 0 or need > 2:
-		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
-			"event survivors %d (need 14-16)" % survivors.size())
-		await get_tree().create_timer(8.0).timeout
-		director.quit_to_menu()
-		return
-	var draw: Dictionary = director.event_draw_pool(eid, need,
-		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
-	if not bool(draw.get("ok", false)) \
-			or (draw.get("drawn", []) as Array).size() != need:
-		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
-			"pool draw failed: " + str(draw.get("error", "short bench")))
-		await get_tree().create_timer(8.0).timeout
-		director.quit_to_menu()
-		return
-	var roster: Array = survivors + (draw.get("drawn", []) as Array)
+	var roster: Array = []
+	if bool(st.get("redraw_roster", false)):
+		# Fresh roster every iteration: all 16 drawn green-weighted
+		# from the vault (no survivors carry over). Loud abort on a
+		# short school bench, same as the top-up draw.
+		var full: Dictionary = director.event_draw_roster(eid, 16,
+			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+		if not bool(full.get("ok", false)) \
+				or (full.get("drawn", []) as Array).size() != 16:
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+				"fresh draw failed: " + str(full.get("error", "short bench")))
+			await get_tree().create_timer(8.0).timeout
+			director.quit_to_menu()
+			return
+		roster = full.get("drawn", [])
+		print("[Arena] Event %s fresh roster drawn: %d brains" % [eid, roster.size()])
+	else:
+		var survivors: Array = []
+		for g in (ev_old.get("group_order", []) as Array):
+			var gd: Dictionary = (ev_old.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				if not (str(pid) in gone) and not (str(pid) in survivors):
+					survivors.append(str(pid))
+		# Normally 14 (16 minus 2 eliminated); a waived elimination leaves
+		# 15-16 and the draw shrinks to fit - the roster still lands on 16.
+		# Anything else is a corrupt manifest, not a stall: show it, quit.
+		var need := 16 - survivors.size()
+		if need < 0 or need > 2:
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+				"event survivors %d (need 14-16)" % survivors.size())
+			await get_tree().create_timer(8.0).timeout
+			director.quit_to_menu()
+			return
+		var draw: Dictionary = director.event_draw_pool(eid, need,
+			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+		if not bool(draw.get("ok", false)) \
+				or (draw.get("drawn", []) as Array).size() != need:
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+				"pool draw failed: " + str(draw.get("error", "short bench")))
+			await get_tree().create_timer(8.0).timeout
+			director.quit_to_menu()
+			return
+		roster = survivors + (draw.get("drawn", []) as Array)
 	var beg: Dictionary = director.event_begin(roster, st, gen)
 	if not bool(beg.get("ok", false)):
 		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,

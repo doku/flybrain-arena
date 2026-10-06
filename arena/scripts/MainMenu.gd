@@ -73,6 +73,7 @@ var _ref_bridging := false
 var tourney_size: OptionButton
 var tourney_bestof: OptionButton
 var tourney_random: CheckButton
+var tourney_redraw: CheckButton
 var tourney_consolation: CheckButton
 var evo_mutate_traits: CheckButton
 var evo_min_matches: SpinBox
@@ -938,6 +939,11 @@ func _build_tourney_column() -> HBoxContainer:
 	evo_mutate_traits.tooltip_text = "ON = each generation's winner-clone re-rolls one random trait (learning rate, dist gain, evasion, yaw bias) alongside genome structural mutation. OFF = exact hyperparameter copy."
 	evo_mutate_traits.button_pressed = true
 	r.add_child(evo_mutate_traits)
+	tourney_redraw = CheckButton.new()
+	tourney_redraw.text = "Fresh roster every iteration"
+	tourney_redraw.tooltip_text = "Size-16 continuous only: every iteration draws all 16 from the vault green-weighted (debutants surface first) instead of carrying 14 survivors. Needs 16 schooled brains."
+	tourney_redraw.button_pressed = false
+	r.add_child(tourney_redraw)
 	evo_min_matches = _spin("Evo demote: min matches", r, 1.0, 12.0, 1.0, 10.0,
 		"Career ring experience required before a brain can be demoted to archives: only fighters with at least this many vault-record matches AND below the ELO line are evaluated at generation end. Green brains are never demoted.")
 	evo_elo_cutoff = _spin("Evo demote: ELO below", r, 0.0, 2000.0, 25.0, 0.0,
@@ -1667,6 +1673,14 @@ func _on_start_evolution() -> void:
 	var size := int(TournamentDirector.size_options()[tourney_size.selected])
 	var bestof := int(TournamentDirector.best_of_options()[tourney_bestof.selected])
 	var ids := _selected_player_ids()
+	# Fresh-roster mode draws its own 16 (manual selection bypassed);
+	# the flag rides settings so every handoff redraws too.
+	if size == 16 and is_instance_valid(tourney_redraw) and tourney_redraw.button_pressed:
+		var fresh := _draw_fresh_roster()
+		if fresh.is_empty():
+			return
+		_start_event_evolution(fresh, bestof)
+		return
 	# Continuous mode demands a FULL roster: a short bracket yields 7 (or 3)
 	# round-0 losers, consolation can never start (needs 2/4/8), and
 	# the shortness self-perpetuates every generation after.
@@ -1696,11 +1710,26 @@ func _on_start_evolution() -> void:
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
 
 
+func _draw_fresh_roster() -> Array:
+	# Green-weighted full draw for fresh-roster mode (menu parity with
+	# the handoff draw): schooled gate 50 + evo ELO cutoff over the
+	# whole vault. Empty (with status set) when the bench is short.
+	var cards: Dictionary = TournamentDirector._event_live_cards()
+	var roster: Array = TournamentDirector.list_brains_cached()
+	var floor := float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 0.0
+	var qualified: Array = TournamentDirector.schooled_ids(roster, cards, 50, floor)
+	if qualified.size() < 16:
+		bracket_status.text = "Fresh roster needs 16 schooled brains (found %d) - school the bench first." % qualified.size()
+		return []
+	return TournamentDirector.draw_green_picks(qualified, cards, 16)
+
+
 func _start_event_evolution(ids: Array, bestof: int) -> void:
 	# Group-stage continuous mode: snake-draft event manifest, group A file,
 	# then the arena chains A-D + final with queue intermissions.
 	var settings := {"best_of": bestof, "lr_scale": tourney_lr.value,
 		"round_time": tourney_round_time.value, "random_draw": false,
+		"redraw_roster": is_instance_valid(tourney_redraw) and tourney_redraw.button_pressed,
 		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
 			and evo_mutate_traits.button_pressed else 0,
 		"episodes": 50,
@@ -1758,7 +1787,16 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 		bracket_status.text = "Cannot start: group A file missing"
 		return
 	TournamentDirector.event_set_phase(eid, "groups_A")
-	bracket_status.text = "EVENT %s gen 1 ready - GROUP A (%s)." % [eid, str(gres.get("tournament_id", ""))]
+	var fresh_note := ""
+	if bool(settings.get("redraw_roster", false)):
+		var greens := 0
+		for pid in ids:
+			if by_id.has(str(pid)):
+				var rec: Dictionary = (by_id[str(pid)] as Dictionary).get("record", {})
+				if int(rec.get("matches", 0)) < 10:
+					greens += 1
+		fresh_note = " fresh draw (%d debutants)" % greens
+	bracket_status.text = "EVENT %s gen 1 ready - GROUP A (%s).%s" % [eid, str(gres.get("tournament_id", "")), fresh_note]
 	_render_bracket()
 	await get_tree().create_timer(0.5).timeout
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")

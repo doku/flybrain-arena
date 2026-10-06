@@ -123,6 +123,80 @@ func test_final_fixed_order() -> void:
 		and str((r0[0] as Dictionary).get("b_id", "")) == "f02", "QF order preserved, no reseeding")
 
 
+func test_redraw_full_roster() -> void:
+	# Fresh-roster draw: all 16 from the vault green-weighted, NOBODY
+	# excluded (last iteration's fighters may re-qualify). Short
+	# school benches abort loudly.
+	var brains := _brains(24, 2000)
+	var ids: Array = []
+	for i in range(16):
+		ids.append(str(brains[i]["id"]))
+	var beg: Dictionary = D.call("event_begin", ids,
+		{"best_of": 1, "lr_scale": 0.5, "round_time": 40.0}, 21, brains)
+	_check(bool(beg.get("ok", false)), "redraw fixture event begins")
+	var eid := str(beg.get("event_id", ""))
+	var cards := {}
+	for i in range(24):
+		var pid := str(brains[i]["id"])
+		# Six greens scattered across participants and outsiders;
+		# everyone schooled (train 80), veterans carry 30-50 matches.
+		var green := i in [0, 3, 7, 16, 17, 20]
+		cards[pid] = {"elo": 1500.0, "train": 80,
+			"matches": (i % 3) if green else (30 + i)}
+	# Full take: all 24 qualify, so the draw must return the whole
+	# set (participants included - the top-up draw would return 8).
+	var full: Dictionary = D.call("event_draw_roster", eid, 24, 50, 0.0,
+		cards, brains)
+	_check(bool(full.get("ok", false)), "full roster draws")
+	var wall: Array = (full.get("drawn", []) as Array).duplicate()
+	wall.sort()
+	var expect: Array = []
+	for b in brains:
+		expect.append(str(b["id"]))
+	expect.sort()
+	_check(wall == expect, "fresh draw excludes nobody")
+	# Seeded partial draw: greens outnumber veterans, and the same
+	# seed replays the same roster (weighting locked, not vibes).
+	seed(23)
+	var d1: Dictionary = D.call("event_draw_roster", eid, 16, 50, 0.0,
+		cards, brains)
+	seed(23)
+	var d2: Dictionary = D.call("event_draw_roster", eid, 16, 50, 0.0,
+		cards, brains)
+	var r1: Array = d1.get("drawn", [])
+	_check(r1 == (d2.get("drawn", []) as Array), "seeded draw replays exactly")
+	_check(r1.size() == 16, "fresh draw deals sixteen")
+	var uniq := {}
+	for pid in r1:
+		uniq[str(pid)] = true
+	_check(uniq.size() == 16, "fresh draw has no duplicates")
+	var greens := 0
+	for pid in r1:
+		if int((cards[str(pid)] as Dictionary).get("matches", 99)) < 10:
+			greens += 1
+	# Six greens in a 24-pool: the weighting surfaces every one of
+	# them (seed-locked; a broken curve drops one and fails here).
+	_check(greens == 6, "green weighting wins the draw")
+	# Short bench: only 10 schooled -> loud abort, no partial roster.
+	var thin := {}
+	for i in range(10):
+		var pid := str(brains[i]["id"])
+		thin[pid] = {"elo": 1500.0, "train": 80, "matches": 0}
+	var short: Dictionary = D.call("event_draw_roster", eid, 16, 50, 0.0,
+		thin, brains)
+	_check(not bool(short.get("ok", false))
+		and str(short.get("error", "")).begins_with("roster short"),
+		"short bench aborts loudly")
+	# Static gate unit: floors + exclude set, no files involved.
+	var q: Array = D.call("schooled_ids",
+		[{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": ""}],
+		{"a": {"elo": 1300.0, "train": 80, "matches": 0},
+			"b": {"elo": 1300.0, "train": 10, "matches": 0},
+			"c": {"elo": 900.0, "train": 80, "matches": 0}},
+		50, 1000.0, {"c": true})
+	_check(q == ["a"], "schooled gate floors + excludes")
+
+
 func test_event_chain() -> void:
 	var brains := _brains(16, 2000)
 	var ids: Array = []
@@ -1445,6 +1519,7 @@ func _initialize() -> void:
 	test_schedule_and_ko()
 	test_ko_tiebreak()
 	test_final_fixed_order()
+	test_redraw_full_roster()
 	test_event_chain()
 	test_overview_render()
 	test_prebuilt_overview()
