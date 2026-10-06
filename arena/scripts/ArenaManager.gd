@@ -942,6 +942,11 @@ func _build_bracket_overlay() -> void:
 	brow.add_theme_constant_override("separation", 8)
 	brow.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	brow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Floor under the bracket row: header rows (title, wait, standings,
+	# intermission, strip) can stack during transitions - the bracket
+	# area never collapses below this, so its position and spacing hold
+	# and the scroll takes the overflow internally instead.
+	brow.custom_minimum_size = Vector2(0, 380)
 	vb.add_child(brow)
 	bracket_row = brow
 	gallery_box = VBoxContainer.new()
@@ -963,6 +968,11 @@ func _build_bracket_overlay() -> void:
 	gallery_title.add_theme_font_size_override("font_size", 20)
 	gallery_title.add_theme_color_override("font_color",
 		BracketView.COL_SHOWCASE)
+	# Same 1px-soup disease as the intermission label: a bare label in
+	# a centered row collapses and wraps long fighter names into a
+	# vertical stack. Expand + wrap like its sibling.
+	gallery_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gallery_title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	title_row.add_child(gallery_title)
 	gallery_star = Label.new()
 	gallery_star.text = "*"

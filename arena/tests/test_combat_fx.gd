@@ -671,6 +671,16 @@ func test_intermission_header_band() -> void:
 	_check(not arena.intermission_row.visible, "header hidden until used")
 	_check(arena.intermission_label.size_flags_horizontal == Control.SIZE_EXPAND_FILL,
 		"header label takes leftover row width (never 1px soup)")
+	# Same disease class in the gallery title row (centered HBox with
+	# buttons/markers): long fighter names must wrap, never stack.
+	_check(arena.gallery_title.size_flags_horizontal == Control.SIZE_EXPAND_FILL,
+		"gallery title takes leftover row width")
+	_check(arena.gallery_title.autowrap_mode != TextServer.AUTOWRAP_OFF,
+		"gallery title wraps")
+	# Bracket row holds a fixed floor so stacked header rows can never
+	# squeeze it out of view; the scroll absorbs overflow internally.
+	_check(arena.bracket_row.custom_minimum_size.y >= 380.0,
+		"bracket row keeps its floor")
 
 func test_group_report_send() -> void:
 	# Group seal: minted GRP nonce, groupbank context armed, forgive
@@ -1103,6 +1113,7 @@ func _process(_delta: float) -> bool:
 	test_idle_not_cached()
 	test_match_ready_refuses_ghosts()
 	test_stats_survive_perf_off()
+	test_intermission_header_band()
 	test_group_report_send()
 	test_group_banked_applies()
 	test_group_forgive_map()
