@@ -463,17 +463,152 @@ func test_forgivable_roundbank() -> void:
 
 
 func test_roundbank_retry() -> void:
-	# The roundbank watchdog resends the SAME nonce once (idempotent),
-	# then the fail-loud takes its normal path.
+	# The roundbank watchdog resends the SAME nonce on every expiry
+	# (idempotent ladder, never a battle reload): no recovery cycle,
+	# no fail-loud, same id re-armed. Group twin rides the same rule.
 	arena.tournament_active = true
+	arena.brain_client.is_connected_server = true
 	arena._seq_context = "roundbank"
 	arena._seq_retried = false
 	arena._seq_deadline_msec = 1
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = true
+	arena._bank_retries = 0
+	arena._bank_last_send_msec = 0
+	arena._server_reloads = 0
 	arena._seq_last_round_report = {"tournament_id": "T1",
 		"match": "R1M1", "round_nonce": "RND-1-2",
 		"matches": []}
 	arena._check_seq_watchdog()
-	_check(arena._seq_retried, "roundbank retry fires once")
+	_check(arena._bank_retries == 1, "roundbank watchdog resends same nonce")
+	_check(arena._seq_round_id == "RND-1-2", "resend keeps the nonce")
+	_check(arena._tourney_awaiting_roundbank, "still awaiting after resend")
+	_check(arena._server_reloads == 0, "bank expiry never reloads")
+	_check(str(arena._seq_context) == "roundbank", "watchdog re-armed")
+	arena._seq_deadline_msec = 1
+	arena._check_seq_watchdog()
+	_check(arena._bank_retries == 2, "roundbank expiry resends again")
+	_check(arena._server_reloads == 0, "second bank expiry still no reload")
+	arena._seq_context = "groupbank"
+	arena._seq_deadline_msec = 1
+	arena._group_bank_pending = true
+	arena._tourney_awaiting_groupbank = true
+	arena._seq_last_group_report = {"tournament_id": "T1",
+		"match": "R1M1", "group_nonce": "GRP-1-2"}
+	arena._check_seq_watchdog()
+	_check(arena._seq_group_id == "GRP-1-2", "group resend keeps its nonce")
+	_check(arena._server_reloads == 0, "group expiry never reloads")
+	arena._seq_context = ""
+	arena._round_bank_pending = false
+	arena._group_bank_pending = false
+	arena._tourney_awaiting_roundbank = false
+	arena._tourney_awaiting_groupbank = false
+	arena._seq_last_round_report = {}
+	arena._seq_last_group_report = {}
+	arena._bank_retries = 0
+
+
+func test_bank_tick_resends() -> void:
+	# Owed-bank tick: a lost ack heals without any watchdog cycle -
+	# and without the seq context a recovery cleared.
+	arena.tournament_active = true
+	arena.brain_client.is_connected_server = true
+	arena._recover_in_flight = false
+	arena._seq_context = ""
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = false
+	arena._bank_retries = 0
+	# Engine uptime in-suite is seconds: stamp the last send far in
+	# the past so the 30 s cadence reads as due either way.
+	arena._bank_last_send_msec = -60000
+	arena._seq_last_round_report = {"tournament_id": "T1",
+		"match": "R1M1", "round_nonce": "RND-9-9", "matches": []}
+	arena._bank_resend_tick()
+	_check(arena._bank_retries == 1, "tick resends the owed bank")
+	_check(arena._seq_round_id == "RND-9-9", "tick keeps the nonce")
+	_check(arena._tourney_awaiting_roundbank, "tick re-arms the wait")
+	arena._bank_resend_tick()
+	_check(arena._bank_retries == 1, "tick respects its cadence")
+	arena._round_bank_pending = false
+	arena._bank_last_send_msec = -60000
+	arena._bank_retries = 0
+	arena._bank_resend_tick()
+	_check(arena._bank_retries == 0, "tick silent with no bank owed")
+	arena._seq_last_round_report = {}
+	arena._tourney_awaiting_roundbank = false
+
+
+func test_late_bank_ack_after_recover_applies() -> void:
+	# The semifinal-stall regression: a bank ack landing after a
+	# recovery cleared the seq must still clear the owed latch
+	# (forgive retained) instead of dropping as late/duplicate.
+	var d = arena._director()
+	if d == null:
+		_check(true, "late ack skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	d.tourney = {"id": "T1"}
+	arena.tournament_active = true
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_round_id = "RND-9"
+	arena._seq_forgive_roundbank = {"tournament_id": "T1",
+		"match": arena.tourney_match_label, "battle": "RND-9"}
+	arena._load_gated_on_bank = false
+	arena._on_round_banked("RND-9", "T1", "R1M1")
+	_check(not arena._round_bank_pending, "late ack clears the owed latch")
+	_check(arena._seq_forgive_roundbank.is_empty(), "applied ack closes forgive")
+	arena._seq_round_id = ""
+	d.tourney = old_tourney
+
+
+func test_recover_carries_owed_bank() -> void:
+	# Recovery with a bank owed: the forgive window survives, the
+	# stored-report resend arms, and the reload bypasses the bank
+	# gate (the old code parked it: the exact semifinal stall).
+	var d = arena._director()
+	if d == null:
+		_check(true, "recover bank skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1",
+			"a_name": "A", "b_name": "B"}]]}
+	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
+		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_forgive_roundbank = {"tournament_id": "TREC",
+		"match": "R1M1", "battle": "RND-7"}
+	arena._seq_last_round_report = {"tournament_id": "TREC",
+		"match": "R1M1", "round_nonce": "RND-7", "matches": []}
+	arena._pending_roundbank_resend = false
+	arena._load_gated_on_bank = false
+	var ok: bool = arena._recover_server_state("unit test")
+	_check(ok, "bank-owed recovery proceeds")
+	_check(arena._pending_roundbank_resend, "owed bank arms its resend")
+	_check(not arena._seq_forgive_roundbank.is_empty(), "owed bank keeps forgive")
+	_check(not arena._load_gated_on_bank, "recovery load bypasses the gate")
+	_check(arena.tourney_awaiting_load, "recovery load issued")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena._round_bank_pending = false
+	arena._pending_roundbank_resend = false
+	arena._seq_forgive_roundbank = {}
+	arena._seq_last_round_report = {}
+	arena._seq_context = ""
+	arena.is_round_active = false
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
 
 
 func test_server_brain_loss_reloads() -> void:
@@ -1104,6 +1239,9 @@ func _process(_delta: float) -> bool:
 	test_round_report_send()
 	test_forgivable_roundbank()
 	test_roundbank_retry()
+	test_bank_tick_resends()
+	test_late_bank_ack_after_recover_applies()
+	test_recover_carries_owed_bank()
 	test_roundbank_brain_loss_resends()
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()

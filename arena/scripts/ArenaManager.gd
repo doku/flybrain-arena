@@ -391,11 +391,24 @@ var bracket_button: Button
 # the server answers a resent round_over (same tournament/match/battle
 # id) from its persisted verdict instead of banking twice. A late reply
 # arriving after a fail-loud timeout is dropped, never applied twice.
-var _seq_context: String = "" # "" | "load" | "reset" | "battle"
+# Bank contexts (roundbank/groupbank) are the exception: the owed report
+# re-sends under its SAME nonce until the ack lands (server-answered
+# from the stored verdict, never double-banked), on a 30 s tick plus
+# every watchdog expiry - a lost ack heals in seconds with no recovery
+# cycle. Only a dead link (reconnects failing) parks loud.
+var _seq_context: String = "" # "" | "load" | "reset" | "battle" | "roundbank" | "groupbank"
 var _seq_deadline_msec: int = 0
 var _seq_retried: bool = false
 var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
+# Owed-bank resend ladder: consecutive same-nonce resends without an
+# ack (status readout), consecutive dead-link resends (fail-loud trip),
+# and the last resend stamp (30 s tick cadence).
+const BANK_RESEND_EVERY_MSEC := 30000
+const BANK_LINK_FAIL_LOUD := 5
+var _bank_retries := 0
+var _bank_link_fails := 0
+var _bank_last_send_msec := 0
 # Mid-match server-brain-loss recovery: the server restarts (or is
 # relaunched) under a live tournament, and the next match_reset fails
 # on the fresh server. Reloading the CURRENT match self-heals (the
@@ -1348,6 +1361,9 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 			str(rr.get("tournament_id", "")), str(rr.get("match", "")),
 			(rr.get("matches", []) as Array), bool(rr.get("group", false)))
 		_arm_seq("roundbank")
+		_bank_last_send_msec = Time.get_ticks_msec()
+		_bank_retries += 1
+		_bank_link_fails = 0
 		print("[Arena] Resent stored round report %s after reload." % _seq_round_id)
 		var rhead := _verdict_headline()
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
@@ -1385,6 +1401,9 @@ func _resend_stored_group_report() -> bool:
 		brain_client.request_group_report(_seq_group_id,
 			str(gr.get("tournament_id", "")), str(gr.get("match", "")))
 		_arm_seq("groupbank")
+		_bank_last_send_msec = Time.get_ticks_msec()
+		_bank_retries += 1
+		_bank_link_fails = 0
 		print("[Arena] Resent stored group report %s after reload." % _seq_group_id)
 		if is_instance_valid(status_label):
 			status_label.text = "STALLED - RETRYING GROUP BANK ..."
@@ -1482,6 +1501,7 @@ func _on_server_error(error: String) -> void:
 		_arena_log("round overtaken by group bank - confirmed, no resend")
 		_tourney_awaiting_roundbank = false
 		_round_bank_pending = false
+		_bank_ladder_reset()
 		if _seq_context == "roundbank":
 			_clear_seq()
 		_seq_forgive_roundbank = {}
@@ -1983,6 +2003,33 @@ func _clear_seq() -> void:
 	_seq_battle_id = ""
 	_seq_last_round = {}
 
+
+func _fail_loud_server_silent() -> void:
+	_hide_wait_bracket()
+	_show_loading("STALLED - NO SERVER REPLY",
+		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
+	if is_instance_valid(status_label):
+		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
+
+
+func _bank_resend_tick() -> void:
+	# Owed-bank self-heal: while a round or group bank is owed, the
+	# STORED report re-sends every 30 s (same nonce, idempotent) so a
+	# lost ack heals in seconds, not watchdog cycles. Keyed on the
+	# pending latches - not the seq context, which a recovery may have
+	# cleared - and silent apart from the status counter. Suppressed
+	# mid-recovery (the reload's brains_loaded carries the resend).
+	if not tournament_active or _recover_in_flight:
+		return
+	if Time.get_ticks_msec() - _bank_last_send_msec < BANK_RESEND_EVERY_MSEC:
+		return
+	if _round_bank_pending and not _seq_last_round_report.is_empty():
+		if not _bank_resend_round("tick"):
+			_fail_loud_server_silent()
+	elif _group_bank_pending and not _seq_last_group_report.is_empty():
+		if not _bank_resend_group("tick"):
+			_fail_loud_server_silent()
+
 func _check_seq_watchdog() -> void:
 	if _seq_context == "":
 		return
@@ -2040,46 +2087,42 @@ func _check_seq_watchdog() -> void:
 		if is_instance_valid(status_label):
 			status_label.text = "SERVER SILENT - see server_log.txt - QUIT TO MENU + RESUME"
 		return
+	# Bank contexts never escalate to battle reloads: the owed report
+	# re-sends under its SAME nonce until the ack lands (the server
+	# answers repeats from its stored verdict, never double-banks).
+	# Uncapped on a live link; only a dead link parks loud. The
+	# single-retry flag below is for load/reset/battle only.
+	if _seq_context == "roundbank" and not _seq_last_round_report.is_empty():
+		print("[Arena] Retrying round report id=", _seq_round_id,
+			" (same id, idempotent)")
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("STALLED - RETRYING ROUND BANK",
+				"No confirmation for the round yet. Re-sending the SAME report id "
+				+ "(the server answers repeats from its stored verdict, no double count)...",
+				Color(0.85, 0.85, 0.9))
+		if not _bank_resend_round("watchdog", false):
+			_fail_loud_server_silent()
+			return
+		if is_instance_valid(status_label):
+			status_label.text = "STALLED - RETRYING ROUND BANK (try %d) ..." % _bank_retries
+		return
+	if _seq_context == "groupbank" and not _seq_last_group_report.is_empty():
+		print("[Arena] Retrying group report id=", _seq_group_id,
+			" (same id, idempotent)")
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("STALLED - RETRYING GROUP BANK",
+				"No confirmation for the group yet. Re-sending the SAME report id "
+				+ "(the server answers repeats from its stored verdict, no double count)...",
+				Color(0.85, 0.85, 0.9))
+		if not _bank_resend_group("watchdog", false):
+			_fail_loud_server_silent()
+			return
+		if is_instance_valid(status_label):
+			status_label.text = "STALLED - RETRYING GROUP BANK (try %d) ..." % _bank_retries
+		return
 	if not _seq_retried:
 		_seq_retried = true
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for(_seq_context)
-		if _seq_context == "roundbank" and not _seq_last_round_report.is_empty():
-			# Same round nonce, idempotent: the server answers repeats
-			# from the stored round verdict, never double-banks.
-			var mr := _seq_last_round_report
-			print("[Arena] Retrying round report id=", _seq_round_id,
-				" (same id, idempotent)")
-			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-				_set_wait_header("STALLED - RETRYING ROUND BANK",
-					"No confirmation for the round yet. Re-sending the SAME report id "
-					+ "(the server answers repeats from its stored verdict, no double count)...",
-					Color(0.85, 0.85, 0.9))
-			if is_instance_valid(status_label):
-				status_label.text = "STALLED - RETRYING ROUND BANK ..."
-			brain_client.reconnect()
-			brain_client.request_round_report(
-				str(mr.get("round_nonce", "")), str(mr.get("tournament_id", "")),
-				str(mr.get("match", "")), (mr.get("matches", []) as Array),
-				bool(mr.get("group", false)))
-			return
-		if _seq_context == "groupbank" and not _seq_last_group_report.is_empty():
-			# Same group nonce, idempotent: the server answers repeats
-			# from the stored group verdict, never double-banks.
-			var gr := _seq_last_group_report
-			print("[Arena] Retrying group report id=", _seq_group_id,
-				" (same id, idempotent)")
-			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-				_set_wait_header("STALLED - RETRYING GROUP BANK",
-					"No confirmation for the group yet. Re-sending the SAME report id "
-					+ "(the server answers repeats from its stored verdict, no double count)...",
-					Color(0.85, 0.85, 0.9))
-			if is_instance_valid(status_label):
-				status_label.text = "STALLED - RETRYING GROUP BANK ..."
-			brain_client.reconnect()
-			brain_client.request_group_report(
-				str(gr.get("group_nonce", "")), str(gr.get("tournament_id", "")),
-				str(gr.get("match", "")))
-			return
 		if _seq_context == "load" and not _seq_last_load.is_empty():
 			var p := _seq_last_load
 			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
@@ -2105,19 +2148,17 @@ func _check_seq_watchdog() -> void:
 			brain_client.request_match_reset(tourney_match_label)
 		return
 	# Second expiry: the quit+resume recipe runs in place before
-	# anything parks loud (a wedged load/reset/roundbank un-wedges with
+	# anything parks loud (a wedged load/reset un-wedges with
 	# a fresh seq/socket + re-issued load; a late reply can never
-	# silently start a round behind the recovery). Only a persistently
+	# silently start a round behind the recovery). Bank contexts never
+	# reach here (they resend above). Only a persistently
 	# broken server (cap exhausted) lands the fail-loud screen.
 	_clear_seq()
 	tourney_awaiting_load = false
 	if tournament_active and _recover_server_state("no server reply"):
 		return
 	_hide_wait_bracket()
-	_show_loading("STALLED - NO SERVER REPLY",
-		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
-	if is_instance_valid(status_label):
-		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
+	_fail_loud_server_silent()
 
 var _round_overtime := 1.0
 
@@ -2187,8 +2228,10 @@ func _reset_round() -> void:
 
 func _physics_process(delta: float) -> void:
 	# Watchdog runs even between rounds: that limbo is exactly where a
-	# lost server reply would wedge the game.
+	# lost server reply would wedge the game. The owed-bank tick rides
+	# alongside so a lost bank ack heals without a watchdog cycle.
 	_check_seq_watchdog()
+	_bank_resend_tick()
 	_check_step_watchdog()
 	if not is_round_active:
 		return
@@ -4961,9 +5004,11 @@ func _on_battle_progress(battle_id: String) -> void:
 	elif _seq_context == "roundbank" and battle_id != "" \
 			and battle_id == _seq_round_id:
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("roundbank")
+		_bank_link_fails = 0
 	elif _seq_context == "groupbank" and battle_id != "" \
 			and battle_id == _seq_group_id:
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("groupbank")
+		_bank_link_fails = 0
 
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
@@ -5291,6 +5336,7 @@ func _send_round_report() -> void:
 		tourney_match_label, _round_match_cache, group_mode)
 	_round_match_cache.clear()
 	_arm_seq("roundbank")
+	_bank_ladder_reset()
 
 
 func _tourney_is_group() -> bool:
@@ -5319,6 +5365,77 @@ func _send_group_report() -> void:
 		tourney_match_label)
 	_arm_seq("groupbank")
 	_arena_log("group report sent: %s (%s)" % [_seq_group_id, tourney_match_label])
+	_bank_ladder_reset()
+
+
+func _bank_ladder_reset() -> void:
+	_bank_retries = 0
+	_bank_link_fails = 0
+	_bank_last_send_msec = Time.get_ticks_msec()
+
+
+func _bank_link_alive() -> bool:
+	# Reconnect only when the socket is down (recreating it every
+	# resend would widow in-flight replies on a new local port).
+	# Counts consecutive dead-link resends; the caller fails loud at
+	# BANK_LINK_FAIL_LOUD. A silent-but-connected server never trips.
+	if brain_client.is_connected_server:
+		return true
+	if brain_client.reconnect():
+		_bank_link_fails = 0
+		return true
+	_bank_link_fails += 1
+	print("[Arena] Bank resend skipped - link down (%d/%d)." % [_bank_link_fails, BANK_LINK_FAIL_LOUD])
+	_arena_log("bank resend link down %d/%d" % [_bank_link_fails, BANK_LINK_FAIL_LOUD])
+	return _bank_link_fails < BANK_LINK_FAIL_LOUD
+
+
+func _bank_resend_round(reason: String, announce: bool = true) -> bool:
+	# Same-nonce resend of the STORED round report (the server answers
+	# repeats from its stored verdict, never double-banks). True =
+	# sent (or safely skipped); false = link dead-tripped, fail loud.
+	if _seq_last_round_report.is_empty():
+		return true
+	if not _bank_link_alive():
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	var mr := _seq_last_round_report
+	_seq_round_id = str(mr.get("round_nonce", ""))
+	_tourney_awaiting_roundbank = true
+	_bank_link_fails = 0
+	brain_client.request_round_report(_seq_round_id,
+		str(mr.get("tournament_id", "")), str(mr.get("match", "")),
+		(mr.get("matches", []) as Array), bool(mr.get("group", false)))
+	_bank_last_send_msec = Time.get_ticks_msec()
+	_bank_retries += 1
+	_arm_seq("roundbank")
+	print("[Arena] Resent round report %s (%s, try %d)." % [_seq_round_id, reason, _bank_retries])
+	_arena_log("resent round report %s (%s, try %d)" % [_seq_round_id, reason, _bank_retries])
+	if announce and is_instance_valid(status_label):
+		status_label.text = "BANKING ROUND - retry %d (same report, no double count)..." % _bank_retries
+	return true
+
+
+func _bank_resend_group(reason: String, announce: bool = true) -> bool:
+	# Group-seal twin of _bank_resend_round: same nonce, idempotent,
+	# true = sent (or safely skipped), false = link dead-tripped.
+	if _seq_last_group_report.is_empty():
+		return true
+	if not _bank_link_alive():
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	var gr := _seq_last_group_report
+	_seq_group_id = str(gr.get("group_nonce", ""))
+	_tourney_awaiting_groupbank = true
+	_bank_link_fails = 0
+	brain_client.request_group_report(_seq_group_id,
+		str(gr.get("tournament_id", "")), str(gr.get("match", "")))
+	_bank_last_send_msec = Time.get_ticks_msec()
+	_bank_retries += 1
+	_arm_seq("groupbank")
+	print("[Arena] Resent group report %s (%s, try %d)." % [_seq_group_id, reason, _bank_retries])
+	_arena_log("resent group report %s (%s, try %d)" % [_seq_group_id, reason, _bank_retries])
+	if announce and is_instance_valid(status_label):
+		status_label.text = "BANKING GROUP - retry %d (same report, no double count)..." % _bank_retries
+	return true
 
 
 func _forgivable_groupbank(group_nonce: String) -> bool:
@@ -5370,6 +5487,7 @@ func _on_group_banked(group_nonce: String, tid: String) -> void:
 		return
 	_tourney_awaiting_groupbank = false
 	_group_bank_pending = false
+	_bank_ladder_reset()
 	_clear_seq()
 	# Consuming the owed ack closes the forgive window.
 	_seq_forgive_groupbank = {}
@@ -5410,6 +5528,7 @@ func _on_round_banked(round_nonce: String, tid: String, match_label: String) -> 
 		return
 	_tourney_awaiting_roundbank = false
 	_round_bank_pending = false
+	_bank_ladder_reset()
 	_clear_seq()
 	# Consuming the owed ack closes the forgive window.
 	_seq_forgive_roundbank = {}
@@ -6213,7 +6332,10 @@ func _recover_server_state(reason: String) -> bool:
 	# seq/latches, fresh UDP socket, re-issued load from the current
 	# director position. Stored payloads resend under their SAME nonce
 	# where one is owed (callers set the pending-resend flag BEFORE
-	# calling; consumed in _on_brains_loaded). Capped: MAX_SERVER_RELOADS
+	# calling, and an owed bank arms it here too; consumed in
+	# _on_brains_loaded). The reload bypasses the bank gate (it
+	# re-establishes server state for a resend, not a fight) and an
+	# owed bank keeps its forgive window. Capped: MAX_SERVER_RELOADS
 	# between clean loads; past the cap the caller parks loud (a
 	# persistently broken server is not automatable). Status line only
 	# - silent healing otherwise.
@@ -6230,7 +6352,20 @@ func _recover_server_state(reason: String) -> bool:
 	_tourney_awaiting_battle = false
 	_tourney_awaiting_roundbank = false
 	_seq_forgive_match = {}
-	_seq_forgive_roundbank = {}
+	# A still-owed bank keeps its forgive window: the ack that resolves
+	# the deadlock may land after this recovery, and it must apply
+	# (the window closes on the ack, never here).
+	if not _round_bank_pending:
+		_seq_forgive_roundbank = {}
+	if not _group_bank_pending:
+		_seq_forgive_groupbank = {}
+	# A bank owed across this recovery must ride along: arm its
+	# stored-report resend so the reload below lands it (same nonce)
+	# instead of starting a round on stale brains.
+	if _round_bank_pending and not _seq_last_round_report.is_empty():
+		_pending_roundbank_resend = true
+	if _group_bank_pending and not _seq_last_group_report.is_empty():
+		_pending_groupbank_resend = true
 	_hide_wait_bracket()
 	_hide_loading()
 	brain_client.reconnect()
@@ -6241,7 +6376,10 @@ func _recover_server_state(reason: String) -> bool:
 		status_label.text = "RECOVERING: %s - reloading %s..." % [reason,
 			expand_match_label(tourney_match_label)]
 	_recover_in_flight = true
-	_request_current_battle_load()
+	# Bypass the bank gate: this reload re-establishes server brains
+	# for an armed bank resend (consumed in _on_brains_loaded), never
+	# a fight (the resend suppresses the round start).
+	_request_current_battle_load(true)
 	return true
 
 

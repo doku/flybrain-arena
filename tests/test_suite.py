@@ -6625,8 +6625,13 @@ class TestBattleTransaction(unittest.TestCase):
         self.srv._handle_round_report(
             _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
             {"rec": None}, {"tournament_id": "T", "match": "R1M1"},
-            0.5, True, _FakeEvo(), _FakeRL(), 1.0, lambda: "tourney T match M1",
+            0.5, True, _FakeEvo(), rl, 1.0, lambda: "tourney T match M1",
             csr, pops, {})
+        # The resend re-acks from the stored verdict (the client retry
+        # ladder depends on this reply to clear its owed latch).
+        again = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(again["status"], "round_banked")
+        self.assertEqual(again["battle_id"], "RND-1")
         la2, _ = vault_pkg.load_brain(_rec_a["id"])
         self.assertEqual(la2["record"]["battles"], 1)
         self.assertEqual(la2["record"]["matches"], 1)
