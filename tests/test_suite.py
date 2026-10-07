@@ -6636,6 +6636,47 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(la2["record"]["battles"], 1)
         self.assertEqual(la2["record"]["matches"], 1)
 
+    def test_handle_warm_wirings(self):
+        # Bind-only pre-warm: novel wirings bind into the shared caches
+        # (objects discarded), a second pass skips everything (key
+        # agreement with the binds), the reply counts the split. The
+        # third fighter shares the wiring but not the mapping: struct
+        # hit, codec miss, still a warm.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        ra, rb = self._round_fighters(["WrmA", "WrmB"], wbasis)
+        rc = vault_pkg.new_record("WrmC", {"experiment": "lplc2_contra_dn",
+                                           "mapping": "gyro_flow"})
+        vault_pkg.save_brain(rc, np.ascontiguousarray(
+            np.asarray(wbasis, dtype=np.float32).copy()))
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        sc = {}
+        cc = {}
+        paths = [vault_pkg.package_path(ra), vault_pkg.package_path(rb),
+                 vault_pkg.package_path(rc)]
+        w1 = self.srv._handle_warm_wirings(_FakeSock(), ("127.0.0.1", 1),
+                                           {"paths": paths}, csr, pops, sc, cc)
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "wirings_warm")
+        self.assertEqual(w1, (2, 1))
+        ka, _ = self.srv._wiring_cache_keys(ra)
+        self.assertIn(ka, sc)
+        w2 = self.srv._handle_warm_wirings(_FakeSock(), ("127.0.0.1", 1),
+                                           {"paths": paths}, csr, pops, sc, cc)
+        self.assertEqual(w2, (0, 3))
+        # Unknown paths skip silently (they refuse at load time anyway).
+        w3 = self.srv._handle_warm_wirings(_FakeSock(), ("127.0.0.1", 1),
+                                           {"paths": ["nope.flybrain"]},
+                                           csr, pops, {}, {})
+        self.assertEqual(w3, (0, 0))
+
     def _group_reset(self):
         self.srv._group_pinned.clear()
         self.srv._group_pinned.update({"tournament_id": "", "brains": {}})
@@ -7551,13 +7592,43 @@ class TestPrepareSlot(unittest.TestCase):
     """Preload-slot + zero-activity gates: the prepare slot activates in
     O(1) for the exact match, and a tournament reset with no loaded
     brains fails loud instead of running a boot-brain round."""
+    def test_wiring_cache_keys(self):
+        import brain_server as bs
+        rec = {"id": "k1", "name": "K1",
+               "generator_params": {"experiment": None, "mapping": None,
+                                    "yaw_bias": None}}
+        skey, ckey = bs._wiring_cache_keys(rec)
+        self.assertEqual(skey, bs._norm_experiment(None))
+        self.assertEqual(len(ckey), 4)
+        again = bs._wiring_cache_keys(rec)
+        self.assertEqual((skey, ckey), again)
+        bad = {"id": "k9", "name": "K9",
+               "generator_params": {"experiment": "no-such-wiring-ever",
+                                    "mapping": None}}
+        with self.assertRaises(ValueError):
+            bs._wiring_cache_keys(bad)
+
     def test_prepared_slot_matches(self):
         import brain_server as bs
-        pa = {"brain": object(), "path": "a.flybrain"}
-        pb = {"brain": object(), "path": "b.flybrain"}
+        import os
+        anchor = os.path.abspath(__file__)
+        mt = os.path.getmtime(anchor)
+        pa = {"brain": object(), "path": anchor, "mtime": mt}
+        pb = {"brain": object(), "path": anchor, "mtime": mt}
         tag = {"tournament_id": "T1", "match": "R1M1"}
         msg = {"tournament_id": "T1", "match": "R1M1",
-               "alpha_path": "a.flybrain", "beta_path": "b.flybrain"}
+               "alpha_path": anchor, "beta_path": anchor}
+        self.assertTrue(bs._prepared_slot_matches(pa, pb, tag, msg))
+        # Stale stamp (a bank landed after the prepare) falls through
+        # to a fresh load instead of fighting on old weights.
+        self.assertFalse(bs._prepared_slot_matches(
+            dict(pa, mtime=mt - 1.0), pb, tag, msg))
+        # Missing file never matches, even unstamped.
+        gone = {"brain": object(), "path": "gone.flybrain", "mtime": None}
+        gmsg = dict(msg, alpha_path="gone.flybrain")
+        self.assertFalse(bs._prepared_slot_matches(gone, pb, tag, gmsg))
+        self.assertFalse(bs._prepared_slot_matches(
+            {"brain": None, "path": anchor}, pb, tag, msg))
         self.assertTrue(bs._prepared_slot_matches(pa, pb, tag, msg))
         self.assertFalse(bs._prepared_slot_matches(
             {"brain": None, "path": "a.flybrain"}, pb, tag, msg))

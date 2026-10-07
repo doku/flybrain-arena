@@ -307,7 +307,6 @@ var _pending_groupbank_resend := false
 var _pending_final_group: Dictionary = {}
 var _load_gated_on_bank := false
 var _pending_advance: Dictionary = {}
-var _pending_final_ev: Dictionary = {}
 # Last-step sensorimotor context (the dopamine replay's inputs): the
 # sens refs land at send time, the ctrl refs at motor-reply time -
 # exactly what the server used to capture per battle.
@@ -1290,9 +1289,15 @@ func _preload_next_match() -> void:
 	# pointing at the next match (post-advance / post-switch), so
 	# get_load_params IS the next match. Best-effort (no director /
 	# missing paths -> no-op); never starts rounds, never touches the
-	# watchdog.
+	# watchdog. Skipped while the final is stashed unbuilt (the
+	# director still points at the old group - preparing it would burn
+	# a 5-20 s server cycle on the wrong brains right when QF1 wants
+	# the slot; the ack handler preloads once the final is built).
 	var director := _director()
 	if director == null or not tournament_active:
+		return
+	if not _pending_final_group.is_empty():
+		print("[Arena] Preload skipped - final unbuilt (stashed behind banks).")
 		return
 	var p: Dictionary = director.get_load_params()
 	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
@@ -1533,17 +1538,6 @@ func _on_server_error(error: String) -> void:
 			var pa := _pending_advance
 			_pending_advance = {}
 			_handle_advance_result(pa)
-		if not _pending_final_ev.is_empty():
-			var fev := _pending_final_ev
-			_pending_final_ev = {}
-			print("[Arena] Banked - building the queued final now.")
-			if _event_build_final(fev):
-				_event_gallery_update()
-			_show_arena_bracket("EVENT %s · FINAL" % str(fev.get("id", "")))
-		if not _pending_advance.is_empty():
-			var pa2 := _pending_advance
-			_pending_advance = {}
-			_handle_advance_result(pa2)
 		if _load_gated_on_bank:
 			_load_gated_on_bank = false
 			_request_current_battle_load()
@@ -5569,6 +5563,9 @@ func _on_group_banked(group_nonce: String, tid: String) -> void:
 		print("[Arena] Group banked - building the queued final now.")
 		if _event_build_final(fgev):
 			_event_gallery_update()
+			# QF1 is known now: warm the slot under the rest of the
+			# countdown instead of loading cold post-ack.
+			_preload_next_match()
 		_show_arena_bracket("EVENT %s · FINAL" % str(fgev.get("id", "")))
 	if _load_gated_on_bank:
 		_load_gated_on_bank = false
@@ -5607,17 +5604,6 @@ func _on_round_banked(round_nonce: String, tid: String, match_label: String) -> 
 	if not _pending_advance.is_empty():
 		# Stashed tournament-end chain (review already shown pre-ack):
 		# the crown + handoff need the banked vault, available now.
-		var pa := _pending_advance
-		_pending_advance = {}
-		_handle_advance_result(pa)
-	if not _pending_final_ev.is_empty():
-		var fev := _pending_final_ev
-		_pending_final_ev = {}
-		print("[Arena] Banked - building the queued final now.")
-		if _event_build_final(fev):
-			_event_gallery_update()
-		_show_arena_bracket("EVENT %s · FINAL" % str(fev.get("id", "")))
-	if not _pending_advance.is_empty():
 		var pa := _pending_advance
 		_pending_advance = {}
 		_handle_advance_result(pa)
@@ -6309,9 +6295,8 @@ func _event_group_done(res: Dictionary) -> void:
 	if _round_bank_pending:
 		print("[Arena] Bank %s still owed at intermission - countdown runs under it; loads gate on the ack." % _seq_round_id)
 	# The final's player ELO snapshots must come post-bank: stash the
-	# build while EITHER bank is owed and let the group ack build it.
-	# (Round acks never consume this stash - only _on_group_banked.
-	# Separate var from _pending_final_ev for exactly that reason.)
+	# build while EITHER bank is owed and let the group ack build it
+	# (round acks never consume this stash - only _on_group_banked).
 	if nxt == "final" and (_round_bank_pending or _group_bank_pending):
 		_pending_final_group = ev.duplicate(true)
 		title += " (banking round...)"
@@ -6620,6 +6605,9 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 		director.quit_to_menu()
 		return
 	var new_eid := str(beg.get("event_id", ""))
+	# Bind pre-warm for the whole roster: genome compiles land under
+	# the group builds + GROUP A countdown instead of post-ack loads.
+	brain_client.request_warm_wirings(director.vault_paths_for(roster))
 	# Bench remainder rides into the new event; in-flight breed specs
 	# ride along too (absolute result paths), so no verdict ever
 	# orphans across the boundary. Banked done entries stay behind:

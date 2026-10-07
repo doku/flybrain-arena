@@ -1056,6 +1056,49 @@ func test_loading_supervisor_recovers() -> void:
 	d.brains_cache_msec = old_msec
 
 
+func test_preload_skips_unbuilt_final() -> void:
+	# Final stashed behind banks: the director still points at the old
+	# group, so preloading would burn a 5-20 s server cycle on the
+	# wrong brains. The ack handler preloads once built instead.
+	arena.tournament_active = true
+	arena._pending_final_group = {"id": "E9"}
+	var before: Dictionary = (arena._preload_params as Dictionary).duplicate(true)
+	arena._preload_next_match()
+	_check(arena._preload_params == before, "stale final skips preload")
+	arena._pending_final_group = {}
+
+
+func test_preload_targets_current_match() -> void:
+	# Preload sends the director's CURRENT match to the prepare slot
+	# (the property the post-build preload in the ack handler relies
+	# on: the director points at final QF1 by then).
+	var d = arena._director()
+	if d == null:
+		_check(true, "preload skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	d.tourney = {"id": "TPRE", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1",
+			"a_name": "A", "b_name": "B"}]]}
+	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
+		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena._pending_final_group = {}
+	arena._preload_params = {}
+	arena.brain_client.is_connected_server = true
+	arena._preload_next_match()
+	_check(str((arena._preload_params as Dictionary).get("match", "")) == "R1M1",
+		"preload targets the current match")
+	arena._preload_params = {}
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+
+
 func test_roundbank_brain_loss_resends() -> void:
 	# Server restart killed the round bank: the free-mode error arms a
 	# stored-report resend (supervisor reload, capped); the reload
@@ -1359,6 +1402,8 @@ func _process(_delta: float) -> bool:
 	test_recover_carries_owed_bank()
 	test_overtake_fires_parked_load()
 	test_loading_supervisor_recovers()
+	test_preload_skips_unbuilt_final()
+	test_preload_targets_current_match()
 	test_roundbank_brain_loss_resends()
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()

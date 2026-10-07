@@ -56,7 +56,27 @@ func test_guarded_send_never_crashes() -> void:
 	b.request_restart({}, {})
 	b.request_raster_map("alpha", "dn_left")
 	b.request_tournament_load("a", "b", "T9", "R1M9", 0.5)
+	b.request_warm_wirings([])
+	b.request_warm_wirings(["a.flybrain"])
 	_check(true, "all senders safe while disconnected")
+	b.queue_free()
+
+
+func test_round_banked_carries_nonce() -> void:
+	# The server keys the ack nonce as battle_id (never round_nonce):
+	# the client must forward it so forgive/mismatch checks see it.
+	var b = _new_client()
+	var got: Array = []
+	b.round_banked_received.connect(
+		func(nonce, tid, match): got.append([nonce, tid, match]))
+	b._handle_server_response({"status": "round_banked",
+		"battle_id": "RND-1", "tournament_id": "T",
+		"match": "R1M1"})
+	_check(got == [["RND-1", "T", "R1M1"]], "round ack forwards battle_id nonce")
+	# Informational replies (warm ack) are ignored, never crash.
+	b._handle_server_response({"status": "wirings_warm",
+		"warmed": 3, "skipped": 13})
+	_check(got.size() == 1, "warm ack touches no signal")
 	b.queue_free()
 
 
@@ -64,6 +84,7 @@ func _initialize() -> void:
 	test_reconnect_sets_flag()
 	test_send_heals_broken_socket()
 	test_guarded_send_never_crashes()
+	test_round_banked_carries_nonce()
 	if failures == 0:
 		print("ALL BRAINCLIENT TESTS PASSED")
 	else:

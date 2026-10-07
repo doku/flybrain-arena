@@ -197,6 +197,25 @@ func test_redraw_full_roster() -> void:
 	_check(q == ["a"], "schooled gate floors + excludes")
 
 
+func test_vault_paths_for() -> void:
+	# Roster ids resolve to vault paths in one cached pass; unknown
+	# ids skip silently (warm pre-warming + preload diagnostics).
+	var old_cache: Array = D.brains_cache
+	var old_msec: int = D.brains_cache_msec
+	var old_dir: String = D.brains_dir
+	D.brains_cache = [{"id": "k1", "filename": "k1.flybrain"},
+		{"id": "k2", "filename": "k2.flybrain"}]
+	D.brains_cache_msec = Time.get_ticks_msec()
+	D.brains_dir = "user://test_paths"
+	var paths: Array = D.call("vault_paths_for", ["k1", "nope", "k2"])
+	_check(paths == ["user://test_paths/k1.flybrain",
+		"user://test_paths/k2.flybrain"],
+		"roster resolves to paths, unknown skips")
+	D.brains_cache = old_cache
+	D.brains_cache_msec = 0
+	D.brains_dir = old_dir
+
+
 func test_event_chain() -> void:
 	var brains := _brains(16, 2000)
 	var ids: Array = []
@@ -1520,6 +1539,7 @@ func _initialize() -> void:
 	test_ko_tiebreak()
 	test_final_fixed_order()
 	test_redraw_full_roster()
+	test_vault_paths_for()
 	test_event_chain()
 	test_overview_render()
 	test_prebuilt_overview()

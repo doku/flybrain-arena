@@ -165,6 +165,15 @@ func request_tournament_prepare(alpha_path: String, beta_path: String, tournamen
 		"match": match_label
 	})
 
+func request_warm_wirings(paths: Array) -> void:
+	# Bind-only pre-warm for a roster: the server loads meta, skips
+	# cached wirings, and binds novel ones (shared caches), keeping
+	# nothing. Fire-and-forget (no watch, no reply handling): genome
+	# compiles land under intermissions instead of post-ack loads.
+	if not is_connected_server or paths.is_empty():
+		return
+	_send_dict({"type": "warm_wirings", "paths": paths})
+
 func request_raster_map(side: String, pool: String) -> void:
 	if not is_connected_server:
 		return
@@ -273,7 +282,7 @@ func _handle_server_response(data: Dictionary) -> void:
 			str(data.get("battle_id", "")))
 	elif status == "round_banked":
 		round_banked_received.emit(
-			str(data.get("round_nonce", "")),
+			str(data.get("battle_id", "")),
 			str(data.get("tournament_id", "")),
 			str(data.get("match", "")))
 	elif status == "group_banked":

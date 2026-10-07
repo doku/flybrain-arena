@@ -1739,6 +1739,12 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 	if not bool(beg.get("ok", false)):
 		bracket_status.text = "Cannot start: %s" % str(beg.get("error", "?"))
 		return
+	# Bind pre-warm for the whole roster (fire-and-forget): genome
+	# compiles land under the group builds + tip-off, not post-ack.
+	var warmer = load("res://scripts/BrainClient.gd").new()
+	if warmer.reconnect():
+		warmer.request_warm_wirings(TournamentDirector.vault_paths_for(ids))
+	warmer.queue_free()
 	var eid := str(beg.get("event_id", ""))
 	var by_id := {}
 	for b in TournamentDirector.list_brains_cached():

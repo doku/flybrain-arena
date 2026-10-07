@@ -1138,6 +1138,53 @@ def _handle_group_round(sock, client_addr, msg, round_id, tid, mlabel,
               f"(kept verdict): {e}", flush=True)
 
 
+def _handle_warm_wirings(sock, client_addr, msg, csr, pops,
+                         struct_cache, codec_cache):
+    """Bind-only pre-warm for a roster: meta first (skip cached
+    wirings), full load+bind only for novel ones, objects discarded.
+    No slot, no retention, no watch - the client fires it under
+    intermissions so compiles don't land post-ack. Bad files skip
+    loudly (they refuse at load time anyway). Returns (warmed,
+    skipped)."""
+    import brain_package as vault_pkg
+    warmed = 0
+    skipped = 0
+    wpaths = msg.get("paths", []) or []
+    for _wi, _wp in enumerate(wpaths):
+        try:
+            _wrec = vault_pkg.load_brain_record(str(_wp))
+        except Exception:
+            continue
+        if not isinstance(_wrec, dict):
+            continue
+        try:
+            _sk, _ck = _wiring_cache_keys(_wrec)
+        except Exception:
+            continue
+        if _sk in struct_cache and _ck in codec_cache:
+            skipped += 1
+            continue
+        try:
+            _rec_w, _w = vault_pkg.load_brain(str(_wp))
+            _bind_brain(_rec_w, _w, csr, pops, struct_cache)
+            _bind_codecs(_rec_w, pops, codec_cache)
+            warmed += 1
+            _emit_progress(sock, client_addr, "warm",
+                           "fighter %d/%d" % (_wi + 1, len(wpaths)))
+        except Exception as e:
+            print(f"[Server] warm failed for {_wp}: {e}", flush=True)
+    print(f"[Server] Wirings warm: {warmed} bound, "
+          f"{skipped} cached.", flush=True)
+    try:
+        sock.sendto(json.dumps({"status": "wirings_warm",
+                                "warmed": warmed,
+                                "skipped": skipped}).encode("utf-8"),
+                    client_addr)
+    except OSError as e:
+        print(f"[Server] warm reply failed: {e}", flush=True)
+    return warmed, skipped
+
+
 def _handle_group_report(sock, client_addr, msg, tourney_a, tourney_b,
                          tourney_tag, tournament_lr_scale, evo_mgr,
                          dopamine_rl, base_lr, tourney_note,
@@ -1248,6 +1295,30 @@ def _norm_experiment(value):
     """Canonical wiring key: None for base, else a sorted tuple of names
     (additive mixes; see experimental_wiring.normalize_experiment)."""
     return normalize_experiment(value)
+
+
+def _wiring_cache_keys(rec):
+    """(struct_key, codec_key) for a record from META ONLY (no weights).
+    Same keys _bind_brain/_bind_codecs insert: a fighter warm-then-bound
+    must agree with a fighter bound directly (a test locks the
+    agreement). Raises ValueError on bad wiring, like the binds."""
+    from sensory_motor import BLEND_DEFAULTS
+    gp = rec.get("generator_params", {}) or {}
+    genome = gp.get("genome", None)
+    if genome is not None:
+        skey = "genome:" + genome_label(genome)
+    else:
+        skey = _norm_experiment(gp.get("experiment", None))
+    m = normalize_mapping(gp.get("mapping", None))
+    yb = normalize_yaw_bias(gp.get("yaw_bias", None))
+    legacy = is_legacy_record(rec)
+    blends = {}
+    for _bk, _bd in BLEND_DEFAULTS.items():
+        try:
+            blends[_bk] = max(0.0, min(1.0, float(gp.get(_bk, _bd))))
+        except (TypeError, ValueError):
+            blends[_bk] = _bd
+    return skey, (m, legacy, yb, tuple(sorted(blends.items())))
 
 
 def _bind_brain(rec, weights, csr, pops, struct_cache):
@@ -1411,12 +1482,30 @@ def _prepared_slot_matches(prepare_a, prepare_b, prepare_tag, msg):
     """True when the prepare slot holds THIS match (same tournament,
     match label, both paths): activation swaps it in O(1) instead of
     the full disk load. A server restart empties the slot - the
-    official path stays the fallback. Pure (unit-tested)."""
-    return (prepare_a.get("brain") is not None
+    official path stays the fallback. Vault mtimes version the slot:
+    a bank that landed after the prepare falls through to a fresh
+    load instead of fighting on stale weights. Pure (unit-tested)."""
+    if not (prepare_a.get("brain") is not None
             and prepare_tag.get("tournament_id") == str(msg.get("tournament_id", ""))
             and prepare_tag.get("match") == str(msg.get("match", ""))
             and prepare_a.get("path") == str(msg.get("alpha_path", ""))
-            and prepare_b.get("path") == str(msg.get("beta_path", "")))
+            and prepare_b.get("path") == str(msg.get("beta_path", ""))):
+        return False
+    for _slot, _field in ((prepare_a, "alpha_path"),
+                          (prepare_b, "beta_path")):
+        _cur = _vault_mtime(msg.get(_field, ""))
+        if _cur is None or _slot.get("mtime", None) != _cur:
+            return False
+    return True
+
+
+def _vault_mtime(path):
+    """Vault file mtime or None (missing/unreadable): the prepare-slot
+    version stamp. Pure (unit-tested)."""
+    try:
+        return os.path.getmtime(str(path))
+    except OSError:
+        return None
 
 
 # Pinned group session (group-bank mode): brains stay bound in RAM for
@@ -2273,11 +2362,13 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             prepare_a.update(
                                 rec=ent_pa["rec"],
                                 path=str(msg.get("alpha_path", "")),
+                                mtime=_vault_mtime(msg.get("alpha_path", "")),
                                 brain=ent_pa["brain"],
                                 enc=ent_pa["enc"], dec=ent_pa["dec"])
                             prepare_b.update(
                                 rec=ent_pb["rec"],
                                 path=str(msg.get("beta_path", "")),
+                                mtime=_vault_mtime(msg.get("beta_path", "")),
                                 brain=ent_pb["brain"],
                                 enc=ent_pb["enc"], dec=ent_pb["dec"])
                             prepare_tag["tournament_id"] = str(
@@ -2316,8 +2407,10 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             client_addr)
                         continue
                 prepare_a.update(rec=rec_a, path=str(msg.get("alpha_path", "")),
+                                 mtime=_vault_mtime(msg.get("alpha_path", "")),
                                  brain=new_alpha, enc=enc_a, dec=dec_a)
                 prepare_b.update(rec=rec_b, path=str(msg.get("beta_path", "")),
+                                 mtime=_vault_mtime(msg.get("beta_path", "")),
                                  brain=new_beta, enc=enc_b, dec=dec_b)
                 prepare_tag["tournament_id"] = str(msg.get("tournament_id", ""))
                 prepare_tag["match"] = str(msg.get("match", ""))
@@ -2331,6 +2424,12 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     "tournament_id": prepare_tag["tournament_id"],
                     "match": prepare_tag["match"],
                 }).encode("utf-8"), client_addr)
+
+            elif msg_type == "warm_wirings":
+                # Bind-only pre-warm (no slot, no retention, no watch).
+                _handle_warm_wirings(sock, client_addr, msg, csr, pops,
+                                     struct_cache, codec_cache)
+                continue
 
             elif msg_type == "match_reset":
                 # Clean LIF state between tournament battles. Weights (the

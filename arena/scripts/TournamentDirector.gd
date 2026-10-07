@@ -1194,6 +1194,20 @@ func brain_path(brain_id: String) -> String:
 	return ""
 
 
+func vault_paths_for(player_ids: Array) -> Array:
+	# Vault file paths for a roster, one cached roster pass (warm
+	# pre-warming, preload diagnostics). Unknown ids skip silently.
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var out: Array = []
+	for pid in player_ids:
+		var fn := str((by_id.get(str(pid), {}) as Dictionary).get("filename", ""))
+		if fn != "":
+			out.append(brains_dir.path_join(fn))
+	return out
+
+
 func get_load_params() -> Dictionary:
 	var m := current_match()
 	# One roster pass for both fighters (cached; never two shells).
