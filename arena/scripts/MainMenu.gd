@@ -73,6 +73,10 @@ var score_up_btn: Button
 var score_down_btn: Button
 var score_queue_label: Label
 var _score_base: String = ""
+# Standalone training panel (arena pause overlay): _ready runs its
+# normal scene-boot flow (FO_DIRECT bypass, busy overlay, resume) —
+# the standalone build scaffolds its own members and skips all that.
+var standalone := false
 # True while a reference-stock generate is in flight: its completion
 # detours into the training queue instead of the normal generate flow.
 var _ref_bridging := false
@@ -114,6 +118,8 @@ var _page_buttons: Array = []
 
 
 func _ready() -> void:
+	if standalone:
+		return
 	if OS.get_environment("FO_DIRECT") == "1":
 		get_tree().change_scene_to_file.call_deferred("res://scenes/ArenaGlade.tscn")
 		return
@@ -176,6 +182,8 @@ func _build_busy_overlay() -> void:
 
 
 func set_busy(text: String) -> void:
+	if not is_instance_valid(busy_overlay):
+		return
 	busy_label.text = text
 	busy_frame = 0
 	busy_tick = 0.0
@@ -184,6 +192,8 @@ func set_busy(text: String) -> void:
 
 
 func clear_busy() -> void:
+	if not is_instance_valid(busy_overlay):
+		return
 	busy_overlay.visible = false
 
 
@@ -1242,6 +1252,66 @@ func _on_archive_delete_confirmed(arch_id: String, arch_name: String) -> void:
 	refresh_vault()
 
 
+func build_standalone_training() -> Control:
+	# Arena pause overlay: the training page standalone (no scene
+	# swap, no _ready scene-boot flow). Scaffolds the members the
+	# handlers touch (detail/log labels, hidden vault/participant
+	# stubs so _fill_brain_lists works), loads the roster, connects
+	# the live signals, then builds the real training column inside.
+	standalone = true
+	var box := VBoxContainer.new()
+	box.name = "StandaloneTraining"
+	box.add_theme_constant_override("separation", 8)
+	brains = TournamentDirector.list_brains_cached()
+	selected_brain = {}
+	detail_label = Label.new()
+	detail_label.add_theme_font_size_override("font_size", 13)
+	detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(detail_label)
+	brain_list = ItemList.new()
+	brain_list.visible = false
+	add_child(brain_list)
+	player_list = ItemList.new()
+	player_list.visible = false
+	player_list.select_mode = ItemList.SELECT_MULTI
+	add_child(player_list)
+	box.add_child(_build_gen_column())
+	log_label = Label.new()
+	log_label.add_theme_font_size_override("font_size", 13)
+	log_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(log_label)
+	_refresh_timer = Timer.new()
+	_refresh_timer.wait_time = 0.5
+	_refresh_timer.one_shot = true
+	_refresh_timer.timeout.connect(func():
+		if _refresh_pending:
+			_standalone_refresh())
+	add_child(_refresh_timer)
+	if not TournamentDirector.vault_changed.is_connected(_standalone_refresh):
+		TournamentDirector.vault_changed.connect(_standalone_refresh)
+	TournamentDirector.job_progress.connect(_on_job_progress)
+	TournamentDirector.job_failed.connect(_on_job_failed)
+	TournamentDirector.score_stamped.connect(_on_score_stamped)
+	TournamentDirector.async_done.connect(_on_async_done)
+	TournamentDirector.train_queue_changed.connect(_refresh_train_queue)
+	TournamentDirector.score_queue_changed.connect(_refresh_score_queue)
+	TournamentDirector.score_progress.connect(_on_score_progress)
+	_fill_brain_lists()
+	_refresh_train_queue()
+	_refresh_score_queue()
+	return box
+
+
+func _standalone_refresh() -> void:
+	# Overlay refresh: roster + queues only (no archive/bracket view;
+	# the standalone panel builds neither). Immediate (the debounced
+	# path is for the scene menu's coalescing needs).
+	brains = TournamentDirector.list_brains_cached()
+	_fill_brain_lists()
+	_refresh_train_queue()
+	_refresh_score_queue()
+
+
 func _on_brain_selected(idx: int) -> void:
 	if _syncing_selection:
 		return
@@ -1750,6 +1820,9 @@ func _selected_player_ids() -> Array:
 
 
 func _update_bracket_preview() -> void:
+	# Standalone training panels build no tournament widgets.
+	if not is_instance_valid(tourney_size) or not is_instance_valid(bracket_status):
+		return
 	var n := _selected_player_ids().size()
 	var size := int(TournamentDirector.size_options()[tourney_size.selected])
 	var bestof := int(TournamentDirector.best_of_options()[tourney_bestof.selected])

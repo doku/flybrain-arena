@@ -308,6 +308,11 @@ func _poll_async() -> void:
 		if result.get("ok", false):
 			vault_changed.emit()
 		async_done.emit(op, result)
+	elif get_tree() != null and get_tree().paused:
+		# Paused (arena overlay): the wall-clock timeout must not fire
+		# while suspended — the worker keeps running and its result
+		# file still adopts (the branch above) the moment it lands.
+		return
 	elif Time.get_ticks_msec() - int(pending_async.get("started", 0)) \
 			> int(pending_async.get("timeout_msec", 1800000)):
 		var op2 := str(pending_async.get("op", ""))

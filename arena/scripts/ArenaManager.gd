@@ -431,6 +431,13 @@ func _evo_awaited_spec(kind: String) -> Dictionary:
 const NEXTGEN_GALLERY_EVERY := 7.0
 const NEXTGEN_STRIP_EVERY := 1.0
 var bracket_button: Button
+# Pause overlay (MENU button): the training page standalone over the
+# frozen arena — no scene change, UDP socket stays open, workers and
+# the server unperturbed. ALWAYS mode keeps its buttons alive while
+# the tree is paused; ArenaManager (INHERIT) freezes beneath it.
+var menu_overlay: Control
+var _menu_view: Control
+var _pause_started_msec := 0
 
 # Sequencing watchdog: every tournament server round-trip arms a deadline.
 # Load/reset/battle retry the pending request once, then fail loudly
@@ -872,6 +879,9 @@ func _build_menu_bar(tournament: bool) -> void:
 		var evo_stop_b := _menu_bar_button("STOP CONTINUOUS", "Stop the continuous tournament loop (keeps current bracket).")
 		evo_stop_b.pressed.connect(_on_evo_stop)
 		bar.add_child(evo_stop_b)
+		var menu_b := _menu_bar_button("MENU", "Pause the battle and open training + queues (workers keep running).")
+		menu_b.pressed.connect(_on_menu_pause)
+		bar.add_child(menu_b)
 	else:
 		if is_instance_valid(merge_button):
 			merge_button.visible = false
@@ -889,6 +899,9 @@ func _build_menu_bar(tournament: bool) -> void:
 		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
 		mute_button.pressed.connect(_on_mute_button)
 		bar.add_child(mute_button)
+		var menu_b := _menu_bar_button("MENU", "Pause the battle and open training + queues (workers keep running).")
+		menu_b.pressed.connect(_on_menu_pause)
+		bar.add_child(menu_b)
 
 
 const BV_LAYERS := ["bars", "flow", "raster", "brain3d"]
@@ -901,6 +914,120 @@ func _unhandled_input(event: InputEvent) -> void:
 			_cycle_bv_layer()
 		elif (event as InputEventKey).keycode == KEY_M:
 			_set_muted(not _sound_muted)
+
+
+func _build_menu_overlay() -> void:
+	# Pause overlay: dim + training panel + RESUME/QUIT. ALWAYS mode
+	# keeps the buttons working while the tree is paused; the panel
+	# scrolls (the training columns target the menu window, the arena
+	# gives them more room but scroll anyway for small windows).
+	var hud: CanvasLayer = $HUD
+	menu_overlay = Control.new()
+	menu_overlay.name = "MenuOverlay"
+	menu_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_overlay.process_mode = Node.PROCESS_MODE_ALWAYS
+	menu_overlay.visible = false
+	hud.add_child(menu_overlay)
+	var dim := ColorRect.new()
+	dim.color = Color(0.02, 0.02, 0.05, 0.82)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_overlay.add_child(dim)
+	var margin := MarginContainer.new()
+	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
+	margin.add_theme_constant_override("margin_left", 16)
+	margin.add_theme_constant_override("margin_right", 16)
+	margin.add_theme_constant_override("margin_top", 12)
+	margin.add_theme_constant_override("margin_bottom", 12)
+	menu_overlay.add_child(margin)
+	var panel := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.06, 0.06, 0.09, 0.96)
+	sb.border_color = Color(0.4, 0.4, 0.46)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(6)
+	sb.content_margin_left = 12.0
+	sb.content_margin_right = 12.0
+	sb.content_margin_top = 8.0
+	sb.content_margin_bottom = 8.0
+	panel.add_theme_stylebox_override("panel", sb)
+	margin.add_child(panel)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 8)
+	panel.add_child(box)
+	var head := Label.new()
+	head.text = "BATTLE PAUSED - TRAINING & QUEUES (workers keep running)"
+	head.add_theme_font_size_override("font_size", 18)
+	head.add_theme_color_override("font_color", Color(1.0, 0.85, 0.35))
+	box.add_child(head)
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box.add_child(scroll)
+	var menu_scr = load("res://scripts/MainMenu.gd")
+	_menu_view = menu_scr.new()
+	_menu_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_menu_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_menu_view.add_child(_menu_view.build_standalone_training())
+	scroll.add_child(_menu_view)
+	var brow := HBoxContainer.new()
+	brow.add_theme_constant_override("separation", 6)
+	box.add_child(brow)
+	var resume_b := Button.new()
+	resume_b.text = "RESUME"
+	resume_b.custom_minimum_size = Vector2(130, 30)
+	resume_b.pressed.connect(_on_menu_resume)
+	brow.add_child(resume_b)
+	var quit_b := Button.new()
+	quit_b.text = "QUIT TO MENU"
+	quit_b.custom_minimum_size = Vector2(130, 30)
+	quit_b.tooltip_text = "End the battle (flushes banks) and leave to the vault menu."
+	quit_b.pressed.connect(_on_menu_quit)
+	brow.add_child(quit_b)
+
+
+func _on_menu_pause() -> void:
+	if not is_instance_valid(menu_overlay):
+		_build_menu_overlay()
+	_pause_started_msec = Time.get_ticks_msec()
+	get_tree().paused = true
+	menu_overlay.visible = true
+
+
+func _on_menu_resume() -> void:
+	# Rebase the wall-clock deadlines by the paused duration: the
+	# watchdogs froze with the tree, so an un-rebased deadline would
+	# fire spuriously on the first physics tick after resume.
+	var d := Time.get_ticks_msec() - _pause_started_msec
+	if d > 0:
+		if _seq_deadline_msec > 0:
+			_seq_deadline_msec += d
+		if _step_deadline_msec > 0:
+			_step_deadline_msec += d
+		if _bank_last_send_msec > 0:
+			_bank_last_send_msec += d
+		if _load_stall_since_msec > 0:
+			_load_stall_since_msec += d
+	_pause_started_msec = 0
+	menu_overlay.visible = false
+	get_tree().paused = false
+
+
+func _on_menu_quit() -> void:
+	# The exact QUIT TO MENU teardown (flush + leave), unpaused first:
+	# a scene change under a paused tree would boot the menu scene
+	# paused (frozen menu, dead inputs).
+	if is_instance_valid(menu_overlay):
+		menu_overlay.visible = false
+	get_tree().paused = false
+	_pause_started_msec = 0
+	_on_quit_to_menu()
+
+
+func _wait(secs: float) -> SceneTreeTimer:
+	# Pause-aware battle-flow wait: freezes with the tree so an open
+	# overlay pauses countdowns/awaits instead of running them through
+	# behind the user's back. Slow-mo keeps its realtime timers.
+	return get_tree().create_timer(secs, false, false, false)
 
 
 func _cycle_bv_layer() -> void:
@@ -4245,7 +4372,7 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 	tw.tween_property(winner_overlay, "modulate:a", 1.0, 0.35)
 
 	# Let the callout land before the countdown starts.
-	await get_tree().create_timer(1.2).timeout
+	await _wait(1.2).timeout
 
 	# Informational banners (empty prefix: GROUP COMPLETE, CHAMPION,
 	# quick-battle) hold statically - only a real next step counts
@@ -4256,14 +4383,14 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 			if is_instance_valid(countdown_label):
 				countdown_label.text = "%s IN %d..." % [countdown_prefix, i]
 			_play_sfx("beep")
-			await get_tree().create_timer(1.0).timeout
+			await _wait(1.0).timeout
 
 		if is_instance_valid(countdown_label):
 			countdown_label.text = "FIGHT!"
 		_play_sfx("fight")
-		await get_tree().create_timer(0.8).timeout
+		await _wait(0.8).timeout
 	else:
-		await get_tree().create_timer(0.8).timeout
+		await _wait(0.8).timeout
 
 	winner_overlay.visible = false
 	if auto_reset:
@@ -5082,7 +5209,7 @@ func _await_landing() -> void:
 			b_down = bool(fly_beta.landing_done())
 		if a_down and b_down:
 			return
-		await get_tree().create_timer(0.25).timeout
+		await _wait(0.25).timeout
 		waited += 0.25
 
 # Knockout banner: free battle keeps the classic "FLY ALPHA" phrasing;
@@ -5350,7 +5477,7 @@ func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
 				_slot_name("alpha"), int(_wander_dock(_da)), _da,
 				_slot_name("beta"), int(_wander_dock(_db)), _db],
 			"REMATCH", false)
-		await get_tree().create_timer(5.0).timeout
+		await _wait(5.0).timeout
 		var draw_adv: Dictionary = director.on_battle_result("draw",
 			_flight_summary(flight_alpha, fly_alpha),
 			_flight_summary(flight_beta, fly_beta),
@@ -5414,7 +5541,7 @@ func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
 			Color(1.0, 0.55, 0.3) if battle_winner == "alpha" else Color(0.4, 0.75, 1.0),
 			sub, "NEXT BATTLE", false)
 		_announce_clip("battle_orange" if battle_winner == "alpha" else "battle_blue")
-		await get_tree().create_timer(5.0).timeout
+		await _wait(5.0).timeout
 		_update_tourney_status("BATTLE %d" % (_battle_count() + 1))
 		var whead := _verdict_headline()
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
@@ -5470,7 +5597,7 @@ func _on_match_over(match_winner: String, score: String) -> void:
 		# Decisive matches get the voice; drawn splits stay silent
 		# (no winner to name - the bracket shows the shared point).
 		_announce_clip("match_orange" if match_winner == "alpha" else "match_blue")
-	await get_tree().create_timer(6.0).timeout
+	await _wait(6.0).timeout
 	_hide_arena_bracket()
 	# Round boundary: the current round's index moved, or the file
 	# completed (group_complete / tournament_end). Mid-round matches
@@ -5928,7 +6055,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 			var qslot := _slot_of(champ_id)
 			_announce_clip("exhibition_orange" if qslot == "alpha"
 				else ("exhibition_blue" if qslot == "beta" else "exhibition"))
-			await get_tree().create_timer(5.0).timeout
+			await _wait(5.0).timeout
 			director.quit_to_menu()
 			return
 		if _round_bank_pending:
@@ -5979,7 +6106,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 		# Bounded so a dead server can never hang the game here.
 		var waited := 0.0
 		while not _tourney_close_ack and waited < 60.0:
-			await get_tree().create_timer(0.25).timeout
+			await _wait(0.25).timeout
 			waited += 0.25
 		if not _tourney_close_ack:
 			push_warning("[Arena] tournament_closed ack timeout; menu stats may lag the vault file.")
@@ -6006,7 +6133,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 				_update_evo_status_line()
 				if is_instance_valid(status_label):
 					status_label.text = "CONTINUOUS GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_base_name(champ_name)]
-			await get_tree().create_timer(3.0).timeout
+			await _wait(3.0).timeout
 			_hide_arena_bracket()
 		_request_current_battle_load()
 
@@ -6531,7 +6658,7 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 			print("[Arena] Intermission '%s' broke early (%.0fs left): event inactive" % [title, left])
 			break
 		intermission_label.text = "%s\nNext bracket in %d s — SKIP to start now" % [sub, int(ceil(left))]
-		await get_tree().create_timer(1.0).timeout
+		await _wait(1.0).timeout
 		left -= 1.0
 	intermission_row.visible = false
 	if not _event_active():
@@ -6638,7 +6765,7 @@ func _event_pool_wait(need: int = EVENT_POOL_TARGET, include_current: bool = fal
 		_event_pool_ready_count(include_current), need])
 	var waited := 0.0
 	while _evo_active() and waited < EVO_AWAIT_TIMEOUT:
-		await get_tree().create_timer(5.0).timeout
+		await _wait(5.0).timeout
 		waited += 5.0
 		_evo_adopt_finished()
 		_event_drain_done_to_pool()
@@ -6808,7 +6935,7 @@ func _run_event_handoff() -> void:
 		else:
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 				"elimination failed: " + str(elim.get("error", "?")))
-			await get_tree().create_timer(8.0).timeout
+			await _wait(8.0).timeout
 			director.quit_to_menu()
 			return
 	else:
@@ -6831,7 +6958,7 @@ func _run_event_handoff() -> void:
 		var why := await _event_pool_wait(pool_need, redraw)
 		if why != "":
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid, why)
-			await get_tree().create_timer(8.0).timeout
+			await _wait(8.0).timeout
 			director.quit_to_menu()
 			return
 	_event_start_next(ev, gone)
@@ -6855,7 +6982,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 				or (full.get("drawn", []) as Array).size() != 16:
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 				"fresh draw failed: " + str(full.get("error", "short bench")))
-			await get_tree().create_timer(8.0).timeout
+			await _wait(8.0).timeout
 			director.quit_to_menu()
 			return
 		roster = full.get("drawn", [])
@@ -6874,7 +7001,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 		if need < 0 or need > 2:
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 				"event survivors %d (need 14-16)" % survivors.size())
-			await get_tree().create_timer(8.0).timeout
+			await _wait(8.0).timeout
 			director.quit_to_menu()
 			return
 		var draw: Dictionary = director.event_draw_pool(eid, need,
@@ -6883,7 +7010,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 				or (draw.get("drawn", []) as Array).size() != need:
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 				"pool draw failed: " + str(draw.get("error", "short bench")))
-			await get_tree().create_timer(8.0).timeout
+			await _wait(8.0).timeout
 			director.quit_to_menu()
 			return
 		roster = survivors + (draw.get("drawn", []) as Array)
@@ -6891,7 +7018,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	if not bool(beg.get("ok", false)):
 		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 			"next event failed: " + str(beg.get("error", "?")))
-		await get_tree().create_timer(8.0).timeout
+		await _wait(8.0).timeout
 		director.quit_to_menu()
 		return
 	var new_eid := str(beg.get("event_id", ""))
@@ -6917,13 +7044,13 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	if not _event_build_all_groups(ev_new):
 		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 			"next event brackets failed to build")
-		await get_tree().create_timer(8.0).timeout
+		await _wait(8.0).timeout
 		director.quit_to_menu()
 		return
 	if not _event_switch_group(ev_new, "A"):
 		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
 			"next event group A failed to load")
-		await get_tree().create_timer(8.0).timeout
+		await _wait(8.0).timeout
 		director.quit_to_menu()
 		return
 	director.tourney["evo"] = {"active": true, "generation": gen,
@@ -7216,7 +7343,7 @@ func _evo_await_result(display: String, progress_path: String,
 	evo_wait_result = {}
 	var waited := 0.0
 	while evo_waiting and waited < EVO_AWAIT_TIMEOUT:
-		await get_tree().create_timer(2.0).timeout
+		await _wait(2.0).timeout
 		waited += 2.0
 		if not _evo_active():
 			_evo_kill_job()
@@ -7934,7 +8061,7 @@ func _run_evo_generation() -> void:
 	if is_instance_valid(status_label):
 		status_label.text = "CONTINUOUS gen %d ready (%d fighters, pool %d/%d)." % [
 			gen + 1, roster.size(), _evo_pool_size(), _evo_pool_threshold()]
-	await get_tree().create_timer(2.0).timeout
+	await _wait(2.0).timeout
 	_hide_nextgen()
 	_hide_evo_phase()
 	_request_current_battle_load()
@@ -8485,7 +8612,7 @@ func _evo_await_queued(kind: String) -> String:
 						bep = "ep %d/%d" % [int(bprog.get("episode", 0)), int(_prog_total(bprog))]
 					_show_evo_phase("BREEDING " + display0,
 						"Queued behind %s (%s)..." % [blabel, bep])
-				await get_tree().create_timer(2.0).timeout
+				await _wait(2.0).timeout
 				swait += 2.0
 				_evo_adopt_finished()
 				tdir = _director()
@@ -8630,7 +8757,7 @@ func _on_restarted(round_winner: String) -> void:
 	_record_win(round_winner)
 	if is_instance_valid(status_label):
 		status_label.text = "RESTART BANKED: " + _slot_name(round_winner) + " LED - fresh round"
-	await get_tree().create_timer(1.0).timeout
+	await _wait(1.0).timeout
 	_reset_round()
 
 func _record_win(winner: String) -> void:
