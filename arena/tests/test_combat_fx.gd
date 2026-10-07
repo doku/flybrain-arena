@@ -385,9 +385,10 @@ func test_load_fail_loud_clears_latch() -> void:
 
 
 func test_round_match_over_advances() -> void:
-	# Round-batch: match over appends the match (ids + battles) to the
-	# round cache, clears the battle cache, and advances LOCALLY - no
-	# server send until the round boundary (mid-round: nothing armed).
+	# Per-match banking: match over sends the match (ids + battles)
+	# into the pending table under its deterministic nonce, clears
+	# the battle cache, and advances LOCALLY - no round payload, no
+	# bank latch mid-round (those wait for the round boundary).
 	var d = arena._director()
 	if d == null:
 		_check(true, "round advance skipped (no director)")
@@ -406,17 +407,24 @@ func test_round_match_over_advances() -> void:
 	arena.tourney_match_label = "R1M1"
 	arena._match_battle_cache = [{"battle_id": "R1M1-B1-1-1", "draw": false,
 		"verdict": {"winner_slot": "alpha"}}]
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
 	arena._on_match_over("alpha", "1 - 0")
-	_check((arena._round_match_cache as Array).size() == 1,
-		"match cached for the round")
+	_check((arena._round_match_cache as Array).is_empty(),
+		"match flows to the pending table, not the round cache")
+	_check(arena._match_banks_pending.has(arena._current_match_nonce()),
+		"match tracked under its deterministic nonce")
 	_check((arena._match_battle_cache as Array).is_empty(),
 		"battle cache cleared")
 	_check(int(d.tourney.get("current_match", -1)) == 1,
 		"bracket advanced locally")
 	_check(not arena._tourney_awaiting_roundbank,
 		"mid-round arms no bank")
-	_check(str(arena._seq_round_id) == "", "mid-round mints no nonce")
+	_check(not arena._round_bank_pending,
+		"mid-round sets no round latch")
 	arena._round_match_cache.clear()
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
 	arena._hide_arena_bracket()
 	d.tourney = old_tourney
 	d.tournament_dir = old_dir
@@ -1099,6 +1107,179 @@ func test_preload_targets_current_match() -> void:
 	d.brains_cache_msec = old_msec
 
 
+func test_match_nonce_deterministic() -> void:
+	# Match nonces recompute identically (resume/flush dedup key),
+	# differing per match and round.
+	arena.tourney_match_label = "R1M4"
+	var n1 := str(arena._current_match_nonce())
+	_check(n1 == str(arena._current_match_nonce()), "match nonce recomputable")
+	_check("R1M4" in n1, "nonce carries the label")
+	arena.tourney_match_label = "R1M3"
+	_check(str(arena._current_match_nonce()) != n1, "nonce differs per match")
+	arena.tourney_match_label = "R1M4"
+
+
+func test_match_bank_decision() -> void:
+	# Only multi-match bracket rounds bank per match; groups and
+	# single-match rounds keep the round report. Pure over the
+	# director position (call before advance_after_match).
+	var d = arena._director()
+	if d == null:
+		_check(true, "bank decision skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	d.tourney = {"id": "TDEC", "format": "bracket", "current_round": 0,
+		"rounds": [[{}, {}, {}, {}], [{}, {}]]}
+	_check(arena._match_bank_round(), "four-match bracket banks per match")
+	d.tourney = {"id": "TDEC", "format": "bracket", "current_round": 1,
+		"rounds": [[{}, {}, {}, {}], [{}, {}]]}
+	_check(arena._match_bank_round(), "two-match bracket banks per match")
+	d.tourney = {"id": "TDEC", "format": "bracket", "current_round": 0,
+		"rounds": [[{}]]}
+	_check(not arena._match_bank_round(), "single-match round keeps round report")
+	d.tourney = {"id": "TDEC", "format": "groups", "current_round": 0,
+		"rounds": [[{}, {}], [{}, {}]]}
+	_check(not arena._match_bank_round(), "groups keep round reports")
+	d.tourney = old_tourney
+
+
+func test_match_send_and_complete() -> void:
+	# Per-match bank: send tracks the pending table (same nonce),
+	# unknown acks drop, the tick resends outside live battles only,
+	# and the last ack completes the round (latch, stamp, parked load).
+	var d = arena._director()
+	if d == null:
+		_check(true, "match bank skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_matchbank"
+	DirAccess.make_dir_recursive_absolute("user://test_matchbank")
+	var real: Array = d.list_brains_cached()
+	if real.size() < 2:
+		_check(true, "match bank skipped (vault short)")
+		d.tourney = old_tourney
+		d.tournament_dir = old_dir
+		return
+	var ra: Dictionary = real[0]
+	var rb: Dictionary = real[1]
+	d.tourney = {"id": "TMB", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": str(ra.get("id", "")), "b_id": str(rb.get("id", "")),
+			"bank_nonce": "", "banked": false,
+			"winner_id": str(ra.get("id", ""))}]]}
+	d.brains_cache = [ra, rb]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena.brain_client.is_connected_server = true
+	arena.is_round_active = false
+	arena._recover_in_flight = false
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
+	arena._bank_link_fails = 0
+	var entry := {"match_id": "TMB|R0R1M1", "match_winner": "alpha",
+		"round": 0, "match": 0, "label": "R1M1", "battles": [{"battle_id": "B1"}]}
+	arena._send_match_report(entry)
+	_check(arena._match_banks_pending.has("TMB|R0R1M1"), "match send tracked")
+	_check(int(arena._match_bank_retries.get("TMB|R0R1M1", 0)) == 1,
+		"initial send counted")
+	arena._on_match_banked("alpha", 0.0, 0.0, "nope")
+	_check(arena._match_banks_pending.has("TMB|R0R1M1"), "unknown ack ignored")
+	var st: Dictionary = arena._match_banks_pending["TMB|R0R1M1"]
+	st["last_send"] = -60000
+	arena._match_banks_pending["TMB|R0R1M1"] = st
+	arena._bank_resend_tick()
+	_check(int(arena._match_bank_retries.get("TMB|R0R1M1", 0)) == 2,
+		"tick resends same nonce")
+	arena.is_round_active = true
+	st = arena._match_banks_pending["TMB|R0R1M1"]
+	st["last_send"] = -60000
+	arena._match_banks_pending["TMB|R0R1M1"] = st
+	arena._bank_resend_tick()
+	_check(int(arena._match_bank_retries.get("TMB|R0R1M1", 0)) == 2,
+		"live battle suppresses resends")
+	arena.is_round_active = false
+	arena._round_bank_pending = true
+	arena._round_match_banked = true
+	arena._load_gated_on_bank = true
+	arena._pending_advance = {}
+	arena._on_match_banked("alpha", 0.0, 0.0, "TMB|R0R1M1")
+	_check(arena._match_banks_pending.is_empty(), "ack clears the entry")
+	_check(not arena._round_bank_pending, "last ack completes the round")
+	_check(not arena._load_gated_on_bank, "parked load fired")
+	_check(arena.tourney_awaiting_load, "load re-issued")
+	_check(bool((((d.tourney.get("rounds", []) as Array)[0] as Array)[0] as Dictionary).get("banked", false)),
+		"banked flag stamped")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena._round_bank_pending = false
+	arena._round_match_banked = false
+	arena._seq_context = ""
+	arena.tourney_awaiting_load = false
+	arena.is_round_active = false
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_matchbank"):
+		for f in DirAccess.get_files_at("user://test_matchbank"):
+			DirAccess.remove_absolute("user://test_matchbank".path_join(f))
+		DirAccess.remove_absolute("user://test_matchbank")
+
+
+func test_flush_splits_per_match() -> void:
+	# Quit-flush drains per match on match-pathed rounds (small
+	# datagrams that arrive), one report otherwise.
+	var d = arena._director()
+	if d == null:
+		_check(true, "flush skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	d.tourney = {"id": "TFL", "format": "bracket", "current_round": 0,
+		"current_match": 2,
+		"rounds": [[{}, {}, {}, {}]]}
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M3"
+	arena.brain_client.is_connected_server = true
+	arena._round_match_cache = [
+		{"match_id": "TFL|R0R1M1", "match_winner": "alpha",
+			"battles": [{"battle_id": "B1"}]},
+		{"match_id": "TFL|R0R1M2", "match_winner": "beta",
+			"battles": [{"battle_id": "B2"}]}]
+	arena._match_battle_cache = []
+	arena._flush_round_report()
+	_check((arena._round_match_cache as Array).is_empty(), "flush drains the cache")
+	d.tourney = old_tourney
+
+
+func test_audit_banked_rounds() -> void:
+	# Resume honesty: completed multi-match rounds with decided but
+	# unbanked matches report the gap; clean files stay silent.
+	var d = arena._director()
+	if d == null:
+		_check(true, "audit skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	arena.tournament_active = true
+	d.tourney = {"id": "TAU", "status": "running", "format": "bracket",
+		"current_round": 1,
+		"rounds": [
+			[{"winner_id": "a", "banked": true}, {"winner_id": "b", "banked": true},
+				{"winner_id": "c", "banked": false}, {"winner_id": "e", "banked": false}],
+			[{"winner_id": "a"}, {"winner_id": ""}]]}
+	_check(arena._audit_banked_rounds() == 2, "audit counts the gap")
+	d.tourney = {"id": "TAU", "status": "running", "format": "bracket",
+		"current_round": 1,
+		"rounds": [
+			[{"winner_id": "a", "banked": true}, {"winner_id": "b", "banked": true}],
+			[{"winner_id": "a"}, {"winner_id": ""}]]}
+	_check(arena._audit_banked_rounds() == 0, "clean file stays silent")
+	d.tourney = old_tourney
+
+
 func test_roundbank_brain_loss_resends() -> void:
 	# Server restart killed the round bank: the free-mode error arms a
 	# stored-report resend (supervisor reload, capped); the reload
@@ -1404,6 +1585,11 @@ func _process(_delta: float) -> bool:
 	test_loading_supervisor_recovers()
 	test_preload_skips_unbuilt_final()
 	test_preload_targets_current_match()
+	test_match_nonce_deterministic()
+	test_match_bank_decision()
+	test_match_send_and_complete()
+	test_flush_splits_per_match()
+	test_audit_banked_rounds()
 	test_roundbank_brain_loss_resends()
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()

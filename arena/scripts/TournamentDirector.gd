@@ -1053,6 +1053,7 @@ func _new_match(a, b) -> Dictionary:
 		"wins_a": 0, "wins_b": 0, "draws": 0,
 		"winner_id": "", "battles": 0,
 		"ko_a": 0, "ko_b": 0,
+		"banked": false, "bank_nonce": "",
 	}
 
 

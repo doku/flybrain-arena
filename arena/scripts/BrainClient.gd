@@ -120,9 +120,12 @@ func send_round_over(stats_alpha: Dictionary, stats_beta: Dictionary, arena_draw
 
 func request_match_report(match_winner: String, tournament_id: String,
 		match_label: String, match_id: String, battles: Array,
+		alpha_id: String = "", beta_id: String = "",
+		alpha_path: String = "", beta_path: String = "",
 		partial: bool = false) -> void:
 	# ONE bank per match: every cached battle rides one message; the
-	# server replays them in order, then banks the match (one journal,
+	# server resolves the fighters from the paths (never the live
+	# pair), replays them in order, then banks the match (one journal,
 	# one save pair). Partial = quit-flush: banks battles only, the
 	# match result stays undecided.
 	if not is_connected_server:
@@ -133,6 +136,10 @@ func request_match_report(match_winner: String, tournament_id: String,
 		"tournament_id": tournament_id,
 		"match": match_label,
 		"match_id": match_id,
+		"alpha_id": alpha_id,
+		"beta_id": beta_id,
+		"alpha_path": alpha_path,
+		"beta_path": beta_path,
 		"battles": battles,
 		"partial": partial
 	})

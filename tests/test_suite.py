@@ -6677,6 +6677,121 @@ class TestBattleTransaction(unittest.TestCase):
                                            csr, pops, {}, {})
         self.assertEqual(w3, (0, 0))
 
+    def _clean_match_verdicts(self):
+        # Per-match verdict sidecars live in the tournaments dir (same
+        # isolation story as the single-slot verdict in tearDown).
+        try:
+            d = self.srv.TOURNAMENTS_DIR
+            for f in os.listdir(d):
+                if f.startswith("match_verdict_") and f.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(d, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def test_match_reports_equal_round_report(self):
+        # Parity: two single-match banks equal one two-match round bank
+        # (records, ELO, wins, KOs) - the incremental path banks the
+        # same learning in smaller datagrams. Plus match resend dedup
+        # (including after a later match banked: sidecar, not just the
+        # single-slot verdict).
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        fa = self._round_fighters(["PA1", "PB1", "PC1", "PD1"], wbasis)
+        fb = self._round_fighters(["PA2", "PB2", "PC2", "PD2"], wbasis)
+        self.addCleanup(self._clean_match_verdicts)
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+
+        def _battle(bid):
+            return {"battle_id": bid, "draw": False, "draw_penalty": False,
+                    "end_reason": "ko",
+                    "verdict": {"winner_slot": "alpha",
+                                "blow_source": "thorax", "blow_amount": 80.0,
+                                "loser_slot": "beta"},
+                    "stats_a": {"kills": 1}, "stats_b": {"kills": 0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl}
+
+        def _mpath(ra, rb, mid, mlabel):
+            return {"match_id": mid, "tournament_id": "TP",
+                    "match": mlabel, "match_winner": "alpha",
+                    "alpha_path": vault_pkg.package_path(ra),
+                    "beta_path": vault_pkg.package_path(rb),
+                    "battles": [_battle(mid + "-B1")]}
+
+        def _snap(recs):
+            out = []
+            for r in recs:
+                rec, _w = vault_pkg.load_brain(r["id"])
+                d = rec["record"]
+                out.append((d.get("battles"), d.get("wins"),
+                            d.get("matches"), d.get("matches_won"),
+                            d.get("elo"), d.get("ko")))
+            return out
+
+        tag = {"tournament_id": "TP", "match": "R1"}
+        # Path A: two single-match banks.
+        for i in (0, 2):
+            self.srv._handle_match_report(
+                _FakeSock(), ("127.0.0.1", 1),
+                _mpath(fa[i], fa[i + 1], "MA%d" % (i // 2 + 1),
+                       "R1M%d" % (i // 2 + 1)),
+                tag, 0.5, True, _FakeEvo(), _FakeRL(), 1.0,
+                lambda: "parity", csr, pops, {})
+        ma1 = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(ma1["status"], "tournament_match_battled")
+        # Same-nonce resend re-acks without re-banking.
+        before = _snap(fa)
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1),
+            _mpath(fa[0], fa[1], "MA1", "R1M1"),
+            tag, 0.5, True, _FakeEvo(), _FakeRL(), 1.0,
+            lambda: "parity", csr, pops, {})
+        again = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(again["status"], "tournament_match_battled")
+        self.assertEqual(again["battle_id"], "MA1")
+        self.assertEqual(_snap(fa), before)
+        # Path B: one two-match round bank over fresh fighters.
+        rmsg = {"round_nonce": "RND-P", "tournament_id": "TP",
+                "match": "R1M2",
+                "matches": [
+                    {"match_id": "MB1", "match_winner": "alpha",
+                     "alpha_path": vault_pkg.package_path(fb[0]),
+                     "beta_path": vault_pkg.package_path(fb[1]),
+                     "battles": [_battle("MB1-B1")]},
+                    {"match_id": "MB2", "match_winner": "alpha",
+                     "alpha_path": vault_pkg.package_path(fb[2]),
+                     "beta_path": vault_pkg.package_path(fb[3]),
+                     "battles": [_battle("MB2-B1")]}]}
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), rmsg, {"rec": None},
+            {"rec": None}, {"tournament_id": "TP", "match": "R1M2"},
+            0.5, True, _FakeEvo(), _FakeRL(), 1.0, lambda: "parity",
+            csr, pops, {})
+        self.assertEqual(_snap(fa), _snap(fb))
+
     def _group_reset(self):
         self.srv._group_pinned.clear()
         self.srv._group_pinned.update({"tournament_id": "", "brains": {}})
