@@ -437,6 +437,10 @@ const QUEUES_FILENAME := "queues.json"
 
 
 func _queues_path() -> String:
+	# Empty when job_dir was never configured (bare test doubles):
+	# callers treat that as stay-in-memory.
+	if str(job_dir) == "":
+		return ""
 	return job_dir.path_join(QUEUES_FILENAME)
 
 
@@ -445,7 +449,11 @@ func _save_queues() -> void:
 	# to menu (or app restart) resumes them instead of dropping work.
 	# Cheap small file, best-effort (a failed write only loses the
 	# file, never the in-memory queues).
-	var f := FileAccess.open(_queues_path(), FileAccess.WRITE)
+	var path := _queues_path()
+	if path == "":
+		return
+	DirAccess.make_dir_recursive_absolute(job_dir)
+	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f == null:
 		print("[Director] queues save failed (continuing in-memory).")
 		return

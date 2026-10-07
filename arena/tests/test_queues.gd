@@ -214,6 +214,18 @@ func test_boot_live_and_stale() -> void:
 	D.call("_save_queues")
 
 
+func test_unconfigured_double_skips_save() -> void:
+	# Bare test doubles (no job_dir) stay in-memory instead of
+	# littering the working directory.
+	var bare = load("res://scripts/TournamentDirector.gd").new()
+	bare.job_dir = ""
+	_check(bare.call("_queues_path") == "", "no path without job_dir")
+	bare.enqueue_training("x1", "Ex", 10, {})
+	bare.call("_save_queues")
+	_check((bare.train_queue as Array).size() == 1, "memory queue unaffected")
+	bare.queue_free()
+
+
 func test_corrupt_file() -> void:
 	_write_result(JDIR.path_join("queues.json"), "not json{{{")
 	var d2 = _new_director()
@@ -230,6 +242,7 @@ func _initialize() -> void:
 	test_boot_adopt_complete()
 	test_boot_requeue_crash()
 	test_boot_live_and_stale()
+	test_unconfigured_double_skips_save()
 	test_corrupt_file()
 	_cleanup()
 	if failures == 0:
