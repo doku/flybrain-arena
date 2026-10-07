@@ -367,7 +367,7 @@ var intermission_row: HBoxContainer
 var intermission_label: Label
 var _event_skip := false
 const EVENT_INTERMISSION_SECS := 60.0
-const EVENT_PREVIEW_SECS := 30.0
+const EVENT_TIPOFF_SECS := 60.0
 const EVENT_FINAL_SECS := 120.0
 # Event gallery (bracket-view right column): rotates fighter stat
 # cards for the next pending group (all fighters pre-event). Keyed
@@ -6259,7 +6259,7 @@ func _event_resume_intermission() -> bool:
 
 
 func _event_pre_showcase() -> void:
-	# Brand-new event tip-off (runs once): 30 s bracket overview with
+	# Brand-new event tip-off (runs once): 60 s bracket overview with
 	# all sixteen fighters rotating through the gallery, then Group A
 	# loads normally below.
 	var director := _director()
@@ -6268,7 +6268,7 @@ func _event_pre_showcase() -> void:
 	_event_gallery_update(true)
 	var eid := _event_id()
 	if not await _event_intermission("EVENT %s · TIP-OFF" % eid,
-			"Group A starts in", EVENT_PREVIEW_SECS, true):
+			"Group A starts in", EVENT_TIPOFF_SECS, true):
 		director.quit_to_menu()
 		return
 

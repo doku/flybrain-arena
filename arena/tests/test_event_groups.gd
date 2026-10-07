@@ -973,14 +973,14 @@ func test_countdown_gates() -> void:
 	# is_round_active=true fought behind boot tip-offs/resumes and
 	# phantom-timed-out a battle on the first tick). Official start
 	# stays brains_loaded -> _reset_round. Countdown times pinned:
-	# 30 s tip-off, 60 s between groups, 120 s before the final.
+	# 60 s tip-off, 60 s between groups, 120 s before the final.
 	var A = load("res://scripts/ArenaManager.gd").new()
 	A.set("is_round_active", true)
 	A.call("_close_round_for_wait")
 	_check(not bool(A.get("is_round_active")), "wait helper closes a live round")
 	A.call("_close_round_for_wait")
 	_check(not bool(A.get("is_round_active")), "wait helper stays closed")
-	_check(absf(A.EVENT_PREVIEW_SECS - 30.0) < 0.01, "tip-off counts down 30 s")
+	_check(absf(A.EVENT_TIPOFF_SECS - 60.0) < 0.01, "tip-off counts down 60 s")
 	_check(absf(A.EVENT_INTERMISSION_SECS - 60.0) < 0.01,
 		"group intermission counts down 60 s")
 	_check(absf(A.EVENT_FINAL_SECS - 120.0) < 0.01,
