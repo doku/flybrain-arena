@@ -371,6 +371,11 @@ const POOL_TRAIN_TARGET := 50
 const EVENT_TOPUP_EVERY := 30.0
 var _event_topup_cd := 0.0
 const EVENT_POOL_CAP := 4
+# Threshold-skip log latch: the pool sits above threshold for whole
+# generations at a time, and the per-tick queue attempts would flood
+# stdout with the same skip line. Report the transition once; the next
+# actually-queued breed re-arms it.
+var _pool_skip_logged := false
 # In-flight awaited breed: _evo_await_queued DETACHES its spec from
 # pending, so every progress readout (strip, gallery, status line)
 # must consult this fallback or flatline for the whole (long) await.
@@ -7052,6 +7057,8 @@ func _evo_queue_spec(kind: String, brain_name: String, parent_id: String,
 	for spec in pending:
 		if str((spec as Dictionary).get("kind", "")) == kind:
 			return
+	# A real queue event re-arms the threshold-skip log (state changed).
+	_pool_skip_logged = false
 	var paths := _evo_spec_paths(kind, target_gen)
 	pending.append({"kind": kind, "name": brain_name, "parent": parent_id,
 		"seed": seed, "gen": target_gen, "progress": paths[0],
@@ -7109,8 +7116,10 @@ func _evo_queue_wild(target_gen: int, mode: String = "") -> void:
 	if _evo_has_kind("wild"):
 		return
 	if not _evo_breeding_wanted():
-		print("[Arena] Pool %d/%d - wild breed skipped (pool at threshold)." % [
-			_evo_pool_size(), _evo_pool_threshold()])
+		if not _pool_skip_logged:
+			_pool_skip_logged = true
+			print("[Arena] Pool %d/%d - wild breed skipped (pool at threshold)." % [
+				_evo_pool_size(), _evo_pool_threshold()])
 		return
 	if mode == "":
 		mode = _evo_wild_mode(target_gen)
@@ -7148,8 +7157,10 @@ func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String,
 	if champ_id == "" or _evo_has_kind("clone"):
 		return
 	if not _evo_breeding_wanted():
-		print("[Arena] Pool %d/%d - kin breed skipped (pool at threshold)." % [
-			_evo_pool_size(), _evo_pool_threshold()])
+		if not _pool_skip_logged:
+			_pool_skip_logged = true
+			print("[Arena] Pool %d/%d - kin breed skipped (pool at threshold)." % [
+				_evo_pool_size(), _evo_pool_threshold()])
 		return
 	# Spec carries the pedigree BASE for display; the worker appends
 	# -kin/-jr with the lineage counters at banking (counters are
