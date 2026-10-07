@@ -90,12 +90,13 @@ var pending_async: Dictionary = {}
 
 # Menu training queue: FIFO of {id, name, episodes, params}. The menu
 # enqueues while a job runs; the pump starts the head whenever the
-# shared worker slot frees up. In-memory only (menu restart drops it;
-# a running worker keeps going but is no longer polled).
+# shared worker slot frees up. Persisted to brains/jobs/queues.json
+# on every mutation (quit/menu restart resumes it); a running worker
+# keeps going and is reattached by boot adopt.
 var train_queue: Array = []
 # Last finished trainings (ring of {name, episodes}, newest last, cap
 # 5): the arena HUD shows the most recent DONE so finished work stays
-# visible instead of vanishing silently. In-memory only like the queue.
+# visible instead of vanishing silently. Persisted with the queues.
 var completed_trains: Array = []
 # Spawn hold (arena sets from is_round_active): queue pumps refuse to
 # boot workers mid-battle (process-boot spikes frame pacing); queued
@@ -130,6 +131,8 @@ func _ready() -> void:
 	job_dir = brains_dir.path_join(JOB_DIRNAME)
 	DirAccess.make_dir_recursive_absolute(tournament_dir)
 	DirAccess.make_dir_recursive_absolute(job_dir)
+	_load_queues()
+	_adopt_boot_queues()
 
 
 func _resolve_python() -> void:
@@ -279,6 +282,7 @@ func run_cli_async(op: String, args: Array, result_file: String,
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
 	pending_async = {"pid": pid, "result_file": result_file, "op": op,
 		"started": Time.get_ticks_msec(), "timeout_msec": timeout_msec}
+	_save_queues()
 	return {"ok": true, "pid": pid}
 
 
@@ -300,6 +304,7 @@ func _poll_async() -> void:
 				return  # Partial write; retry next frame.
 		var op := str(pending_async.get("op", ""))
 		pending_async = {}
+		_save_queues()
 		if result.get("ok", false):
 			vault_changed.emit()
 		async_done.emit(op, result)
@@ -307,6 +312,7 @@ func _poll_async() -> void:
 			> int(pending_async.get("timeout_msec", 1800000)):
 		var op2 := str(pending_async.get("op", ""))
 		pending_async = {}
+		_save_queues()
 		async_done.emit(op2, {"ok": false, "error": "operation timed out"})
 
 
@@ -427,8 +433,77 @@ func import_brain(npz_path: String, brain_name: String) -> Dictionary:
 	return res
 
 
+const QUEUES_FILENAME := "queues.json"
+
+
+func _queues_path() -> String:
+	return job_dir.path_join(QUEUES_FILENAME)
+
+
+func _save_queues() -> void:
+	# Persists train/score queues, active jobs and the done ring: quit
+	# to menu (or app restart) resumes them instead of dropping work.
+	# Cheap small file, best-effort (a failed write only loses the
+	# file, never the in-memory queues).
+	var f := FileAccess.open(_queues_path(), FileAccess.WRITE)
+	if f == null:
+		print("[Director] queues save failed (continuing in-memory).")
+		return
+	f.store_string(JSON.stringify({"train_queue": train_queue,
+		"score_queue": score_queue, "active_job": active_job,
+		"score_job": score_job, "completed_trains": completed_trains,
+		"pending_async": pending_async,
+		"saved_at_unix": Time.get_unix_time_from_system()}))
+	f.close()
+
+
+func _load_queues() -> void:
+	# Restores persisted queues at boot; corrupt/missing file starts
+	# empty (log, never crash). Shape-checked field by field.
+	train_queue = []
+	score_queue = []
+	active_job = {}
+	score_job = {}
+	completed_trains = []
+	pending_async = {}
+	var f := FileAccess.open(_queues_path(), FileAccess.READ)
+	if f == null:
+		return
+	var text := f.get_as_text().strip_edges()
+	f.close()
+	if not (text.begins_with("{") and text.ends_with("}")):
+		print("[Director] queues file unreadable - starting empty.")
+		return
+	var parsed = JSON.parse_string(text)
+	if not (parsed is Dictionary):
+		print("[Director] queues file unreadable - starting empty.")
+		return
+	if parsed.get("train_queue", []) is Array:
+		for item in (parsed.get("train_queue", []) as Array):
+			if item is Dictionary and str((item as Dictionary).get("id", "")) != "":
+				train_queue.append(item)
+	if parsed.get("score_queue", []) is Array:
+		for item in (parsed.get("score_queue", []) as Array):
+			if item is Dictionary and str((item as Dictionary).get("id", "")) != "":
+				score_queue.append(item)
+	if parsed.get("active_job", {}) is Dictionary:
+		active_job = parsed.get("active_job", {})
+	if parsed.get("score_job", {}) is Dictionary:
+		score_job = parsed.get("score_job", {})
+	if parsed.get("completed_trains", []) is Array:
+		completed_trains = parsed.get("completed_trains", [])
+		while completed_trains.size() > 5:
+			completed_trains.pop_front()
+	if parsed.get("pending_async", {}) is Dictionary:
+		pending_async = parsed.get("pending_async", {})
+	print("[Director] queues restored: %d train + %d score waiting%s%s." % [
+		train_queue.size(), score_queue.size(),
+		" +active train" if not active_job.is_empty() else "",
+		" +active score" if not score_job.is_empty() else ""])
+
+
 func start_training(brain_id: String, episodes: int, params: Dictionary,
-		snapshot: bool = true, brain_name: String = "") -> Dictionary:
+	snapshot: bool = true, brain_name: String = "") -> Dictionary:
 	if not python_ready:
 		return {"ok": false, "error": "no working python found (%s)" % python_probe_error}
 	if not active_job.is_empty():
@@ -460,9 +535,10 @@ func start_training(brain_id: String, episodes: int, params: Dictionary,
 	active_job = {"pid": pid, "progress_path": progress_path,
 		"result_file": result_file, "brain_id": brain_id,
 		"episodes": episodes, "school": params.has("curriculum"),
-		"name": brain_name}
+		"name": brain_name, "params": params}
 	_last_job_text = ""
 	_last_job_res = {}
+	_save_queues()
 	return {"ok": true, "pid": pid}
 
 
@@ -496,39 +572,48 @@ func poll_job() -> Dictionary:
 		_last_job_total = total_now
 		job_progress.emit(ep_now, total_now)
 	if float(res.get("pct", 0.0)) >= 100.0:
-		print("[Director] Job done: %s (%d/%d)" % [
-			str(active_job.get("brain_id", "?")),
-			int(res.get("episode", 0)), int(res.get("total", 0))])
-		# School trains earn a probe top-up (eval_only, weights
-		# untouched): its points bank into the single score odometer
-		# under the same rules as training.
-		var done_school := bool(active_job.get("school", false))
-		var done_id := str(active_job.get("brain_id", ""))
-		var done_name := str(active_job.get("name", ""))
-		if done_name == "":
-			done_name = done_id
-		_record_train_done(done_name, int(res.get("episode", 0)))
-		active_job = {}
-		vault_changed.emit()
-		_pump_train_queue()
-		if done_school and done_id != "":
-			# Via the queue (never silently dropped when a batch
-			# probe holds the slot; id doubles as display name).
-			enqueue_score(done_id, done_id)
-		return res
+		return _finish_train_job(res)
 	# Fail loud: the backend writes its result file on success AND on
 	# error. If the process is gone without reaching 100%, the job
 	# crashed (e.g. arity mismatch before episode 1) - report the backend
 	# error instead of hanging at episode 0/50 forever.
 	var pid := int(active_job.get("pid", 0))
 	if pid > 0 and not OS.is_process_running(pid):
-		var err_text := _read_job_result_error(str(active_job.get("result_file", "")))
-		print("[Director] Job failed: %s - %s" % [
-			str(active_job.get("brain_id", "?")), err_text])
-		active_job = {}
-		job_failed.emit(err_text)
-		_pump_train_queue()
+		_fail_train_job(_read_job_result_error(str(active_job.get("result_file", ""))))
 	return res
+
+
+func _finish_train_job(res: Dictionary) -> Dictionary:
+	# Banks a completed train (shared by the poller and boot adopt):
+	# done ring, vault refresh, queue pump, school probe follow-up.
+	print("[Director] Job done: %s (%d/%d)" % [
+		str(active_job.get("brain_id", "?")),
+		int(res.get("episode", 0)), int(res.get("total", 0))])
+	var done_school := bool(active_job.get("school", false))
+	var done_id := str(active_job.get("brain_id", ""))
+	var done_name := str(active_job.get("name", ""))
+	if done_name == "":
+		done_name = done_id
+	_record_train_done(done_name, int(res.get("episode", 0)))
+	active_job = {}
+	_save_queues()
+	vault_changed.emit()
+	_pump_train_queue()
+	if done_school and done_id != "":
+		# Via the queue (never silently dropped when a batch
+		# probe holds the slot; id doubles as display name).
+		enqueue_score(done_id, done_id)
+	return res
+
+
+func _fail_train_job(err_text: String) -> void:
+	# Banks a crashed train (shared by the poller and boot adopt).
+	print("[Director] Job failed: %s - %s" % [
+		str(active_job.get("brain_id", "?")), err_text])
+	active_job = {}
+	_save_queues()
+	job_failed.emit(err_text)
+	_pump_train_queue()
 
 
 func _record_train_done(brain_name: String, episodes: int) -> void:
@@ -548,7 +633,55 @@ func enqueue_training(brain_id: String, brain_name: String, episodes: int,
 	print("[Director] Queued %s x%d (#%d, depth %d)" % [brain_name,
 		maxi(1, episodes), train_queue.size(), train_queue.size()])
 	train_queue_changed.emit()
+	_save_queues()
 	return train_queue.size()
+
+
+func move_queued(index: int, direction: int) -> bool:
+	# Reorders the train queue (Up/Down): swaps with the neighbor in
+	# the given direction. Pure array op + signal + save.
+	if index < 0 or index >= train_queue.size():
+		return false
+	var j := index + direction
+	if j < 0 or j >= train_queue.size():
+		return false
+	var item: Dictionary = train_queue[index]
+	train_queue.remove_at(index)
+	train_queue.insert(j, item)
+	print("[Director] Queue moved: %s to #%d." % [
+		str(item.get("name", "?")), j + 1])
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func move_queued_top(index: int) -> bool:
+	# Promotes a queued train to the head (runs next).
+	if index <= 0 or index >= train_queue.size():
+		return false
+	var item: Dictionary = train_queue[index]
+	train_queue.remove_at(index)
+	train_queue.push_front(item)
+	print("[Director] Queue promoted: %s to #1." % [
+		str(item.get("name", "?"))])
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func set_queued_episodes(index: int, episodes: int) -> bool:
+	# Edits a queued train's episode count (1-500, clamped) before it
+	# launches. The running job is untouched (edit that one by
+	# requeueing: cancel + re-add).
+	if index < 0 or index >= train_queue.size():
+		return false
+	var eps := maxi(1, mini(500, episodes))
+	(train_queue[index] as Dictionary)["episodes"] = eps
+	print("[Director] Queue episodes: %s now x%d." % [
+		str((train_queue[index] as Dictionary).get("name", "?")), eps])
+	train_queue_changed.emit()
+	_save_queues()
+	return true
 
 
 func cancel_queued(index: int) -> bool:
@@ -559,6 +692,7 @@ func cancel_queued(index: int) -> bool:
 		train_queue.size()])
 	train_queue.remove_at(index)
 	train_queue_changed.emit()
+	_save_queues()
 	return true
 
 
@@ -575,6 +709,7 @@ func purge_queued(brain_id: String) -> int:
 			dropped, "y" if dropped == 1 else "ies", brain_id])
 		train_queue = kept
 		train_queue_changed.emit()
+		_save_queues()
 	return dropped
 
 
@@ -583,6 +718,7 @@ func clear_train_queue() -> void:
 		return
 	train_queue.clear()
 	train_queue_changed.emit()
+	_save_queues()
 
 
 func pump_train_queue() -> bool:
@@ -611,7 +747,105 @@ func _pump_train_queue() -> bool:
 		str(head.get("name", "?")), train_queue.size() - 1])
 	train_queue.pop_front()
 	train_queue_changed.emit()
+	_save_queues()
 	return true
+
+
+func _adopt_boot_queues() -> void:
+	# Boot recovery for persisted queues: live pids reattach (the
+	# poller resumes), completed result files adopt immediately, dead
+	# pids with no result requeue (train/score) or free the slot
+	# (async). Never kills: a crash must not eat work. Runs once.
+	if not active_job.is_empty():
+		var pid := int(active_job.get("pid", 0))
+		var res := _read_job_result(str(active_job.get("result_file", "")))
+		if pid > 0 and OS.is_process_running(pid):
+			print("[Director] Reattached running train job %s (pid %d)." % [
+				str(active_job.get("brain_id", "?")), pid])
+			_last_job_text = ""
+			_last_job_ep = -1
+			_last_job_total = -1
+		elif float(res.get("pct", 0.0)) >= 100.0:
+			_finish_train_job(res)
+		elif res.get("ok", null) == false:
+			_fail_train_job(str(res.get("error", "training process exited")))
+		else:
+			_requeue_active_train_job()
+	if not score_job.is_empty():
+		var spid := int(score_job.get("pid", 0))
+		var sres := _read_job_result(str(score_job.get("result_file", "")))
+		if spid > 0 and OS.is_process_running(spid):
+			print("[Director] Reattached running score probe %s (pid %d)." % [
+				str(score_job.get("brain_id", "?")), spid])
+			_last_score_text = ""
+			_last_score_ep = -1
+			_last_score_total = -1
+		elif not sres.is_empty():
+			_finish_score_job(sres)
+		else:
+			_requeue_active_score_job()
+	if not pending_async.is_empty():
+		var apid := int(pending_async.get("pid", 0))
+		var arf := str(pending_async.get("result_file", ""))
+		if (apid <= 0 or not OS.is_process_running(apid)) \
+				and _read_job_result(arf).is_empty() \
+				and not FileAccess.file_exists(arf):
+			# Stale slot (dead worker, no verdict coming): free it now
+			# instead of wedging every spawn for 30 minutes.
+			print("[Director] Dropping stale async slot (%s, pid gone)." % [
+				str(pending_async.get("op", "?"))])
+			pending_async = {}
+			_save_queues()
+
+
+func _read_job_result(path: String) -> Dictionary:
+	# Parsed result verdict or {} (missing/partial/unparsable).
+	if path == "":
+		return {}
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return {}
+	var text := f.get_as_text().strip_edges()
+	f.close()
+	if not (text.begins_with("{") and text.ends_with("}")):
+		return {}
+	var parsed = JSON.parse_string(text)
+	return parsed if parsed is Dictionary else {}
+
+
+func _requeue_active_train_job() -> void:
+	# Crashed train with no verdict: back to the head with its exact
+	# recipe (params rode along in the job dict), then pump.
+	var bid := str(active_job.get("brain_id", ""))
+	var bname := str(active_job.get("name", ""))
+	if bid == "":
+		active_job = {}
+		_save_queues()
+		return
+	if bname == "":
+		bname = bid
+	print("[Director] Requeueing crashed train job %s." % bname)
+	train_queue.push_front({"id": bid, "name": bname,
+		"episodes": maxi(1, int(active_job.get("episodes", 50))),
+		"params": active_job.get("params", {})})
+	active_job = {}
+	_save_queues()
+	train_queue_changed.emit()
+	_pump_train_queue()
+
+
+func _requeue_active_score_job() -> void:
+	var bid := str(score_job.get("brain_id", ""))
+	if bid == "":
+		score_job = {}
+		_save_queues()
+		return
+	print("[Director] Requeueing crashed score probe %s." % bid)
+	score_queue.push_front({"id": bid, "name": bid})
+	score_job = {}
+	_save_queues()
+	score_queue_changed.emit()
+	_pump_score_queue()
 
 
 func _read_job_result_error(result_file: String) -> String:
@@ -650,7 +884,7 @@ func _process(delta: float) -> void:
 
 
 # Menu scoring queue: FIFO of {id, name}. Batch eval probes run one
-# at a time in the score slot; in-memory only like the train queue.
+# at a time in the score slot; persisted with the train queue.
 var score_queue: Array = []
 
 
@@ -668,8 +902,39 @@ func enqueue_score(brain_id: String, brain_name: String) -> int:
 	var pos := score_queue.size()
 	print("[Director] Queued scoring %s (#%d)" % [brain_name, pos])
 	score_queue_changed.emit()
+	_save_queues()
 	pump_score_queue()
 	return pos
+
+
+func move_score_queued(index: int, direction: int) -> bool:
+	# Reorders the scoring queue (Up/Down). Pure array op + signal.
+	if index < 0 or index >= score_queue.size():
+		return false
+	var j := index + direction
+	if j < 0 or j >= score_queue.size():
+		return false
+	var item: Dictionary = score_queue[index]
+	score_queue.remove_at(index)
+	score_queue.insert(j, item)
+	print("[Director] Score queue moved: %s to #%d." % [
+		str(item.get("name", "?")), j + 1])
+	score_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func move_score_queued_top(index: int) -> bool:
+	if index <= 0 or index >= score_queue.size():
+		return false
+	var item: Dictionary = score_queue[index]
+	score_queue.remove_at(index)
+	score_queue.push_front(item)
+	print("[Director] Score queue promoted: %s to #1." % [
+		str(item.get("name", "?"))])
+	score_queue_changed.emit()
+	_save_queues()
+	return true
 
 
 func cancel_score_queued(index: int) -> void:
@@ -680,6 +945,7 @@ func cancel_score_queued(index: int) -> void:
 		score_queue.size() - 1])
 	score_queue.remove_at(index)
 	score_queue_changed.emit()
+	_save_queues()
 
 
 func clear_score_queue() -> void:
@@ -687,6 +953,7 @@ func clear_score_queue() -> void:
 		return
 	score_queue.clear()
 	score_queue_changed.emit()
+	_save_queues()
 
 
 func pump_score_queue() -> bool:
@@ -709,6 +976,7 @@ func _pump_score_queue() -> bool:
 		str(head.get("name", "?")), score_queue.size() - 1])
 	score_queue.pop_front()
 	score_queue_changed.emit()
+	_save_queues()
 	return true
 
 
@@ -734,6 +1002,7 @@ func _launch_score(brain_id: String) -> bool:
 	score_job = {"pid": pid, "result_file": result_file,
 		"progress_path": progress_path, "brain_id": brain_id}
 	_last_score_text = ""
+	_save_queues()
 	print("[Director] Eval probe started for %s." % brain_id)
 	return true
 
@@ -767,23 +1036,39 @@ func _poll_score() -> void:
 		if text.begins_with("{") and text.ends_with("}"):
 			var parsed = JSON.parse_string(text)
 			if parsed is Dictionary:
-				score_job = {}
-				if bool(parsed.get("ok", false)):
-					var sc := float(parsed.get("eval_score", 0.0))
-					print("[Director] Eval score %.1f stamped for %s." % [sc, bid])
-					score_stamped.emit(bid, sc)
-				else:
-					print("[Director] Eval probe failed for %s: %s" % [
-						bid, str(parsed.get("error", "?"))])
-				vault_changed.emit()
-				pump_score_queue()
+				_finish_score_job(parsed)
 				return
 			return  # Partial write; retry next frame.
 	var pid := int(score_job.get("pid", 0))
 	if pid > 0 and not OS.is_process_running(pid):
-		print("[Director] Eval probe died silently for %s (see brains/jobs log)." % bid)
-		score_job = {}
-		pump_score_queue()
+		_fail_score_job()
+
+
+func _finish_score_job(parsed: Dictionary) -> void:
+	# Banks a completed eval probe (shared by the poller and boot
+	# adopt): stamp, vault refresh, queue pump.
+	var bid := str(score_job.get("brain_id", ""))
+	score_job = {}
+	_save_queues()
+	if bool(parsed.get("ok", false)):
+		var sc := float(parsed.get("eval_score", 0.0))
+		print("[Director] Eval score %.1f stamped for %s." % [sc, bid])
+		score_stamped.emit(bid, sc)
+	else:
+		print("[Director] Eval probe failed for %s: %s" % [
+			bid, str(parsed.get("error", "?"))])
+	vault_changed.emit()
+	pump_score_queue()
+
+
+func _fail_score_job() -> void:
+	# Banks a silently-died probe (shared by the poller and boot
+	# adopt): clear, pump, never hang the slot.
+	var bid := str(score_job.get("brain_id", ""))
+	print("[Director] Eval probe died silently for %s (see brains/jobs log)." % bid)
+	score_job = {}
+	_save_queues()
+	pump_score_queue()
 
 
 # ── Tournament setup ────────────────────────────────────────────────

@@ -393,6 +393,37 @@ var _pool_skip_logged := false
 var evo_await_spec := {}
 
 
+func _evo_await_remember(spec: Dictionary) -> void:
+	# Detach with a file trail: the full spec rides along in memory
+	# (progress readouts) AND in tourney.evo.awaiting (quit/resume
+	# re-inserts it into pending instead of orphaning the verdict).
+	evo_await_spec = {"kind": str(spec.get("kind", "")),
+		"name": str(spec.get("name", "")),
+		"gen": int(spec.get("gen", 1)),
+		"progress": str(spec.get("progress", "")),
+		"launched": bool(spec.get("launched", false)),
+		"mode": str(spec.get("mode", ""))}
+	var director := _director()
+	if director != null:
+		if not director.tourney.has("evo"):
+			director.tourney["evo"] = {}
+		(director.tourney.get("evo", {}) as Dictionary)["awaiting"] = spec.duplicate(true)
+		director.save_state()
+
+
+func _evo_await_forget() -> void:
+	# Clears the detach (adopt/abort/timeout/STOP) in memory and file
+	# alike: a stale file entry would resurrect a finished breed on
+	# the next adopt sweep.
+	evo_await_spec = {}
+	var director := _director()
+	if director != null:
+		var evo: Dictionary = director.tourney.get("evo", {})
+		if evo.has("awaiting"):
+			evo.erase("awaiting")
+			director.save_state()
+
+
 func _evo_awaited_spec(kind: String) -> Dictionary:
 	if str(evo_await_spec.get("kind", "")) == kind:
 		return evo_await_spec
@@ -7632,6 +7663,23 @@ func _evo_adopt_finished(force: bool = false) -> Dictionary:
 	var pending := _evo_pending()
 	var done := _evo_done()
 	var director := _director()
+	# Detached-await rescue (quit/resume mid-handoff): a spec trailed
+	# in tourney.evo.awaiting rejoins pending once (deduped by kind)
+	# so the normal sweep adopts its verdict instead of orphaning it.
+	if director != null:
+		var evo: Dictionary = director.tourney.get("evo", {})
+		var awaiting: Dictionary = evo.get("awaiting", {})
+		if not awaiting.is_empty():
+			var akind := str(awaiting.get("kind", ""))
+			var dup := akind == ""
+			for spec in pending:
+				if str((spec as Dictionary).get("kind", "")) == akind:
+					dup = true
+			if not dup:
+				pending.append(awaiting.duplicate(true))
+				print("[Arena] Re-adopted detached %s breed from a prior session." % akind)
+			evo.erase("awaiting")
+			_evo_save_queue(pending, done)
 	var keep: Array = []
 	for spec in pending:
 		var sd := spec as Dictionary
@@ -8405,12 +8453,8 @@ func _evo_await_queued(kind: String) -> String:
 			continue
 		pending.remove_at(i)
 		_evo_save_queue(pending, _evo_done())
+		_evo_await_remember(s)
 		var sname0 := str(s.get("name", ""))
-		evo_await_spec = {"kind": kind, "name": sname0,
-			"gen": int(s.get("gen", 1)),
-			"progress": str(s.get("progress", "")),
-			"launched": bool(s.get("launched", false)),
-			"mode": str(s.get("mode", ""))}
 		var display0 := sname0 if sname0 != "" else "wild"
 		if not bool(s.get("launched", false)):
 			# The lane may still be held by the sibling breed (e.g. wild
@@ -8425,7 +8469,7 @@ func _evo_await_queued(kind: String) -> String:
 					or not _evo_blocking_spec(kind).is_empty()) \
 					and swait < EVO_AWAIT_TIMEOUT:
 				if not _evo_active():
-					evo_await_spec = {}
+					_evo_await_forget()
 					return ""
 				var blk := _evo_blocking_spec(kind)
 				if blk.is_empty():
@@ -8446,17 +8490,17 @@ func _evo_await_queued(kind: String) -> String:
 				_evo_adopt_finished()
 				tdir = _director()
 			if tdir == null:
-				evo_await_spec = {}
+				_evo_await_forget()
 				return ""
 			if not tdir.pending_async.is_empty():
 				_show_evo_phase("BREEDING " + display0,
 					"Training slot never freed - check brains/jobs log")
-				evo_await_spec = {}
+				_evo_await_forget()
 				return ""
 			if not _evo_spawn_spec(s):
 				_show_evo_phase("BREEDING " + display0,
 					"Breed failed to start: %s" % evo_last_spawn_error)
-				evo_await_spec = {}
+				_evo_await_forget()
 				return ""
 		# Fresh spawns and watcher-launched jobs alike: the await loop's
 		# liveness gate and kill path key off evo_breed_pid.
@@ -8470,7 +8514,7 @@ func _evo_await_queued(kind: String) -> String:
 			var done := _evo_done()
 			done[kind] = {"id": bred, "name": evo_last_bred_name}
 			_evo_save_queue(_evo_pending(), done)
-		evo_await_spec = {}
+		_evo_await_forget()
 		return bred
 	return ""
 
@@ -8485,7 +8529,7 @@ func _evo_abort(reason: String) -> void:
 		var evo: Dictionary = director.tourney["evo"]
 		evo["active"] = false
 		director.save_state()
-	evo_await_spec = {}
+	_evo_await_forget()
 	_hide_nextgen()
 	_hide_evo_phase()
 	if is_instance_valid(status_label):
@@ -8516,7 +8560,7 @@ func _on_evo_stop() -> void:
 		director.pending_async = {}
 	# Clear pipeline queue so the watcher stops trying to spawn/adopt.
 	_evo_save_queue([], {})
-	evo_await_spec = {}
+	_evo_await_forget()
 	_evo_abort("stopped by user")
 
 

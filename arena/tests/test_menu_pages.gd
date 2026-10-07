@@ -89,6 +89,13 @@ func _process(_delta: float) -> bool:
 	_check(srow.get_combined_minimum_size().x <= 900.0,
 		"SOUND row stays bounded without voice names")
 	_check(menu.evo_pool_threshold != null, "pool threshold spin exists")
+	_check(_is_on_page(menu.queue_up_btn, 1), "queue UP on training page")
+	_check(_is_on_page(menu.queue_down_btn, 1), "queue DOWN on training page")
+	_check(_is_on_page(menu.queue_top_btn, 1), "queue TOP on training page")
+	_check(_is_on_page(menu.queue_episodes, 1), "queue episodes spin on training page")
+	_check(_is_on_page(menu.queue_setep_btn, 1), "queue SET EP on training page")
+	_check(_is_on_page(menu.score_up_btn, 1), "score UP on training page")
+	_check(_is_on_page(menu.score_down_btn, 1), "score DOWN on training page")
 	_check(_is_on_page(menu.tourney_redraw, 2), "fresh-roster toggle on tournament page")
 	_check(not menu.tourney_redraw.button_pressed, "fresh-roster defaults OFF")
 	_check(int(menu.evo_pool_threshold.min_value) == 0

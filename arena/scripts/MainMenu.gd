@@ -61,9 +61,16 @@ var job_bar: ProgressBar
 var job_label: Label
 var queue_list: ItemList
 var queue_label: Label
+var queue_up_btn: Button
+var queue_down_btn: Button
+var queue_top_btn: Button
+var queue_episodes: SpinBox
+var queue_setep_btn: Button
 var score_bar: ProgressBar
 var score_label: Label
 var score_list: ItemList
+var score_up_btn: Button
+var score_down_btn: Button
 var score_queue_label: Label
 var _score_base: String = ""
 # True while a reference-stock generate is in flight: its completion
@@ -134,6 +141,11 @@ func _ready() -> void:
 	refresh_vault(true)
 	clear_busy()
 	_refresh_resume()
+	# A queue held mid-battle (slot free, items waiting) stalls with
+	# no arena watcher pumping: kick both queues once here (completions
+	# self-pump afterwards).
+	TournamentDirector.pump_train_queue()
+	TournamentDirector.pump_score_queue()
 
 
 func _build_busy_overlay() -> void:
@@ -588,7 +600,7 @@ func _build_gen_column() -> HBoxContainer:
 	queue_label.add_theme_font_size_override("font_size", 13)
 	q.add_child(queue_label)
 	queue_list = ItemList.new()
-	queue_list.custom_minimum_size = Vector2(0, 60)
+	queue_list.custom_minimum_size = Vector2(0, 48)
 	queue_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	queue_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	q.add_child(queue_list)
@@ -603,6 +615,41 @@ func _build_gen_column() -> HBoxContainer:
 	qclr.text = "CLEAR QUEUE"
 	qclr.pressed.connect(_on_queue_clear)
 	qrow.add_child(qclr)
+	queue_up_btn = Button.new()
+	queue_up_btn.text = "UP"
+	queue_up_btn.tooltip_text = "Move the selected queued train earlier."
+	queue_up_btn.pressed.connect(_on_queue_up)
+	qrow.add_child(queue_up_btn)
+	queue_down_btn = Button.new()
+	queue_down_btn.text = "DOWN"
+	queue_down_btn.tooltip_text = "Move the selected queued train later."
+	queue_down_btn.pressed.connect(_on_queue_down)
+	qrow.add_child(queue_down_btn)
+	queue_top_btn = Button.new()
+	queue_top_btn.text = "TOP"
+	queue_top_btn.tooltip_text = "Promote the selected queued train to run next."
+	queue_top_btn.pressed.connect(_on_queue_top)
+	qrow.add_child(queue_top_btn)
+	var qerow := HBoxContainer.new()
+	qerow.add_theme_constant_override("separation", 6)
+	q.add_child(qerow)
+	var qel := Label.new()
+	qel.text = "Episodes:"
+	qel.add_theme_font_size_override("font_size", 13)
+	qerow.add_child(qel)
+	queue_episodes = SpinBox.new()
+	queue_episodes.min_value = 1
+	queue_episodes.max_value = 500
+	queue_episodes.step = 1
+	queue_episodes.value = 50
+	queue_episodes.tooltip_text = "Episode count for the selected queued train."
+	queue_episodes.custom_minimum_size = Vector2(70, 0)
+	qerow.add_child(queue_episodes)
+	queue_setep_btn = Button.new()
+	queue_setep_btn.text = "SET EP"
+	queue_setep_btn.tooltip_text = "Apply the episode count to the selected queued train."
+	queue_setep_btn.pressed.connect(_on_queue_setep)
+	qerow.add_child(queue_setep_btn)
 	# Batch eval scoring: queue brains for 6-ep probes (weights
 	# untouched, scores stamped). Runs FIFO in the score slot while
 	# training uses its own worker; cancellable like the train queue.
@@ -633,7 +680,7 @@ func _build_gen_column() -> HBoxContainer:
 	score_queue_label.add_theme_font_size_override("font_size", 13)
 	q.add_child(score_queue_label)
 	score_list = ItemList.new()
-	score_list.custom_minimum_size = Vector2(0, 60)
+	score_list.custom_minimum_size = Vector2(0, 48)
 	score_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	score_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	q.add_child(score_list)
@@ -648,6 +695,16 @@ func _build_gen_column() -> HBoxContainer:
 	sqclr.text = "CLEAR QUEUE"
 	sqclr.pressed.connect(_on_score_queue_clear)
 	sqrow.add_child(sqclr)
+	score_up_btn = Button.new()
+	score_up_btn.text = "UP"
+	score_up_btn.tooltip_text = "Move the selected queued probe earlier."
+	score_up_btn.pressed.connect(_on_score_up)
+	sqrow.add_child(score_up_btn)
+	score_down_btn = Button.new()
+	score_down_btn.text = "DOWN"
+	score_down_btn.tooltip_text = "Move the selected queued probe later."
+	score_down_btn.pressed.connect(_on_score_down)
+	sqrow.add_child(score_down_btn)
 	page.add_child(c)
 	page.add_child(q)
 	return page
@@ -1477,6 +1534,37 @@ func _on_queue_remove() -> void:
 	TournamentDirector.cancel_queued(int(sel[0]))
 
 
+func _on_queue_up() -> void:
+	var sel := queue_list.get_selected_items()
+	if sel.is_empty():
+		return
+	if TournamentDirector.move_queued(int(sel[0]), -1):
+		queue_list.select(int(sel[0]) - 1)
+
+
+func _on_queue_down() -> void:
+	var sel := queue_list.get_selected_items()
+	if sel.is_empty():
+		return
+	if TournamentDirector.move_queued(int(sel[0]), 1):
+		queue_list.select(int(sel[0]) + 1)
+
+
+func _on_queue_top() -> void:
+	var sel := queue_list.get_selected_items()
+	if sel.is_empty():
+		return
+	if TournamentDirector.move_queued_top(int(sel[0])):
+		queue_list.select(0)
+
+
+func _on_queue_setep() -> void:
+	var sel := queue_list.get_selected_items()
+	if sel.is_empty() or not is_instance_valid(queue_episodes):
+		return
+	TournamentDirector.set_queued_episodes(int(sel[0]), int(queue_episodes.value))
+
+
 func _on_queue_clear() -> void:
 	TournamentDirector.clear_train_queue()
 
@@ -1556,6 +1644,26 @@ func _on_score_queue_remove() -> void:
 	if sel.is_empty():
 		return
 	TournamentDirector.cancel_score_queued(int(sel[0]))
+
+
+func _on_score_up() -> void:
+	if not is_instance_valid(score_list):
+		return
+	var sel := score_list.get_selected_items()
+	if sel.is_empty():
+		return
+	if TournamentDirector.move_score_queued(int(sel[0]), -1):
+		score_list.select(int(sel[0]) - 1)
+
+
+func _on_score_down() -> void:
+	if not is_instance_valid(score_list):
+		return
+	var sel := score_list.get_selected_items()
+	if sel.is_empty():
+		return
+	if TournamentDirector.move_score_queued(int(sel[0]), 1):
+		score_list.select(int(sel[0]) + 1)
 
 
 func _on_score_queue_clear() -> void:
