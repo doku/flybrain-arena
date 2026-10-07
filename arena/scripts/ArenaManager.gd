@@ -414,6 +414,14 @@ const BANK_LINK_FAIL_LOUD := 5
 var _bank_retries := 0
 var _bank_link_fails := 0
 var _bank_last_send_msec := 0
+# Loading dead-man's switch: a load was issued but no watchdog watches
+# it (context lost without an answer) and no bank owns the stall.
+# Normal loads arm the load context synchronously, so a sustained
+# true-state is a wedge, never a slow server. Fires the capped
+# in-place recovery once per episode (loud on exhaustion).
+const LOAD_STALL_SUPERVISE_MSEC := 60000
+var _load_stall_since_msec := 0
+var _load_stall_fired := false
 # Mid-match server-brain-loss recovery: the server restarts (or is
 # relaunched) under a live tournament, and the next match_reset fails
 # on the fresh server. Reloading the CURRENT match self-heals (the
@@ -1202,6 +1210,8 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	# banking wait; the ack fires the parked load. Recovery reloads
 	# bypass (they re-establish server state for a resend, not a fight).
 	if (_round_bank_pending or _group_bank_pending) and not bypass_bank_gate:
+		if not _load_gated_on_bank:
+			_arena_log("load parked on owed bank %s" % _seq_round_id)
 		_load_gated_on_bank = true
 		if is_instance_valid(status_label):
 			status_label.text = "BANKING ROUND - loading %s on the ack..." % expand_match_label(tourney_match_label)
@@ -1269,6 +1279,8 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	# mode/tag at every wait entry).
 	brain_client.request_server_state()
 	_arm_seq("load")
+	_arena_log("load sent: %s (%s vs %s)" % [tourney_match_label,
+		tourney_a_name, tourney_b_name])
 
 func _preload_next_match() -> void:
 	# Sends the NEXT match's brains to the server's prepare slot while
@@ -1316,6 +1328,7 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 	if not tournament_active:
 		return
 	if not tourney_awaiting_load and _seq_context != "load":
+		_arena_log("brains_loaded dropped: nothing awaited (context=%s)" % _seq_context)
 		return
 	# Match-echo validation: the reply must answer the CURRENT awaited
 	# load (same tournament file + match label). A stale/late reply
@@ -1385,6 +1398,7 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 	_hide_wait_bracket()
 	_hide_loading()
 	_update_tourney_status("READY")
+	_arena_log("round starting: %s" % tourney_match_label)
 	_reset_round()
 
 
@@ -1510,6 +1524,29 @@ func _on_server_error(error: String) -> void:
 		if _seq_context == "roundbank":
 			_clear_seq()
 		_seq_forgive_roundbank = {}
+		# Confirmed like any ack: run the deferred chains and fire a
+		# parked load (an intermission that expired mid-stall parks on
+		# the gate; nothing else re-requests it after this return).
+		_hide_wait_bracket()
+		_hide_loading()
+		if not _pending_advance.is_empty():
+			var pa := _pending_advance
+			_pending_advance = {}
+			_handle_advance_result(pa)
+		if not _pending_final_ev.is_empty():
+			var fev := _pending_final_ev
+			_pending_final_ev = {}
+			print("[Arena] Banked - building the queued final now.")
+			if _event_build_final(fev):
+				_event_gallery_update()
+			_show_arena_bracket("EVENT %s · FINAL" % str(fev.get("id", "")))
+		if not _pending_advance.is_empty():
+			var pa2 := _pending_advance
+			_pending_advance = {}
+			_handle_advance_result(pa2)
+		if _load_gated_on_bank:
+			_load_gated_on_bank = false
+			_request_current_battle_load()
 		return
 	if err_context == "roundbank" and tournament_active \
 			and error.begins_with("round_report while in FREE mode") \
@@ -2017,6 +2054,33 @@ func _fail_loud_server_silent() -> void:
 		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
 
 
+func _loading_supervise_tick() -> void:
+	# Dead-man's switch for the LOADING wait: a load was issued but no
+	# watchdog watches it (context lost without an answer) and no bank
+	# owns the stall. Normal loads arm the load context in the same
+	# call that sets the latch, so a sustained true-state is a wedge,
+	# never a slow server: run the capped in-place recovery once per
+	# episode (loud on exhaustion) instead of sitting on the wait view.
+	if not tournament_active or _recover_in_flight \
+			or not tourney_awaiting_load or _seq_context == "load" \
+			or _round_bank_pending or _group_bank_pending:
+		_load_stall_since_msec = 0
+		_load_stall_fired = false
+		return
+	if _load_stall_fired:
+		return
+	var now := Time.get_ticks_msec()
+	if _load_stall_since_msec == 0:
+		_load_stall_since_msec = now
+		return
+	if now - _load_stall_since_msec < LOAD_STALL_SUPERVISE_MSEC:
+		return
+	_load_stall_fired = true
+	print("[Arena] Loading stalled with no watch - recovering in place.")
+	_arena_log("loading stalled with no watch - recovering in place")
+	_recover_server_state("loading stalled with no watch")
+
+
 func _bank_resend_tick() -> void:
 	# Owed-bank self-heal: while a round or group bank is owed, the
 	# STORED report re-sends every 30 s (same nonce, idempotent) so a
@@ -2237,6 +2301,7 @@ func _physics_process(delta: float) -> void:
 	# alongside so a lost bank ack heals without a watchdog cycle.
 	_check_seq_watchdog()
 	_bank_resend_tick()
+	_loading_supervise_tick()
 	_check_step_watchdog()
 	if not is_round_active:
 		return

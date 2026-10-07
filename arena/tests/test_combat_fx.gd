@@ -941,6 +941,121 @@ func test_motors_slot() -> void:
 		"trace hides outside MOTORS")
 
 
+func test_overtake_fires_parked_load() -> void:
+	# Round overtaken by its group bank is a CONFIRM, not a drop:
+	# deferred chains drain and a parked load fires (an intermission
+	# that expired mid-stall parks on the gate; nothing else
+	# re-requests it after the overtake return).
+	var d = arena._director()
+	if d == null:
+		_check(true, "overtake skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1",
+			"a_name": "A", "b_name": "B"}]]}
+	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
+		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = true
+	arena._seq_context = "roundbank"
+	arena._seq_round_id = "RND-7"
+	arena._seq_forgive_roundbank = {"tournament_id": "TREC",
+		"match": "R1M1", "battle": "RND-7"}
+	arena._load_gated_on_bank = true
+	arena._pending_advance = {"action": "next_match"}
+	arena._on_server_error(
+		"round_report: group already banked - QUIT TO MENU + RESUME")
+	_check(not arena._round_bank_pending, "overtake stands the latch down")
+	_check(arena._pending_advance.is_empty(), "overtake drains the chain")
+	_check(not arena._load_gated_on_bank, "overtake fires the parked load")
+	_check(arena.tourney_awaiting_load, "parked load re-issued")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena._round_bank_pending = false
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_context = ""
+	arena._seq_round_id = ""
+	arena._seq_forgive_roundbank = {}
+	arena.tourney_awaiting_load = false
+	arena.is_round_active = false
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+
+
+func test_loading_supervisor_recovers() -> void:
+	# LOADING with no watch: a load was issued but no watchdog
+	# watches it and no bank owns the stall -> capped in-place
+	# recovery, once per episode. Watched loads and bank stalls
+	# never trip it.
+	var d = arena._director()
+	if d == null:
+		_check(true, "supervisor skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1",
+			"a_name": "A", "b_name": "B"}]]}
+	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
+		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._round_bank_pending = false
+	arena._group_bank_pending = false
+	arena.tourney_awaiting_load = true
+	arena._seq_context = ""
+	arena._load_stall_since_msec = 0
+	arena._load_stall_fired = false
+	arena._loading_supervise_tick()
+	_check(arena._load_stall_since_msec != 0, "stall clock starts")
+	arena._load_stall_since_msec = Time.get_ticks_msec() - 61000
+	arena._loading_supervise_tick()
+	_check(arena._server_reloads == 1, "unwatched load recovers")
+	_check(arena._recover_in_flight, "recovery marked in flight")
+	_check(arena._load_stall_fired, "one shot per episode")
+	arena._loading_supervise_tick()
+	_check(arena._server_reloads == 1, "no repeat spam")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena._load_stall_since_msec = 0
+	arena._load_stall_fired = false
+	arena._seq_context = "load"
+	arena._load_stall_since_msec = Time.get_ticks_msec() - 61000
+	arena._loading_supervise_tick()
+	_check(arena._server_reloads == 0, "watched load never trips")
+	arena._seq_context = ""
+	arena._round_bank_pending = true
+	arena._load_stall_since_msec = Time.get_ticks_msec() - 61000
+	arena._loading_supervise_tick()
+	_check(arena._server_reloads == 0, "bank stall never trips")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena._round_bank_pending = false
+	arena._seq_context = ""
+	arena._load_stall_since_msec = 0
+	arena._load_stall_fired = false
+	arena.tourney_awaiting_load = false
+	arena.is_round_active = false
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+
+
 func test_roundbank_brain_loss_resends() -> void:
 	# Server restart killed the round bank: the free-mode error arms a
 	# stored-report resend (supervisor reload, capped); the reload
@@ -1242,6 +1357,8 @@ func _process(_delta: float) -> bool:
 	test_bank_tick_resends()
 	test_late_bank_ack_after_recover_applies()
 	test_recover_carries_owed_bank()
+	test_overtake_fires_parked_load()
+	test_loading_supervisor_recovers()
 	test_roundbank_brain_loss_resends()
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()
