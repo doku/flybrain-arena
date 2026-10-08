@@ -1011,7 +1011,7 @@ func _build_tourney_column() -> HBoxContainer:
 	tourney_redraw.tooltip_text = "Size-16 continuous only: every iteration draws all 16 from the vault green-weighted (debutants surface first) instead of carrying 14 survivors. Needs 16 schooled brains."
 	tourney_redraw.button_pressed = false
 	r.add_child(tourney_redraw)
-	evo_min_matches = _spin("Evo demote: min matches", r, 1.0, 12.0, 1.0, 10.0,
+	evo_min_matches = _spin("Evo demote: min matches", r, 1.0, 50.0, 1.0, 10.0,
 		"Career ring experience required before a brain can be demoted to archives: only fighters with at least this many vault-record matches AND below the ELO line are evaluated at generation end. Green brains are never demoted.")
 	evo_elo_cutoff = _spin("Evo demote: ELO below", r, 0.0, 2000.0, 25.0, 0.0,
 		"Demotion line: among experienced fighters, only those rated below this ELO are archived (0 = off, lowest-ELO pair goes regardless).")
