@@ -152,6 +152,35 @@ func drive_speed(activation: float) -> float:
 # 0.15 s is the full-speed default.
 var cmd_age: float = 0.0
 var hold_tau: float = 0.15
+# Stale-command hover: the brain answers every few hundred ms, so a
+# command older than CMD_STALE_SECS means the link is dead (CONTROL
+# LINK SLOW holding under laptop throttle) or the round is over
+# (steps stop with it). Dead commands read as ZERO - the fly brakes
+# to a hover instead of drifting on the last order into trees and
+# circling. 1.0 s never bites live flight (replies land far faster)
+# but freezes a dead link fast. Pure (unit-tested).
+const CMD_STALE_SECS: float = 1.0
+
+
+func commands_live() -> bool:
+	return cmd_age <= CMD_STALE_SECS
+
+
+func neutralize() -> void:
+	# Freeze NOW: zero every brain command plus the velocity, so the
+	# fly hangs in place instead of drifting. cmd_age parks past
+	# stale so the hover gate holds until a fresh reply lands (which
+	# resets it via apply_brain_controls - never wedges).
+	current_thrust = 0.0
+	current_yaw_torque = 0.0
+	current_pitch_torque = 0.0
+	current_roll_torque = 0.0
+	is_ram_burst = false
+	ram_drive = 0.0
+	is_emergency_evade = false
+	spear_thrust_cmd = 0.0
+	cmd_age = CMD_STALE_SECS + 1.0
+	velocity = Vector3.ZERO
 
 var left_wing_intact: bool = true
 var right_wing_intact: bool = true
@@ -269,7 +298,7 @@ func set_combat_enabled(on: bool) -> void:
 	combat_enabled = on
 
 func apply_brain_controls(ctrl: Dictionary) -> void:
-	if is_disabled:
+	if is_disabled or landing_mode > 0:
 		return
 	current_thrust = ctrl.get("thrust", 0.2)
 	current_yaw_torque = ctrl.get("yaw_torque", 0.0)
@@ -607,19 +636,27 @@ func _physics_process(delta: float) -> void:
 		right_wing_mesh.rotation.z = -flap
 
 	# Leaky command hold (see cmd_age): stale torque commands decay so a
-	# slow brain steers bounded arcs instead of winding up spins.
+	# slow brain steers bounded arcs instead of winding up spins. Past
+	# CMD_STALE_SECS the commands are DEAD (link holding / round over)
+	# and read as zero, so the fly hovers instead of drifting.
 	cmd_age += delta
+	var live := commands_live()
 	var hold := exp(-cmd_age / hold_tau)
-	var yaw_cmd := current_yaw_torque * hold
-	var pitch_cmd := current_pitch_torque * hold
-	var roll_cmd := current_roll_torque * hold
+	var yaw_cmd := current_yaw_torque * hold if live else 0.0
+	var pitch_cmd := current_pitch_torque * hold if live else 0.0
+	var roll_cmd := current_roll_torque * hold if live else 0.0
 
 	# Flight speed from motor activation (no base cruise: zero drive
 	# hovers) on the shared log curve, plus the ram charge headroom
 	# scaled by DNpe017 rate (never a programmed multiplier). The ram
 	# charge is refractory: one charge per window (mirrors the lunge).
-	var eff_ram := _ram_charge_tick(delta, ram_drive)
-	var target_speed = drive_speed(current_thrust) + RAM_EXTRA * eff_ram
+	# Dead commands mean zero drive AND zero ram headroom (a latched
+	# window must not outlive the link that charged it).
+	var thrust_in := current_thrust if live else 0.0
+	var eff_ram := _ram_charge_tick(delta, ram_drive if live else 0.0)
+	if not live:
+		eff_ram = 0.0
+	var target_speed = drive_speed(thrust_in) + RAM_EXTRA * eff_ram
 	var forward_vec = -global_transform.basis.z
 
 	# Yaw rotation (snapshot basis first: the seizure watch measures the
@@ -673,13 +710,15 @@ func _physics_process(delta: float) -> void:
 	# Emergency evade dive (Giant Fiber): pure vertical escape. Roll
 	# used to snap here by script (rotate_z) - now banks are brain-
 	# commanded through the roll readout, so this stays hands-off.
-	if is_emergency_evade:
+	# Dead with stale commands (no escape orders from a dead link).
+	if live and is_emergency_evade:
 		velocity.y -= 25.0 * delta
 
 	# Spear lunge attack (mouth-motor driven): a forward impulse plus a
-	# visible spear thrust, one discrete strike per cooldown.
+	# visible spear thrust, one discrete strike per cooldown. Dead
+	# commands never trigger a lunge.
 	lunge_cooldown = maxf(0.0, lunge_cooldown - delta)
-	if spear_thrust_cmd > 0.4 and lunge_cooldown <= 0.0:
+	if live and spear_thrust_cmd > 0.4 and lunge_cooldown <= 0.0:
 		velocity += (-global_transform.basis.z).normalized() * LUNGE_KICK * spear_thrust_cmd
 		lunge_cooldown = LUNGE_COOLDOWN
 		lunge_t = LUNGE_TIME
@@ -713,7 +752,7 @@ func _physics_process(delta: float) -> void:
 	var pre_move_speed = velocity.length()
 	velocity += forward_vec * target_speed * delta * THRUST_GAIN
 	velocity *= pow(drag_coeff, delta * 60.0)
-	if current_thrust < 0.25:
+	if thrust_in < 0.25:
 		velocity *= pow(0.85, delta * 60.0)
 	# Hard speed cap: lunge/clash/ram transients may spike, but nothing
 	# sustains above max_speed*SPEED_CAP_MULT. Time spent pinned at the

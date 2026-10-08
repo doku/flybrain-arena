@@ -5124,6 +5124,14 @@ func _update_ctrl_label() -> void:
 
 
 func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int, stats: Dictionary = {}) -> void:
+	# Dead-round replies drop: steps stop with the round, so any reply
+	# landing now is a straggler - applying it would replant fresh
+	# commands into finished flies (the post-timeout drift into trees)
+	# and pollute the banked flight accumulators. The flag dies with
+	# the round already; nothing else here may run post-round.
+	if not is_round_active:
+		_step_in_flight = false
+		return
 	# A reply landed: the link is free for the next step. Cleared
 	# first (before any application below) so a slow frame can never
 	# leave the flag set past the reply that frees it.
@@ -5673,6 +5681,10 @@ func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
 		_arm_seq("reset")
 		return
 	var winner_name := tourney_a_name if battle_winner == "alpha" else tourney_b_name
+	# Timeout wins land like KOs and draws: without this the flies
+	# kept flying on their last commands through the callout and the
+	# match-reset wait (the post-timeout drift into trees).
+	_begin_landing(battle_winner)
 	# Legacy server-reply entry passes no response: consult once here
 	# (the _battle_done_local entry already did and passes it in).
 	# Either way the response is validated before anything advances.
@@ -8919,6 +8931,13 @@ func _on_generation_advanced(new_gen: int, winner: String) -> void:
 	print("[Arena] Champion: ", winner.to_upper(), "! Evolving Generation ", new_gen, "...")
 	current_generation = new_gen
 	_record_win(winner)
+	# Land like every other round end: without this the free-battle
+	# winner kept drifting on its last commands through the champion
+	# callout and countdown. Unknown slots land both upright.
+	if winner == "alpha" or winner == "beta":
+		_begin_landing(winner)
+	else:
+		_begin_landing("")
 	if is_instance_valid(gen_label):
 		gen_label.text = "GENERATION: %04d" % new_gen
 	if is_instance_valid(status_label):
@@ -8945,6 +8964,11 @@ func _on_restart_pressed() -> void:
 		return
 	is_round_active = false
 	_set_combat(false)
+	# Freeze now: the bank wait below runs a full second with no
+	# brain in the loop - stale commands must not fly it.
+	for fly in [fly_alpha, fly_beta]:
+		if is_instance_valid(fly) and fly.has_method("neutralize"):
+			fly.call("neutralize")
 	if is_instance_valid(status_label):
 		status_label.text = "ROUND RESTARTED - banking battle rewards..."
 	print("[Arena] Restart requested! Sending battle stats for dopamine banking...")

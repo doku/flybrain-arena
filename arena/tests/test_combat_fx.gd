@@ -685,6 +685,7 @@ func test_step_pacing_gate() -> void:
 func test_step_reply_clears_and_counts() -> void:
 	# A reply frees the link and counts the applied pair; the HUD
 	# shows n/srv so lost replies read as a gap.
+	arena.is_round_active = true
 	arena._step_in_flight = true
 	arena._step_timeouts = 3
 	var n0: int = arena._ctrl_n
@@ -697,6 +698,29 @@ func test_step_reply_clears_and_counts() -> void:
 	arena._update_ctrl_label()
 	_check(("n=%d" % (n0 + 1)) in arena.ctrl_label.text, "HUD shows applied n")
 	_check("srv=41" in arena.ctrl_label.text, "HUD shows server srv")
+
+
+func test_dead_round_reply_drops() -> void:
+	# A straggler reply after the round ended replants nothing: no
+	# fresh commands into finished flies (the post-timeout drift into
+	# trees), no pollution of the banked accumulators. Only the
+	# in-flight flag dies.
+	arena.is_round_active = false
+	arena._step_in_flight = true
+	arena.fly_alpha.current_thrust = 0.77
+	arena.fly_alpha.cmd_age = 5.0
+	var n_before: int = arena._ctrl_n
+	arena._on_motor_controls({"thrust": 1.0, "yaw_torque": 1.0},
+		{"thrust": 1.0, "yaw_torque": -1.0},
+		1, {"step_seq": 42, "alpha": {"spikes": 9}, "beta": {"spikes": 9}})
+	_check(not arena._step_in_flight, "straggler still frees the flag")
+	_check(absf(arena.fly_alpha.current_thrust - 0.77) < 0.001,
+		"straggler replants no thrust")
+	_check(arena.fly_alpha.cmd_age == 5.0, "straggler resets no clock")
+	_check(arena._ctrl_n == n_before, "straggler counts no pair")
+	arena.fly_alpha.current_thrust = 0.2
+	arena.fly_alpha.cmd_age = 0.0
+	arena._step_in_flight = false
 
 
 func test_step_watchdog_recovers_silently() -> void:
@@ -2019,6 +2043,7 @@ func _process(_delta: float) -> bool:
 	test_roundbank_brain_loss_resends()
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()
+	test_dead_round_reply_drops()
 	test_step_watchdog_recovers_silently()
 	test_gallery_star()
 	test_idle_parks_loud()

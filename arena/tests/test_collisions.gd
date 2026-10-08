@@ -48,6 +48,52 @@ func _pair_for_tip(a, b, side := 1.0) -> void:
 	b.velocity = Vector3.ZERO
 
 
+func test_stale_commands_read_dead() -> void:
+	# A 1 s-silenced brain is a dead link (CONTROL LINK SLOW holding
+	# under throttle) or a finished round (steps stop with it): fresh
+	# commands are live, stale ones are not.
+	var f = _fly("TS")
+	f.apply_brain_controls({"thrust": 1.0, "yaw_torque": 1.0})
+	_check(f.commands_live(), "fresh commands are live")
+	f.cmd_age = f.CMD_STALE_SECS + 1.0
+	_check(not f.commands_live(), "unrefreshed commands go stale")
+	f.queue_free()
+
+
+func test_neutralize_freezes() -> void:
+	# Freeze NOW: every command plus the velocity zeroes, and the age
+	# parks past stale so the hover gate holds until a fresh reply.
+	var f = _fly("TN")
+	f.apply_brain_controls({"thrust": 1.0, "yaw_torque": 0.5,
+		"pitch_torque": 0.5, "roll_torque": 0.5, "ram_drive": 1.0,
+		"emergency_evade": true, "spear_thrust": 1.0})
+	f.velocity = Vector3(5, 1, 5)
+	f.neutralize()
+	_check(f.current_thrust == 0.0, "neutralize kills thrust")
+	_check(f.current_yaw_torque == 0.0, "neutralize kills yaw")
+	_check(f.ram_drive == 0.0, "neutralize kills ram")
+	_check(not f.is_emergency_evade, "neutralize kills evade")
+	_check(f.velocity == Vector3.ZERO, "neutralize kills velocity")
+	_check(not f.commands_live(), "neutralize parks past stale")
+	# A fresh reply still revives (never wedges).
+	f.apply_brain_controls({"thrust": 0.5})
+	_check(f.commands_live(), "fresh reply revives after neutralize")
+	_check(absf(f.current_thrust - 0.5) < 0.001, "revive replants thrust")
+	f.queue_free()
+
+
+func test_landing_ignores_brain() -> void:
+	# Ceremony owns the body: late replies during landing must not
+	# replant commands (or reset the stale clock) behind it.
+	var f = _fly("TL")
+	f.neutralize()
+	f.begin_landing(true)
+	f.apply_brain_controls({"thrust": 1.0, "yaw_torque": 1.0})
+	_check(f.current_thrust == 0.0, "landing ignores late thrust")
+	_check(not f.commands_live(), "landing keeps the clock stale")
+	f.queue_free()
+
+
 func test_tip_in_box_tears() -> void:
 	var a = _fly("TA")
 	var b = _fly("TB")
@@ -194,6 +240,9 @@ func _process(_delta: float) -> bool:
 		test_mutual_pass_resolves_once()
 		test_manager_drops_same_frame()
 		test_tree_never_tears()
+		test_stale_commands_read_dead()
+		test_neutralize_freezes()
+		test_landing_ignores_brain()
 		if failures == 0:
 			print("ALL COLLISION TESTS PASSED")
 		else:
