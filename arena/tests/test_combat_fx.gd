@@ -17,6 +17,11 @@ var _callout_fire_at := 0
 var _callout_watch := false
 var _callout_bad := false
 var _callout_until := 0
+var _hold_fire_at := 0
+var _hold_watch := false
+var _hold_seen := false
+var _hold_fired_at := 0
+var _hold_until := 0
 
 
 func _check(cond: bool, label: String) -> void:
@@ -1826,6 +1831,42 @@ func _watch_callout_tick() -> void:
 		_check(not _callout_bad, "static callout never counts down")
 
 
+func test_callout_hold() -> void:
+	# Coronation hold: a callout with hold_secs stays up past the
+	# normal ~2 s beat (the event-champion flash used to vanish
+	# before anyone read it). Fires late so the static-callout watch
+	# above is done driving the shared overlay first.
+	_check(arena.EVENT_CHAMPION_HOLD_SECS >= 10.0,
+		"coronation hold is a real beat")
+	_hold_fire_at = Time.get_ticks_msec() + 20000
+
+
+func _watch_hold_tick() -> void:
+	# Hold beat is 2.0 s + 4.0 s hold: still up at +2.5 s, down by
+	# +12 s. One verdict when the overlay hides (or the wall passes).
+	if _hold_fire_at != 0 and Time.get_ticks_msec() >= _hold_fire_at:
+		_hold_fire_at = 0
+		arena._show_callout("H", Color.WHITE, "S", "", false, 4.0)
+		_hold_fired_at = Time.get_ticks_msec()
+		_hold_until = _hold_fired_at + 12000
+		_hold_watch = true
+		_hold_seen = false
+		return
+	if not _hold_watch:
+		return
+	var elapsed := Time.get_ticks_msec() - _hold_fired_at
+	if is_instance_valid(arena.winner_overlay) and arena.winner_overlay.visible \
+			and elapsed > 2500:
+		_hold_seen = true
+	if _hold_seen and is_instance_valid(arena.winner_overlay) \
+			and not arena.winner_overlay.visible:
+		_hold_watch = false
+		_check(true, "hold keeps the callout past its beat")
+	elif Time.get_ticks_msec() > _hold_until:
+		_hold_watch = false
+		_check(_hold_seen, "hold keeps the callout past its beat")
+
+
 func test_handoff_failure_view() -> void:
 	# Handoff failures park on FINAL REVIEW with the reason, never on
 	# a bare arena. (The timed quit lives in the callers, untouched
@@ -2043,13 +2084,15 @@ func _process(_delta: float) -> bool:
 		_callout_until = Time.get_ticks_msec() + 8000
 	if _callout_watch:
 		_watch_callout_tick()
+	_watch_hold_tick()
 	if _rec_stage == 1:
 		if tick < _rec_ready_tick:
 			return false
 		_rec_stage = 2
 		_finish_record_contract()
 	if _tests_done:
-		if _rec_stage == 2 and _callout_fire_at == 0 and not _callout_watch:
+		if _rec_stage == 2 and _callout_fire_at == 0 and not _callout_watch \
+				and _hold_fire_at == 0 and not _hold_watch:
 			if failures == 0:
 				print("ALL COMBAT-FX TESTS PASSED")
 			else:
@@ -2110,6 +2153,7 @@ func _process(_delta: float) -> bool:
 	test_state_poll()
 	test_motors_slot()
 	test_callout_static()
+	test_callout_hold()
 	test_handoff_failure_view()
 	test_tipoff_freshness()
 	test_wait_bracket_flow()

@@ -379,6 +379,9 @@ var _event_skip := false
 const EVENT_INTERMISSION_SECS := 60.0
 const EVENT_TIPOFF_SECS := 60.0
 const EVENT_FINAL_SECS := 120.0
+# Event-champion coronation: the winner screen holds this long before
+# the handoff builds the next event (a bare ~2 s flash never lands).
+const EVENT_CHAMPION_HOLD_SECS := 15.0
 # Event gallery (bracket-view right column): rotates fighter stat
 # cards for the next pending group (all fighters pre-event). Keyed
 # cache so records refetch only when the target changes.
@@ -4508,10 +4511,12 @@ func _play_sfx(sfx_name: String) -> void:
 			return
 
 
-func _show_callout(title: String, title_color: Color, sub: String, countdown_prefix: String, auto_reset: bool) -> void:
+func _show_callout(title: String, title_color: Color, sub: String, countdown_prefix: String, auto_reset: bool, hold_secs: float = 0.0) -> void:
 	# Centered callout (win, draw, restart) with a 3-2-1 countdown. When
 	# auto_reset is false the caller sequences the next step itself
 	# (tournament battles wait for the server's match_reset instead).
+	# hold_secs keeps the callout up past its beat (event-champion
+	# coronation) - callers needing the delay await the same span.
 	# Restore winner-callout sizes (loading states shrink them).
 	if is_instance_valid(winner_label):
 		winner_label.text = title
@@ -4546,6 +4551,8 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 	else:
 		await _wait(0.8).timeout
 
+	if hold_secs > 0.0:
+		await _wait(hold_secs).timeout
 	winner_overlay.visible = false
 	if auto_reset:
 		_reset_round()
@@ -7138,8 +7145,14 @@ func _run_event_handoff() -> void:
 	await _save_bracket_record(true)
 	_show_arena_bracket("EVENT %s - BUILDING NEXT EVENT" % eid)
 	_show_callout("EVENT %s CHAMPION: %s" % [eid, director.champion_name()],
-		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false)
+		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false,
+		EVENT_CHAMPION_HOLD_SECS)
 	_announce_clip("event_champion")
+	if is_instance_valid(status_label):
+		status_label.text = "EVENT %s CHAMPION %s - coronation, next event builds in %ds" % [eid, director.champion_name(), int(EVENT_CHAMPION_HOLD_SECS)]
+	# Coronation beat: the winner screen holds (callout + status)
+	# while the viewer reads it - the handoff builds only after.
+	await _wait(EVENT_CHAMPION_HOLD_SECS).timeout
 	_event_drain_done_to_pool()
 	var ev0: Dictionary = director.event_load(eid)
 	var st0: Dictionary = ev0.get("settings", {})
