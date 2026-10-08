@@ -27,6 +27,16 @@ func _check(cond: bool, label: String) -> void:
 		printerr("FAIL: ", label)
 
 
+func _real_brain_pair(d) -> Array:
+	# Two real vault brains (stub matches whose files EXIST, so load
+	# pre-flights pass): the vault is read-only here. Empty when the
+	# vault is short (callers skip).
+	var real: Array = d.list_brains_cached()
+	if real.size() < 2:
+		return []
+	return [real[0], real[1]]
+
+
 func test_builds() -> void:
 	# Built by the real _ready (same path as the game).
 	_check(is_instance_valid(arena.ring_alpha), "alpha ring node built")
@@ -581,12 +591,17 @@ func test_recover_carries_owed_bank() -> void:
 	var old_tourney: Dictionary = d.tourney
 	var old_cache: Array = d.brains_cache
 	var old_msec: int = d.brains_cache_msec
+	var rpc: Array = _real_brain_pair(d)
+	if rpc.is_empty():
+		_check(true, "recover bank skipped (vault short)")
+		return
+	var ra: Dictionary = rpc[0]
+	var rb: Dictionary = rpc[1]
 	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
 		"current_round": 0, "current_match": 0,
-		"rounds": [[{"a_id": "a1", "b_id": "b1",
+		"rounds": [[{"a_id": str(ra.get("id", "")), "b_id": str(rb.get("id", "")),
 			"a_name": "A", "b_name": "B"}]]}
-	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
-		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache = [ra, rb]
 	d.brains_cache_msec = Time.get_ticks_msec()
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
@@ -961,23 +976,31 @@ func test_overtake_fires_parked_load() -> void:
 	var old_tourney: Dictionary = d.tourney
 	var old_cache: Array = d.brains_cache
 	var old_msec: int = d.brains_cache_msec
+	var pair: Array = _real_brain_pair(d)
+	if pair.is_empty():
+		_check(true, "overtake skipped (vault short)")
+		return
+	var r1: Dictionary = pair[0]
+	var r2: Dictionary = pair[1]
 	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
 		"current_round": 0, "current_match": 0,
-		"rounds": [[{"a_id": "a1", "b_id": "b1",
+		"rounds": [[{"a_id": str(r1.get("id", "")), "b_id": str(r2.get("id", "")),
 			"a_name": "A", "b_name": "B"}]]}
-	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
-		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache = [r1, r2]
 	d.brains_cache_msec = Time.get_ticks_msec()
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
-	arena._server_reloads = 0
-	arena._recover_in_flight = false
 	arena._round_bank_pending = true
 	arena._tourney_awaiting_roundbank = true
 	arena._seq_context = "roundbank"
 	arena._seq_round_id = "RND-7"
 	arena._seq_forgive_roundbank = {"tournament_id": "TREC",
 		"match": "R1M1", "battle": "RND-7"}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._pending_roundbank_resend = false
+	arena._seq_last_round_report = {"tournament_id": "TREC",
+		"match": "R1M1", "round_nonce": "RND-7", "matches": []}
 	arena._load_gated_on_bank = true
 	arena._pending_advance = {"action": "next_match"}
 	arena._on_server_error(
@@ -1012,12 +1035,17 @@ func test_loading_supervisor_recovers() -> void:
 	var old_tourney: Dictionary = d.tourney
 	var old_cache: Array = d.brains_cache
 	var old_msec: int = d.brains_cache_msec
+	var rpc2: Array = _real_brain_pair(d)
+	if rpc2.is_empty():
+		_check(true, "supervisor skipped (vault short)")
+		return
+	var qa: Dictionary = rpc2[0]
+	var qb: Dictionary = rpc2[1]
 	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
 		"current_round": 0, "current_match": 0,
-		"rounds": [[{"a_id": "a1", "b_id": "b1",
+		"rounds": [[{"a_id": str(qa.get("id", "")), "b_id": str(qb.get("id", "")),
 			"a_name": "A", "b_name": "B"}]]}
-	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
-		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache = [qa, qb]
 	d.brains_cache_msec = Time.get_ticks_msec()
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
@@ -1087,12 +1115,18 @@ func test_preload_targets_current_match() -> void:
 	var old_tourney: Dictionary = d.tourney
 	var old_cache: Array = d.brains_cache
 	var old_msec: int = d.brains_cache_msec
-	d.tourney = {"id": "TPRE", "status": "running", "lr_scale": 0.5,
+	var pair0: Array = _real_brain_pair(d)
+	if pair0.is_empty():
+		_check(true, "supervisor skipped (vault short)")
+		d.tourney = old_tourney
+		return
+	var s1: Dictionary = pair0[0]
+	var s2: Dictionary = pair0[1]
+	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
 		"current_round": 0, "current_match": 0,
-		"rounds": [[{"a_id": "a1", "b_id": "b1",
+		"rounds": [[{"a_id": str(s1.get("id", "")), "b_id": str(s2.get("id", "")),
 			"a_name": "A", "b_name": "B"}]]}
-	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
-		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache = [s1, s2]
 	d.brains_cache_msec = Time.get_ticks_msec()
 	arena.tournament_active = true
 	arena._pending_final_group = {}
@@ -1277,6 +1311,17 @@ func test_audit_banked_rounds() -> void:
 			[{"winner_id": "a", "banked": true}, {"winner_id": "b", "banked": true}],
 			[{"winner_id": "a"}, {"winner_id": ""}]]}
 	_check(arena._audit_banked_rounds() == 0, "clean file stays silent")
+	# Decided-without-fighting is not lost: walkovers and byes never
+	# had anything to bank (but real gaps beside them still count).
+	d.tourney = {"id": "TAU", "status": "running", "format": "bracket",
+		"current_round": 1,
+		"rounds": [
+			[{"winner_id": "a", "banked": true},
+				{"winner_id": "b", "skipped": true, "walkover": "x"},
+				{"winner_id": "c"},
+				{"winner_id": "e", "banked": true, "bye": true}],
+			[{"winner_id": "a"}, {"winner_id": ""}]]}
+	_check(arena._audit_banked_rounds() == 1, "walkovers excluded, gaps counted")
 	d.tourney = old_tourney
 
 
@@ -1422,6 +1467,134 @@ func test_manual_bracket_survives() -> void:
 	arena._seq_context = ""
 
 
+func test_vanish_walks_over_and_advances() -> void:
+	# Missing vault file at load: no packet goes out; every remaining
+	# undecided match of the vanished fighter walks over, the pointer
+	# advances past the decided position, and the next load issues.
+	# In-progress battles of the broken match are discarded (loud);
+	# other matches' caches are untouched.
+	var d = arena._director()
+	if d == null:
+		_check(true, "vanish skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_vanish"
+	DirAccess.make_dir_recursive_absolute("user://test_vanish")
+	var real: Array = d.list_brains_cached()
+	if real.size() < 2:
+		_check(true, "vanish skipped (vault short)")
+		d.tourney = old_tourney
+		d.tournament_dir = old_dir
+		return
+	var r1: Dictionary = real[0]
+	var r2: Dictionary = real[1]
+	d.tourney = {"id": "TV", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "gone1", "b_id": "b1", "a_name": "Gone",
+			"b_name": "B"},
+			{"a_id": str(r1.get("id", "")), "b_id": str(r2.get("id", "")),
+				"a_name": "R1", "b_name": "R2"}]]}
+	d.brains_cache = [{"id": "gone1", "filename": "gone1.flybrain"},
+		{"id": "b1", "filename": "b1.flybrain"}, r1, r2]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena.brain_client.is_connected_server = true
+	arena.is_round_active = false
+	arena._recover_in_flight = false
+	arena._round_bank_pending = false
+	arena._group_bank_pending = false
+	arena._match_battle_cache = [{"battle_id": "B9"}]
+	arena.tourney_awaiting_load = false
+	arena._on_fighter_vanished("gone1", "unit test")
+	var r0: Array = (d.tourney.get("rounds", []) as Array)[0]
+	_check(str((r0[0] as Dictionary).get("winner_id", "")) == "b1"
+		and bool((r0[0] as Dictionary).get("skipped", false)),
+		"vanished match walks over")
+	_check((arena._match_battle_cache as Array).is_empty(),
+		"broken match battles discarded")
+	_check(int(d.tourney.get("current_match", -1)) == 1,
+		"pointer advances past the walkover")
+	_check(arena.tourney_awaiting_load, "next load issued")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena.tourney_awaiting_load = false
+	arena.is_round_active = false
+	arena._seq_context = ""
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_vanish"):
+		for f in DirAccess.get_files_at("user://test_vanish"):
+			DirAccess.remove_absolute("user://test_vanish".path_join(f))
+		DirAccess.remove_absolute("user://test_vanish")
+
+
+func test_vanish_error_skips_recovery() -> void:
+	# Server "not found in vault" is deterministic: walkover now,
+	# never a recovery cycle (server_reloads untouched).
+	var d = arena._director()
+	if d == null:
+		_check(true, "vanish error skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_cache: Array = d.brains_cache
+	var old_msec: int = d.brains_cache_msec
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_vanish_err"
+	DirAccess.make_dir_recursive_absolute("user://test_vanish_err")
+	var real: Array = d.list_brains_cached()
+	if real.size() < 2:
+		_check(true, "vanish error skipped (vault short)")
+		d.tourney = old_tourney
+		d.tournament_dir = old_dir
+		return
+	var r1: Dictionary = real[0]
+	var r2: Dictionary = real[1]
+	d.tourney = {"id": "TV2", "status": "running", "lr_scale": 0.5,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "gone2", "b_id": "b2", "a_name": "Gone",
+			"b_name": "B"},
+			{"a_id": str(r1.get("id", "")), "b_id": str(r2.get("id", "")),
+				"a_name": "R1", "b_name": "R2"}]]}
+	d.brains_cache = [{"id": "gone2", "filename": "gone2.flybrain"},
+		{"id": "b2", "filename": "b2.flybrain"}, r1, r2]
+	d.brains_cache_msec = Time.get_ticks_msec()
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena.brain_client.is_connected_server = true
+	arena.is_round_active = false
+	arena._recover_in_flight = false
+	arena._round_bank_pending = false
+	arena._group_bank_pending = false
+	arena._server_reloads = 0
+	arena._seq_context = "load"
+	arena._on_server_error(
+		"tournament_load: Brain 'gone2.flybrain' not found in vault X")
+	var rr0: Array = (d.tourney.get("rounds", []) as Array)[0]
+	_check(str((rr0[0] as Dictionary).get("winner_id", "")) == "b2",
+		"deterministic error walks over")
+	_check(arena._server_reloads == 0, "no recovery burned")
+	_check(not arena._recover_in_flight, "no recovery armed")
+	arena._recover_in_flight = false
+	arena._server_reloads = 0
+	arena.tourney_awaiting_load = false
+	arena.is_round_active = false
+	arena._seq_context = ""
+	d.tourney = old_tourney
+	d.brains_cache = old_cache
+	d.brains_cache_msec = old_msec
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_vanish_err"):
+		for f in DirAccess.get_files_at("user://test_vanish_err"):
+			DirAccess.remove_absolute("user://test_vanish_err".path_join(f))
+		DirAccess.remove_absolute("user://test_vanish_err")
+
+
 func test_roundbank_brain_loss_resends() -> void:
 	# Server restart killed the round bank: the free-mode error arms a
 	# stored-report resend (supervisor reload, capped); the reload
@@ -1560,12 +1733,17 @@ func test_auto_recover_supervisor() -> void:
 	var old_tourney: Dictionary = d.tourney
 	var old_cache: Array = d.brains_cache
 	var old_msec: int = d.brains_cache_msec
+	var rpc3: Array = _real_brain_pair(d)
+	if rpc3.is_empty():
+		_check(true, "supervisor skipped (vault short)")
+		return
+	var sa: Dictionary = rpc3[0]
+	var sb: Dictionary = rpc3[1]
 	d.tourney = {"id": "TREC", "status": "running", "lr_scale": 0.5,
 		"current_round": 0, "current_match": 0,
-		"rounds": [[{"a_id": "a1", "b_id": "b1",
+		"rounds": [[{"a_id": str(sa.get("id", "")), "b_id": str(sb.get("id", "")),
 			"a_name": "A", "b_name": "B"}]]}
-	d.brains_cache = [{"id": "a1", "filename": "a1.flybrain"},
-		{"id": "b1", "filename": "b1.flybrain"}]
+	d.brains_cache = [sa, sb]
 	d.brains_cache_msec = Time.get_ticks_msec()
 	arena.tournament_active = true
 	arena.tourney_match_label = "R1M1"
@@ -1732,6 +1910,8 @@ func _process(_delta: float) -> bool:
 	test_match_send_and_complete()
 	test_flush_splits_per_match()
 	test_audit_banked_rounds()
+	test_vanish_walks_over_and_advances()
+	test_vanish_error_skips_recovery()
 	test_round_freezes_at_match_over()
 	test_bracket_stays_until_combat()
 	test_manual_bracket_survives()

@@ -197,6 +197,62 @@ func test_redraw_full_roster() -> void:
 	_check(q == ["a"], "schooled gate floors + excludes")
 
 
+func test_forfeit_fighter() -> void:
+	# Vanished fighter: every undecided match holding it walks over
+	# to the present opponent (bye semantics, skipped stamp); decided
+	# matches stand; empty id refuses.
+	var old_tourney: Dictionary = D.tourney
+	D.tourney = {"id": "TF", "status": "running", "current_round": 0,
+		"current_match": 0,
+		"rounds": [
+			[{"a_id": "a", "b_id": "gone", "winner_id": ""},
+				{"a_id": "c", "b_id": "d", "winner_id": "c"}],
+			[{"a_id": "a", "b_id": "gone", "winner_id": ""},
+				{"a_id": "e", "b_id": "f", "winner_id": ""}]]}
+	var res: Dictionary = D.call("forfeit_fighter", "gone", "unit test")
+	_check(bool(res.get("ok", false)), "forfeit resolves")
+	_check((res.get("forfeited", []) as Array) == ["R1M1", "R2M1"],
+		"forfeit names every undecided match")
+	var r0: Array = (D.tourney.get("rounds", []) as Array)[0]
+	_check(str((r0[0] as Dictionary).get("winner_id", "")) == "a"
+		and bool((r0[0] as Dictionary).get("skipped", false)),
+		"walkover winner + skipped stamp")
+	_check(str((r0[1] as Dictionary).get("winner_id", "")) == "c"
+		and not (r0[1] as Dictionary).has("skipped"),
+		"decided matches stand untouched")
+	var bad: Dictionary = D.call("forfeit_fighter", "", "unit test")
+	_check(not bool(bad.get("ok", false)), "empty id refuses")
+	var none: Dictionary = D.call("forfeit_fighter", "gone", "unit test")
+	_check((none.get("forfeited", []) as Array).is_empty(),
+		"second pass finds nothing left")
+	D.tourney = old_tourney
+
+
+func test_live_participant_spots() -> void:
+	# Live brackets holding a fighter: the loaded running tourney +
+	# running event manifests (completed ones ignored).
+	var old_tourney: Dictionary = D.tourney
+	D.tourney = {"id": "TL", "status": "running",
+		"players": [{"id": "p3", "name": "P3"}]}
+	D.call("event_save", {"id": "ESPOT", "status": "running",
+		"group_order": ["A"], "groups": {"A": {"players": ["p1", "p2"]}},
+		"pool": []})
+	_check((D.call("live_participant_spots", "p1") as Array) == ["ESPOT"],
+		"running manifest spots its players")
+	_check((D.call("live_participant_spots", "p3") as Array) == ["TL"],
+		"loaded running tourney spots its players")
+	_check((D.call("live_participant_spots", "nobody") as Array).is_empty(),
+		"strangers have no spots")
+	_check((D.call("live_participant_spots", "") as Array).is_empty(),
+		"empty id has no spots")
+	var ev: Dictionary = D.call("event_load", "ESPOT")
+	ev["status"] = "complete"
+	D.call("event_save", ev)
+	_check((D.call("live_participant_spots", "p1") as Array).is_empty(),
+		"completed manifests ignored")
+	D.tourney = old_tourney
+
+
 func test_vault_paths_for() -> void:
 	# Roster ids resolve to vault paths in one cached pass; unknown
 	# ids skip silently (warm pre-warming + preload diagnostics).
@@ -1539,6 +1595,8 @@ func _initialize() -> void:
 	test_ko_tiebreak()
 	test_final_fixed_order()
 	test_redraw_full_roster()
+	test_forfeit_fighter()
+	test_live_participant_spots()
 	test_vault_paths_for()
 	test_event_chain()
 	test_overview_render()

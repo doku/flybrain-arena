@@ -1773,7 +1773,17 @@ func _on_score_progress(episode: int, total: int) -> void:
 func _on_delete() -> void:
 	if selected_brain.is_empty():
 		return
-	var res: Dictionary = TournamentDirector.delete_brain(str(selected_brain.get("id", "")))
+	var bid := str(selected_brain.get("id", ""))
+	# A fighter in a RUNNING tournament/event cannot be deleted: its
+	# file backs live bracket positions, and the loads would fail on
+	# the missing file mid-event. Archive/restore flows are unaffected
+	# (archived brains are already out of every live roster).
+	var spots: Array = TournamentDirector.live_participant_spots(bid)
+	if not spots.is_empty():
+		log_label.text = "Cannot delete %s - fighting in live %s." % [
+			str(selected_brain.get("name", "?")), str(spots[0])]
+		return
+	var res: Dictionary = TournamentDirector.delete_brain(bid)
 	if res.get("ok", false):
 		selected_brain = {}
 		detail_label.text = ""

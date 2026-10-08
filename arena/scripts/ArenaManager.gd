@@ -839,14 +839,20 @@ func _audit_banked_rounds() -> int:
 			continue
 		var decided := 0
 		var unbanked := 0
+		var playable := 0
 		for mm in rms:
 			var m := mm as Dictionary
+			# Decided-without-fighting (walkovers, seeding byes) never
+			# had anything to bank: not lost, just unplayed.
+			if bool(m.get("skipped", false)) or bool(m.get("bye", false)):
+				continue
+			playable += 1
 			if str(m.get("winner_id", "")) == "":
 				continue
 			decided += 1
 			if not bool(m.get("banked", false)):
 				unbanked += 1
-		if decided == rms.size() and unbanked > 0:
+		if playable > 0 and decided == playable and unbanked > 0:
 			lost += unbanked
 			print("[Arena] Round %d: %d/%d matches banked (%d lost with a prior session)." % [
 				ri + 1, decided - unbanked, rms.size(), unbanked])
@@ -1447,6 +1453,59 @@ func _on_quit_to_menu() -> void:
 		director.hold_spawns = false
 		director.quit_to_menu()
 
+func _missing_fighter_id() -> String:
+	# Which side of the CURRENT match has no vault file ("" = none):
+	# resolves a server "not found in vault" error to a fighter id
+	# without trusting the error text's path layout.
+	var director := _director()
+	if director == null:
+		return ""
+	var p: Dictionary = director.get_load_params()
+	var cm: Dictionary = director.current_match()
+	if str(p.get("alpha_path", "")) != "" \
+			and not FileAccess.file_exists(str(p.get("alpha_path", ""))):
+		return str(cm.get("a_id", ""))
+	if str(p.get("beta_path", "")) != "" \
+			and not FileAccess.file_exists(str(p.get("beta_path", ""))):
+		return str(cm.get("b_id", ""))
+	return ""
+
+
+func _on_fighter_vanished(missing_id: String, where: String) -> void:
+	# A tournament fighter's vault file is gone (archived/deleted
+	# mid-event): walk over ALL its remaining undecided matches to
+	# the present opponents (bye semantics), then continue like a
+	# completed match (advance + handle) - the bracket keeps moving
+	# instead of burning recovery budget on an unrecoverable error.
+	# Loud: a vanished fighter is never routine. Cached battles of a
+	# broken CURRENT match cannot bank (the server needs the file),
+	# so they go too; other matches' caches are untouched.
+	var director := _director()
+	if director == null or str(missing_id) == "":
+		return
+	print("[Arena] Fighter vanished from vault: %s (%s) - walking over its remaining matches." % [missing_id, where])
+	_arena_log("fighter vanished: %s (%s) - walkovers issued" % [missing_id, where])
+	if is_instance_valid(status_label):
+		status_label.text = "FIGHTER VANISHED: %s - walkover, bracket continues..." % missing_id
+	var cm: Dictionary = director.current_match()
+	var cur_involves := str(cm.get("a_id", "")) == missing_id \
+		or str(cm.get("b_id", "")) == missing_id
+	var cur_was_decided := str(cm.get("winner_id", "")) != ""
+	if cur_involves and not _match_battle_cache.is_empty():
+		print("[Arena] Discarding %d unbankable cached battles (%s)." % [_match_battle_cache.size(), missing_id])
+		_arena_log("discarded %d unbankable battles for %s" % [_match_battle_cache.size(), missing_id])
+		_match_battle_cache.clear()
+	var res: Dictionary = director.forfeit_fighter(missing_id, where)
+	print("[Arena] Walkovers issued: %s" % str(res.get("forfeited", [])))
+	if cur_involves and not cur_was_decided:
+		# The current match just got decided by walkover: move past
+		# it like a played match (a blind reload would stall on the
+		# same decided position forever).
+		var adv: Dictionary = director.advance_after_match()
+		_handle_advance_result(adv)
+	else:
+		_request_current_battle_load()
+
 func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	# Bank gate: next-round brains must load post-bank weights, and the
 	# vault files turn post-round only when the bank's saves land (atomic
@@ -1491,6 +1550,19 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % expand_match_label(tourney_match_label)
 		_bracket_manual = false
 		_show_arena_bracket("CANNOT LOAD %s" % expand_match_label(tourney_match_label))
+		return
+	# Pre-flight: the vault file must EXIST, not just resolve. A path
+	# from a stale roster (archived/deleted mid-event) would fail
+	# server-side after a full load cycle - fail here instead, before
+	# a single packet goes out, and walk the bracket over it.
+	var cm0: Dictionary = director.current_match()
+	var gone_id := ""
+	if not FileAccess.file_exists(str(p.get("alpha_path", ""))):
+		gone_id = str(cm0.get("a_id", ""))
+	elif not FileAccess.file_exists(str(p.get("beta_path", ""))):
+		gone_id = str(cm0.get("b_id", ""))
+	if gone_id != "":
+		_on_fighter_vanished(gone_id, "missing at load")
 		return
 	print("[Arena] Requesting tournament load: %s (%s vs %s)" % [
 		str(p.get("match", "?")), str(p.get("a_name", "?")), str(p.get("b_name", "?"))])
@@ -1553,6 +1625,13 @@ func _preload_next_match() -> void:
 		return
 	var p: Dictionary = director.get_load_params()
 	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
+		return
+	# Best-effort too: a vanished file would fail server-side after a
+	# full prepare cycle - skip silently here (the official load's
+	# pre-flight names it and walks the bracket over it).
+	if not FileAccess.file_exists(str(p.get("alpha_path", ""))) \
+			or not FileAccess.file_exists(str(p.get("beta_path", ""))):
+		print("[Arena] Preload skipped - brain file missing for %s." % str(p.get("match", "?")))
 		return
 	# Same match already held by the slot (ready or ack in flight):
 	# no-op - a duplicate prepare would redo the 5-20 s server load.
@@ -1814,6 +1893,20 @@ func _on_server_error(error: String) -> void:
 			and not _pending_groupbank_resend:
 		if _recover_server_state("group bank interrupted"):
 			_pending_groupbank_resend = true
+			return
+	# Vanished fighter (vault file archived/deleted mid-event): the
+	# load/prepare can never succeed, so no recovery cycle - walk the
+	# bracket over it immediately. Deterministic, not transient.
+	# Placed before the in-flight attribution: even a recovery reload
+	# hitting the missing file resolves by walkover, never by retry.
+	if tournament_active and "not found in vault" in error \
+			and (error.begins_with("tournament_load:") \
+				or error.begins_with("tournament_prepare:")):
+		var gone := _missing_fighter_id()
+		print("[Arena] Server reports a vanished fighter: %s" % error)
+		_arena_log("vanished fighter refused: %s" % error)
+		if gone != "":
+			_on_fighter_vanished(gone, "server refused load")
 			return
 	# A recovery load is already in flight (the state poll or a prior
 	# error armed it): the refusal that motivated it can arrive now -
@@ -6996,6 +7089,11 @@ func _run_event_handoff() -> void:
 	else:
 		gone = elim.get("eliminated", [])
 		print("[Arena] Event %s eliminated %s" % [eid, str(gone)])
+	# The elimination just archived brains out of the vault: force the
+	# roster cache fresh BEFORE the pool gate + draw read it (a stale
+	# cache once drafted an archived fighter into the next event,
+	# stalling its first load on a missing file).
+	director.invalidate_brains_cache()
 	director.event_finish(eid, champ_id)
 	var ev: Dictionary = director.event_load(eid)
 	var gen := int(ev.get("generation", 1))

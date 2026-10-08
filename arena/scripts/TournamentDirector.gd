@@ -378,7 +378,10 @@ func archive_list() -> Array:
 
 
 func restore_archived(arch_id: String) -> Dictionary:
-	return _run_cli(["restore", "--id", arch_id])
+	var res := _run_cli(["restore", "--id", arch_id])
+	if res.get("ok", false):
+		vault_changed.emit()
+	return res
 
 
 func delete_archived(arch_id: String) -> Dictionary:
@@ -1193,8 +1196,13 @@ func evo_bottom_two() -> Dictionary:
 
 
 func evo_archive(brain_id: String, reason: String) -> Dictionary:
-	# Blocking: local file move, milliseconds.
-	return _run_cli(["archive", "--id", brain_id, "--reason", reason])
+	# Blocking: local file move, milliseconds. Membership change:
+	# the roster cache must refresh (a same-minute draw off a stale
+	# cache once drafted an archived fighter into the next event).
+	var res := _run_cli(["archive", "--id", brain_id, "--reason", reason])
+	if res.get("ok", false):
+		vault_changed.emit()
+	return res
 
 
 func size_options() -> Array:
@@ -2442,6 +2450,83 @@ func event_eliminate(event_id: String, min_matches: int = 10, elo_cutoff: float 
 		if not bool(ar.get("ok", false)):
 			return {"ok": false, "error": str(ar.get("error", "?"))}
 	return {"ok": true, "eliminated": out}
+
+
+func forfeit_fighter(brain_id: String, reason: String) -> Dictionary:
+	# Walkover for every undecided match holding a vanished fighter
+	# (vault file archived/deleted mid-event): the present opponent
+	# advances with bye semantics, stamped skipped for honest display.
+	# Decided matches stand (their data is already banked or audited).
+	# Unfought walkovers never enter a report cache, so no phantom ELO
+	# banks; standings count them like seeding byes. Returns
+	# {ok, forfeited: ["R1M1", ...]} (empty = nothing undecided left).
+	# Edge (consolation loser-advance): the loser slot may name the
+	# vanished fighter downstream - the load fast-path re-fires per
+	# occurrence, so each future match forfeits on demand instead of
+	# stalling.
+	var pid := str(brain_id)
+	if pid == "":
+		return {"ok": false, "error": "empty id"}
+	var done: Array = []
+	var rounds: Array = tourney.get("rounds", [])
+	for ri in range(rounds.size()):
+		var rms: Array = rounds[ri]
+		for mi in range(rms.size()):
+			var m := rms[mi] as Dictionary
+			if str(m.get("winner_id", "")) != "":
+				continue
+			var other := ""
+			if str(m.get("a_id", "")) == pid:
+				other = str(m.get("b_id", ""))
+			elif str(m.get("b_id", "")) == pid:
+				other = str(m.get("a_id", ""))
+			else:
+				continue
+			if other == "":
+				continue
+			m["winner_id"] = other
+			m["skipped"] = true
+			m["walkover"] = str(reason)
+			done.append("R%dM%d" % [ri + 1, mi + 1])
+	if not done.is_empty():
+		print("[Director] Walkover %s (%d matches): %s" % [pid, done.size(), reason])
+		save_state()
+	return {"ok": true, "forfeited": done}
+
+
+func live_participant_spots(brain_id: String) -> Array:
+	# Every live bracket holding this fighter: [tournament file ids]
+	# across the loaded tourney (when running) and all running event
+	# manifests. Pure readout for the delete guard (menu) and forensics.
+	var pid := str(brain_id)
+	var spots: Array = []
+	if pid == "":
+		return spots
+	if str(tourney.get("status", "")) == "running":
+		for p in (tourney.get("players", []) as Array):
+			if str((p as Dictionary).get("id", "")) == pid:
+				spots.append(str(tourney.get("id", "live")))
+				break
+	if not DirAccess.dir_exists_absolute(tournament_dir):
+		return spots
+	for f in DirAccess.get_files_at(tournament_dir):
+		if not (str(f).begins_with("E") and str(f).ends_with(".json")):
+			continue
+		var fh := FileAccess.open(tournament_dir.path_join(str(f)), FileAccess.READ)
+		if fh == null:
+			continue
+		var ev = JSON.parse_string(fh.get_as_text())
+		fh.close()
+		if not (ev is Dictionary):
+			continue
+		if str((ev as Dictionary).get("status", "")) != "running":
+			continue
+		for g in ((ev as Dictionary).get("group_order", []) as Array):
+			var gd: Dictionary = ((ev as Dictionary).get("groups", {}) as Dictionary).get(str(g), {})
+			for pl in (gd.get("players", []) as Array):
+				if str(pl) == pid and not (str((ev as Dictionary).get("id", "")) in spots):
+					spots.append(str((ev as Dictionary).get("id", "")))
+	return spots
 
 
 func _event_live_elo(live_override: Dictionary = {}) -> Dictionary:
