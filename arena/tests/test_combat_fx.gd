@@ -1023,6 +1023,104 @@ func test_overtake_fires_parked_load() -> void:
 	d.brains_cache_msec = old_msec
 
 
+func test_overtake_preserves_live_load() -> void:
+	# Incident replay, part 1: load sent (latch + context + echo
+	# armed), then a stale round refusal lands BEFORE the
+	# brains_loaded reply. The overtake must confirm the bank WITHOUT
+	# touching the live load wait (the old entry wipe dropped it; the
+	# reply then dropped and the game parked with no latch, no
+	# context, no timer).
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = true
+	arena._seq_forgive_roundbank = {"tournament_id": "T1",
+		"match": "R1M1", "battle": "RND-9"}
+	arena.tourney_awaiting_load = true
+	arena._seq_context = "load"
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._load_gated_on_bank = false
+	arena._pending_advance = {}
+	arena._on_server_error(
+		"round_report: group already banked - QUIT TO MENU + RESUME")
+	_check(arena.tourney_awaiting_load, "overtake keeps the load latch")
+	_check(arena._seq_context == "load", "overtake keeps load context")
+	_check(str(arena._seq_last_load.get("match", "")) == "R1M1",
+		"overtake keeps the load echo")
+	_check(not arena._round_bank_pending, "overtake still clears the bank")
+	_check(not arena._tourney_awaiting_roundbank, "overtake clears awaiting")
+	arena.tourney_awaiting_load = false
+	arena._seq_context = ""
+	arena._seq_last_load = {}
+	arena._round_bank_pending = false
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_forgive_roundbank = {}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+
+
+func test_overtaken_load_still_starts_round() -> void:
+	# Incident replay, part 2: the matching brains_loaded arrives
+	# after the overtake - the round must START (was: dropped as
+	# "nothing awaited", silent permanent stall).
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena._round_bank_pending = true
+	arena._tourney_awaiting_roundbank = true
+	arena._seq_forgive_roundbank = {"tournament_id": "T1",
+		"match": "R1M1", "battle": "RND-9"}
+	arena.tourney_awaiting_load = true
+	arena._seq_context = "load"
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._load_gated_on_bank = false
+	arena._pending_advance = {}
+	arena._pending_roundbank_resend = false
+	arena._seq_last_round_report = {}
+	arena._seq_last_group_report = {}
+	arena._group_bank_pending = false
+	arena.fly_alpha.landing_mode = 2
+	arena.fly_alpha.global_position.y = arena.fly_alpha.LAND_POS_Y
+	arena.fly_beta.landing_mode = 2
+	arena.fly_beta.global_position.y = arena.fly_beta.LAND_POS_Y
+	arena._on_server_error(
+		"round_report: group already banked - QUIT TO MENU + RESUME")
+	arena._on_brains_loaded({}, {}, "T1", "R1M1")
+	_check(arena.is_round_active, "late brains start the round")
+	_check(not arena.tourney_awaiting_load, "load latch consumed")
+	arena.is_round_active = false
+	arena.tourney_awaiting_load = false
+	arena._seq_context = ""
+	arena._seq_last_load = {}
+	arena._round_bank_pending = false
+	arena._tourney_awaiting_roundbank = false
+	arena._seq_forgive_roundbank = {}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+
+
+func test_failloud_clears_load_wait() -> void:
+	# Fail-loud still stands the load down: with recovery capped, a
+	# generic error parks loudly AND clears latch + context, so no
+	# late reply can start a round behind the stalled screen.
+	arena.tournament_active = true
+	arena.tourney_awaiting_load = true
+	arena._seq_context = "load"
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._server_reloads = 2
+	arena._recover_in_flight = false
+	arena._on_server_error("boom")
+	_check(not arena.tourney_awaiting_load, "fail-loud clears the latch")
+	_check(arena._seq_context == "", "fail-loud clears the context")
+	_check(str(arena.status_label.text).begins_with("SERVER ERROR"),
+		"fail-loud names the error")
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+
+
 func test_loading_supervisor_recovers() -> void:
 	# LOADING with no watch: a load was issued but no watchdog
 	# watches it and no bank owns the stall -> capped in-place
@@ -1902,6 +2000,9 @@ func _process(_delta: float) -> bool:
 	test_late_bank_ack_after_recover_applies()
 	test_recover_carries_owed_bank()
 	test_overtake_fires_parked_load()
+	test_overtake_preserves_live_load()
+	test_overtaken_load_still_starts_round()
+	test_failloud_clears_load_wait()
 	test_loading_supervisor_recovers()
 	test_preload_skips_unbuilt_final()
 	test_preload_targets_current_match()

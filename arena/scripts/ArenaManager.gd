@@ -1834,13 +1834,14 @@ func _on_server_error(error: String) -> void:
 			bool(q.get("draw_penalty", false)),
 			str(q.get("end_reason", "")), q.get("verdict", {}))
 		return
-	_tourney_awaiting_battle = false
-	# Captured before _clear_seq wipes it (the recovery below needs it).
+	# Wait state is cleared ONLY by the branch that owns it below
+	# (retry re-arms, recover reloads, overtake confirms, fail-loud
+	# parks). A blanket clear here once dropped a live load wait when
+	# an unrelated stale-bank refusal landed a millisecond before its
+	# brains_loaded reply - parking the game silently with no latch,
+	# no context, no timer. Late replies stay safe via the tid/match
+	# echo check in _on_brains_loaded, never via wiping the wait.
 	var err_context := _seq_context
-	_clear_seq()
-	# General server error during a load: clear the load latch too -
-	# a late reply must never silently start a round on this screen.
-	tourney_awaiting_load = false
 	# Self-healing reload BEFORE the fail-loud below: the server lost
 	# its tournament brains mid-match (restart/crash - the gate error
 	# the server sends for a brainless match_reset). Reloading the
@@ -1929,6 +1930,12 @@ func _on_server_error(error: String) -> void:
 	# the fail-loud screen.
 	if tournament_active and _recover_server_state("server error: " + error):
 		return
+	# Fail-loud parks: stand down every wait here, so no late reply
+	# (brains, battle, reset) can silently start a round on the
+	# stalled screen. Previously covered by a blanket entry clear.
+	_tourney_awaiting_battle = false
+	_clear_seq()
+	tourney_awaiting_load = false
 	_hide_wait_bracket()
 	_show_loading("SERVER ERROR",
 		"SERVER ERROR: %s. " % error
