@@ -780,12 +780,12 @@ func _handle_obstacle_impacts(impact_speed: float, delta: float) -> void:
 			continue
 		# Tiers sit above cruise (~5-8 m/s: safe) and at/below full
 		# thrust (12 m/s: lethal), so cruising the forest is safe and
-		# only hot flight into bark is punished.
+		# only hot flight into bark is punished. Trees HURT but never
+		# tear: wing tears come strictly from the spear point.
 		if impact_speed > 11.0:
-			tear_wing("left" if randf() < 0.5 else "right")
 			take_damage(50.0, "tree_slam")
 			obstacle_hit_cooldown = 1.5
-			print(fly_id, " SLAMMED a tree at ", snappedf(impact_speed, 0.1), " m/s! Wing torn.")
+			print(fly_id, " SLAMMED a tree at ", snappedf(impact_speed, 0.1), " m/s!")
 		elif impact_speed > 6.5:
 			take_damage(15.0, "tree_clip")
 			obstacle_hit_cooldown = 1.0
@@ -854,10 +854,27 @@ func _spear_extension() -> float:
 	return LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
 
 
+func _tip_in_wing_box(victim: FlyPhysics, area: Area3D) -> bool:
+	# True spear-POINT test: the steel tip (the spike area's global
+	# center - the cone tip coincides with it) must sit inside the
+	# wing hurtbox volume (+ a small tick epsilon). The r=0.35 sphere
+	# overlap alone admits sideswipes up to a body-width away from
+	# the point; those graze, never tear.
+	var local: Vector3 = victim.global_transform.affine_inverse() \
+		* front_spike_area.global_position
+	var cx := 0.9
+	if area.name == "LeftWingHurtbox":
+		cx = -0.9
+	var half := Vector3(0.6, 0.05, 0.4) + Vector3(0.1, 0.1, 0.1)
+	return absf(local.x - cx) <= half.x \
+		and absf(local.y - 0.1) <= half.y \
+		and absf(local.z + 0.1) <= half.z
+
+
 func _on_spike_hit_area(area: Area3D) -> void:
 	if is_disabled or not combat_enabled:
 		return
-	
+
 	var victim = area.get_parent()
 	if victim == self or not (victim is FlyPhysics):
 		return
@@ -867,6 +884,15 @@ func _on_spike_hit_area(area: Area3D) -> void:
 	if area.name == "LeftWingHurtbox" or area.name == "RightWingHurtbox":
 		if rel_vel < 4.0:
 			# Too slow to pierce chitin
+			return
+		# Spear POINT only: the sphere overlap alone admits
+		# sideswipes; the tip must actually be inside the wing box.
+		if not _tip_in_wing_box(victim, area):
+			return
+		# Same-frame dedup (mirrors the clash/joust rule): a mutual
+		# pass resolves once - the lower instance id wins, the other
+		# side's report drops (no double tear, no double KO).
+		if get_instance_id() > victim.get_instance_id():
 			return
 		victim.tear_wing("left" if area.name == "LeftWingHurtbox" else "right")
 		_spike_wound(victim)

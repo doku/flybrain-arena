@@ -72,6 +72,10 @@ var ctrl_label: Label
 var bv_reply_ema: float = 0.2
 var bv_shared_tau: float = 0.15
 var bv_last_reply: float = -1.0
+# One-strike-per-frame guard (see _on_strike_landed): the physics
+# frame + attacker of the last applied strike. -1 = nothing applied.
+var _last_strike_frame: int = -1
+var _last_strike_attacker: String = ""
 var bv_cad_n: int = 0
 var bv_cad_dt_sum: float = 0.0
 var bv_cad_tau_sum: float = 0.0
@@ -2524,6 +2528,8 @@ func _reset_round() -> void:
 	# cumulative - see its declaration).
 	_step_in_flight = false
 	_step_timeouts = 0
+	_last_strike_frame = -1
+	_last_strike_attacker = ""
 	bv_stream_alpha.clear()
 	bv_stream_beta.clear()
 	if is_instance_valid(bv_raster_alpha):
@@ -5116,6 +5122,17 @@ func _print_flight_line(slot: String, f: Dictionary) -> void:
 
 
 func _on_strike_landed(attacker_id: String, target_part: String) -> void:
+	# One strike per physics frame: a mutual pass (both flies' sensors
+	# fire in the same tick) resolves the FIRST report only - the
+	# second drops (no double damage, no double KO credit). The
+	# physics-side instance-id dedup handles the same-pair case; this
+	# guards the cross-pair case.
+	var frame := Engine.get_physics_frames()
+	if frame == _last_strike_frame:
+		print("[Arena] Strike dropped (same frame as ", _last_strike_attacker, ").")
+		return
+	_last_strike_frame = frame
+	_last_strike_attacker = attacker_id
 	# Wing hits pay 60 (plus the tear + 15 wound in FlyPhysics): hits register
 	# in fitness even without a kill. Thorax stays 80 (lethal regardless).
 	# A spike clash already wounded BOTH bodies in FlyPhysics; credit the
