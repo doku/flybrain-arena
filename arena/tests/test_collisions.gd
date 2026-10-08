@@ -37,12 +37,13 @@ func _tip_at_attacker_extent(attacker) -> void:
 		+ Vector3(0, 0, -attacker.LUNGE_DIST)
 
 
-func _pair_for_tip(a, b) -> void:
-	# Place b so a's tip point lands exactly in b's RIGHT wing box
-	# center: b facing -Z (identity yaw), offset by the wing pivot.
+func _pair_for_tip(a, b, side := 1.0) -> void:
+	# Place b so a's tip point lands exactly in b's wing box center
+	# (side +1 right, -1 left): b facing -Z (identity yaw), offset by
+	# the wing pivot.
 	_tip_at_attacker_extent(a)
 	var tip: Vector3 = a.front_spike_area.global_position
-	b.global_position = tip - Vector3(0.9, 0.1, -0.1)
+	b.global_position = tip - Vector3(0.9 * side, 0.1, -0.1)
 	b.rotation = Vector3.ZERO
 	b.velocity = Vector3.ZERO
 
@@ -92,28 +93,45 @@ func test_slow_contact_never_tears() -> void:
 
 
 func test_mutual_pass_resolves_once() -> void:
-	# Same-frame dedup (mirrors the clash/joust rule): the higher
-	# instance id's report drops, the lower id resolves. (A mutual
-	# wing-wing pass is geometrically impossible - forward tips vs
-	# lateral wings - so the guard is exercised in both orders.)
+	# Order-independent single resolution per exchange (pair-frame
+	# stamp on BOTH participants): the first reporter resolves
+	# regardless of instance id (a sole high-id reporter tears - the
+	# old id rule dropped these), and a second same-frame report on
+	# the pair drops even with valid geometry (no double tear).
 	var a = _fly("MA")
 	var b = _fly("MB")
 	var high = a if a.get_instance_id() > b.get_instance_id() else b
 	var low = b if high == a else a
-	# High id reports first: tip inside the box, but the guard drops.
-	_pair_for_tip(high, low)
+	# High reports first, valid geometry: resolves.
+	_pair_for_tip(high, low, 1.0)
 	high.velocity = Vector3(0, 0, -10)
 	low.velocity = Vector3.ZERO
 	high._on_spike_hit_area(low.get_node("RightWingHurtbox"))
-	_check(low.right_wing_intact, "higher id drops (dedup)")
-	# Lower id reports the same contact class: tear lands.
-	_pair_for_tip(low, high)
-	low.velocity = Vector3(0, 0, -10)
-	high.velocity = Vector3.ZERO
-	low._on_spike_hit_area(high.get_node("RightWingHurtbox"))
-	_check(not high.right_wing_intact, "lower id resolves (tear lands)")
+	_check(not low.right_wing_intact, "sole high-id reporter tears")
+	# Same pair, other wing, still this frame: dropped.
+	_pair_for_tip(high, low, -1.0)
+	high.velocity = Vector3(0, 0, -10)
+	high._on_spike_hit_area(low.get_node("LeftWingHurtbox"))
+	_check(low.left_wing_intact, "second same-frame report drops")
 	high.queue_free()
 	low.queue_free()
+	# Reverse order, fresh pair: low resolves first, high drops after.
+	var c = _fly("MC")
+	var d = _fly("MD")
+	var hi = c if c.get_instance_id() > d.get_instance_id() else d
+	var lo = d if hi == c else c
+	_pair_for_tip(lo, hi, 1.0)
+	lo.velocity = Vector3(0, 0, -10)
+	hi.velocity = Vector3.ZERO
+	lo._on_spike_hit_area(hi.get_node("RightWingHurtbox"))
+	_check(not hi.right_wing_intact, "low-first resolves")
+	_pair_for_tip(hi, lo, 1.0)
+	hi.velocity = Vector3(0, 0, -10)
+	lo.velocity = Vector3.ZERO
+	hi._on_spike_hit_area(lo.get_node("RightWingHurtbox"))
+	_check(lo.right_wing_intact, "second reporter drops either order")
+	hi.queue_free()
+	lo.queue_free()
 
 
 func test_manager_drops_same_frame() -> void:

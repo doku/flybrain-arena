@@ -212,6 +212,14 @@ const TREE_RAY_LEFT_ANGLE: float = deg_to_rad(35.0)
 # frame while the trigger Areas stay overlapped.
 var clash_cooldown: float = 0.0
 const CLASH_COOLDOWN: float = 0.9
+# Wing-exchange stamp: the physics frame of the last wing resolution
+# this fly took part in (as reporter OR victim). A second wing report
+# involving this fly in the same frame drops - one tear per exchange.
+# Frame numbers are monotonic, so no reset is ever needed. Unlike the
+# clash/joust instance-id rule this is order-independent: a sole
+# reporter resolves regardless of id, and a mutual exchange still
+# resolves exactly once (the first report stamps both participants).
+var _wing_exchange_frame: int = -1
 
 @onready var front_spike_area: Area3D = $FrontSpikeArea
 @onready var thorax_hurtbox: Area3D = $ThoraxHurtbox
@@ -889,11 +897,16 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		# sideswipes; the tip must actually be inside the wing box.
 		if not _tip_in_wing_box(victim, area):
 			return
-		# Same-frame dedup (mirrors the clash/joust rule): a mutual
-		# pass resolves once - the lower instance id wins, the other
-		# side's report drops (no double tear, no double KO).
-		if get_instance_id() > victim.get_instance_id():
+		# One tear per exchange: if this fly already took part in a
+		# wing resolution this frame (as reporter or victim), a second
+		# report drops. The resolver stamps both participants, so a
+		# mutual exchange resolves exactly once regardless of report
+		# order - and a sole reporter always resolves (no id bias).
+		var fr := Engine.get_physics_frames()
+		if _wing_exchange_frame == fr:
 			return
+		_wing_exchange_frame = fr
+		victim._wing_exchange_frame = fr
 		victim.tear_wing("left" if area.name == "LeftWingHurtbox" else "right")
 		_spike_wound(victim)
 		# Momentum knockback: the impalement shoves the victim along the
