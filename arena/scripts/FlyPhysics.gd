@@ -901,8 +901,28 @@ func _spear_extension() -> float:
 	return LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
 
 
-func _tip_in_wing_box(victim: FlyPhysics, area: Area3D) -> bool:
-	# True spear-POINT test: the steel tip (the spike area's global
+# Thorax flesh radius: the r=0.45 sphere plus the same 0.1 tick
+# epsilon the wing boxes carry. Pure (unit-tested).
+const THORAX_FLESH_R: float = 0.55
+
+
+func _tip_in_thorax(victim: FlyPhysics) -> bool:
+	var tip: Vector3 = victim.global_transform.affine_inverse() \
+		* front_spike_area.global_position
+	return tip.length() <= THORAX_FLESH_R
+
+
+func _tip_in_wing(victim: FlyPhysics) -> bool:
+	# Either wing box by the same point rule as _tip_in_wing_box
+	# (node refs, so pure-script flies without a scene read false).
+	for wing in ["LeftWingHurtbox", "RightWingHurtbox"]:
+		var area := victim.get_node_or_null(wing) as Area3D
+		if area != null and _tip_in_wing_box(victim, area):
+			return true
+	return false
+
+
+func _tip_in_wing_box(victim: FlyPhysics, area: Area3D) -> bool:	# True spear-POINT test: the steel tip (the spike area's global
 	# center - the cone tip coincides with it) must sit inside the
 	# wing hurtbox volume (+ a small tick epsilon). The r=0.35 sphere
 	# overlap alone admits sideswipes up to a body-width away from
@@ -975,7 +995,17 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		# Spike-to-spike head-on joust: resolved once (deduped), both take a
 		# body spike wound, and one side randomly gives so the pair breaks
 		# apart instead of self-cancelling into a permanent ram.
+		# Striker exception: a tip already in flesh is a STRIKE, not a
+		# mutual clash - the wing/thorax branch owns that exchange, and
+		# clashing too wounds the striker for their own hit (area
+		# callback order decided who bled). Skipped only where the
+		# strike will actually resolve (wing needs its rel_vel gate;
+		# thorax always resolves) so slow pressed grazes still unstick
+		# through the clash below.
 		if not victim.is_disabled and (rel_vel >= 2.0 or _facing_victim(victim)):
+			if _tip_in_thorax(victim) \
+					or (_tip_in_wing(victim) and rel_vel >= 4.0):
+				return
 			_resolve_spike_clash(victim)
 
 func _apply_knockback(victim: FlyPhysics, dir: Vector3, mag: float) -> void:

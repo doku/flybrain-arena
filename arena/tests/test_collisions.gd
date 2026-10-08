@@ -94,6 +94,75 @@ func test_landing_ignores_brain() -> void:
 	f.queue_free()
 
 
+func _striker_pair() -> Array:
+	# Two flies with the lower instance id as the striker: clash
+	# resolution runs on the lower id, so the striker always reaches
+	# it (no vacuous pass from id-order dropout).
+	var a = _fly("SA")
+	var b = _fly("SB")
+	if int(a.get_instance_id()) > int(b.get_instance_id()):
+		return [b, a]
+	return [a, b]
+
+
+func test_strike_suppresses_clash() -> void:
+	# The striker's tip is in the victim's wing box at killing speed
+	# while the spikes also touch: the WING owns the exchange - the
+	# clash must not wound the striker for their own hit (area
+	# callback order used to decide who bled).
+	var pair := _striker_pair()
+	var s = pair[0]
+	var v = pair[1]
+	_pair_for_tip(s, v)
+	s.velocity = Vector3(0, 0, -10)
+	v.velocity = Vector3.ZERO
+	s._on_spike_hit_area(v.get_node("FrontSpikeArea"))
+	_check(s.health == 100.0, "striker takes nothing on their own hit")
+	_check(v.health == 100.0, "no clash wound without a clash")
+	_check(s.clash_cooldown == 0.0, "suppressed clash sets no cooldown")
+	# And the wing strike itself still lands single-sided.
+	s._on_spike_hit_area(v.get_node("RightWingHurtbox"))
+	_check(not v.right_wing_intact, "suppressed clash keeps the tear")
+	_check(s.health == 100.0, "striker still unhurt after the tear")
+	s.queue_free()
+	v.queue_free()
+
+
+func test_thorax_strike_suppresses_clash() -> void:
+	# Tip buried at the victim's origin (rear aspect): clash skips,
+	# then the puncture kills single-sided with the striker unhurt.
+	var pair := _striker_pair()
+	var s = pair[0]
+	var v = pair[1]
+	v.global_position = s.front_spike_area.global_position
+	s.velocity = Vector3(0, 0, -5)
+	v.velocity = Vector3.ZERO
+	s._on_spike_hit_area(v.get_node("FrontSpikeArea"))
+	_check(s.health == 100.0, "striker takes nothing on a buried tip")
+	_check(v.health == 100.0, "no clash wound without a clash")
+	s._on_spike_hit_area(v.get_node("ThoraxHurtbox"))
+	_check(v.is_disabled, "buried tip still punctures")
+	_check(s.health == 100.0, "striker unhurt by their own kill")
+	s.queue_free()
+	v.queue_free()
+
+
+func test_open_clash_still_wounds_both() -> void:
+	# Tips meet in the open (no flesh either way): the intentional
+	# mutual clash is untouched - both take the spike wound.
+	var pair := _striker_pair()
+	var s = pair[0]
+	var v = pair[1]
+	v.global_position = Vector3(0, 0, -4)
+	s.velocity = Vector3(0, 0, -5)
+	v.velocity = Vector3(0, 0, 5)
+	s._on_spike_hit_area(v.get_node("FrontSpikeArea"))
+	_check(absf(s.health - 75.0) < 0.001, "open clash wounds the striker")
+	_check(absf(v.health - 75.0) < 0.001, "open clash wounds the victim")
+	s.queue_free()
+	v.queue_free()
+
+
 func test_tip_in_box_tears() -> void:
 	var a = _fly("TA")
 	var b = _fly("TB")
@@ -243,6 +312,9 @@ func _process(_delta: float) -> bool:
 		test_stale_commands_read_dead()
 		test_neutralize_freezes()
 		test_landing_ignores_brain()
+		test_strike_suppresses_clash()
+		test_thorax_strike_suppresses_clash()
+		test_open_clash_still_wounds_both()
 		if failures == 0:
 			print("ALL COLLISION TESTS PASSED")
 		else:
