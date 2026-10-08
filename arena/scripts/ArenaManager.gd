@@ -5750,6 +5750,16 @@ func _on_match_over(match_winner: String, score: String) -> void:
 	# into the NEXT match's battle cache on a stray timeout).
 	is_round_active = false
 	_set_combat(false)
+	# The decision owns the status NOW: a draw's REPLAYING must die
+	# here, or it sits stale through the result, the group-complete
+	# record and the whole next-bracket intermission (a ~2 min lie
+	# on the group-D-to-final handoff).
+	if is_instance_valid(status_label):
+		if match_winner == "draw":
+			status_label.text = "%s DRAW %s (point split) - match decided" % [expand_match_label(tourney_match_label), score]
+		else:
+			var _mwname := tourney_a_name if match_winner == "alpha" else tourney_b_name
+			status_label.text = "%s DECIDED - %s TAKES IT %s" % [expand_match_label(tourney_match_label), _mwname, score]
 	var director := _director()
 	if director == null:
 		return
@@ -6146,6 +6156,19 @@ func _on_group_banked(group_nonce: String, tid: String) -> void:
 			# countdown instead of loading cold post-ack.
 			_preload_next_match()
 		_show_arena_bracket("EVENT %s · FINAL" % str(fgev.get("id", "")))
+		# Name the reveal on the status line too: the bracket retitle
+		# alone is easy to miss mid-countdown, and the bar may still
+		# read the last battle (or a stale REPLAYING).
+		if is_instance_valid(status_label):
+			var _qf1 := ""
+			for _ln in _event_preview_sub("final").split("\n"):
+				if str(_ln).begins_with("QF:"):
+					_qf1 = str(_ln)
+					break
+			if _qf1 != "":
+				status_label.text = "EVENT %s · FINAL BRACKET SET - opening %s" % [str(fgev.get("id", "")), _qf1]
+			else:
+				status_label.text = "EVENT %s · FINAL BRACKET SET" % str(fgev.get("id", ""))
 	if _load_gated_on_bank:
 		_load_gated_on_bank = false
 		_request_current_battle_load()
@@ -6841,6 +6864,12 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
 	_sync_bracket_button()
+	# The intermission owns the status line for its whole run: the
+	# overlay counts down, but the bottom bar kept whatever the last
+	# battle left (a draw's REPLAYING survived the entire group-D to
+	# final handoff). Static text - the overlay carries the ticking.
+	if is_instance_valid(status_label):
+		status_label.text = "%s - Next bracket in %ds (SKIP to start)" % [title, int(secs)]
 	# Countdown provenance: title carries the caller (TIP-OFF / GROUP
 	# A..D / FINAL), so any "wrong length" report is attributable.
 	print("[Arena] Intermission '%s' for %ds" % [title, int(secs)])

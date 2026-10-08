@@ -1491,6 +1491,56 @@ func test_round_freezes_at_match_over() -> void:
 		DirAccess.remove_absolute("user://test_mfreeze")
 
 
+func test_match_over_clears_replaying_status() -> void:
+	# Group-D-to-final wart: a draw's REPLAYING sat on the status bar
+	# through the result, the group-complete record and the whole
+	# FINAL intermission (~2 min). The decision owns the bar now.
+	var d = arena._director()
+	if d == null:
+		_check(true, "replaying-clear skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_mreplay"
+	DirAccess.make_dir_recursive_absolute("user://test_mreplay")
+	d.tourney = {"id": "TMR", "status": "running",
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1", "a_name": "A",
+			"b_name": "B"},
+			{"a_id": "c1", "b_id": "d1", "a_name": "C",
+			"b_name": "D"}]]}
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena.tourney_a_name = "A"
+	arena.tourney_b_name = "B"
+	arena.is_round_active = true
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
+	arena._round_match_cache = []
+	arena._match_battle_cache = [{"battle_id": "B1", "draw": false,
+		"verdict": {"winner_slot": "alpha"}}]
+	arena.status_label.text = "R1M1 DNF x2 - REPLAYING"
+	arena._on_match_over("alpha", "1 - 0")
+	_check(not ("REPLAYING" in arena.status_label.text),
+		"match over clears stale replaying")
+	_check(("Round 1, Match 1" in arena.status_label.text) and ("1 - 0" in arena.status_label.text),
+		"decision names the match and score")
+	arena.status_label.text = "R1M1 DNF x2 - REPLAYING"
+	arena._on_match_over("draw", "0 - 0")
+	_check(not ("REPLAYING" in arena.status_label.text),
+		"draw split clears stale replaying too")
+	arena._round_match_cache = []
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
+	arena._hide_arena_bracket()
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_mreplay"):
+		for f in DirAccess.get_files_at("user://test_mreplay"):
+			DirAccess.remove_absolute("user://test_mreplay".path_join(f))
+		DirAccess.remove_absolute("user://test_mreplay")
+
+
 func test_bracket_stays_until_combat() -> void:
 	# The bracket survives reply-hides moved to combat-enable:
 	# brains-loaded and match-ready no longer uncover; _reset_round
@@ -2038,6 +2088,7 @@ func _process(_delta: float) -> bool:
 	test_vanish_walks_over_and_advances()
 	test_vanish_error_skips_recovery()
 	test_round_freezes_at_match_over()
+	test_match_over_clears_replaying_status()
 	test_bracket_stays_until_combat()
 	test_manual_bracket_survives()
 	test_roundbank_brain_loss_resends()
