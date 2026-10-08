@@ -1280,6 +1280,148 @@ func test_audit_banked_rounds() -> void:
 	d.tourney = old_tourney
 
 
+func test_round_freezes_at_match_over() -> void:
+	# The round is OVER at match over: sim frozen (steps, timer,
+	# timeout verdicts gated) before the result overlay and the next
+	# load on the finished match's brains.
+	var d = arena._director()
+	if d == null:
+		_check(true, "freeze skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_mfreeze"
+	DirAccess.make_dir_recursive_absolute("user://test_mfreeze")
+	d.tourney = {"id": "TMF", "status": "running",
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1", "a_name": "A",
+			"b_name": "B"},
+			{"a_id": "c1", "b_id": "d1", "a_name": "C",
+			"b_name": "D"}]]}
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	arena.is_round_active = true
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
+	arena._round_match_cache = []
+	arena._match_battle_cache = [{"battle_id": "B1", "draw": false,
+		"verdict": {"winner_slot": "alpha"}}]
+	arena._on_match_over("alpha", "1 - 0")
+	_check(not arena.is_round_active, "match over freezes the round")
+	_check(arena._round_match_cache.is_empty(),
+		"per-match path keeps no round cache")
+	_check(arena._match_banks_pending.has(arena._current_match_nonce()),
+		"match banked under its nonce")
+	arena._round_match_cache = []
+	arena._match_banks_pending = {}
+	arena._match_bank_retries = {}
+	arena._hide_arena_bracket()
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_mfreeze"):
+		for f in DirAccess.get_files_at("user://test_mfreeze"):
+			DirAccess.remove_absolute("user://test_mfreeze".path_join(f))
+		DirAccess.remove_absolute("user://test_mfreeze")
+
+
+func test_bracket_stays_until_combat() -> void:
+	# The bracket survives reply-hides moved to combat-enable:
+	# brains-loaded and match-ready no longer uncover; _reset_round
+	# drops the view exactly at _set_combat(true).
+	var d = arena._director()
+	if d == null:
+		_check(true, "bracket-stays skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_bstay"
+	DirAccess.make_dir_recursive_absolute("user://test_bstay")
+	arena._build_bracket_overlay()
+	d.tourney = {"id": "TBS", "status": "running", "lr_scale": 0.5,
+		"round_time": 40.0,
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1", "a_name": "A",
+			"b_name": "B"}]]}
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	# Programmatic result display: NOT manual (acquired by waits).
+	arena._bracket_manual = false
+	arena._show_arena_bracket("RESULT DISPLAY")
+	_check(arena.bracket_overlay.visible, "result display shows")
+	# Load-send view over the visible programmatic bracket acquires
+	# ownership (what _request_current_battle_load does).
+	_check(arena._show_wait_bracket("LOADING R1M1"), "load view acquires")
+	_check(arena._wait_bracket, "programmatic view acquired by the wait")
+	# Brains arrive: the bracket STAYS UP (no early uncover).
+	arena.tourney_awaiting_load = true
+	arena._seq_context = "load"
+	arena._seq_last_load = {"tournament_id": "TBS", "match": "R1M1"}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._round_bank_pending = false
+	arena._pending_roundbank_resend = false
+	arena._seq_last_round_report = {}
+	arena._seq_last_group_report = {}
+	arena._on_brains_loaded({}, {}, "TBS", "R1M1")
+	_check(arena._wait_bracket, "load acquires the programmatic view")
+	_check(arena.bracket_overlay.visible,
+		"bracket stays up after brains (no early uncover)")
+	# Reset path: same rule (no hide before the round).
+	arena.tourney_awaiting_load = false
+	arena._seq_context = "reset"
+	arena.is_round_active = false
+	# Fresh booted flies sit mid-air with landing_mode 0 (never done):
+	# force them landed so _reset_round's landing await returns at once
+	# and the round-start completes synchronously.
+	arena.fly_alpha.landing_mode = 2
+	arena.fly_alpha.global_position.y = arena.fly_alpha.LAND_POS_Y
+	arena.fly_beta.landing_mode = 2
+	arena.fly_beta.global_position.y = arena.fly_beta.LAND_POS_Y
+	arena._on_match_ready()
+	_check(arena.is_round_active, "round started")
+	# _reset_round hides at combat-enable: the await landed, the view
+	# drops NOW (async tail may still be pending - give it a beat).
+	arena._reset_round()
+	_check(not arena.bracket_overlay.visible,
+		"bracket drops at combat-enable")
+	_check(not arena._wait_bracket, "ownership released at combat-enable")
+	arena.is_round_active = false
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_bstay"):
+		for f in DirAccess.get_files_at("user://test_bstay"):
+			DirAccess.remove_absolute("user://test_bstay".path_join(f))
+		DirAccess.remove_absolute("user://test_bstay")
+
+
+func test_manual_bracket_survives() -> void:
+	# A user-opened bracket is never yanked: replies no-op, the view
+	# stays the user's until they close it.
+	arena._build_bracket_overlay()
+	arena.tournament_active = true
+	arena._on_bracket_toggle()
+	_check(arena.bracket_overlay.visible and arena._bracket_manual,
+		"manual open sets the flag")
+	arena.tourney_awaiting_load = true
+	arena._seq_context = "load"
+	arena._seq_last_load = {"tournament_id": "T1", "match": "R1M1"}
+	arena._server_reloads = 0
+	arena._recover_in_flight = false
+	arena._round_bank_pending = false
+	arena._pending_roundbank_resend = false
+	arena._seq_last_round_report = {}
+	arena._seq_last_group_report = {}
+	arena._on_brains_loaded({}, {}, "T1", "R1M1")
+	_check(not arena._wait_bracket, "manual view never acquired")
+	_check(arena.bracket_overlay.visible, "manual bracket survives reply")
+	arena._on_bracket_toggle()
+	_check(not arena.bracket_overlay.visible and not arena._bracket_manual,
+		"manual close clears the flag")
+	arena.is_round_active = false
+	arena.tourney_awaiting_load = false
+	arena._seq_context = ""
+
+
 func test_roundbank_brain_loss_resends() -> void:
 	# Server restart killed the round bank: the free-mode error arms a
 	# stored-report resend (supervisor reload, capped); the reload
@@ -1590,6 +1732,9 @@ func _process(_delta: float) -> bool:
 	test_match_send_and_complete()
 	test_flush_splits_per_match()
 	test_audit_banked_rounds()
+	test_round_freezes_at_match_over()
+	test_bracket_stays_until_combat()
+	test_manual_bracket_survives()
 	test_roundbank_brain_loss_resends()
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()

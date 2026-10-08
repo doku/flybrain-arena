@@ -333,6 +333,12 @@ var bracket_title: Label
 var wait_title: Label
 var wait_sub: Label
 var _wait_bracket := false
+# Manual-open tracking: only a user-opened bracket is ever exempt from
+# auto-hide. Programmatic views (result displays, errors, reviews) are
+# acquired by the next wait flow so the bracket always drops at
+# combat-enable - without this, a visible programmatic bracket would
+# read as manual and strand the view forever.
+var _bracket_manual := false
 # Next-generation waiting room (evo handoff only): preview bracket +
 # rotating fighter gallery + training strip, sharing the overlay above.
 var gallery_box: VBoxContainer
@@ -1295,7 +1301,10 @@ func _show_wait_bracket(title_text: String) -> bool:
 	var director := _director()
 	if director == null or arena_bracket == null or bracket_overlay == null:
 		return false
-	_wait_bracket = _wait_bracket or not bracket_overlay.visible
+	# Acquire: hidden, or visible-but-programmatic (a result display
+	# the flow raised, not the user's manual bracket).
+	_wait_bracket = _wait_bracket or not bracket_overlay.visible \
+		or not _bracket_manual
 	_show_arena_bracket(title_text)
 	return true
 
@@ -1376,9 +1385,11 @@ func _save_bracket_record(with_png: bool) -> void:
 func _on_bracket_toggle() -> void:
 	if bracket_overlay != null and bracket_overlay.visible:
 		_wait_bracket = false
+		_bracket_manual = false
 		_hide_arena_bracket()
 	elif tournament_active:
 		_wait_bracket = false
+		_bracket_manual = true
 		_show_arena_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name])
 
 func _flush_round_report() -> void:
@@ -1465,11 +1476,17 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	if str(skip.get("action", "")) != "next_match":
 		if is_instance_valid(status_label):
 			status_label.text = "BRACKET STALLED - QUIT TO MENU AND RESUME"
+		# Re-title the bracket (a stale LOADING header must not strand):
+		# programmatic acquire - the next wait flow owns the view.
+		_bracket_manual = false
+		_show_arena_bracket("BRACKET STALLED - QUIT TO MENU AND RESUME")
 		return
 	var p: Dictionary = director.get_load_params()
 	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
 		if is_instance_valid(status_label):
 			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % expand_match_label(tourney_match_label)
+		_bracket_manual = false
+		_show_arena_bracket("CANNOT LOAD %s" % expand_match_label(tourney_match_label))
 		return
 	print("[Arena] Requesting tournament load: %s (%s vs %s)" % [
 		str(p.get("match", "?")), str(p.get("a_name", "?")), str(p.get("b_name", "?"))])
@@ -1641,8 +1658,6 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 		print("[Arena] Reload landed with a bank owed - parking on the gate.")
 		_arena_log("reload landed with bank owed - parked on gate")
 		return
-	_hide_wait_bracket()
-	_hide_loading()
 	_update_tourney_status("READY")
 	_arena_log("round starting: %s" % tourney_match_label)
 	_reset_round()
@@ -1691,8 +1706,7 @@ func _on_match_ready() -> void:
 		_park_unplaceable_battle("", "stale-reset")
 		return
 	_clear_seq()
-	_hide_wait_bracket()
-	_hide_loading()
+	_update_tourney_status("READY")
 	_reset_round()
 
 func _on_server_error(error: String) -> void:
@@ -2540,6 +2554,12 @@ func _reset_round() -> void:
 
 	if is_instance_valid(status_label):
 		status_label.text = "AERIAL JOUST IN PROGRESS"
+	# The bracket drops exactly NOW (combat enabled): the landing
+	# ceremony and the whole load window played covered; the view
+	# opens straight into the live fight. Manual brackets survive
+	# (auto-opened waits only). Free battles no-op (nothing raised).
+	_hide_wait_bracket()
+	_hide_loading()
 
 func _physics_process(delta: float) -> void:
 	# Watchdog runs even between rounds: that limbo is exactly where a
@@ -5501,6 +5521,9 @@ func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
 			_set_wait_header(str(rhead.get("text", "")),
 				str(rhead.get("sub", "")) + "\nwaiting for server (match reset)...",
 				rhead.get("color", Color(0.85, 0.85, 0.9)))
+		else:
+			_show_loading(str(rhead.get("text", "")),
+				str(rhead.get("sub", "")) + "\nwaiting for server (match reset)...")
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 		return
@@ -5548,6 +5571,9 @@ func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
 			_set_wait_header(str(whead.get("text", "")),
 				str(whead.get("sub", "")) + "\nwaiting for server (match reset)...",
 				whead.get("color", Color(0.85, 0.85, 0.9)))
+		else:
+			_show_loading(str(whead.get("text", "")),
+				str(whead.get("sub", "")) + "\nwaiting for server (match reset)...")
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 
@@ -5560,6 +5586,13 @@ func _on_match_over(match_winner: String, score: String) -> void:
 	# carries the draw ELO, no match winner is credited.
 	_last_match_winner = match_winner
 	_last_match_score = score
+	# The round is OVER: freeze the sim now. Steps, the round timer and
+	# the timeout verdicts must never keep running through the result
+	# overlay and the next load on the finished match's brains (the
+	# old "game runs / flying before ready" hole - steps also flowed
+	# into the NEXT match's battle cache on a stray timeout).
+	is_round_active = false
+	_set_combat(false)
 	var director := _director()
 	if director == null:
 		return
@@ -5598,7 +5631,9 @@ func _on_match_over(match_winner: String, score: String) -> void:
 		# (no winner to name - the bracket shows the shared point).
 		_announce_clip("match_orange" if match_winner == "alpha" else "match_blue")
 	await _wait(6.0).timeout
-	_hide_arena_bracket()
+	# The bracket STAYS UP (result display): the round-ended branch
+	# re-titles it to the banking view, the mid-round path re-titles
+	# it to LOADING - no bare-arena moment between result and load.
 	# Round boundary: the current round's index moved, or the file
 	# completed (group_complete / tournament_end). Mid-round matches
 	# just flow to the next load; the bank waits for the boundary.
@@ -6134,7 +6169,8 @@ func _handle_advance_result(res: Dictionary) -> void:
 				if is_instance_valid(status_label):
 					status_label.text = "CONTINUOUS GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_base_name(champ_name)]
 			await _wait(3.0).timeout
-			_hide_arena_bracket()
+			# The bracket STAYS UP: the load re-titles it to LOADING
+			# (same frame) - no bare-arena moment before the fight.
 		_request_current_battle_load()
 
 func _evo_active() -> bool:
@@ -6664,7 +6700,9 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 	if not _event_active():
 		_sync_bracket_button()
 		return false
-	bracket_overlay.visible = false
+	# The bracket STAYS UP into the next flow: the caller's load
+	# re-titles the visible view to LOADING (same frame), so no moment
+	# shows the bare arena between countdown and load.
 	_sync_bracket_button()
 	return true
 
