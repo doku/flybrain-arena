@@ -1729,6 +1729,19 @@ def run_brain_server(host="127.0.0.1", port=9999):
     print("=" * 60)
     print("   BATTLE FLY ARENA - DUAL CONNECTOME NEURO-SERVER")
     print("=" * 60)
+    # Crash forensics: a hard native crash (segfault in compiled
+    # kernels, not a Python exception) leaves no traceback - and the
+    # log just stops mid-bank. faulthandler dumps the Python stack to
+    # a sidecar file on fatal signals (OOM-kill is uncatchable by
+    # anything; an absent sidecar + stopped log still says a lot).
+    try:
+        import faulthandler
+        global _fault_handler_file
+        _fault_handler_file = open(
+            os.path.join(TOURNAMENTS_DIR, "faulthandler_crash.log"), "ab")
+        faulthandler.enable(file=_fault_handler_file)
+    except Exception as e:
+        print(f"[Server] faulthandler unavailable: {e}", flush=True)
 
     try:
         _recover_pending_battle()
@@ -2195,6 +2208,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # Load two managed brains by weight array (base64-free: the
                 # arena sends a vault path readable by the server process).
                 import brain_package as vault_pkg
+                t_load_start = time.perf_counter()
+                load_dbg = "[%s %s]" % (str(msg.get("tournament_id", "?")),
+                                        str(msg.get("match", "?")))
                 tournament_mode = True
                 if "lr_scale" in msg:
                     try:
@@ -2237,7 +2253,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             enc_b, dec_b = ent_b["enc"], ent_b["dec"]
                             pinned_hit = True
                             print("[Server] Pinned group brains activated "
-                                  "(no disk load).", flush=True)
+                                  "(no disk load, %.1fs) %s." % (
+                                      time.perf_counter() - t_load_start,
+                                      load_dbg), flush=True)
                     except Exception as e:
                         print(f"[Server] pinned activation failed ({e}), "
                               f"falling through.", flush=True)
@@ -2252,7 +2270,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                                      enc=None, dec=None)
                     prepare_b.update(rec=None, path=None, brain=None,
                                      enc=None, dec=None)
-                    print("[Server] Preloaded brains activated (no disk load).",
+                    print("[Server] Preloaded brains activated (no disk load, %.1fs) %s." % (
+                        time.perf_counter() - t_load_start, load_dbg),
                           flush=True)
                 else:
                     try:
@@ -2297,7 +2316,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                       f"Alpha <- {rec_a.get('name')} ({rec_a.get('id')}, "
                       f"{len(brain_alpha.weights):,} syn) vs "
                       f"Beta <- {rec_b.get('name')} ({rec_b.get('id')}, "
-                      f"{len(brain_beta.weights):,} syn)", flush=True)
+                      f"{len(brain_beta.weights):,} syn) "
+                      f"(disk load {time.perf_counter() - t_load_start:.1f}s) "
+                      f"{load_dbg}", flush=True)
                 # Match echo: the arena validates WHICH load this answers -
                 # a stale/late reply must never start a round on the
                 # wrong brains.
@@ -2318,6 +2339,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # Pinned-group shortcut: the brains are already bound -
                 # point the prepare slot at them (instant, no disk).
                 import brain_package as vault_pkg
+                t_prep_start = time.perf_counter()
+                prep_dbg = "[%s %s]" % (str(msg.get("tournament_id", "?")),
+                                        str(msg.get("match", "?")))
                 pinned_prep = False
                 if _group_pinned["brains"]:
                     try:
@@ -2348,7 +2372,8 @@ def run_brain_server(host="127.0.0.1", port=9999):
                             pinned_prep = True
                             print("[Server] Prepared next match "
                                   f"{prepare_tag['match']} (pinned, no "
-                                  f"disk load).", flush=True)
+                                  f"disk load, {time.perf_counter() - t_prep_start:.1f}s) "
+                                  f"{prep_dbg}.", flush=True)
                             sock.sendto(json.dumps({
                                 "status": "prepared",
                                 "alpha": {"name": ent_pa["rec"].get("name"),
@@ -2387,7 +2412,9 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 prepare_tag["match"] = str(msg.get("match", ""))
                 print(f"[Server] Prepared next match {prepare_tag['match']}: "
                       f"Alpha <- {rec_a.get('name')} vs "
-                      f"Beta <- {rec_b.get('name')}", flush=True)
+                      f"Beta <- {rec_b.get('name')} "
+                      f"(disk load {time.perf_counter() - t_prep_start:.1f}s) "
+                      f"{prep_dbg}", flush=True)
                 sock.sendto(json.dumps({
                     "status": "prepared",
                     "alpha": {"name": rec_a.get("name"), "id": rec_a.get("id")},

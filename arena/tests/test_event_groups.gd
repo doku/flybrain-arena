@@ -1273,13 +1273,15 @@ func test_eliminate_green_roster() -> void:
 func test_arena_session_log() -> void:
 	# Persistent client-side session log: wedge/recovery events survive
 	# the game window (stdout dies with it). Appends with a timestamp;
-	# recovery + error paths write identifiable lines.
+	# recovery + error paths write identifiable lines. Writes go to an
+	# isolated override - suites must never touch the live file (one
+	# once wiped a live forensic record mid-incident).
 	var A = load("res://scripts/ArenaManager.gd").new()
-	if DirAccess.dir_exists_absolute("user://"):
-		for f in ["arena_log.txt"]:
-			DirAccess.remove_absolute("user://".path_join(f))
+	A.set("session_log_path", "user://test_arena_log.txt")
+	if FileAccess.file_exists("user://test_arena_log.txt"):
+		DirAccess.remove_absolute("user://test_arena_log.txt")
 	A.call("_arena_log", "unit test marker")
-	var f := FileAccess.open("user://arena_log.txt", FileAccess.READ)
+	var f := FileAccess.open("user://test_arena_log.txt", FileAccess.READ)
 	_check(f != null, "session log created")
 	if f != null:
 		var text := f.get_as_text()
@@ -1287,7 +1289,27 @@ func test_arena_session_log() -> void:
 		_check(text.contains("unit test marker"),
 			"session log carries the event")
 		_check(text.length() > 24, "session log stamps the line")
-		DirAccess.remove_absolute("user://arena_log.txt")
+		DirAccess.remove_absolute("user://test_arena_log.txt")
+	A.free()
+
+
+func test_arena_session_log_skips_live_file() -> void:
+	# Headless default path writes nothing (live forensics stay clean).
+	var before := -1
+	if FileAccess.file_exists("user://arena_log.txt"):
+		var rf := FileAccess.open("user://arena_log.txt", FileAccess.READ)
+		if rf != null:
+			before = rf.get_as_text().length()
+			rf.close()
+	var A = load("res://scripts/ArenaManager.gd").new()
+	A.call("_arena_log", "unit test marker must not land")
+	var after := -1
+	if FileAccess.file_exists("user://arena_log.txt"):
+		var rf2 := FileAccess.open("user://arena_log.txt", FileAccess.READ)
+		if rf2 != null:
+			after = rf2.get_as_text().length()
+			rf2.close()
+	_check(after == before, "headless default path writes nothing")
 	A.free()
 
 
@@ -1628,6 +1650,7 @@ func _initialize() -> void:
 	test_match_batch_flow()
 	test_motor_debug()
 	test_arena_session_log()
+	test_arena_session_log_skips_live_file()
 	test_eliminate_career_gate()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()

@@ -465,6 +465,9 @@ var _seq_deadline_msec: int = 0
 var _seq_retried: bool = false
 var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
+# Wall-clock stamp of the last load send: brains arrival / drops log
+# elapsed wait (slow server vs lost reply reads differently).
+var _load_sent_msec := 0
 # Owed-bank resend ladder: consecutive same-nonce resends without an
 # ack (status readout), consecutive dead-link resends (fail-loud trip),
 # and the last resend stamp (30 s tick cadence).
@@ -1534,11 +1537,13 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	# empty brain path and stall waiting for brains that never come.
 	var skip: Dictionary = director.skip_unplayable()
 	if str(skip.get("action", "")) == "tournament_end":
+		_arena_log("load skipped: tournament end")
 		_handle_advance_result(skip)
 		return
 	if str(skip.get("action", "")) != "next_match":
 		if is_instance_valid(status_label):
 			status_label.text = "BRACKET STALLED - QUIT TO MENU AND RESUME"
+		_arena_log("load skipped: bracket stalled (%s)" % str(skip.get("action", "")))
 		# Re-title the bracket (a stale LOADING header must not strand):
 		# programmatic acquire - the next wait flow owns the view.
 		_bracket_manual = false
@@ -1548,6 +1553,7 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
 		if is_instance_valid(status_label):
 			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % expand_match_label(tourney_match_label)
+		_arena_log("load refused: empty brain path for %s" % expand_match_label(tourney_match_label))
 		_bracket_manual = false
 		_show_arena_bracket("CANNOT LOAD %s" % expand_match_label(tourney_match_label))
 		return
@@ -1602,8 +1608,9 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 	# mode/tag at every wait entry).
 	brain_client.request_server_state()
 	_arm_seq("load")
-	_arena_log("load sent: %s (%s vs %s)" % [tourney_match_label,
-		tourney_a_name, tourney_b_name])
+	_load_sent_msec = Time.get_ticks_msec()
+	_arena_log("load sent: %s (%s vs %s) [%s]" % [tourney_match_label,
+		tourney_a_name, tourney_b_name, str(p.get("tournament_id", "?"))])
 
 func _preload_next_match() -> void:
 	# Sends the NEXT match's brains to the server's prepare slot while
@@ -1680,17 +1687,19 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 			reply_tid, reply_match,
 			str(_seq_last_load.get("tournament_id", "")),
 			str(_seq_last_load.get("match", ""))])
-		_arena_log("dropped stale brains_loaded: got %s/%s want %s/%s" % [
+		_arena_log("dropped stale brains_loaded: got %s/%s want %s/%s (waited %.1fs)" % [
 			reply_tid, reply_match,
 			str(_seq_last_load.get("tournament_id", "")),
-			str(_seq_last_load.get("match", ""))])
+			str(_seq_last_load.get("match", "")),
+			float(Time.get_ticks_msec() - _load_sent_msec) / 1000.0])
 		return
 	_clear_seq()
 	tourney_awaiting_load = false
-	_arena_log("brains loaded: %s vs %s (%s)" % [
+	_arena_log("brains loaded: %s vs %s (%s) in %.1fs" % [
 		str((_alpha_info as Dictionary).get("name", "?")),
 		str((_beta_info as Dictionary).get("name", "?")),
-		tourney_match_label])
+		tourney_match_label,
+		float(Time.get_ticks_msec() - _load_sent_msec) / 1000.0])
 	# A clean load resets the self-heal cap (each match gets fresh
 	# recovery budget against server restarts) and consumes the
 	# in-flight marker (recovery complete; later errors act again).
@@ -2394,6 +2403,7 @@ func _clear_seq() -> void:
 
 func _fail_loud_server_silent() -> void:
 	_hide_wait_bracket()
+	_arena_log("STALLED - NO SERVER REPLY, parking loud (%s)" % _wait_state_line())
 	_show_loading("STALLED - NO SERVER REPLY",
 		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
 	if is_instance_valid(status_label):
@@ -2423,8 +2433,26 @@ func _loading_supervise_tick() -> void:
 		return
 	_load_stall_fired = true
 	print("[Arena] Loading stalled with no watch - recovering in place.")
-	_arena_log("loading stalled with no watch - recovering in place")
+	_arena_log("loading stalled with no watch - recovering in place (%s)" % _wait_state_line())
 	_recover_server_state("loading stalled with no watch")
+
+
+func _wait_state_line() -> String:
+	# One-line stuck-state dump for forensics: every latch that gates
+	# progress plus the director position and the last load. Called on
+	# supervisor fire and fail-loud (the moments silence is suspicious).
+	var director := _director()
+	var pos := "?/?"
+	var tid := "?"
+	if director != null:
+		pos = "R%dM%d" % [int(director.tourney.get("current_round", -1)) + 1,
+			int(director.tourney.get("current_match", -1)) + 1]
+		tid = str(director.tourney.get("id", "?"))
+	return "ctx=%s load=%s roundbank=%s groupbank=%s matchbanks=%d recoveries=%d/%d dir=%s[%s] lastload=%s" % [
+		_seq_context, str(tourney_awaiting_load),
+		str(_round_bank_pending), str(_group_bank_pending),
+		_match_banks_pending.size(), _server_reloads, MAX_SERVER_RELOADS,
+		tid, pos, str(_seq_last_load.get("match", "-"))]
 
 
 func _bank_resend_tick() -> void:
@@ -6932,11 +6960,20 @@ func _event_pool_wait(need: int = EVENT_POOL_TARGET, include_current: bool = fal
 	return "pool short - refusing a short-bench event"
 
 
+var session_log_path := "user://arena_log.txt"
+
+
 func _arena_log(msg: String) -> void:
 	# Persistent client-side session log (user://arena_log.txt): the
 	# wedge/recovery timeline stdout never captures (the game window
 	# owns it). Rare events only - open/append/close per line.
-	var path := "user://arena_log.txt"
+	# Headless runs (test suites, probes) never touch the live file:
+	# suite noise once wiped a live forensic record mid-incident.
+	# Tests needing the writer set session_log_path to an isolated file.
+	var path := session_log_path
+	if path == "user://arena_log.txt" \
+			and DisplayServer.get_name() == "headless":
+		return
 	var mode := FileAccess.READ_WRITE if FileAccess.file_exists(path) else FileAccess.WRITE
 	var f := FileAccess.open(path, mode)
 	if f == null:
