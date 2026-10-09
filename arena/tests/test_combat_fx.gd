@@ -995,6 +995,60 @@ func test_group_banked_applies() -> void:
 	arena._seq_context = ""
 
 
+func test_intermission_survives_bank_ack() -> void:
+	# Group-to-group countdown: the match-over review's stale wait
+	# ownership must not let a bank ack landing mid-countdown yank
+	# the bracket view (the viewer got the bare arena under the
+	# "Next bracket in N" row). The intermission takes ownership, so
+	# the ack's hide is a no-op. Same stale flag fed the round-bank
+	# tail (_close_round_bank shares the hide call).
+	var d = arena._director()
+	if d == null:
+		_check(true, "intermission-ack skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_interack"
+	DirAccess.make_dir_recursive_absolute("user://test_interack")
+	d.tourney = {"id": "TIA", "status": "running",
+		"current_round": 0, "current_match": 0,
+		"rounds": [[{"a_id": "a1", "b_id": "b1", "a_name": "A",
+			"b_name": "B"},
+			{"a_id": "c1", "b_id": "d1", "a_name": "C",
+			"b_name": "D"}]]}
+	arena.tournament_active = true
+	arena.tourney_match_label = "R1M1"
+	var rc: bool = arena.is_round_active
+	var octx: String = arena._seq_context
+	var ogate: bool = arena._load_gated_on_bank
+	# Stale ownership from the match-over review, as the group-done
+	# record + intermission used to leave it.
+	arena._wait_bracket = true
+	arena._load_gated_on_bank = false
+	arena._event_intermission("EVENT E - GROUP B", "sub", 0.0, false)
+	_check(arena.bracket_overlay.visible, "intermission raises the bracket")
+	_check(not arena._wait_bracket, "intermission takes wait ownership")
+	# The group seal acks mid-countdown (no stashed final, no gate).
+	arena._tourney_awaiting_groupbank = true
+	arena._group_bank_pending = true
+	arena._seq_group_id = "GRP-1"
+	arena._seq_forgive_groupbank = {"tournament_id": "TIA",
+		"match": "R1M1", "battle": "GRP-1"}
+	arena._on_group_banked("GRP-1", "TIA")
+	_check(arena.bracket_overlay.visible, "mid-countdown ack keeps the bracket")
+	arena._hide_arena_bracket()
+	arena._seq_group_id = ""
+	arena._seq_context = octx
+	arena._load_gated_on_bank = ogate
+	arena.is_round_active = rc
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_interack"):
+		for f in DirAccess.get_files_at("user://test_interack"):
+			DirAccess.remove_absolute("user://test_interack".path_join(f))
+		DirAccess.remove_absolute("user://test_interack")
+
+
 func test_group_forgive_map() -> void:
 	# Same-nonce post-fail-loud ack forgives; anything else does not.
 	# Director file tag drives the tournament match (bare scene has
@@ -2241,6 +2295,7 @@ func _process(_delta: float) -> bool:
 	test_intermission_header_band()
 	test_group_report_send()
 	test_group_banked_applies()
+	test_intermission_survives_bank_ack()
 	test_group_forgive_map()
 	test_round_report_group_flag()
 	test_auto_recover_supervisor()

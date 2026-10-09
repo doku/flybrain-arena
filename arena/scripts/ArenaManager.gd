@@ -6948,6 +6948,14 @@ func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMI
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
 	_sync_bracket_button()
+	# Ownership transfer: the countdown owns this view now. The
+	# match-over review acquired the wait flag, and neither it nor
+	# the group-done record released it - so a bank ack landing
+	# mid-countdown (_on_group_banked / _close_round_bank) would
+	# _hide_wait_bracket the whole overlay and strand the viewer on
+	# the bare arena for the rest of the wait. Clearing here makes
+	# those hides no-op; the post-countdown load re-acquires.
+	_wait_bracket = false
 	# The intermission owns the status line for its whole run: the
 	# overlay counts down, but the bottom bar kept whatever the last
 	# battle left (a draw's REPLAYING survived the entire group-D to
