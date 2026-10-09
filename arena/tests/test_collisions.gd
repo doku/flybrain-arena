@@ -293,6 +293,54 @@ func test_tree_never_tears() -> void:
 	fly.queue_free()
 
 
+func _scent_total(f, dist: float, behind: bool) -> float:
+	# Nose-on (rival ahead) or facing-away (rival behind) total odor
+	# at a fixed range. The reader never moves (its spike globals
+	# stay exact); only the rival is placed. Identity rotations, so
+	# nothing depends on lazy global-basis propagation.
+	var v = _fly("SZ")
+	f.rival = v
+	v.global_position = Vector3(0, 0, dist if behind else -dist)
+	var s: Dictionary = f.get_sensory_data(1.0)
+	var total := float(s.get("pheromone_conc_left", 0.0)) \
+		+ float(s.get("pheromone_conc_right", 0.0))
+	v.queue_free()
+	return total
+
+
+func test_scent_falls_with_distance() -> void:
+	# Log falloff: strictly decreasing, never zero inside the arena.
+	var f = _fly("S1")
+	var near := _scent_total(f, 5.0, false)
+	var mid := _scent_total(f, 28.0, false)
+	var far := _scent_total(f, 55.0, false)
+	_check(near > mid and mid > far, "scent falls with distance")
+	_check(far > 0.0, "far scent never dies")
+	f.queue_free()
+
+
+func test_scent_close_definition() -> void:
+	# Close meters discriminate several times sharper than far
+	# meters (log slope ~1/d vs the old constant slope).
+	var f = _fly("S2")
+	var near := (_scent_total(f, 2.0, false) - _scent_total(f, 10.0, false)) / 8.0
+	var far := (_scent_total(f, 30.0, false) - _scent_total(f, 50.0, false)) / 20.0
+	_check(near > 4.0 * far, "close range reads sharper than far")
+	f.queue_free()
+
+
+func test_scent_edge_regimes() -> void:
+	# Nose-on at the 55 m edge stays found; facing away reads lost.
+	var f = _fly("S3")
+	_check(_scent_total(f, 55.0, false) > 0.12, "edge nose-on stays found")
+	f.queue_free()
+	var g = _fly("S4")
+	_check(_scent_total(g, 55.0, true) < 0.12, "edge facing-away goes quiet")
+	var s: Dictionary = g.get_sensory_data(1.0)
+	_check(float(s.get("scent_lost", 0.0)) > 0.0, "quiet + blind ticks lost")
+	g.queue_free()
+
+
 func _initialize() -> void:
 	# Test bodies instantiate in _process (frames exist: the tree is
 	# only active after the first frame - @onready area refs and
@@ -315,6 +363,9 @@ func _process(_delta: float) -> bool:
 		test_strike_suppresses_clash()
 		test_thorax_strike_suppresses_clash()
 		test_open_clash_still_wounds_both()
+		test_scent_falls_with_distance()
+		test_scent_close_definition()
+		test_scent_edge_regimes()
 		if failures == 0:
 			print("ALL COLLISION TESTS PASSED")
 		else:

@@ -222,6 +222,15 @@ var prev_rival_dist: float = 50.0
 # floor-relative: total at/below LOST_THRESH with nothing visible.
 const LOST_THRESH: float = 0.12
 const LOST_CAST_RATE: float = 0.8
+# Scent falloff (log with a floor): steep near field for distance
+# definition, fat tail that never hits zero so a separated fly always
+# keeps a trail. Same log-curve family as drive_speed. Floor 0.06
+# keeps nose-on at the 55 m edge found (total ~0.3 > LOST_THRESH)
+# while facing-away reads lost. Mirrored cell-for-cell in
+# brain_engine/train_homing.py - change both together.
+const SCENT_FLOOR: float = 0.06
+const SCENT_LOG_K: float = 0.5
+const SCENT_RANGE_M: float = 80.0
 var scent_prev_smooth: float = -1.0
 var scent_lost_time: float = 0.0
 var scent_cast_phase: float = 0.0
@@ -384,16 +393,17 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	var right_dir = global_transform.basis.x
 	var to_rival_dir = to_rival.normalized()
 
-	# Scent never dies with distance: linear falloff over 150m (effectively
-	# infinite inside the play area) with a constant gradient slope, so a
-	# separated fly always has a trail to follow and keeps pursuit.
-	# Directional smelling: strength follows where the nose points
-	# (nose-on-target = full scent, facing away = faint trace), so the
-	# odor gradient leads the fly toward the rival instead of surrounding
-	# it equally from all sides.
+	# Scent falls off log with distance: close meters discriminate
+	# sharply (log slope ~1/d) while the fat tail plus the floor
+	# never reaches zero, so a separated fly always has a trail to
+	# follow and keeps pursuit. Directional smelling: strength follows
+	# where the nose points (nose-on-target = full scent, facing away
+	# = faint trace), so the odor gradient leads the fly toward the
+	# rival instead of surrounding it equally from all sides.
 	var nose_dot = forward.dot(to_rival_dir)
 	var face = 0.15 + 0.85 * clampf((nose_dot + 0.2) / 1.2, 0.0, 1.0)
-	var c_base = clampf((1.0 - dist / 150.0) * face, 0.0, 1.0)
+	var c_base = clampf((SCENT_FLOOR + (1.0 - SCENT_FLOOR) \
+		* (1.0 - log(1.0 + SCENT_LOG_K * dist) / log(1.0 + SCENT_LOG_K * SCENT_RANGE_M))) * face, 0.0, 1.0)
 
 	# Directional antenna orientations (+/- 45 degrees forward-lateral)
 	var ant_dir_left = (forward - right_dir * 0.7).normalized()

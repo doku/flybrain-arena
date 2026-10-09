@@ -3864,6 +3864,41 @@ class TestFlightSchool(unittest.TestCase):
         self.assertGreater(senses["pheromone_conc_left"]
                            + senses["pheromone_conc_right"], 0.0)
 
+    def test_scent_log_falloff_regimes(self):
+        # Log falloff with a floor (mirrors FlyPhysics SCENT_FLOOR 0.06,
+        # SCENT_LOG_K 0.5, SCENT_RANGE_M 80): steep near field, fat tail.
+        # Nose-on totals must match the documented curve within epsilon;
+        # facing away at the edge reads lost.
+        from train_homing import KinematicFly, compute_agent_senses
+        import math
+        def total_at(dist, away=False):
+            fly = KinematicFly(x=0.0, z=0.0,
+                               heading_rad=math.pi if away else 0.0)
+            camp = KinematicFly(x=dist, z=0.0, heading_rad=0.0)
+            senses, _ = compute_agent_senses(fly, camp)
+            return (senses["pheromone_conc_left"]
+                    + senses["pheromone_conc_right"])
+        ds = [2.0, 5.0, 10.0, 28.0, 55.0]
+        totals = [total_at(d) for d in ds]
+        for i in range(len(totals) - 1):
+            self.assertGreater(totals[i], totals[i + 1],
+                               "scent falls with distance")
+        # Pin the curve itself: c_base nose-on, antenna factor for a
+        # dead-ahead rival (0.7 lateral = 35 deg alignment each side).
+        align = 1.0 / math.sqrt(1.0 + 0.7 ** 2)
+        factor = 0.45 + 0.55 * ((align + 0.3) / 1.3)
+        for d, t in zip(ds, totals):
+            c_base = (0.06 + 0.94
+                      * (1.0 - math.log(1.0 + 0.5 * d) / math.log(41.0)))
+            self.assertAlmostEqual(t, 2.0 * c_base * factor, places=3,
+                                   msg="curve parity at %gm" % d)
+        self.assertGreater(totals[-1], 0.12, "edge nose-on stays found")
+        self.assertLess(total_at(55.0, away=True), 0.12,
+                        "edge facing-away goes quiet")
+        near = (totals[0] - totals[2]) / 8.0
+        far = (totals[3] - totals[4]) / 27.0
+        self.assertGreater(near, 4.0 * far, "close reads sharper")
+
 
 class TestT4Recurrence(unittest.TestCase):
     """T4/T5 cannot self-sustain: saturated drive evokes exactly the

@@ -384,15 +384,17 @@ def compute_agent_senses(agent, target, prev_dist=None):
     forward_h = np.array([np.cos(agent.heading), np.sin(agent.heading)], dtype=np.float32)
     right_h = np.array([np.sin(agent.heading), -np.cos(agent.heading)], dtype=np.float32)
 
-    # Scent never dies with distance: linear falloff over 150m (effectively
-    # infinite inside the play area) with a constant gradient slope, so a
-    # separated fly always has a trail to follow and keeps pursuit.
+    # Scent falls off log with distance (mirrors the arena): steep
+    # near field for distance definition, fat tail plus a floor that
+    # never reaches zero so a separated fly always keeps a trail.
     # Directional smelling (mirrors the arena): strength follows where
     # the nose points - nose-on-target is full scent, facing away a faint
     # trace - so the odor gradient leads toward the rival.
+    # Keep the consts identical to FlyPhysics (SCENT_FLOOR/_LOG_K/_RANGE_M).
     nose_dot = float(np.dot(forward_h, to_h_dir))
     face = 0.15 + 0.85 * float(np.clip((nose_dot + 0.2) / 1.2, 0.0, 1.0))
-    c_base = np.clip((1.0 - dist / 150.0) * face, 0.0, 1.0)
+    c_base = np.clip((0.06 + (1.0 - 0.06)
+        * (1.0 - np.log(1.0 + 0.5 * dist) / np.log(1.0 + 0.5 * 80.0))) * face, 0.0, 1.0)
 
     # Directional antenna vectors (+/- 45 deg lateral)
     ant_left = (forward_h - right_h * 0.7) / np.linalg.norm(forward_h - right_h * 0.7)
