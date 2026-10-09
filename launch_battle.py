@@ -111,7 +111,17 @@ def main():
             env=env
         )
     finally:
-        print("\n[*] Shutting down Connectome Server...")
+        # Exit-code honesty: a nonzero Godot return means the game
+        # crashed (or was killed) rather than quit cleanly - say so,
+        # so the next mid-event vanishing window is diagnosable here
+        # instead of reading as a server shutdown.
+        code = godot_proc.returncode if "godot_proc" in dir() else "?"
+        if code == 0:
+            print("\n[*] Godot exited clean (code 0).")
+        else:
+            print(f"\n[*] Godot is gone with exit code {code} - "
+                  "CRASH/KILL suspected, not a clean quit.")
+        print("[*] Shutting down Connectome Server...")
         server_proc.terminate()
         try:
             server_proc.wait(timeout=3)

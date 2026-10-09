@@ -1613,6 +1613,24 @@ class TestUDPServerIntegration(unittest.TestCase):
         self.assertIn("beta", res)
         self.assertIn("thrust", res["alpha"])
         self.assertIn("yaw_torque", res["alpha"])
+        # Step sequencing: untagged sends echo 0 (untracked); a tagged
+        # send echoes its seq so the arena can drop widowed replies.
+        self.assertEqual(res.get("stats", {}).get("step_echo", None), 0,
+                         "untagged step echoes 0")
+        step_packet["step_seq"] = 41
+        res2 = None
+        for _attempt in range(6):
+            try:
+                sock.sendto(json.dumps(step_packet).encode("utf-8"), server_addr)
+                data, _ = sock.recvfrom(65535)
+                res2 = json.loads(data.decode("utf-8"))
+                break
+            except (socket.timeout, ConnectionResetError):
+                time.sleep(0.5)
+        self.assertIsNotNone(res2, "Server failed to echo the tagged step")
+        self.assertEqual(res2.get("status"), "ok")
+        self.assertEqual(res2.get("stats", {}).get("step_echo"), 41,
+                         "tagged step echoes its seq")
 
         # 2. Test round_over on a FRESH socket: the step socket may still hold
         # stale step responses in its buffer, so reuse would mis-order packets.

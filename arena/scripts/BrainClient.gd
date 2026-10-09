@@ -86,12 +86,13 @@ func _process(_delta: float) -> void:
 
 var detail_level: int = 1
 
-func send_sensory_step(sens_alpha: Dictionary, sens_beta: Dictionary) -> void:
+func send_sensory_step(sens_alpha: Dictionary, sens_beta: Dictionary, step_seq: int = 0) -> void:
 	if not is_connected_server:
 		return
 
 	var msg = {
 		"type": "step",
+		"step_seq": step_seq,
 		"alpha": sens_alpha,
 		"beta": sens_beta,
 		"detail": detail_level

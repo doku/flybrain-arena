@@ -87,18 +87,41 @@ var _ctrl_srv_seq: int = 0
 
 # Control-link pacing (stop-and-wait): at most one step reply may be
 # outstanding. TUNING:
-# - STEP_TIMEOUT_MSEC (below): how long to wait for a reply before
-#   assuming it lost and sending fresh state. Raise it if the HUD's
-#   srv-n gap grows on huge brains (server step cost is printed in
-#   server_log.txt every 50 steps: "step ~Nms"); lower it (min ~500)
-#   if flies go limp too long on a genuinely dead link. Rule of
-#   thumb: 7-10x the worst observed single-step ms.
+# - STEP_TIMEOUT_MSEC (below) is the FLOOR: _step_timeout_msec()
+#   adapts the real deadline to ~3x the measured reply cadence, so a
+#   slow-but-alive server stops reading as dead (the chronic
+#   false-timeout spiral on throttled hardware). Rule of thumb for
+#   the floor: leave at 2000; the adapter handles huge brains.
+# - STEP_TIMEOUT_FIRST_MSEC: a round's first step waits this long
+#   (cold caches, post-load bursts).
+# - STEP_TIMEOUT_MAX_MSEC: the adapter never exceeds this, so a
+#   genuinely dead link still surfaces watchdogs on a bounded cadence.
+# - STEP_RECONNECT_EVERY: watchdog fires that rebind the UDP socket
+#   (first at 5, alongside CONTROL LINK SLOW, then at most every 10 s).
+#   Every fire used to reconnect, widowing the in-flight reply and
+#   feeding the server's 10054 storm.
 # - BRAIN_TICK_DT (below) stays the *request ceiling* (20 Hz):
 #   pacing can only slow sends below it, never above.
 const STEP_TIMEOUT_MSEC := 2000
+const STEP_TIMEOUT_EMA_MULT := 3.0
+const STEP_TIMEOUT_MAX_MSEC := 15000
+const STEP_TIMEOUT_FIRST_MSEC := 6000
+const STEP_RECONNECT_EVERY := 5
+const STEP_RECONNECT_MIN_GAP_MSEC := 10000
 var _step_in_flight := false
 var _step_deadline_msec := 0
 var _step_timeouts := 0 # consecutive expiries; >=5 shows link-slow text
+# Step sequencing (stop-and-wait loss signal): cumulative sends,
+# the outstanding send, the round's send base, whether this round
+# heard back yet, and the last watchdog reconnect. The server echoes
+# the seq; a reply to an older send drops as stale instead of
+# replanting ancient commands (and the consecutive counter only
+# resets on a reply to the outstanding send).
+var _step_seq := 0
+var _step_outstanding := 0
+var _step_round_base := 0
+var _step_round_reply := false
+var _step_last_reconnect_msec := 0
 
 # Brain-view L0 pool-rate bars (key, short label, bar-full count).
 # Updated on every motor reply (~5 Hz) with EMA smoothing; always-on
@@ -2659,6 +2682,14 @@ func _reset_round() -> void:
 	# cumulative - see its declaration).
 	_step_in_flight = false
 	_step_timeouts = 0
+	# Sequencing carries across rounds (cumulative like _ctrl_n); the
+	# round base marks this round's first send for the grace deadline,
+	# and the heard-back flag re-arms it. Cadence (bv_reply_ema)
+	# deliberately survives: the next round's brains cost about the
+	# same as this round's.
+	_step_round_base = _step_seq
+	_step_outstanding = 0
+	_step_round_reply = false
 	_last_strike_frame = -1
 	_last_strike_attacker = ""
 	bv_stream_alpha.clear()
@@ -2744,9 +2775,11 @@ func _physics_process(delta: float) -> void:
 	brain_tick_timer += delta
 	if _should_send_step():
 		brain_tick_timer = 0.0
-		brain_client.send_sensory_step(sens_a, sens_b)
+		_step_seq += 1
+		_step_outstanding = _step_seq
+		brain_client.send_sensory_step(sens_a, sens_b, _step_seq)
 		_step_in_flight = true
-		_step_deadline_msec = Time.get_ticks_msec() + STEP_TIMEOUT_MSEC
+		_step_deadline_msec = Time.get_ticks_msec() + _step_timeout_msec()
 		# Dopamine-replay inputs: the sens refs land at send time (the
 		# dicts are fresh per step, so this is the last-sent context).
 		_last_sens_a = sens_a
@@ -2791,6 +2824,33 @@ func _should_send_step() -> bool:
 		and brain_client.is_connected_server
 
 
+func _step_timeout_msec() -> int:
+	# Adaptive step deadline: the floor plus ~3x the measured reply
+	# cadence, capped. A server that answers every 2.5 s gets a ~7.5 s
+	# deadline instead of a chronic false timeout every 2 s; a fast
+	# link keeps the 2 s floor, and a dead one still trips watchdogs
+	# (at most every 15 s). A round's first send always gets the flat
+	# grace (cold caches, post-load bursts). Pure (unit-tested).
+	if not _step_round_reply and _step_outstanding <= _step_round_base + 1:
+		return STEP_TIMEOUT_FIRST_MSEC
+	var ema_ms := int(STEP_TIMEOUT_EMA_MULT * bv_reply_ema * 1000.0)
+	return clampi(maxi(STEP_TIMEOUT_MSEC, ema_ms), STEP_TIMEOUT_MSEC,
+		STEP_TIMEOUT_MAX_MSEC)
+
+
+func _step_should_reconnect(now_msec: int) -> bool:
+	# Reconnect only on escalation: every fire used to rebind the UDP
+	# socket, widowing the in-flight reply (and feeding the server's
+	# 10054 storm) on what was merely a slow answer. First reconnect
+	# rides the CONTROL LINK SLOW escalation; after that at most one
+	# per 10 s while replies stay away. Pure (unit-tested).
+	if _step_timeouts < STEP_RECONNECT_EVERY:
+		return false
+	if _step_timeouts == STEP_RECONNECT_EVERY:
+		return true
+	return now_msec - _step_last_reconnect_msec > STEP_RECONNECT_MIN_GAP_MSEC
+
+
 func _check_step_watchdog() -> void:
 	# Lost-reply recovery for paced steps. Deliberately SILENT (no
 	# wait-bracket/modal): a missed step is routine and the next tick
@@ -2798,7 +2858,10 @@ func _check_step_watchdog() -> void:
 	# fresh sensory state is strictly better than stale. Escalation
 	# policy lives here too: only 5+ consecutive timeouts (~10 s with
 	# zero control) earns status text, never a modal. To make step
-	# loss fail LOUD instead, hook _step_timeouts here.
+	# loss fail LOUD instead, hook _step_timeouts here. Deadline is
+	# adaptive (_step_timeout_msec): ~10 s on a fast link, longer on
+	# a throttled one - the COUNT is the escalation signal, not the
+	# wall time.
 	if not _step_in_flight:
 		return
 	if not is_round_active:
@@ -2808,11 +2871,15 @@ func _check_step_watchdog() -> void:
 		return
 	_step_in_flight = false
 	_step_timeouts += 1
-	# Heal a poisoned UDP socket before the next send: the lost reply
-	# may be chasing a dead port already (same pattern as the seq
-	# retries).
-	brain_client.reconnect()
-	print("[Arena] Step watchdog: no control reply within %d ms (consecutive=%d)." % [STEP_TIMEOUT_MSEC, _step_timeouts])
+	# Gated reconnect: a fresh socket heals a truly poisoned one, but
+	# rebinding on every fire widows the reply already in flight, so
+	# routine expiry just clears the flag for a fresh send (fresh
+	# sensory state is strictly better than stale).
+	var _now := Time.get_ticks_msec()
+	if _step_should_reconnect(_now):
+		_step_last_reconnect_msec = _now
+		brain_client.reconnect()
+	print("[Arena] Step watchdog: no control reply within %d ms (consecutive=%d)." % [_step_timeout_msec(), _step_timeouts])
 	_arena_log("step watchdog fired: consecutive=%d" % _step_timeouts)
 	if _step_timeouts >= 5 and is_instance_valid(status_label):
 		status_label.text = "CONTROL LINK SLOW - reflex holding..."
@@ -5139,6 +5206,16 @@ func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int,
 	if not is_round_active:
 		_step_in_flight = false
 		return
+	# Sequenced replies: the server echoes the send's seq. A reply to
+	# an older send is a widowed straggler (its successor already owns
+	# the flag) - applying it would replant ancient commands and feed
+	# the cadence tracker a lie. It drops without touching the flag,
+	# the counters, or the streak. Echo 0/absent means untracked (old
+	# server or untagged send): always applied, as before.
+	var _echo := int(stats.get("step_echo", 0))
+	if _echo > 0 and _echo < _step_outstanding:
+		return
+	_step_round_reply = true
 	# A reply landed: the link is free for the next step. Cleared
 	# first (before any application below) so a slow frame can never
 	# leave the flag set past the reply that frees it.

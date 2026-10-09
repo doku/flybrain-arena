@@ -728,6 +728,97 @@ func test_dead_round_reply_drops() -> void:
 	arena._step_in_flight = false
 
 
+func test_step_timeout_adapts() -> void:
+	# Adaptive deadline: floor on a fast link, ~3x EMA on a slow
+	# one (capped), flat grace for a round's first send. The fixed
+	# 2 s deadline used to false-timeout every step on throttled
+	# hardware (2.5 s service), wedging the link forever.
+	var ob: int = arena._step_round_base
+	var oo: int = arena._step_outstanding
+	var os: int = arena._step_seq
+	var orr: bool = arena._step_round_reply
+	var oema: float = arena.bv_reply_ema
+	arena._step_round_reply = true
+	arena.bv_reply_ema = 0.2
+	_check(arena._step_timeout_msec() == 2000, "fast link keeps the floor")
+	arena.bv_reply_ema = 1.0
+	_check(arena._step_timeout_msec() == 3000, "slow link scales by EMA")
+	arena.bv_reply_ema = 10.0
+	_check(arena._step_timeout_msec() == 15000, "runaway EMA caps out")
+	arena._step_round_base = 5
+	arena._step_seq = 5
+	arena._step_outstanding = 6
+	arena._step_round_reply = false
+	_check(arena._step_timeout_msec() == 6000, "round's first send gets grace")
+	arena._step_outstanding = 7
+	arena.bv_reply_ema = 1.0
+	_check(arena._step_timeout_msec() == 3000, "grace spends after first send")
+	arena._step_round_base = ob
+	arena._step_outstanding = oo
+	arena._step_seq = os
+	arena._step_round_reply = orr
+	arena.bv_reply_ema = oema
+
+
+func test_step_reconnect_gated() -> void:
+	# Reconnect only on escalation: routine expiry just clears the
+	# flag - rebinding every fire widowed the in-flight reply and fed
+	# the server's 10054 storm. Pure gating, wall-clock injected.
+	var ot: int = arena._step_timeouts
+	var olr: int = arena._step_last_reconnect_msec
+	arena._step_last_reconnect_msec = 0
+	arena._step_timeouts = 3
+	_check(not arena._step_should_reconnect(100000), "early fires never rebind")
+	arena._step_timeouts = 5
+	_check(arena._step_should_reconnect(100000), "escalation rebinds once")
+	arena._step_timeouts = 7
+	arena._step_last_reconnect_msec = 100000
+	_check(not arena._step_should_reconnect(100000), "no rebind storm after")
+	arena._step_last_reconnect_msec = 100000 - 11000
+	_check(arena._step_should_reconnect(100000), "stuck link retries each 10 s")
+	arena._step_timeouts = ot
+	arena._step_last_reconnect_msec = olr
+
+
+func test_stale_echo_drops() -> void:
+	# Sequenced replies: a reply to an older send drops without
+	# touching the flag (the newer send still owns it), the commands,
+	# or the streak; the current echo applies normally.
+	arena.is_round_active = true
+	arena._step_outstanding = 10
+	arena._step_in_flight = true
+	arena._step_timeouts = 2
+	arena._step_round_reply = false
+	arena.fly_alpha.current_thrust = 0.77
+	arena.fly_alpha.cmd_age = 5.0
+	var n_before: int = arena._ctrl_n
+	arena._on_motor_controls({"thrust": 1.0, "yaw_torque": 1.0},
+		{"thrust": 1.0, "yaw_torque": -1.0},
+		1, {"step_seq": 41, "step_echo": 7,
+			"alpha": {"spikes": 1}, "beta": {"spikes": 1}})
+	_check(arena._step_in_flight, "widowed reply frees no flag")
+	_check(absf(arena.fly_alpha.current_thrust - 0.77) < 0.001,
+		"widowed reply replants no thrust")
+	_check(arena._ctrl_n == n_before, "widowed reply counts no pair")
+	_check(arena._step_timeouts == 2, "widowed reply breaks no streak")
+	_check(not arena._step_round_reply, "widowed reply hears nothing")
+	arena._on_motor_controls({"thrust": 0.9, "yaw_torque": 0.0,
+		"pitch_torque": 0.0, "roll_torque": 0.0},
+		{"thrust": 0.9, "yaw_torque": 0.0,
+			"pitch_torque": 0.0, "roll_torque": 0.0},
+		1, {"step_seq": 42, "step_echo": 10,
+			"alpha": {"spikes": 1}, "beta": {"spikes": 1}})
+	_check(not arena._step_in_flight, "current echo frees the flag")
+	_check(absf(arena.fly_alpha.current_thrust - 0.9) < 0.001,
+		"current echo applies")
+	_check(arena._ctrl_n == n_before + 1, "current echo counts the pair")
+	_check(arena._step_round_reply, "current echo hears back")
+	arena.fly_alpha.current_thrust = 0.2
+	arena.fly_alpha.cmd_age = 0.0
+	arena._step_in_flight = false
+	arena._step_outstanding = 0
+
+
 func test_step_watchdog_recovers_silently() -> void:
 	# Lost reply: the flag clears so the next tick sends fresh state -
 	# no modal, no wait-bracket, only a log line. Five in a row earns
@@ -2138,6 +2229,9 @@ func _process(_delta: float) -> bool:
 	test_step_pacing_gate()
 	test_step_reply_clears_and_counts()
 	test_dead_round_reply_drops()
+	test_step_timeout_adapts()
+	test_step_reconnect_gated()
+	test_stale_echo_drops()
 	test_step_watchdog_recovers_silently()
 	test_gallery_star()
 	test_idle_parks_loud()

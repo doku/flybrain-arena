@@ -1963,6 +1963,14 @@ def run_brain_server(host="127.0.0.1", port=9999):
                 # Extract sensory state from Godot
                 sens_a = msg.get("alpha", {})
                 sens_b = msg.get("beta", {})
+                # Client step sequence for staleness detection (0/absent
+                # = untracked old client): echoed back in the reply stats
+                # so the arena can drop widowed replies instead of
+                # applying ancient commands.
+                try:
+                    step_echo = int(msg.get("step_seq", 0))
+                except (TypeError, ValueError):
+                    step_echo = 0
 
                 # Per-side neuro-mapping codecs in tournament/quick mode;
                 # the shared base pair in free battle (no records bound).
@@ -2032,9 +2040,20 @@ def run_brain_server(host="127.0.0.1", port=9999):
                         # Never reset this counter mid-session or the
                         # HUD gap becomes meaningless.
                         "step_seq": step_count,
+                        # Echo of the client's step_seq (0 when the
+                        # client didn't tag): lets the arena drop a
+                        # widowed reply to an older send.
+                        "step_echo": step_echo,
                     },
                 }
-                sock.sendto(json.dumps(response).encode("utf-8"), client_addr)
+                try:
+                    sock.sendto(json.dumps(response).encode("utf-8"), client_addr)
+                except OSError as e:
+                    # A reply to a client port that just rebound (watchdog
+                    # reconnect) earns ICMP unreachable on Windows; the
+                    # arena already moved on, so drop it quietly instead
+                    # of tripping the outer handler.
+                    print(f"[Server Error] step reply send failed: {e}", flush=True)
                 step_ms += (time.monotonic() - _t_step) * 1000.0
                 if step_count % 50 == 0:
                     print(f"[Server] step ~{step_ms / 50.0:.0f}ms "
