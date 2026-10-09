@@ -1547,7 +1547,7 @@ func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
 			_arena_log("load parked on owed bank %s" % _seq_round_id)
 		_load_gated_on_bank = true
 		if is_instance_valid(status_label):
-			status_label.text = "BANKING ROUND - loading %s on the ack..." % expand_match_label(tourney_match_label)
+			status_label.text = "SAVING ROUND - loading %s on confirmation..." % expand_match_label(tourney_match_label)
 		print("[Arena] Load parked: round bank %s still owed." % _seq_round_id)
 		return
 	_restore_timescale()
@@ -1757,7 +1757,7 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 		var rhead := _verdict_headline()
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
 			_set_wait_header(str(rhead.get("text", "")),
-				str(rhead.get("sub", "")) + "\nbanking the round (resend)...",
+				str(rhead.get("sub", "")) + "\nsaving the round (resend)...",
 				rhead.get("color", Color(0.85, 0.85, 0.9)))
 		# A group seal may be owed on top of the round: resend it after
 		# the round (the round rebuilds the session the seal needs).
@@ -1772,7 +1772,7 @@ func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
 		# round on stale brains. The ack fires the parked load.
 		_load_gated_on_bank = true
 		if is_instance_valid(status_label):
-			status_label.text = "BANKING - round starting on the ack..."
+			status_label.text = "SAVING - round starting on confirmation..."
 		print("[Arena] Reload landed with a bank owed - parking on the gate.")
 		_arena_log("reload landed with bank owed - parked on gate")
 		return
@@ -1804,7 +1804,7 @@ func _resend_stored_group_report() -> bool:
 		_bank_link_fails = 0
 		print("[Arena] Resent stored group report %s after reload." % _seq_group_id)
 		if is_instance_valid(status_label):
-			status_label.text = "STALLED - RETRYING GROUP BANK ..."
+			status_label.text = "STALLED - RESENDING GROUP RESULTS ..."
 		return true
 	return false
 
@@ -1842,13 +1842,13 @@ func _on_server_error(error: String) -> void:
 		print("[Arena] Battle report errored (%s); retrying same id=" % error,
 			_seq_battle_id)
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-			_set_wait_header("BATTLE REPORT ERRORED - RETRYING",
-				"Server error: %s. Re-sending the SAME report id %s " % [error, expand_battle_id(_seq_battle_id)]
+			_set_wait_header("BATTLE RESULTS ERRORED - RETRYING",
+				"Server error: %s. Re-sending the SAME results %s " % [error, expand_battle_id(_seq_battle_id)]
 				+ "(the server answers repeats from its stored verdict, no double count)...",
 				Color(0.85, 0.85, 0.9))
 		else:
-			_show_loading("BATTLE REPORT ERRORED - RETRYING",
-				"Server error: %s. Re-sending the SAME report id %s " % [error, expand_battle_id(_seq_battle_id)]
+			_show_loading("BATTLE RESULTS ERRORED - RETRYING",
+				"Server error: %s. Re-sending the SAME results %s " % [error, expand_battle_id(_seq_battle_id)]
 				+ "(the server answers repeats from its stored verdict, no double count)...")
 		if is_instance_valid(status_label):
 			status_label.text = "BATTLE ERROR - RETRYING %s ..." % expand_battle_id(_seq_battle_id)
@@ -2540,13 +2540,13 @@ func _check_seq_watchdog() -> void:
 			var q := _seq_last_round
 			print("[Arena] Retrying battle report id=", _seq_battle_id,
 				" (same id, idempotent)")
-			var retry_sub := "No confirmation for battle %s yet. Re-sending the SAME report id " % expand_battle_id(_seq_battle_id) \
+			var retry_sub := "No confirmation for battle %s yet. Re-sending the SAME results " % expand_battle_id(_seq_battle_id) \
 				+ "(the server answers repeats from its stored verdict, no double count)..."
 			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-				_set_wait_header("STALLED - RETRYING BATTLE REPORT",
+				_set_wait_header("STALLED - RESENDING BATTLE RESULTS",
 					retry_sub, Color(0.85, 0.85, 0.9))
 			else:
-				_show_loading("STALLED - RETRYING BATTLE REPORT", retry_sub)
+				_show_loading("STALLED - RESENDING BATTLE RESULTS", retry_sub)
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING BATTLE %s ..." % expand_battle_id(_seq_battle_id)
 			# Heal a poisoned UDP socket before resending: the reply to
@@ -2583,29 +2583,29 @@ func _check_seq_watchdog() -> void:
 		print("[Arena] Retrying round report id=", _seq_round_id,
 			" (same id, idempotent)")
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-			_set_wait_header("STALLED - RETRYING ROUND BANK",
-				"No confirmation for the round yet. Re-sending the SAME report id "
+			_set_wait_header("STALLED - RESENDING ROUND RESULTS",
+				"No confirmation for the round yet. Re-sending the SAME results "
 				+ "(the server answers repeats from its stored verdict, no double count)...",
 				Color(0.85, 0.85, 0.9))
 		if not _bank_resend_round("watchdog", false):
 			_fail_loud_server_silent()
 			return
 		if is_instance_valid(status_label):
-			status_label.text = "STALLED - RETRYING ROUND BANK (try %d) ..." % _bank_retries
+				status_label.text = "STALLED - RESENDING ROUND RESULTS (try %d) ..." % _bank_retries
 		return
 	if _seq_context == "groupbank" and not _seq_last_group_report.is_empty():
 		print("[Arena] Retrying group report id=", _seq_group_id,
 			" (same id, idempotent)")
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
-			_set_wait_header("STALLED - RETRYING GROUP BANK",
-				"No confirmation for the group yet. Re-sending the SAME report id "
+			_set_wait_header("STALLED - RESENDING GROUP RESULTS",
+				"No confirmation for the group yet. Re-sending the SAME results "
 				+ "(the server answers repeats from its stored verdict, no double count)...",
 				Color(0.85, 0.85, 0.9))
 		if not _bank_resend_group("watchdog", false):
 			_fail_loud_server_silent()
 			return
 		if is_instance_valid(status_label):
-			status_label.text = "STALLED - RETRYING GROUP BANK (try %d) ..." % _bank_retries
+				status_label.text = "STALLED - RESENDING GROUP RESULTS (try %d) ..." % _bank_retries
 		return
 	if not _seq_retried:
 		_seq_retried = true
@@ -5899,11 +5899,11 @@ func _on_match_over(match_winner: String, score: String) -> void:
 		# banks or loads unseen.
 		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
 			_set_wait_header("ROUND COMPLETE - REVIEWING BRACKET",
-				"banking the finished round - next round loads on the ack...",
+				"saving the finished round - next round loads on confirmation...",
 				Color(0.85, 0.85, 0.9))
 		else:
 			_show_loading("ROUND COMPLETE - REVIEWING BRACKET",
-				"banking the finished round...")
+				"saving the finished round...")
 		if match_pathed:
 			# No round payload exists (matches banked individually);
 			# the latch clears when every match acked, then the
@@ -6148,7 +6148,7 @@ func _bank_resend_round(reason: String, announce: bool = true) -> bool:
 	print("[Arena] Resent round report %s (%s, try %d)." % [_seq_round_id, reason, _bank_retries])
 	_arena_log("resent round report %s (%s, try %d)" % [_seq_round_id, reason, _bank_retries])
 	if announce and is_instance_valid(status_label):
-		status_label.text = "BANKING ROUND - retry %d (same report, no double count)..." % _bank_retries
+			status_label.text = "SAVING ROUND - retry %d (same results, no double count)..." % _bank_retries
 	return true
 
 
@@ -6171,7 +6171,7 @@ func _bank_resend_group(reason: String, announce: bool = true) -> bool:
 	print("[Arena] Resent group report %s (%s, try %d)." % [_seq_group_id, reason, _bank_retries])
 	_arena_log("resent group report %s (%s, try %d)" % [_seq_group_id, reason, _bank_retries])
 	if announce and is_instance_valid(status_label):
-		status_label.text = "BANKING GROUP - retry %d (same report, no double count)..." % _bank_retries
+			status_label.text = "SAVING GROUP - retry %d (same results, no double count)..." % _bank_retries
 	return true
 
 
@@ -6367,9 +6367,9 @@ func _handle_advance_result(res: Dictionary) -> void:
 			_hide_wait_bracket()
 			_hide_loading()
 			winner_overlay.visible = false
-			_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET (banking round...)" % director.champion_name())
+			_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET (saving round...)" % director.champion_name())
 			if is_instance_valid(status_label):
-				status_label.text = "TOURNAMENT COMPLETE - banking round, crown follows..."
+				status_label.text = "TOURNAMENT COMPLETE - saving round, crown follows..."
 			return
 		var champ_slot := _slot_of(champ_id)
 		_tourney_close_ack = false
@@ -6412,7 +6412,7 @@ func _handle_advance_result(res: Dictionary) -> void:
 			if is_instance_valid(status_label):
 				status_label.text += " (title may lag - see server_log.txt)"
 		elif is_instance_valid(status_label):
-			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s (title banked) - review, then QUIT TO MENU" % [champ_name, last_line]
+			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s (title saved) - review, then QUIT TO MENU" % [champ_name, last_line]
 	else:
 		if bool(res.get("consolation_started", false)):
 			_show_arena_bracket("LOSERS BRACKET - LOSER ADVANCES TO LAST PLACE")
@@ -7006,7 +7006,7 @@ func _event_group_done(res: Dictionary) -> void:
 	_show_arena_bracket("GROUP %s COMPLETE - FINAL RECORD" % group)
 	await _save_bracket_record(true)
 	var _bset: Array = (rec.get("booster", []) as Array)
-	var _bsub := "STANDINGS BANKED"
+	var _bsub := "STANDINGS SAVED"
 	if not _bset.is_empty():
 		_bsub += "  •  BOOSTER: %d (post-event +50 school)" % _bset.size()
 		print("[Arena] Group %s booster-marked: %s" % [group, str(_bset)])
@@ -7032,7 +7032,7 @@ func _event_group_done(res: Dictionary) -> void:
 	# (round acks never consume this stash - only _on_group_banked).
 	if nxt == "final" and (_round_bank_pending or _group_bank_pending):
 		_pending_final_group = ev.duplicate(true)
-		title += " (banking round...)"
+		title += " (saving round...)"
 		_event_gallery_update()
 		if not await _event_intermission(title, sub, wait_secs, true):
 			director.quit_to_menu()
@@ -9097,14 +9097,14 @@ func _on_restart_pressed() -> void:
 		if is_instance_valid(fly) and fly.has_method("neutralize"):
 			fly.call("neutralize")
 	if is_instance_valid(status_label):
-		status_label.text = "ROUND RESTARTED - banking battle rewards..."
+		status_label.text = "ROUND RESTARTED - saving battle rewards..."
 	print("[Arena] Restart requested! Sending battle stats for dopamine banking...")
 	brain_client.request_restart(stats_alpha, stats_beta)
 
 func _on_restarted(round_winner: String) -> void:
 	_record_win(round_winner)
 	if is_instance_valid(status_label):
-		status_label.text = "RESTART BANKED: " + _slot_name(round_winner) + " LED - fresh round"
+		status_label.text = "RESTART SAVED: " + _slot_name(round_winner) + " LED - fresh round"
 	await _wait(1.0).timeout
 	_reset_round()
 
