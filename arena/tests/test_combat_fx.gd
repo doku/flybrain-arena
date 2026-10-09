@@ -995,6 +995,33 @@ func test_group_banked_applies() -> void:
 	arena._seq_context = ""
 
 
+func test_body_count_covers_ready_count() -> void:
+	# Draw-first gate property: vault BODIES (no episode bar) always
+	# cover the schooled READY count - the handoff waits on breeding
+	# only when bodies run short, never on schooling alone.
+	var d = arena._director()
+	if d == null:
+		_check(true, "body count skipped (no director)")
+		return
+	var old_tourney: Dictionary = d.tourney
+	var old_dir: String = d.tournament_dir
+	d.tournament_dir = "user://test_ebody"
+	DirAccess.make_dir_recursive_absolute("user://test_ebody")
+	d.tourney = {"event_id": "EBC"}
+	d.event_save({"id": "EBC", "group_order": ["A"],
+		"groups": {"A": {"players": ["qx1", "qx2"]}},
+		"settings": {"elo_cutoff": 0.0}, "pool": []})
+	var bodies: int = arena._event_body_count(false)
+	var ready: int = arena._event_pool_ready_count(false)
+	_check(bodies >= ready, "bodies cover the schooled count")
+	d.tourney = old_tourney
+	d.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_ebody"):
+		for f in DirAccess.get_files_at("user://test_ebody"):
+			DirAccess.remove_absolute("user://test_ebody".path_join(f))
+		DirAccess.remove_absolute("user://test_ebody")
+
+
 func test_intermission_survives_bank_ack() -> void:
 	# Group-to-group countdown: the match-over review's stale wait
 	# ownership must not let a bank ack landing mid-countdown yank
@@ -2296,6 +2323,7 @@ func _process(_delta: float) -> bool:
 	test_group_report_send()
 	test_group_banked_applies()
 	test_intermission_survives_bank_ack()
+	test_body_count_covers_ready_count()
 	test_group_forgive_map()
 	test_round_report_group_flag()
 	test_auto_recover_supervisor()

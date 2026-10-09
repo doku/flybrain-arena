@@ -1356,6 +1356,57 @@ func test_eliminate_career_gate() -> void:
 	D.free()
 
 
+func test_backfill_greenest_first() -> void:
+	# Draw-first backfill: the strict schooled draw's leftovers ordered
+	# greenest-first (fewest career matches, then most episodes). ELO
+	# floor and exclusion still apply; only schooling relaxes. skip
+	# carries strict-drawn ids so a handoff never fields twice.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	var roster := [{"id": "v1"}, {"id": "v2"}, {"id": "g1"},
+		{"id": "g2"}, {"id": "low"}, {"id": "part1"}]
+	var cards := {
+		"v1": {"elo": 1500.0, "train": 80, "matches": 30},
+		"v2": {"elo": 1400.0, "train": 80, "matches": 25},
+		"g1": {"elo": 800.0, "train": 2, "matches": 2},
+		"g2": {"elo": 1300.0, "train": 1, "matches": 0},
+		"low": {"elo": 600.0, "train": 90, "matches": 40},
+		"part1": {"elo": 1500.0, "train": 80, "matches": 0}}
+	var picks: Array = D.filler_ids(roster, cards, 700.0, {"part1": true},
+		["g2"], 10)
+	_check(picks == ["g1", "v2", "v1"], "greenest first, floor/exclude/skip hold")
+	D.free()
+
+
+func test_draw_backfill_consumes() -> void:
+	# Backfill draws greenest-first bodies, erases them from the bench
+	# pool, and saves; a short vault fails loud (true empty case).
+	DirAccess.make_dir_recursive_absolute("user://test_event_groups")
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	D.tournament_dir = "user://test_event_groups"
+	D.call("event_save", {"id": "EBB", "group_order": ["A"],
+		"groups": {"A": {"players": ["part1"]}},
+		"pool": ["g1", "v2", "part1"]})
+	var roster := [{"id": "v1"}, {"id": "v2"}, {"id": "g1"},
+		{"id": "part1"}]
+	var cards := {
+		"v1": {"elo": 1500.0, "train": 80, "matches": 30},
+		"v2": {"elo": 1400.0, "train": 80, "matches": 25},
+		"g1": {"elo": 800.0, "train": 2, "matches": 2},
+		"part1": {"elo": 1500.0, "train": 80, "matches": 0}}
+	var back: Dictionary = D.call("event_draw_backfill",
+		"EBB", 2, 0.0, [], false, cards, roster)
+	_check(bool(back.get("ok", false)), "backfill draws bodies")
+	_check(back.get("drawn", []) == ["g1", "v2"], "backfill greenest first")
+	var ev: Dictionary = D.call("event_load", "EBB")
+	_check(not ("g1" in (ev.get("pool", []) as Array))
+		and not ("v2" in (ev.get("pool", []) as Array)),
+		"backfill leaves the bench pool")
+	var short: Dictionary = D.call("event_draw_backfill",
+		"EBB", 5, 0.0, [], false, cards, roster)
+	_check(not bool(short.get("ok", false)), "empty vault fails loud")
+	D.free()
+
+
 func test_vault_draw_excludes_participants() -> void:
 	# Promotion draws from the whole vault: qualified outsiders are
 	# drawable, current-event players never (own advancement path),
@@ -1652,6 +1703,8 @@ func _initialize() -> void:
 	test_arena_session_log()
 	test_arena_session_log_skips_live_file()
 	test_eliminate_career_gate()
+	test_backfill_greenest_first()
+	test_draw_backfill_consumes()
 	test_vault_draw_excludes_participants()
 	test_showcase_sync()
 	test_showcase_overview()

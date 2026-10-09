@@ -7067,8 +7067,40 @@ func _event_pool_ready_count(include_current: bool = false) -> int:
 	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
 
 
+func _event_body_count(redraw: bool) -> int:
+	# Vault BODIES for the next draw regardless of schooling: the ELO
+	# floor and the participant exclusion still apply, only the
+	# episode bar drops to 0. The handoff waits on breeding only when
+	# even bodies run short; an unqualified bench fields green
+	# debutants now (backfill) while school runs in parallel.
+	var director := _director()
+	if director == null:
+		return 0
+	var ev: Dictionary = director.event_load(_event_id())
+	if ev.is_empty():
+		return 0
+	var st: Dictionary = ev.get("settings", {})
+	var q: Dictionary = director.event_draw_candidates(_event_id(), 0,
+		float(st.get("elo_cutoff", 0.0)), {}, [], redraw)
+	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
+
+
+func _announce_backfill_fielded(eid: String, count: int) -> void:
+	# Draw-first messaging: the strict bench was short, so green
+	# debutants field now and school tops them up in parallel. The
+	# GROUP A intermission re-titles the status right after; the
+	# console + session log keep this line.
+	var msg := "EVENT %s fielded %d (green backfill - school tops up in parallel)" % [eid, count]
+	print("[Arena] ", msg)
+	_arena_log(msg)
+	if is_instance_valid(status_label):
+		status_label.text = msg
+
+
 func _event_pool_wait(need: int = EVENT_POOL_TARGET, include_current: bool = false) -> String:
-	# Rare fallback: bench short at handoff. Waits on the FINAL review
+	# Last resort: the vault itself is short of BODIES at handoff
+	# (not just schooled brains - an unqualified bench backfills
+	# green debutants instead of waiting). Waits on the FINAL review
 	# screen (bracket visible, queue status live) while the background
 	# queue works - never a bare progress bar. STOP aborts. Returns ""
 	# when the bench filled, else the reason (the caller parks on
@@ -7286,11 +7318,14 @@ func _run_event_handoff() -> void:
 	if not _evo_has_kind("wild"):
 		_evo_queue_wild(gen + 1)
 	_event_drain_done_to_pool()
-	# Redraw mode needs a full 16 schooled brains (roster included);
-	# survivor mode only needs the top-up pair.
+	# Redraw mode needs a full 16 vault bodies (roster included);
+	# survivor mode only needs the top-up pair. Draw-first: bodies,
+	# not schooled - an unqualified bench fields green debutants now
+	# (backfill in _event_start_next) while school tops them up in
+	# parallel mid-event. Only a true empty vault waits on breeding.
 	var redraw := bool(st0.get("redraw_roster", false))
 	var pool_need := 16 if redraw else EVENT_POOL_TARGET
-	if _event_pool_ready_count(redraw) < pool_need:
+	if _event_body_count(redraw) < pool_need:
 		var why := await _event_pool_wait(pool_need, redraw)
 		if why != "":
 			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid, why)
@@ -7310,18 +7345,26 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 	var roster: Array = []
 	if bool(st.get("redraw_roster", false)):
 		# Fresh roster every iteration: all 16 drawn green-weighted
-		# from the vault (no survivors carry over). Loud abort on a
-		# short school bench, same as the top-up draw.
+		# from the vault (no survivors carry over). Draw-first: a
+		# short schooled bench backfills greenest-first and fields
+		# NOW (school tops picks up in parallel); only a true empty
+		# vault aborts here.
 		var full: Dictionary = director.event_draw_roster(eid, 16,
 			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
-		if not bool(full.get("ok", false)) \
-				or (full.get("drawn", []) as Array).size() != 16:
-			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
-				"fresh draw failed: " + str(full.get("error", "short bench")))
-			await _wait(8.0).timeout
-			director.quit_to_menu()
-			return
-		roster = full.get("drawn", [])
+		if bool(full.get("ok", false)) \
+				and (full.get("drawn", []) as Array).size() == 16:
+			roster = full.get("drawn", [])
+		else:
+			var back: Dictionary = director.event_draw_backfill(eid, 16,
+				float(st.get("elo_cutoff", 0.0)), [], true)
+			roster = back.get("drawn", [])
+			if roster.size() != 16:
+				_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+					"fresh draw failed: " + str(back.get("error", "short bench")))
+				await _wait(8.0).timeout
+				director.quit_to_menu()
+				return
+			_announce_backfill_fielded(eid, roster.size())
 		print("[Arena] Event %s fresh roster drawn: %d brains" % [eid, roster.size()])
 	else:
 		var survivors: Array = []
@@ -7342,14 +7385,25 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 			return
 		var draw: Dictionary = director.event_draw_pool(eid, need,
 			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
-		if not bool(draw.get("ok", false)) \
-				or (draw.get("drawn", []) as Array).size() != need:
-			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
-				"pool draw failed: " + str(draw.get("error", "short bench")))
-			await _wait(8.0).timeout
-			director.quit_to_menu()
-			return
-		roster = survivors + (draw.get("drawn", []) as Array)
+		var picked: Array = []
+		if bool(draw.get("ok", false)) \
+				and (draw.get("drawn", []) as Array).size() == need:
+			picked = draw.get("drawn", [])
+		else:
+			# Draw-first backfill: short schooled bench fields the
+			# greenest vault bodies now (school tops them up in
+			# parallel); only a true empty vault aborts here.
+			var back: Dictionary = director.event_draw_backfill(eid, need,
+				float(st.get("elo_cutoff", 0.0)), [], false)
+			picked = back.get("drawn", [])
+			if picked.size() != need:
+				_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+					"pool draw failed: " + str(back.get("error", "short bench")))
+				await _wait(8.0).timeout
+				director.quit_to_menu()
+				return
+			_announce_backfill_fielded(eid, 16)
+		roster = survivors + picked
 	var beg: Dictionary = director.event_begin(roster, st, gen)
 	if not bool(beg.get("ok", false)):
 		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,

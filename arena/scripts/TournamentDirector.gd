@@ -2626,8 +2626,38 @@ static func schooled_ids(roster: Array, cards: Dictionary, min_train: int = 50, 
 	return out
 
 
-static func draw_green_picks(qualified: Array, cards: Dictionary, n: int) -> Array:
-	# Green-weighted random draw: one weighted pass per slot with weight
+static func filler_ids(roster: Array, cards: Dictionary, elo_floor: float = 0.0, exclude := {}, skip: Array = [], n: int = 1) -> Array:
+	# Backfill picks for draw-first handoffs: vault brains the strict
+	# schooled draw skipped, ordered greenest-first (fewest career
+	# matches, then most school episodes) so debutants field while the
+	# school loop tops them up in parallel mid-event. The ELO floor
+	# and the exclusion set still apply (demotion line and current
+	# fighters stay out); only the school-episode bar relaxes. skip
+	# carries already-drawn ids so one handoff never fields the same
+	# brain twice. Pure (no files).
+	var skipset := {}
+	for pid in skip:
+		skipset[str(pid)] = true
+	var cands: Array = []
+	for b in roster:
+		var pid := str((b as Dictionary).get("id", ""))
+		if pid == "" or exclude.has(pid) or skipset.has(pid) \
+				or not cards.has(pid):
+			continue
+		if float((cards[pid] as Dictionary).get("elo", 0.0)) >= elo_floor:
+			cands.append(pid)
+	cands.sort_custom(func(a, b):
+		var ca: Dictionary = cards[str(a)]
+		var cb: Dictionary = cards[str(b)]
+		var ma := int(ca.get("matches", 0))
+		var mb := int(cb.get("matches", 0))
+		if ma != mb:
+			return ma < mb
+		return int(ca.get("train", 0)) > int(cb.get("train", 0)))
+	return cands.slice(0, mini(n, cands.size()))
+
+
+static func draw_green_picks(qualified: Array, cards: Dictionary, n: int) -> Array:	# Green-weighted random draw: one weighted pass per slot with weight
 	# 1/(1+matches), so debutants surface first while veterans stay
 	# possible. Pure apart from the RNG; short bags just draw short
 	# (callers gate on the count).
@@ -2726,6 +2756,37 @@ func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: f
 	if not event_save(ev):
 		return {"ok": false, "error": "cannot save event"}
 	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}
+
+
+func event_draw_backfill(event_id: String, n: int, elo_floor: float = 0.0, skip: Array = [], include_participants: bool = false, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+	# Draw-first backfill: greenest-first vault bodies the strict
+	# schooled draw skipped, so a handoff fields NOW instead of
+	# waiting on breeding/schooling. Same ELO floor and participant
+	# exclusion as the strict draws; skip carries their drawn ids so
+	# one handoff never fields the same brain twice. Drawn ids leave
+	# the bench pool like strict picks. Fails only when even bodies
+	# run short (true empty vault).
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var participants := {}
+	if not include_participants:
+		for g in (ev.get("group_order", []) as Array):
+			var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				participants[str(pid)] = true
+	var roster: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
+	var cards := _event_live_cards(live_override)
+	var drawn := filler_ids(roster, cards, elo_floor, participants, skip, n)
+	if drawn.size() < n:
+		return {"ok": false, "error": "backfill short (%d/%d bodies)" % [drawn.size(), n]}
+	var pool: Array = ev.get("pool", [])
+	for pid in drawn:
+		pool.erase(str(pid))
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "drawn": drawn, "pool": pool}
 
 
 func event_overview_data(event_id: String) -> Dictionary:
