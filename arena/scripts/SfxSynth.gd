@@ -1,15 +1,20 @@
 class_name SfxSynth
 extends RefCounted
-## Shared procedural battle-SFX synthesizer (arena + menu preview).
-## No audio assets ship: every effect is a sine(+sweep) under exp decay
-## plus a white-noise wash, packed once into 16-bit AudioStreamWAV.
-## Palettes are recipe tables only - same engine, different character.
-## Judge by ear via the menu SOUND row (palette picker + Preview).
+## Shared battle-SFX builder (arena + menu preview). Two backends:
+## procedural palettes (classic/punchy/bright: sine(+sweep) under exp
+## decay plus a white-noise wash, no assets) and sampled palettes
+## (kenny_A/kenny_B: CC0 recordings under res://audio/sfx, loaded
+## from disk). Judge by ear via the menu SOUND row (palette picker +
+## Preview).
 
-const RATE := 22050 # synth sample rate; covers every effect below at
-	# half the memory of 44100. Raise only for brighter tops.
-const PALETTES := ["classic", "punchy", "bright"]
+const RATE := 22050 # synth + conversion sample rate (Kenny wavs are
+	# converted to exactly this). Raise only for brighter tops.
+const PALETTES := ["classic", "punchy", "bright", "kenny_A", "kenny_B"]
 const EFFECTS := ["thump", "clash", "tear", "boom", "beep", "fight"]
+# Sampled packs live here (working tree until winners ship; only
+# shipped files get committed). Missing file = procedural classic
+# fallback + warning, never silence.
+const SAMPLED_DIR := "res://audio/sfx"
 
 
 static func recipes(palette: String) -> Dictionary:
@@ -78,11 +83,33 @@ static func tone(freq: float, secs: float, decay: float, noise_amt: float = 0.0,
 
 static func build(palette: String) -> Dictionary:
 	# name -> AudioStreamWAV for the whole palette. Pure (no nodes):
-	# callers own playback.
+	# callers own playback. kenny_* load CC0 recordings; the rest
+	# synthesize from the recipe table.
+	if palette == "kenny_A" or palette == "kenny_B":
+		return load_pack(palette)
 	var table := recipes(palette)
 	var out := {}
 	for effect in EFFECTS:
 		var r: Array = table[effect]
+		out[effect] = tone(float(r[0]), float(r[1]), float(r[2]),
+			float(r[3]), float(r[4]))
+	return out
+
+
+static func load_pack(palette: String) -> Dictionary:
+	# One sampled pack off disk. A missing file falls back to the
+	# procedural classic recipe for that effect (audition packs may
+	# be partial) with a warning - never a hole in the pool.
+	var out := {}
+	var classic := recipes("classic")
+	for effect in EFFECTS:
+		var stream := AudioStreamWAV.load_from_file(
+			"%s/%s/%s.wav" % [SAMPLED_DIR, palette, effect])
+		if stream != null:
+			out[effect] = stream
+			continue
+		push_warning("SfxSynth: missing %s/%s.wav, classic fallback" % [palette, effect])
+		var r: Array = classic[effect]
 		out[effect] = tone(float(r[0]), float(r[1]), float(r[2]),
 			float(r[3]), float(r[4]))
 	return out
