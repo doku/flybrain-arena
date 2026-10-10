@@ -63,12 +63,32 @@ def _nt_sign_map():
             for b, v in zip(nt["body"].values, nt["consensus_nt"].values)}
 
 
+_CSR_MEMO = {}
+_POPS_MEMO = {}
+
+
+def _file_stamp(path):
+    try:
+        return (os.path.getmtime(path), os.path.getsize(path))
+    except OSError:
+        return None
+
+
 def load_or_extract_populations(force_regen=False):
-    """Extracts critical sensory and motor neuron index sets from annotations."""
+    """Extracts critical sensory and motor neuron index sets from annotations.
+
+    In-process memo keyed by (cache-file stamp, force_regen): multi-stage
+    breeds/trains call this 2-3x per command; the 2nd..Nth call serves
+    memory instead of re-reading/re-parsing the ~0.6 MB JSON."""
+    stamp = (_file_stamp(POPULATIONS_CACHE_FILE), bool(force_regen))
+    if not force_regen and stamp in _POPS_MEMO:
+        return _POPS_MEMO[stamp]
     if os.path.exists(POPULATIONS_CACHE_FILE) and not force_regen:
         print(f"[Loader] Loading cached populations from {POPULATIONS_CACHE_FILE}...")
         with open(POPULATIONS_CACHE_FILE, "r") as f:
-            return json.load(f)
+            pops = json.load(f)
+        _POPS_MEMO[stamp] = pops
+        return pops
 
     print("[Loader] Parsing MaleCNS annotations for sensory/motor populations...")
     df = _retained_annotations()
@@ -145,6 +165,12 @@ def load_or_extract_populations(force_regen=False):
     # the spear_lunge wiring drives them; the decoder reads them for all
     # brains (silent pools read 0 = no lunge, safe by default).
     motor_mouth = get_indices(types.str.match(r"^MNxm", na=False))
+    # Roll-motor readout (learned banks): haltere motor neurons, clean
+    # bilateral 11L/10R. Halteres are the fly's equilibrium organs, so
+    # their motor laterality driving roll is honest dipteran biology.
+    # Anchored: only MNhl* rows match. Silent without wiring (read 0 =
+    # wings level), so unwired brains fly exactly as before.
+    motor_roll_mnhl = get_indices(types.str.match(r"^MNhl", na=False))
 
     # --- Dopaminergic Reinforcement & Mushroom Body ---
     dopamine_pam = get_indices(types.str.contains("PAM", na=False))
@@ -199,6 +225,8 @@ def load_or_extract_populations(force_regen=False):
         "motor_ram_dnpe017": motor_ram_dnpe017,
         # Mouthpart motor readout (spear lunge)
         "motor_mouth": motor_mouth,
+        # Haltere roll-motor readout (learned banks)
+        "motor_roll_mnhl": motor_roll_mnhl,
         # Reinforcement
         "dopamine_pam": dopamine_pam,
         "dopamine_ppl1": dopamine_ppl1,
@@ -234,11 +262,19 @@ def load_or_extract_populations(force_regen=False):
 
     with open(POPULATIONS_CACHE_FILE, "w") as f:
         json.dump(pops, f, indent=2)
+    _POPS_MEMO[stamp] = pops
     return pops
 
 
 def load_or_build_csr(min_synapse_threshold=1):
-    """Loads or builds the CSR sparse synaptic weight matrix (MaleCNS)."""
+    """Loads or builds the CSR sparse synaptic weight matrix (MaleCNS).
+
+    In-process memo keyed by (cache-file stamp, threshold): multi-stage
+    breeds/trains rebuild this 2-3x per command; the 2nd..Nth call
+    returns the shared object (no duplicate ~200 MB read)."""
+    stamp = (_file_stamp(CSR_CACHE_FILE), min_synapse_threshold)
+    if stamp in _CSR_MEMO:
+        return _CSR_MEMO[stamp]
     if os.path.exists(CSR_CACHE_FILE):
         print(f"[Loader] Loading cached CSR connectome from {CSR_CACHE_FILE}...")
         loader = np.load(CSR_CACHE_FILE)
@@ -246,7 +282,9 @@ def load_or_build_csr(min_synapse_threshold=1):
             (loader["data"], loader["indices"], loader["indptr"]),
             shape=loader["shape"]
         )
+        loader.close()
         print(f"[Loader] CSR matrix ready: {csr.shape[0]} neurons, {csr.nnz:,} synapses.")
+        _CSR_MEMO[stamp] = csr
         return csr
 
     print("[Loader] Building MaleCNS CSR connectome from edges file (first-time only)...")
@@ -305,6 +343,7 @@ def load_or_build_csr(min_synapse_threshold=1):
     np.savez_compressed(CSR_CACHE_FILE, data=csr.data, indices=csr.indices,
                         indptr=csr.indptr, shape=csr.shape)
     print(f"[Loader] Built and cached in {time.time()-t0:.2f}s.")
+    _CSR_MEMO[stamp] = csr
     return csr
 
 

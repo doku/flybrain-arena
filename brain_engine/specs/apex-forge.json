@@ -1,0 +1,1 @@
+{"align_bonus": [0.5, 0.2, -0.3], "dist_gain": 0.1, "evasion": 0.2, "experiment": ["lplc2_contra_dn", "retina_wide", "spear_lunge"], "learning_rate": 0.005, "mapping": ["retina", "flow_trans"], "seed": 987654321, "variant": "custom", "yaw_bias": 0.0}

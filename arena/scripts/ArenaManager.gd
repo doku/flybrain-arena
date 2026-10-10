@@ -11,9 +11,57 @@ const BracketView = preload("res://scripts/TournamentBracket.gd")
 var current_round_time: float = 0.0
 var current_generation: int = 1
 var is_round_active: bool = true
+# DNF wander rule: the white outer arena ring sits 30 m from center
+# (glade_ground.gdshader). A timeout-tie measures each fly's meters
+# past that ring; farthest out reads confused/evading. Overtime
+# battles dock 4 HP per drift meter (cap 50, zero drift docks zero),
+# so wandering converts into a decisive disadvantage and a third DNF
+# gets rare: unequal health breaks the next tie on damage.
+const ARENA_RING_R := 30.0
+const DOCK_PER_M := 4.0
+const DOCK_CAP := 50.0
+# Chase exemption: flies within this many meters of each other are
+# still fighting, wherever they are - both chasing out past the ring
+# is valid engagement, not wandering. Only a fly that is BOTH past
+# the ring AND separated from its rival reads drift.
+const CHASE_TOGETHER_M := 8.0
 
-var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
-var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
+
+func _wander_overshoot(fly) -> float:
+	# Meters past the arena ring, floor zero (inside/A-ring reads 0).
+	if not is_instance_valid(fly):
+		return 0.0
+	var flat := Vector2((fly as Node3D).global_position.x,
+		(fly as Node3D).global_position.z)
+	return maxf(flat.length() - ARENA_RING_R, 0.0)
+
+
+func _wander_dock(drift: float) -> float:
+	# Overtime starting-health dock for a drift reading. Pure
+	# (unit-tested): 0 -> 0, 2.5 -> 10, 10 -> 40, >=12.5 -> 50.
+	return clampf(float(drift) * DOCK_PER_M, 0.0, DOCK_CAP)
+
+
+func _flat_separation() -> float:
+	# XZ meters between the flies; -1 when either is missing (unknown
+	# reads disengaged - never exempt on missing data).
+	if not is_instance_valid(fly_alpha) or not is_instance_valid(fly_beta):
+		return -1.0
+	var pa := (fly_alpha as Node3D).global_position
+	var pb := (fly_beta as Node3D).global_position
+	return Vector2(pa.x - pb.x, pa.z - pb.z).length()
+
+
+func _gate_drift(drift_a: float, drift_b: float, sep_m: float) -> Array:
+	# Chase exemption, pure (unit-tested): engaged flies (within
+	# CHASE_TOGETHER_M) read zero drift even outside the ring; unknown
+	# or wide separation keeps each fly's own overshoot.
+	if sep_m >= 0.0 and sep_m <= CHASE_TOGETHER_M:
+		return [0.0, 0.0]
+	return [float(drift_a), float(drift_b)]
+
+var stats_alpha := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
+var stats_beta  := { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0, "scrape_time_s": 0.0 }
 
 # Shared control cadence (fairness invariant): BOTH flies' commands
 # arrive in one packet, so both always share the same reply interval
@@ -24,9 +72,56 @@ var ctrl_label: Label
 var bv_reply_ema: float = 0.2
 var bv_shared_tau: float = 0.15
 var bv_last_reply: float = -1.0
+# One-strike-per-frame guard (see _on_strike_landed): the physics
+# frame + attacker of the last applied strike. -1 = nothing applied.
+var _last_strike_frame: int = -1
+var _last_strike_attacker: String = ""
 var bv_cad_n: int = 0
 var bv_cad_dt_sum: float = 0.0
 var bv_cad_tau_sum: float = 0.0
+# Lockstep proof (HUD n/srv): control pairs applied vs server steps
+# integrated. Session-cumulative to match the server's cumulative
+# step_count - do NOT reset per round (see _on_motor_controls).
+var _ctrl_n: int = 0
+var _ctrl_srv_seq: int = 0
+
+# Control-link pacing (stop-and-wait): at most one step reply may be
+# outstanding. TUNING:
+# - STEP_TIMEOUT_MSEC (below) is the FLOOR: _step_timeout_msec()
+#   adapts the real deadline to ~3x the measured reply cadence, so a
+#   slow-but-alive server stops reading as dead (the chronic
+#   false-timeout spiral on throttled hardware). Rule of thumb for
+#   the floor: leave at 2000; the adapter handles huge brains.
+# - STEP_TIMEOUT_FIRST_MSEC: a round's first step waits this long
+#   (cold caches, post-load bursts).
+# - STEP_TIMEOUT_MAX_MSEC: the adapter never exceeds this, so a
+#   genuinely dead link still surfaces watchdogs on a bounded cadence.
+# - STEP_RECONNECT_EVERY: watchdog fires that rebind the UDP socket
+#   (first at 5, alongside CONTROL LINK SLOW, then at most every 10 s).
+#   Every fire used to reconnect, widowing the in-flight reply and
+#   feeding the server's 10054 storm.
+# - BRAIN_TICK_DT (below) stays the *request ceiling* (20 Hz):
+#   pacing can only slow sends below it, never above.
+const STEP_TIMEOUT_MSEC := 2000
+const STEP_TIMEOUT_EMA_MULT := 3.0
+const STEP_TIMEOUT_MAX_MSEC := 15000
+const STEP_TIMEOUT_FIRST_MSEC := 6000
+const STEP_RECONNECT_EVERY := 5
+const STEP_RECONNECT_MIN_GAP_MSEC := 10000
+var _step_in_flight := false
+var _step_deadline_msec := 0
+var _step_timeouts := 0 # consecutive expiries; >=5 shows link-slow text
+# Step sequencing (stop-and-wait loss signal): cumulative sends,
+# the outstanding send, the round's send base, whether this round
+# heard back yet, and the last watchdog reconnect. The server echoes
+# the seq; a reply to an older send drops as stale instead of
+# replanting ancient commands (and the consecutive counter only
+# resets on a reply to the outstanding send).
+var _step_seq := 0
+var _step_outstanding := 0
+var _step_round_base := 0
+var _step_round_reply := false
+var _step_last_reconnect_msec := 0
 
 # Brain-view L0 pool-rate bars (key, short label, bar-full count).
 # Updated on every motor reply (~5 Hz) with EMA smoothing; always-on
@@ -122,22 +217,14 @@ const BV_NET_COLORS := {
 	"mbon_app": Color(0.7, 0.4, 1.0), "mbon_av": Color(0.5, 0.2, 0.8),
 	"dn_left": Color(1.0, 0.6, 0.15), "dn_right": Color(1.0, 0.6, 0.15),
 }
-# Replay (L4): per-battle pool-rate stream. One count array per motor
+# Pool-rate stream (flights telemetry): one count array per motor
 # reply (~5 Hz), capped; banked into the tournament JSON `flights`
-# entry when the menu record toggle is on, plus an in-memory copy for
-# the post-battle scrubber. ~50 KB per 40 s battle ??toggle-gated.
+# entry when the menu record toggle is on. ~50 KB per 40 s battle -
+# toggle-gated. (The post-battle scrubber viewer was removed: the
+# REPLAY button never worked and was never used.)
 const BV_STREAM_MAX := 600
 var bv_stream_alpha: Array = []
 var bv_stream_beta: Array = []
-var bv_replay_mode := false
-var bv_replay_idx := 0
-var bv_replay_playing := false
-var bv_replay_accum := 0.0
-var bv_replay_panel: PanelContainer
-var bv_replay_slider: HSlider
-var bv_replay_playbtn: Button
-var bv_replay_label: Label
-var bv_replay_prior_bars: Array = []
 
 # Per-battle flight telemetry (answered by control step): altitude profile,
 # thrust/pitch command means, evade/ram exposure, spear demand. Reported
@@ -159,8 +246,7 @@ var beta_wing_l: Label
 var beta_wing_r: Label
 var alpha_row_name: Label
 var beta_row_name: Label
-var alpha_hit_flash: ColorRect
-var beta_hit_flash: ColorRect
+
 
 # Dynamic tree fade: trees sitting on the camera->fly line go translucent so
 # the fight stays visible; everything else stays solid. Rebuilt per frame.
@@ -172,6 +258,17 @@ var tree_sight_entries: Array = []
 var winner_overlay: Control
 var winner_label: Label
 var countdown_label: Label
+# Callout typography: 64pt across an 1100px floor keeps
+# "NAME TAKES BATTLE (2 - 0)" to two clean lines (name + result)
+# instead of wrapping mid-phrase at 88pt.
+const CALLOUT_TITLE_FS := 64
+# Slow-motion finish: after the final blow the fight plays at quarter
+# speed for a beat (the landing unfolds dramatically), timescale
+# restores, a 1 s beat passes, and only then the winner text lands.
+const SLOWMO_SCALE := 0.25
+const SLOWMO_SECS := 2.0
+const WINNER_BEAT_SECS := 1.0
+var _slowmo_active := false
 
 # Tournament mode (driven by the TournamentDirector autoload; off = classic
 # free battle with generational evolution).
@@ -179,12 +276,204 @@ var tournament_active: bool = false
 var tourney_a_name: String = "ALPHA"
 var tourney_b_name: String = "BETA"
 var tourney_match_label: String = ""
+# Battle verdict: how the round ended ("ko" | "time" | "draw", set by the
+# KO/timeout handlers before _report_battle) plus the killing blow read
+# off the victim's damage ledger. Composed into _last_verdict at report
+# time so the server reply, callout, and retry all tell the same story.
+# Timeouts carry the arena-decided winner (_time_winner); ties go draw.
+const TIME_TIE_EPS := 0.5
+var _end_reason := ""
+var _ko_victim := ""
+var _time_winner := ""
+var _last_verdict := {}
+
+
+func _timeout_winner(ha: float, hb: float) -> String:
+	# Timeout decided by remaining health — most health wins, every
+	# dent counts (tree rams and ground scrapes are bad flying too).
+	# Within half a point is a tie for the DNF/overtime ladder. Pure
+	# (unit-tested); the arena decides, the server only records.
+	if absf(ha - hb) < TIME_TIE_EPS:
+		return "draw"
+	return "alpha" if ha > hb else "beta"
 var tourney_awaiting_load: bool = false
+# Preload bookkeeping (NEXT match into the server's prepare slot):
+# separate from _seq_last_load so the watchdog never retries a prepare
+# as the official load. A prepared reply only marks readiness; the
+# official load (activation hit or disk fallback) stays the starter.
+var _preload_params: Dictionary = {}
+var _preload_ready := false
+# Batched match reporting: every battle's sync payload caches here and
+# the WHOLE match banks once at match over (one message, one journal,
+# one save pair server-side). Between battles only the ms match_reset
+# runs, so battles flow back-to-back on identical weights.
+var _match_battle_cache: Array = []
+var _last_match_winner := ""
+var _last_match_score := ""
+# Round-batch reporting: completed matches append here; ONE round_report
+# banks the whole round at the round boundary (round nonce, one journal,
+# one save set server-side). Between matches only the ms match_reset
+# runs, so best-of series flow back-to-back on identical pre-round
+# weights. Battles AND matches fight on the same weights all round.
+var _round_match_cache: Array = []
+var _round_bank_pending := false
+var _tourney_awaiting_roundbank := false
+var _seq_round_id := ""
+var _seq_last_round_report: Dictionary = {}
+var _seq_forgive_roundbank: Dictionary = {}
+var _pending_roundbank_resend := false
+# Group-bank twins (group files only): the rounds journal fast; the
+# group seal saves once. Same nonce/verdict contract, separate state
+# so round acks never consume group waits.
+var _group_bank_pending := false
+var _tourney_awaiting_groupbank := false
+var _seq_group_id := ""
+var _seq_last_group_report: Dictionary = {}
+var _seq_forgive_groupbank: Dictionary = {}
+var _pending_groupbank_resend := false
+var _pending_final_group: Dictionary = {}
+var _load_gated_on_bank := false
+var _pending_advance: Dictionary = {}
+# Per-match incremental banks (multi-match bracket rounds only): each
+# match reports at match_over while the next match runs; the round
+# latch clears when every match acked (no round payload exists for
+# these rounds). nonce -> {report fields, round, match, retries,
+# last_send}. Acks are context-free (the table IS the matcher); the
+# tick resends owed entries outside live battles.
+var _match_banks_pending := {}
+var _match_bank_retries := {}
+# Round latch for match-pathed rounds (set at round completion, no
+# payload behind it): distinguishes "round complete, matches banking"
+# from round-report rounds (which carry _seq_last_round_report).
+var _round_match_banked := false
+# Last-step sensorimotor context (the dopamine replay's inputs): the
+# sens refs land at send time, the ctrl refs at motor-reply time -
+# exactly what the server used to capture per battle.
+var _last_sens_a: Dictionary = {}
+var _last_sens_b: Dictionary = {}
+var _last_ctrl_a: Dictionary = {}
+var _last_ctrl_b: Dictionary = {}
 var bracket_overlay: Control
 var arena_bracket: BracketView
 var bracket_scroll: ScrollContainer
 var bracket_title: Label
+var wait_title: Label
+var wait_sub: Label
+var _wait_bracket := false
+# Manual-open tracking: only a user-opened bracket is ever exempt from
+# auto-hide. Programmatic views (result displays, errors, reviews) are
+# acquired by the next wait flow so the bracket always drops at
+# combat-enable - without this, a visible programmatic bracket would
+# read as manual and strand the view forever.
+var _bracket_manual := false
+# Next-generation waiting room (evo handoff only): preview bracket +
+# rotating fighter gallery + training strip, sharing the overlay above.
+var gallery_box: VBoxContainer
+var gallery_title: Label
+var gallery_star: Label
+var gallery_elo: Label
+var gallery_rows: Label
+var strip_box: HBoxContainer
+var strip_clone_label: Label
+var strip_clone_bar: ProgressBar
+var strip_wild_label: Label
+var strip_wild_bar: ProgressBar
+var nextgen_visible := false
+var nextgen_preview := {}
+var nextgen_gallery: Array = []
+var nextgen_gallery_idx := 0
+var nextgen_gallery_tick := 0.0
+var nextgen_strip_tick := 0.0
+var nextgen_brains := {}
+var nextgen_survivors: Array = []
+var nextgen_gone: Array = []
+var nextgen_size := 8
+var nextgen_gen := 1
+var nextgen_champ_id := ""
+var nextgen_champ_name := ""
+var nextgen_clone_name := ""
+
+# Group-stage event widgets (evo size-16): standings table + the
+# intermission countdown row, sharing the bracket overlay above.
+var standings_label: Label
+var intermission_row: HBoxContainer
+var intermission_label: Label
+var _event_skip := false
+const EVENT_INTERMISSION_SECS := 60.0
+const EVENT_TIPOFF_SECS := 60.0
+const EVENT_FINAL_SECS := 120.0
+# Event-champion coronation: the winner screen holds this long before
+# the handoff builds the next event (a bare ~2 s flash never lands).
+const EVENT_CHAMPION_HOLD_SECS := 15.0
+# Event gallery (bracket-view right column): rotates fighter stat
+# cards for the next pending group (all fighters pre-event). Keyed
+# cache so records refetch only when the target changes.
+var _event_gallery_active := false
+var _event_gallery_key := ""
+var _event_gallery_moved := false
+var bracket_row: HBoxContainer
+const EVENT_MIN_MATCHES := 10
+const EVENT_POOL_TARGET := 2
+const POOL_TRAIN_TARGET := 50
+const EVENT_TOPUP_EVERY := 30.0
+var _event_topup_cd := 0.0
+const EVENT_POOL_CAP := 4
+# Threshold-skip log latch: the pool sits above threshold for whole
+# generations at a time, and the per-tick queue attempts would flood
+# stdout with the same skip line. Report the transition once; the next
+# actually-queued breed re-arms it.
+var _pool_skip_logged := false
+# In-flight awaited breed: _evo_await_queued DETACHES its spec from
+# pending, so every progress readout (strip, gallery, status line)
+# must consult this fallback or flatline for the whole (long) await.
+var evo_await_spec := {}
+
+
+func _evo_await_remember(spec: Dictionary) -> void:
+	# Detach with a file trail: the full spec rides along in memory
+	# (progress readouts) AND in tourney.evo.awaiting (quit/resume
+	# re-inserts it into pending instead of orphaning the verdict).
+	evo_await_spec = {"kind": str(spec.get("kind", "")),
+		"name": str(spec.get("name", "")),
+		"gen": int(spec.get("gen", 1)),
+		"progress": str(spec.get("progress", "")),
+		"launched": bool(spec.get("launched", false)),
+		"mode": str(spec.get("mode", ""))}
+	var director := _director()
+	if director != null:
+		if not director.tourney.has("evo"):
+			director.tourney["evo"] = {}
+		(director.tourney.get("evo", {}) as Dictionary)["awaiting"] = spec.duplicate(true)
+		director.save_state()
+
+
+func _evo_await_forget() -> void:
+	# Clears the detach (adopt/abort/timeout/STOP) in memory and file
+	# alike: a stale file entry would resurrect a finished breed on
+	# the next adopt sweep.
+	evo_await_spec = {}
+	var director := _director()
+	if director != null:
+		var evo: Dictionary = director.tourney.get("evo", {})
+		if evo.has("awaiting"):
+			evo.erase("awaiting")
+			director.save_state()
+
+
+func _evo_awaited_spec(kind: String) -> Dictionary:
+	if str(evo_await_spec.get("kind", "")) == kind:
+		return evo_await_spec
+	return {}
+const NEXTGEN_GALLERY_EVERY := 7.0
+const NEXTGEN_STRIP_EVERY := 1.0
 var bracket_button: Button
+# Pause overlay (MENU button): the training page standalone over the
+# frozen arena — no scene change, UDP socket stays open, workers and
+# the server unperturbed. ALWAYS mode keeps its buttons alive while
+# the tree is paused; ArenaManager (INHERIT) freezes beneath it.
+var menu_overlay: Control
+var _menu_view: Control
+var _pause_started_msec := 0
 
 # Sequencing watchdog: every tournament server round-trip arms a deadline.
 # Load/reset/battle retry the pending request once, then fail loudly
@@ -192,13 +481,65 @@ var bracket_button: Button
 # the server answers a resent round_over (same tournament/match/battle
 # id) from its persisted verdict instead of banking twice. A late reply
 # arriving after a fail-loud timeout is dropped, never applied twice.
-var _seq_context: String = "" # "" | "load" | "reset" | "battle"
+# Bank contexts (roundbank/groupbank) are the exception: the owed report
+# re-sends under its SAME nonce until the ack lands (server-answered
+# from the stored verdict, never double-banked), on a 30 s tick plus
+# every watchdog expiry - a lost ack heals in seconds with no recovery
+# cycle. Only a dead link (reconnects failing) parks loud.
+var _seq_context: String = "" # "" | "load" | "reset" | "battle" | "roundbank" | "groupbank"
 var _seq_deadline_msec: int = 0
 var _seq_retried: bool = false
 var _seq_last_load: Dictionary = {}
 var _seq_last_round: Dictionary = {}
+# Wall-clock stamp of the last load send: brains arrival / drops log
+# elapsed wait (slow server vs lost reply reads differently).
+var _load_sent_msec := 0
+# Owed-bank resend ladder: consecutive same-nonce resends without an
+# ack (status readout), consecutive dead-link resends (fail-loud trip),
+# and the last resend stamp (30 s tick cadence).
+const BANK_RESEND_EVERY_MSEC := 30000
+const BANK_LINK_FAIL_LOUD := 5
+var _bank_retries := 0
+var _bank_link_fails := 0
+var _bank_last_send_msec := 0
+# Loading dead-man's switch: a load was issued but no watchdog watches
+# it (context lost without an answer) and no bank owns the stall.
+# Normal loads arm the load context synchronously, so a sustained
+# true-state is a wedge, never a slow server. Fires the capped
+# in-place recovery once per episode (loud on exhaustion).
+const LOAD_STALL_SUPERVISE_MSEC := 60000
+var _load_stall_since_msec := 0
+var _load_stall_fired := false
+# Mid-match server-brain-loss recovery: the server restarts (or is
+# relaunched) under a live tournament, and the next match_reset fails
+# on the fresh server. Reloading the CURRENT match self-heals (the
+# fresh load's _reset_round continues the match; the arena's cached
+# battles still bank at match over) where the old fail-loud killed the
+# tournament. Capped: a persistently broken server still lands loud.
+const MAX_SERVER_RELOADS := 2
+var _server_reloads := 0
+# Pending match-bank resend across a recovery reload: the server lost
+# state mid-bank (restart), the reload restores brains, then the STORED
+# report (same nonce, idempotent) goes out again instead of starting a
+# round. Set on the free-mode error, consumed in _on_brains_loaded.
+# A supervisor reload is in flight: errors/state replies arriving now
+# are attributed but never re-trigger (the refusal that MOTIVATED the
+# recovery can land after it armed; brains_loaded consumes it).
+var _recover_in_flight := false
+# Forgiveness context for a banked-but-unconfirmed battle: set at
+# report, cleared when its reply is applied. A post-fail-loud reply
+# matching this triple is applied instead of dropped (self-heals
+# SERVER SILENT when the bank actually landed); anything else stays
+# dropped so a battle is never applied twice.
+var _seq_forgive_match: Dictionary = {}
 const SEQ_TIMEOUT_MSEC: int = 30000
-const SEQ_BATTLE_TIMEOUT_MSEC: int = 30000
+# Battle reports routinely take ~60 s (dopamine + gain pinning over 25M
+# synapses, then vault writes + journal fsync). A 30 s watchdog fired
+# on EVERY battle and doubled server work with a retry that always
+# lost the race. 240 s fails loud on real stalls while surviving
+# loaded-machine battles (compressed saves shrank the work; this is
+# the safety net, not the fix).
+const SEQ_BATTLE_TIMEOUT_MSEC: int = 240000
 # Id for the in-flight battle (match + battle number). Echoed by the
 # server for log correlation AND the idempotency key for safe retries.
 var _seq_battle_id: String = ""
@@ -230,6 +571,53 @@ var _tourney_close_ack: bool = false
 @onready var pip_beta_feat: Label = $HUD/PiPBetaFeat
 @onready var pip_alpha_label: Label = $HUD/PiPAlphaLabel
 @onready var pip_beta_label: Label = $HUD/PiPBetaLabel
+@onready var pip_alpha_view: SubViewport = $HUD/PiPAlpha/PiPAlphaView
+@onready var pip_beta_view: SubViewport = $HUD/PiPBeta/PiPBetaView
+@onready var pip_alpha_box: Control = $HUD/PiPAlpha
+@onready var pip_beta_box: Control = $HUD/PiPBeta
+
+# Laptop performance switches (menu PERFORMANCE row, user://perf.cfg):
+# eye-view PiPs render throttled (every 3rd tick) or hidden outright;
+# glow + sun shadows toggleable. All default true (current look).
+var perf_pip := true
+var perf_glow := true
+var perf_shadows := true
+var _pip_tick := 0
+var _pip_hidden := false
+# PiP-slot modes, cycled by the BRAIN button: EYES (fly-head cams),
+# BRAIN (cams parked on the spinning 3D clouds), STATS (live fly stat
+# cards instead of viewports), MOTORS (live motor-command debug: text
+# rows + bipolar bars + scrolling command traces per fly).
+const PIP_SLOT_MODES := ["EYES", "BRAIN", "STATS", "MOTORS"]
+var pip_slot_mode := "STATS"
+var pip_stats_alpha: Label
+var pip_stats_beta: Label
+var pip_flash_alpha: ColorRect
+var pip_flash_beta: ColorRect
+var pip_name_alpha: Label
+# Motor debug (MOTORS PiP slot): last-120 command snapshots per side
+# for the scrolling traces, consecutive zero-spike replies per side
+# for the silence badge, spike-rate EMAs for the tick readout.
+const MOTOR_TRACE_MAX := 120
+const MOTOR_SILENT_REPLIES := 10
+var _motor_trace_alpha: Array = []
+var _motor_trace_beta: Array = []
+var _motor_silent_alpha := 0
+var _motor_silent_beta := 0
+var _motor_spike_ema_alpha := 0.0
+var _motor_spike_ema_beta := 0.0
+var pip_motor_bars_alpha: Array = []
+var pip_motor_bars_beta: Array = []
+var pip_motor_trace_alpha: Control
+var pip_motor_trace_beta: Control
+var pip_motor_scope_alpha: PanelContainer
+var pip_motor_scope_beta: PanelContainer
+var pip_name_beta: Label
+# Active flash tweens (one per wash rect / per label, previous killed
+# on re-flash): the KO presentation must stop the attacker's fading
+# flash DEAD, and a killed tween needs its reference.
+var _pip_wash_tween := {}
+var _label_flash_tween := {}
 
 # Display name for a slot: the assigned brain name in tournament/quick
 # battles, plain ALPHA/BETA in free battle (no vault identities there).
@@ -291,10 +679,11 @@ const HORIZON_RING_MIN: float = 45.0
 const HORIZON_RING_MAX: float = 180.0
 
 func _ready() -> void:
+	_apply_beauty_pass()
 	fly_alpha.fly_id = "alpha"
 	fly_beta.fly_id = "beta"
-	fly_alpha.set_team_color(Color(1.0, 0.35, 0.1))
-	fly_beta.set_team_color(Color(0.15, 0.6, 1.0))
+	fly_alpha.set_team_color(Color(1.0, 0.55, 0.30))
+	fly_beta.set_team_color(Color(0.4, 0.75, 1.0))
 	if is_instance_valid(brain_alpha_label):
 		brain_alpha_label.add_theme_color_override("font_color", Color(1.0, 0.55, 0.3))
 	if is_instance_valid(brain_beta_label):
@@ -313,15 +702,24 @@ func _ready() -> void:
 	fly_beta.wing_torn.connect(func(side): _on_wing_torn("beta", side))
 
 	brain_client.motor_controls_received.connect(_on_motor_controls)
+	# (the _last_ctrl capture inside feeds the deferred dopamine replay)
 	brain_client.generation_advanced.connect(_on_generation_advanced)
 	brain_client.merged.connect(_on_merged)
 	brain_client.restarted.connect(_on_restarted)
 	brain_client.tournament_battle_received.connect(_on_tournament_battle)
+	brain_client.server_state_received.connect(_on_server_state)
+	brain_client.battle_progress_received.connect(_on_battle_progress)
+	brain_client.round_banked_received.connect(_on_round_banked)
+	brain_client.group_banked_received.connect(_on_group_banked)
+	brain_client.match_banked_received.connect(_on_match_banked)
 	var _edir := _director()
 	if _edir != null:
 		_edir.async_done.connect(_on_evo_async)
+		_edir.job_progress.connect(_on_train_progress)
+		_edir.train_queue_changed.connect(_on_train_queue_changed)
 	brain_client.raster_map_received.connect(_on_raster_map)
-	brain_client.brains_loaded.connect(_on_brains_loaded)
+	brain_client.brains_loaded_received.connect(_on_brains_loaded)
+	brain_client.prepared_received.connect(_on_prepared)
 	brain_client.match_ready_received.connect(_on_match_ready)
 	brain_client.server_error_received.connect(_on_server_error)
 	# Title ack: the server replies tournament_closed AFTER the champion's
@@ -334,7 +732,8 @@ func _ready() -> void:
 		restart_button.pressed.connect(_on_restart_pressed)
 
 	_build_health_hud()
-	_build_hit_flash()
+	_build_combat_fx()
+	_build_vignette()
 	_build_winner_overlay()
 	_layout_match_hud()
 	_build_brainview()
@@ -351,24 +750,144 @@ func _ready() -> void:
 		# Classic free battle: make sure the server left any tournament /
 		# quick brains behind and restored the boot variants.
 		_build_menu_bar(false)
+		print("[Arena] Requesting free_mode (no director tournament).")
 		brain_client.request_free_mode()
 		_reset_round()
 
+func _apply_beauty_pass() -> void:
+	# Vibrant stylized look, wired at runtime: painted ground + sky
+	# shaders ride material_override / sky_material so the tscn keeps
+	# its plain materials as a fallback if a shader ever fails to load.
+	var ground_mi := get_node_or_null("Ground/GroundMesh") as MeshInstance3D
+	if ground_mi != null:
+		var gmat := ShaderMaterial.new()
+		gmat.shader = preload("res://scripts/glade_ground.gdshader")
+		ground_mi.material_override = gmat
+	var director := _director()
+	if director != null and director.has_method("perf_get"):
+		perf_pip = bool(director.call("perf_get", "pip"))
+		perf_glow = bool(director.call("perf_get", "glow"))
+		perf_shadows = bool(director.call("perf_get", "shadows"))
+	_init_sound()
+	var wenv := get_node_or_null("WorldEnvironment") as WorldEnvironment
+	var env: Environment = wenv.environment if wenv != null else null
+	if env != null:
+		env.glow_enabled = perf_glow
+	var sun := get_node_or_null("DirectionalLight3D") as DirectionalLight3D
+	if sun != null:
+		sun.shadow_enabled = perf_shadows
+	if env != null and env.sky != null:
+		var smat := ShaderMaterial.new()
+		smat.shader = preload("res://scripts/stylized_sky.gdshader")
+		env.sky.sky_material = smat
+		env.sky.process_mode = Sky.PROCESS_MODE_REALTIME
+		# Horizon melts into the scene fog: match it automatically.
+		var fog := env.fog_light_color
+		smat.set_shader_parameter("horizon_color",
+			Vector3(fog.r, fog.g, fog.b))
+
+
+var _dir_ref: Node = null
+var _dir_lookup_done := false
+
+
 func _director() -> Node:
-	return get_node_or_null("/root/TournamentDirector")
+	# Bare-instance safe (headless unit tests): absolute lookup outside
+	# the tree errors in the log, so report null the quiet way.
+	# Memoized: ~40 call sites, several on tick paths; the director is
+	# an autoload (lives for the whole session), so one lookup suffices.
+	if _dir_lookup_done:
+		return _dir_ref
+	if not is_inside_tree():
+		return null
+	_dir_ref = get_node_or_null("/root/TournamentDirector")
+	_dir_lookup_done = _dir_ref != null
+	return _dir_ref
 
 func _enter_tournament_mode() -> void:
+	# Close the round BEFORE the first await: the boot countdowns
+	# (tip-off / resume intermission) run ahead of any load request,
+	# and the scene's is_round_active=true default would fight and
+	# phantom-timeout behind them from the very first physics tick.
+	_close_round_for_wait()
 	tournament_active = true
 	var director := _director()
 	director.arena = self
 	_build_bracket_overlay()
 	_build_menu_bar(true)
+	if is_instance_valid(timer_label):
+		timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	if is_instance_valid(status_label):
+		status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_apply_pip_slot()
 	# Pipeline kick-off: queue a wild breed for the next generation
 	# immediately, so it trains in the background while gen 1 plays.
+	# Events stock the pool bench instead (clones need the champion,
+	# so only wilds pipeline mid-event). Fresh events open with a
+	# 30 s tip-off: full overview plus every fighter in the gallery.
 	if _evo_active():
-		var evo: Dictionary = director.tourney.get("evo", {})
-		_evo_queue_wild(int(evo.get("generation", 1)) + 1)
+		if _event_active():
+			_event_maintain_pool()
+			if _event_is_fresh():
+				await _event_pre_showcase()
+				if not _event_active():
+					return
+			elif not await _event_resume_intermission():
+				var rdirector := _director()
+				if rdirector != null:
+					rdirector.quit_to_menu()
+				return
+		else:
+			var evo: Dictionary = director.tourney.get("evo", {})
+			_evo_queue_wild(int(evo.get("generation", 1)) + 1)
+	_audit_banked_rounds()
 	_request_current_battle_load()
+
+
+func _audit_banked_rounds() -> int:
+	# Resume honesty: decided-but-unbanked matches in completed
+	# multi-match bracket rounds lost their payloads with the prior
+	# session (memory-only cache) - count them loudly instead of
+	# silently pretending the vault is whole. Round-pathed rounds
+	# (groups/single) are gate-guaranteed: play cannot advance past
+	# an unacked seal, so only the match-pathed shape is audited.
+	# Silent when there is nothing to say. Returns the lost count.
+	var director := _director()
+	if director == null or not tournament_active:
+		return 0
+	if str(director.tourney.get("status", "")) != "running":
+		return 0
+	if str(director.tourney.get("format", "bracket")) == "groups":
+		return 0
+	var rounds: Array = director.tourney.get("rounds", [])
+	var cur := int(director.tourney.get("current_round", 0))
+	var lost := 0
+	for ri in range(rounds.size()):
+		var rms: Array = rounds[ri]
+		if rms.size() <= 1 or ri >= cur:
+			continue
+		var decided := 0
+		var unbanked := 0
+		var playable := 0
+		for mm in rms:
+			var m := mm as Dictionary
+			# Decided-without-fighting (walkovers, seeding byes) never
+			# had anything to bank: not lost, just unplayed.
+			if bool(m.get("skipped", false)) or bool(m.get("bye", false)):
+				continue
+			playable += 1
+			if str(m.get("winner_id", "")) == "":
+				continue
+			decided += 1
+			if not bool(m.get("banked", false)):
+				unbanked += 1
+		if playable > 0 and decided == playable and unbanked > 0:
+			lost += unbanked
+			print("[Arena] Round %d: %d/%d matches banked (%d lost with a prior session)." % [
+				ri + 1, decided - unbanked, rms.size(), unbanked])
+	if lost > 0:
+		_arena_log("resume: %d matches unbanked from prior sessions (vault missing their learning)" % lost)
+	return lost
 
 
 # Compact bottom-center menu bar: keeps Quit/Restart/Bracket/Merge out of
@@ -396,15 +915,18 @@ func _build_menu_bar(tournament: bool) -> void:
 		bracket_button = _menu_bar_button("BRACKET", "Show/hide the tournament bracket.")
 		bracket_button.pressed.connect(_on_bracket_toggle)
 		bar.add_child(bracket_button)
-		var brain_b := _menu_bar_button("BRAIN", "Cycle brain views: bars, flow, raster, 3D.")
+		var brain_b := _menu_bar_button("STATS VIEW", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
-		var replay_bt := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
-		replay_bt.pressed.connect(_toggle_replay)
-		bar.add_child(replay_bt)
-		var evo_stop_b := _menu_bar_button("EVO STOP", "Stop the evolution loop (keeps current bracket).")
+		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
+		mute_button.pressed.connect(_on_mute_button)
+		bar.add_child(mute_button)
+		var evo_stop_b := _menu_bar_button("STOP CONTINUOUS", "Stop the continuous tournament loop (keeps current bracket).")
 		evo_stop_b.pressed.connect(_on_evo_stop)
 		bar.add_child(evo_stop_b)
+		var menu_b := _menu_bar_button("MENU", "Pause the battle and open training + queues (workers keep running).")
+		menu_b.pressed.connect(_on_menu_pause)
+		bar.add_child(menu_b)
 	else:
 		if is_instance_valid(merge_button):
 			merge_button.visible = false
@@ -416,12 +938,15 @@ func _build_menu_bar(tournament: bool) -> void:
 		var restart_b := _menu_bar_button("RESTART", "Restart the round (banks rewards).")
 		restart_b.pressed.connect(_on_restart_pressed)
 		bar.add_child(restart_b)
-		var brain_b := _menu_bar_button("BRAIN", "Cycle brain views: bars, flow, raster, 3D.")
+		var brain_b := _menu_bar_button("STATS VIEW", "Cycle PiP slot: fly eyes, brain 3D, fly stats. (N cycles diagrams.)")
 		brain_b.pressed.connect(_on_brain_button)
 		bar.add_child(brain_b)
-		var replay_b2 := _menu_bar_button("REPLAY", "Scrub the last battle's brain stream.")
-		replay_b2.pressed.connect(_toggle_replay)
-		bar.add_child(replay_b2)
+		mute_button = _menu_bar_button("MUTE", "Mute/unmute all battle sound. (M)")
+		mute_button.pressed.connect(_on_mute_button)
+		bar.add_child(mute_button)
+		var menu_b := _menu_bar_button("MENU", "Pause the battle and open training + queues (workers keep running).")
+		menu_b.pressed.connect(_on_menu_pause)
+		bar.add_child(menu_b)
 
 
 const BV_LAYERS := ["bars", "flow", "raster", "brain3d"]
@@ -432,6 +957,122 @@ func _unhandled_input(event: InputEvent) -> void:
 			_toggle_brainview()
 		elif (event as InputEventKey).keycode == KEY_N:
 			_cycle_bv_layer()
+		elif (event as InputEventKey).keycode == KEY_M:
+			_set_muted(not _sound_muted)
+
+
+func _build_menu_overlay() -> void:
+	# Pause overlay: dim + training panel + RESUME/QUIT. ALWAYS mode
+	# keeps the buttons working while the tree is paused; the panel
+	# scrolls (the training columns target the menu window, the arena
+	# gives them more room but scroll anyway for small windows).
+	var hud: CanvasLayer = $HUD
+	menu_overlay = Control.new()
+	menu_overlay.name = "MenuOverlay"
+	menu_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_overlay.process_mode = Node.PROCESS_MODE_ALWAYS
+	menu_overlay.visible = false
+	hud.add_child(menu_overlay)
+	var dim := ColorRect.new()
+	dim.color = Color(0.02, 0.02, 0.05, 0.82)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_overlay.add_child(dim)
+	var margin := MarginContainer.new()
+	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
+	margin.add_theme_constant_override("margin_left", 16)
+	margin.add_theme_constant_override("margin_right", 16)
+	margin.add_theme_constant_override("margin_top", 12)
+	margin.add_theme_constant_override("margin_bottom", 12)
+	menu_overlay.add_child(margin)
+	var panel := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.06, 0.06, 0.09, 0.96)
+	sb.border_color = Color(0.4, 0.4, 0.46)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(6)
+	sb.content_margin_left = 12.0
+	sb.content_margin_right = 12.0
+	sb.content_margin_top = 8.0
+	sb.content_margin_bottom = 8.0
+	panel.add_theme_stylebox_override("panel", sb)
+	margin.add_child(panel)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 8)
+	panel.add_child(box)
+	var head := Label.new()
+	head.text = "BATTLE PAUSED - TRAINING & QUEUES (workers keep running)"
+	head.add_theme_font_size_override("font_size", 18)
+	head.add_theme_color_override("font_color", Color(1.0, 0.85, 0.35))
+	box.add_child(head)
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box.add_child(scroll)
+	var menu_scr = load("res://scripts/MainMenu.gd")
+	_menu_view = menu_scr.new()
+	_menu_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_menu_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_menu_view.add_child(_menu_view.build_standalone_training())
+	scroll.add_child(_menu_view)
+	var brow := HBoxContainer.new()
+	brow.add_theme_constant_override("separation", 6)
+	box.add_child(brow)
+	var resume_b := Button.new()
+	resume_b.text = "RESUME"
+	resume_b.custom_minimum_size = Vector2(130, 30)
+	resume_b.pressed.connect(_on_menu_resume)
+	brow.add_child(resume_b)
+	var quit_b := Button.new()
+	quit_b.text = "QUIT TO MENU"
+	quit_b.custom_minimum_size = Vector2(130, 30)
+	quit_b.tooltip_text = "End the battle (flushes banks) and leave to the vault menu."
+	quit_b.pressed.connect(_on_menu_quit)
+	brow.add_child(quit_b)
+
+
+func _on_menu_pause() -> void:
+	if not is_instance_valid(menu_overlay):
+		_build_menu_overlay()
+	_pause_started_msec = Time.get_ticks_msec()
+	get_tree().paused = true
+	menu_overlay.visible = true
+
+
+func _on_menu_resume() -> void:
+	# Rebase the wall-clock deadlines by the paused duration: the
+	# watchdogs froze with the tree, so an un-rebased deadline would
+	# fire spuriously on the first physics tick after resume.
+	var d := Time.get_ticks_msec() - _pause_started_msec
+	if d > 0:
+		if _seq_deadline_msec > 0:
+			_seq_deadline_msec += d
+		if _step_deadline_msec > 0:
+			_step_deadline_msec += d
+		if _bank_last_send_msec > 0:
+			_bank_last_send_msec += d
+		if _load_stall_since_msec > 0:
+			_load_stall_since_msec += d
+	_pause_started_msec = 0
+	menu_overlay.visible = false
+	get_tree().paused = false
+
+
+func _on_menu_quit() -> void:
+	# The exact QUIT TO MENU teardown (flush + leave), unpaused first:
+	# a scene change under a paused tree would boot the menu scene
+	# paused (frozen menu, dead inputs).
+	if is_instance_valid(menu_overlay):
+		menu_overlay.visible = false
+	get_tree().paused = false
+	_pause_started_msec = 0
+	_on_quit_to_menu()
+
+
+func _wait(secs: float) -> SceneTreeTimer:
+	# Pause-aware battle-flow wait: freezes with the tree so an open
+	# overlay pauses countdowns/awaits instead of running them through
+	# behind the user's back. Slow-mo keeps its realtime timers.
+	return get_tree().create_timer(secs, false, false, false)
 
 
 func _cycle_bv_layer() -> void:
@@ -460,8 +1101,10 @@ func _menu_bar_button(text: String, tip: String) -> Button:
 	return b
 
 func _build_bracket_overlay() -> void:
-	# Full-screen bracket graph: title + scrollable TournamentBracket +
-	# close. Hidden by default; auto-shown when a match completes.
+	# Edge-to-edge bracket graph: title + scrollable TournamentBracket +
+	# close. The panel fills the whole viewport (no side margins) with a
+	# slightly translucent backdrop so the arena stays faintly visible.
+	# Hidden by default; auto-shown when a match completes.
 	var hud: CanvasLayer = $HUD
 	bracket_overlay = Control.new()
 	bracket_overlay.name = "BracketOverlay"
@@ -470,72 +1113,273 @@ func _build_bracket_overlay() -> void:
 	bracket_overlay.visible = false
 	hud.add_child(bracket_overlay)
 	var dim := ColorRect.new()
-	dim.color = Color(0.02, 0.02, 0.05, 0.72)
+	dim.color = Color(0.02, 0.02, 0.05, 0.55)
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	bracket_overlay.add_child(dim)
-	var center := CenterContainer.new()
-	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	bracket_overlay.add_child(center)
 	var panel := PanelContainer.new()
-	# Near-fullscreen at the 1280x720 canvas (40px side / 35px vertical
-	# margins) so the bracket gets maximum room before scrolling.
-	panel.custom_minimum_size = Vector2(1200, 650)
+	panel.set_anchors_preset(Control.PRESET_FULL_RECT)
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.06, 0.06, 0.09, 0.98)
+	sb.bg_color = Color(0.06, 0.06, 0.09, 0.9)
 	sb.border_color = Color(0.4, 0.4, 0.46)
-	sb.set_border_width_all(2)
-	sb.set_corner_radius_all(8)
-	sb.content_margin_left = 12.0
-	sb.content_margin_right = 12.0
-	sb.content_margin_top = 10.0
-	sb.content_margin_bottom = 10.0
+	sb.set_border_width_all(1)
+	sb.content_margin_left = 6.0
+	sb.content_margin_right = 6.0
+	sb.content_margin_top = 4.0
+	sb.content_margin_bottom = 4.0
 	panel.add_theme_stylebox_override("panel", sb)
-	center.add_child(panel)
+	bracket_overlay.add_child(panel)
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 8)
+	vb.add_theme_constant_override("separation", 4)
 	panel.add_child(vb)
 	bracket_title = Label.new()
 	bracket_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	bracket_title.add_theme_font_size_override("font_size", 22)
+	bracket_title.add_theme_font_size_override("font_size", 18)
 	vb.add_child(bracket_title)
+	# Squeezed wait header (server waits only, hidden otherwise):
+	# outcome/wait title in verdict color + white detail line. Plain
+	# minimum-size rows above the sole EXPAND_FILL scroll row, so the
+	# bracket reflows by exactly their height.
+	wait_title = Label.new()
+	wait_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	wait_title.add_theme_font_size_override("font_size", 16)
+	wait_title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wait_title.visible = false
+	vb.add_child(wait_title)
+	wait_sub = Label.new()
+	wait_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	wait_sub.add_theme_font_size_override("font_size", 13)
+	wait_sub.add_theme_color_override("font_color", Color(1, 1, 1, 0.9))
+	wait_sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wait_sub.visible = false
+	vb.add_child(wait_sub)
+	# Group standings (event group brackets only, hidden otherwise).
+	standings_label = Label.new()
+	standings_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	standings_label.add_theme_font_size_override("font_size", 14)
+	standings_label.visible = false
+	vb.add_child(standings_label)
+	# Intermission row (event transitions only): countdown + skip/stop.
+	intermission_row = HBoxContainer.new()
+	intermission_row.add_theme_constant_override("separation", 16)
+	intermission_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	intermission_row.visible = false
+	vb.add_child(intermission_row)
+	intermission_label = Label.new()
+	intermission_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	intermission_label.add_theme_font_size_override("font_size", 16)
+	# EXPAND_FILL is load-bearing: without it the label renders at its
+	# ~1px minimum inside this button row and every line wraps into
+	# vertical soup (measured 73 lines for a 3-line text). With it the
+	# label takes all leftover row width and the roster reads.
+	intermission_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Dedicated top-margin band for the preview row: wraps (the
+	# side-by-side names must fold, never run off-edge) with a fixed
+	# two-row floor, so the per-second countdown rewrites never resize
+	# or reflow the bracket below. Same minimum-size-rows pattern as
+	# the wait header above.
+	intermission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	intermission_label.custom_minimum_size = Vector2(0, 52)
+	intermission_row.add_child(intermission_label)
+	var skip_btn := Button.new()
+	skip_btn.text = "SKIP WAIT"
+	skip_btn.pressed.connect(_on_intermission_skip)
+	intermission_row.add_child(skip_btn)
+	var stop_btn := Button.new()
+	stop_btn.text = "STOP EVENT"
+	stop_btn.pressed.connect(_on_intermission_stop)
+	intermission_row.add_child(stop_btn)
+	# Training strip FIRST (next-gen waiting room only): progress must
+	# stay visible even when a tall bracket fills the scroll area below.
+	strip_box = HBoxContainer.new()
+	strip_box.add_theme_constant_override("separation", 16)
+	strip_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	strip_box.visible = false
+	vb.add_child(strip_box)
+	for slot in ["clone", "wild"]:
+		var cell := VBoxContainer.new()
+		cell.add_theme_constant_override("separation", 2)
+		cell.custom_minimum_size = Vector2(300, 0)
+		strip_box.add_child(cell)
+		var lab := Label.new()
+		lab.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lab.add_theme_font_size_override("font_size", 14)
+		cell.add_child(lab)
+		var bar := ProgressBar.new()
+		bar.min_value = 0.0
+		bar.max_value = 100.0
+		bar.custom_minimum_size = Vector2(300, 20)
+		bar.show_percentage = true
+		cell.add_child(bar)
+		if slot == "clone":
+			strip_clone_label = lab
+			strip_clone_bar = bar
+		else:
+			strip_wild_label = lab
+			strip_wild_bar = bar
+	# Bracket row: gallery column (next-gen waiting room only, hidden
+	# otherwise so mid-tournament views render exactly as before).
+	var brow := HBoxContainer.new()
+	brow.add_theme_constant_override("separation", 8)
+	brow.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	brow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Floor under the bracket row: header rows (title, wait, standings,
+	# intermission, strip) can stack during transitions - the bracket
+	# area never collapses below this, so its position and spacing hold
+	# and the scroll takes the overflow internally instead.
+	brow.custom_minimum_size = Vector2(0, 380)
+	vb.add_child(brow)
+	bracket_row = brow
+	gallery_box = VBoxContainer.new()
+	gallery_box.custom_minimum_size = Vector2(300, 0)
+	gallery_box.add_theme_constant_override("separation", 2)
+	gallery_box.visible = false
+	brow.add_child(gallery_box)
+	# Showcased name in the shared cyan accent (same color as the
+	# bracket rows) plus the same red "*" marker the bracket rows
+	# carry, so the gallery names its showcased fighter exactly the
+	# way the bracket does. Title + star ride a centered row so the
+	# star sits right after the name; the card keeps its dark look.
+	var title_row := HBoxContainer.new()
+	title_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	title_row.add_theme_constant_override("separation", 6)
+	gallery_box.add_child(title_row)
+	gallery_title = Label.new()
+	gallery_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	gallery_title.add_theme_font_size_override("font_size", 20)
+	gallery_title.add_theme_color_override("font_color",
+		BracketView.COL_SHOWCASE)
+	# Same 1px-soup disease as the intermission label: a bare label in
+	# a centered row collapses and wraps long fighter names into a
+	# vertical stack. Expand + wrap like its sibling.
+	gallery_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gallery_title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	title_row.add_child(gallery_title)
+	gallery_star = Label.new()
+	gallery_star.text = "*"
+	gallery_star.add_theme_font_size_override("font_size", 20)
+	gallery_star.add_theme_color_override("font_color",
+		BracketView.COL_MARKER)
+	gallery_star.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	gallery_star.visible = false
+	title_row.add_child(gallery_star)
+	gallery_elo = Label.new()
+	gallery_elo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	gallery_elo.add_theme_font_size_override("font_size", 28)
+	gallery_box.add_child(gallery_elo)
+	gallery_rows = Label.new()
+	gallery_rows.add_theme_font_size_override("font_size", 14)
+	gallery_rows.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	gallery_box.add_child(gallery_rows)
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-	vb.add_child(scroll)
+	brow.add_child(scroll)
 	bracket_scroll = scroll
 	arena_bracket = BracketView.new()
 	arena_bracket.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	arena_bracket.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.add_child(arena_bracket)
-	var close_btn := Button.new()
-	close_btn.text = "CLOSE"
-	close_btn.pressed.connect(_hide_arena_bracket)
-	var hbox := HBoxContainer.new()
-	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	hbox.add_child(close_btn)
-	vb.add_child(hbox)
+	# No overlay CLOSE row: it sat under the bottom menu bar and could
+	# never receive clicks. The menu-bar "Bracket Close" button (kept
+	# in sync by _sync_bracket_button) is the close control.
+	# Countdown above bracket: WinnerOverlay is built first (lower
+	# sibling), so raise it over the bracket - the NEXT BATTLE callout
+	# then plays on top of the waiting bracket instead of under it.
+	if is_instance_valid(winner_overlay):
+		hud.move_child(winner_overlay, bracket_overlay.get_index() + 1)
 
 func _show_arena_bracket(title_text: String) -> void:
 	var director := _director()
 	if director == null or arena_bracket == null:
 		return
+	# Fresh views never carry stale wait text (wait flows set it after).
+	if is_instance_valid(wait_title):
+		wait_title.visible = false
+		wait_title.text = ""
+	if is_instance_valid(wait_sub):
+		wait_sub.visible = false
+		wait_sub.text = ""
 	bracket_title.text = title_text
-	arena_bracket.render_bracket(director.tourney,
-		int(director.tourney.get("current_round", 0)),
-		int(director.tourney.get("current_match", 0)))
+	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
+		# Event view: all four groups in one 2x2 overview (the single
+		# file would render as a fake single-elim). Gallery previews
+		# the next pending group alongside.
+		var ov: Dictionary = director.event_overview_data(_event_id())
+		arena_bracket.render_event_groups(ov, str(ov.get("current", "")))
+		_event_gallery_update()
+	else:
+		arena_bracket.render_bracket(director.tourney,
+			int(director.tourney.get("current_round", 0)),
+			int(director.tourney.get("current_match", 0)))
+	_refresh_standings()
 	# The renderer picks compact metrics for big brackets so most fit
 	# outright; whatever still overflows keeps native scrolling here.
 	if is_instance_valid(bracket_scroll):
 		bracket_scroll.scroll_horizontal = 0
 		bracket_scroll.scroll_vertical = 0
 	bracket_overlay.visible = true
+	_sync_bracket_button()
 
 func _hide_arena_bracket() -> void:
 	if bracket_overlay != null:
 		bracket_overlay.visible = false
+	_sync_bracket_button()
+
+
+func _show_wait_bracket(title_text: String) -> bool:
+	# Bracket + squeezed wait header for routine server waits (battle
+	# load, report await, reset wait, error retry). Returns false when
+	# no bracket can render (caller falls back to fullscreen loading).
+	# Ownership: takes over only a closed overlay; a manually opened
+	# bracket stays the user's (no auto-hide on reply). Never downgrade:
+	# re-shows over a visible overlay (e.g. after the callout) keep the
+	# earlier ownership so the reply still auto-hides our wait view.
+	var director := _director()
+	if director == null or arena_bracket == null or bracket_overlay == null:
+		return false
+	# Acquire: hidden, or visible-but-programmatic (a result display
+	# the flow raised, not the user's manual bracket).
+	_wait_bracket = _wait_bracket or not bracket_overlay.visible \
+		or not _bracket_manual
+	_show_arena_bracket(title_text)
+	return true
+
+
+func _set_wait_header(head: String, sub: String, head_color: Color) -> void:
+	if is_instance_valid(wait_title):
+		wait_title.text = head
+		wait_title.add_theme_color_override("font_color", head_color)
+		wait_title.visible = true
+	if is_instance_valid(wait_sub):
+		wait_sub.text = sub
+		wait_sub.visible = true
+
+
+func _hide_wait_bracket() -> void:
+	# Auto-opened wait view only; manual brackets are never yanked.
+	if not _wait_bracket:
+		return
+	_wait_bracket = false
+	if is_instance_valid(wait_title):
+		wait_title.visible = false
+		wait_title.text = ""
+	if is_instance_valid(wait_sub):
+		wait_sub.visible = false
+		wait_sub.text = ""
+	_hide_arena_bracket()
+
+
+func _sync_bracket_button() -> void:
+	# The overlay's own CLOSE row sits under the bottom menu bar and
+	# can't be reached, so the menu-bar button doubles as the close
+	# control: it reads "Bracket Close" while the overlay is open.
+	if not is_instance_valid(bracket_button):
+		return
+	var open := is_instance_valid(bracket_overlay) and bracket_overlay.visible
+	bracket_button.text = "Bracket Close" if open else "BRACKET"
 
 
 func _save_bracket_record(with_png: bool) -> void:
@@ -563,44 +1407,194 @@ func _save_bracket_record(with_png: bool) -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 	if is_instance_valid(bracket_overlay) and bracket_overlay.visible:
-		var img := get_viewport().get_texture().get_image()
-		if img.save_png(base + ".png") == OK:
-			print("[Arena] Bracket screenshot saved: ", base + ".png")
+		# Headless (dummy renderer) has no real pixels: the viewport
+		# texture read errors and yields null. The frame choreography
+		# above still runs (callers await it), only the capture skips.
+		if DisplayServer.get_name() == "headless":
+			print("[Arena] Bracket screenshot skipped (headless renderer).")
 		else:
-			push_warning("[Arena] Bracket screenshot failed: " + base + ".png")
+			var img := get_viewport().get_texture().get_image()
+			if img.save_png(base + ".png") == OK:
+				print("[Arena] Bracket screenshot saved: ", base + ".png")
+			else:
+				push_warning("[Arena] Bracket screenshot failed: " + base + ".png")
 	if showed:
 		_hide_arena_bracket()
 
 func _on_bracket_toggle() -> void:
 	if bracket_overlay != null and bracket_overlay.visible:
+		_wait_bracket = false
+		_bracket_manual = false
 		_hide_arena_bracket()
 	elif tournament_active:
-		_show_arena_bracket("%s  %s vs %s" % [tourney_match_label, tourney_a_name, tourney_b_name])
+		_wait_bracket = false
+		_bracket_manual = true
+		_show_arena_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name])
+
+func _flush_round_report() -> void:
+	# Best-effort per-match flush: small datagrams actually arrive
+	# (the old whole-round flush could exceed UDP and die silently),
+	# and deterministic nonces dedup repeat quits. Completed cached
+	# matches go full; in-progress strays go partial (battles banked,
+	# result undecided - a refight banks the final under its own key).
+	# Group/single-match rounds keep one round report (their server
+	# model is per-round, payloads are small).
+	if (_match_battle_cache.is_empty() and _round_match_cache.is_empty()) \
+			or not tournament_active:
+		return
+	var strays := 0
+	if not _match_battle_cache.is_empty():
+		_round_match_cache.append(_current_match_entry("pending"))
+		strays = _match_battle_cache.size()
+		_match_battle_cache.clear()
+	var n := _round_match_cache.size()
+	if _match_bank_round():
+		for entry in (_round_match_cache as Array):
+			var em := entry as Dictionary
+			var nonce := str(em.get("match_id", ""))
+			if nonce == "":
+				continue
+			var partial := str(em.get("match_winner", "")) == "pending"
+			if partial:
+				nonce += "|partial"
+			brain_client.request_match_report(
+				str(em.get("match_winner", "pending")), _tourney_id(),
+				str(em.get("label", tourney_match_label)), nonce,
+				(em.get("battles", []) as Array),
+				str(em.get("alpha_id", "")), str(em.get("beta_id", "")),
+				str(em.get("alpha_path", "")), str(em.get("beta_path", "")),
+				partial)
+	else:
+		brain_client.request_round_report(
+			"%s-RND-%d-%d" % [tourney_match_label,
+				Time.get_ticks_msec(), randi() % 100000],
+			_tourney_id(), tourney_match_label,
+			_round_match_cache)
+	_round_match_cache.clear()
+	print("[Arena] Flushed %d cached matches (%d stray battles) before quit." % [n, strays])
+
 
 func _on_quit_to_menu() -> void:
+	_restore_timescale()
+	_flush_round_report()
 	var director := _director()
 	if director != null:
+		director.hold_spawns = false
 		director.quit_to_menu()
 
-func _request_current_battle_load() -> void:
+func _missing_fighter_id() -> String:
+	# Which side of the CURRENT match has no vault file ("" = none):
+	# resolves a server "not found in vault" error to a fighter id
+	# without trusting the error text's path layout.
+	var director := _director()
+	if director == null:
+		return ""
+	var p: Dictionary = director.get_load_params()
+	var cm: Dictionary = director.current_match()
+	if str(p.get("alpha_path", "")) != "" \
+			and not FileAccess.file_exists(str(p.get("alpha_path", ""))):
+		return str(cm.get("a_id", ""))
+	if str(p.get("beta_path", "")) != "" \
+			and not FileAccess.file_exists(str(p.get("beta_path", ""))):
+		return str(cm.get("b_id", ""))
+	return ""
+
+
+func _on_fighter_vanished(missing_id: String, where: String) -> void:
+	# A tournament fighter's vault file is gone (archived/deleted
+	# mid-event): walk over ALL its remaining undecided matches to
+	# the present opponents (bye semantics), then continue like a
+	# completed match (advance + handle) - the bracket keeps moving
+	# instead of burning recovery budget on an unrecoverable error.
+	# Loud: a vanished fighter is never routine. Cached battles of a
+	# broken CURRENT match cannot bank (the server needs the file),
+	# so they go too; other matches' caches are untouched.
+	var director := _director()
+	if director == null or str(missing_id) == "":
+		return
+	print("[Arena] Fighter vanished from vault: %s (%s) - walking over its remaining matches." % [missing_id, where])
+	_arena_log("fighter vanished: %s (%s) - walkovers issued" % [missing_id, where])
+	if is_instance_valid(status_label):
+		status_label.text = "FIGHTER VANISHED: %s - walkover, bracket continues..." % missing_id
+	var cm: Dictionary = director.current_match()
+	var cur_involves := str(cm.get("a_id", "")) == missing_id \
+		or str(cm.get("b_id", "")) == missing_id
+	var cur_was_decided := str(cm.get("winner_id", "")) != ""
+	if cur_involves and not _match_battle_cache.is_empty():
+		print("[Arena] Discarding %d unbankable cached battles (%s)." % [_match_battle_cache.size(), missing_id])
+		_arena_log("discarded %d unbankable battles for %s" % [_match_battle_cache.size(), missing_id])
+		_match_battle_cache.clear()
+	var res: Dictionary = director.forfeit_fighter(missing_id, where)
+	print("[Arena] Walkovers issued: %s" % str(res.get("forfeited", [])))
+	if cur_involves and not cur_was_decided:
+		# The current match just got decided by walkover: move past
+		# it like a played match (a blind reload would stall on the
+		# same decided position forever).
+		var adv: Dictionary = director.advance_after_match()
+		_handle_advance_result(adv)
+	else:
+		_request_current_battle_load()
+
+func _request_current_battle_load(bypass_bank_gate: bool = false) -> void:
+	# Bank gate: next-round brains must load post-bank weights, and the
+	# vault files turn post-round only when the bank's saves land (atomic
+	# replaces: old-or-new, never torn - but old is STALE for the next
+	# round). While a round OR group bank is owed, loads park on a
+	# banking wait; the ack fires the parked load. Recovery reloads
+	# bypass (they re-establish server state for a resend, not a fight).
+	if (_round_bank_pending or _group_bank_pending) and not bypass_bank_gate:
+		if not _load_gated_on_bank:
+			_arena_log("load parked on owed bank %s" % _seq_round_id)
+		_load_gated_on_bank = true
+		if is_instance_valid(status_label):
+			status_label.text = "SAVING ROUND - loading %s on confirmation..." % expand_match_label(tourney_match_label)
+		print("[Arena] Load parked: round bank %s still owed." % _seq_round_id)
+		return
+	_restore_timescale()
 	var director := _director()
 	if director == null:
 		return
+	# Fresh match, no preview: a fail-loud QUIT+RESUME must never
+	# resurrect the previous match's report-wait stamp on re-render.
+	if arena_bracket != null:
+		arena_bracket.live_preview = {}
 	# Walk past resolved byes / walkovers first (round-0 leading byes and
 	# legacy unresolved-bye states), so we never request a load with an
 	# empty brain path and stall waiting for brains that never come.
 	var skip: Dictionary = director.skip_unplayable()
 	if str(skip.get("action", "")) == "tournament_end":
+		_arena_log("load skipped: tournament end")
 		_handle_advance_result(skip)
 		return
 	if str(skip.get("action", "")) != "next_match":
 		if is_instance_valid(status_label):
 			status_label.text = "BRACKET STALLED - QUIT TO MENU AND RESUME"
+		_arena_log("load skipped: bracket stalled (%s)" % str(skip.get("action", "")))
+		# Re-title the bracket (a stale LOADING header must not strand):
+		# programmatic acquire - the next wait flow owns the view.
+		_bracket_manual = false
+		_show_arena_bracket("BRACKET STALLED - QUIT TO MENU AND RESUME")
 		return
 	var p: Dictionary = director.get_load_params()
 	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
 		if is_instance_valid(status_label):
-			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % tourney_match_label
+			status_label.text = "CANNOT LOAD %s - brain file missing, QUIT TO MENU" % expand_match_label(tourney_match_label)
+		_arena_log("load refused: empty brain path for %s" % expand_match_label(tourney_match_label))
+		_bracket_manual = false
+		_show_arena_bracket("CANNOT LOAD %s" % expand_match_label(tourney_match_label))
+		return
+	# Pre-flight: the vault file must EXIST, not just resolve. A path
+	# from a stale roster (archived/deleted mid-event) would fail
+	# server-side after a full load cycle - fail here instead, before
+	# a single packet goes out, and walk the bracket over it.
+	var cm0: Dictionary = director.current_match()
+	var gone_id := ""
+	if not FileAccess.file_exists(str(p.get("alpha_path", ""))):
+		gone_id = str(cm0.get("a_id", ""))
+	elif not FileAccess.file_exists(str(p.get("beta_path", ""))):
+		gone_id = str(cm0.get("b_id", ""))
+	if gone_id != "":
+		_on_fighter_vanished(gone_id, "missing at load")
 		return
 	print("[Arena] Requesting tournament load: %s (%s vs %s)" % [
 		str(p.get("match", "?")), str(p.get("a_name", "?")), str(p.get("b_name", "?"))])
@@ -608,15 +1602,22 @@ func _request_current_battle_load() -> void:
 	tourney_b_name = str(p.get("b_name", "BETA"))
 	tourney_match_label = str(p.get("match", ""))
 	tourney_awaiting_load = true
-	_hide_arena_bracket()
 	refresh_slot_names()
 	# Freeze the arena while the server swaps brains: no steps go out, so
 	# the flies can never fight a round on stale/boot brains ("only
-	# charges" first-battle bug). A persistent loading callout proves the
-	# game is working, not frozen.
+	# charges" first-battle bug). The bracket stays up with a squeezed
+	# wait header (same strings/colors as the old fullscreen loader)
+	# so no moment shows an empty arena; fullscreen only on fallback.
 	is_round_active = false
-	_show_loading("LOADING %s" % tourney_match_label,
-		"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name])
+	_set_combat(false)
+	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+		_set_wait_header("LOADING %s" % expand_match_label(tourney_match_label),
+			"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name],
+			Color(0.85, 0.85, 0.9))
+	else:
+		_hide_arena_bracket()
+		_show_loading("LOADING %s" % expand_match_label(tourney_match_label),
+			"%s vs %s - brains loading..." % [tourney_a_name, tourney_b_name])
 	if is_instance_valid(status_label):
 		status_label.text = "LOADING %s vs %s ..." % [tourney_a_name, tourney_b_name]
 	brain_client.request_tournament_load(
@@ -629,26 +1630,201 @@ func _request_current_battle_load() -> void:
 		"tournament_id": str(p.get("tournament_id", "")),
 		"match": tourney_match_label,
 		"lr_scale": float(p.get("lr_scale", 0.5))}
+	# State poll rides along (attribution: the reply logs the server's
+	# mode/tag at every wait entry).
+	brain_client.request_server_state()
 	_arm_seq("load")
+	_load_sent_msec = Time.get_ticks_msec()
+	_arena_log("load sent: %s (%s vs %s) [%s]" % [tourney_match_label,
+		tourney_a_name, tourney_b_name, str(p.get("tournament_id", "?"))])
 
-func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary) -> void:
+func _preload_next_match() -> void:
+	# Sends the NEXT match's brains to the server's prepare slot while
+	# a countdown or the 6 s review runs: the ~5-20 s disk+binding load
+	# hides under the wait, so the next battle's official load becomes
+	# an O(1) activation. Every call site has the director already
+	# pointing at the next match (post-advance / post-switch), so
+	# get_load_params IS the next match. Best-effort (no director /
+	# missing paths -> no-op); never starts rounds, never touches the
+	# watchdog. Skipped while the final is stashed unbuilt (the
+	# director still points at the old group - preparing it would burn
+	# a 5-20 s server cycle on the wrong brains right when QF1 wants
+	# the slot; the ack handler preloads once the final is built).
+	var director := _director()
+	if director == null or not tournament_active:
+		return
+	if not _pending_final_group.is_empty():
+		print("[Arena] Preload skipped - final unbuilt (stashed behind banks).")
+		return
+	var p: Dictionary = director.get_load_params()
+	if str(p.get("alpha_path", "")) == "" or str(p.get("beta_path", "")) == "":
+		return
+	# Best-effort too: a vanished file would fail server-side after a
+	# full prepare cycle - skip silently here (the official load's
+	# pre-flight names it and walks the bracket over it).
+	if not FileAccess.file_exists(str(p.get("alpha_path", ""))) \
+			or not FileAccess.file_exists(str(p.get("beta_path", ""))):
+		print("[Arena] Preload skipped - brain file missing for %s." % str(p.get("match", "?")))
+		return
+	# Same match already held by the slot (ready or ack in flight):
+	# no-op - a duplicate prepare would redo the 5-20 s server load.
+	if str(_preload_params.get("match", "")) == str(p.get("match", "")) \
+			and str(_preload_params.get("tournament_id", "")) == str(p.get("tournament_id", "")):
+		return
+	_preload_params = p.duplicate(true)
+	_preload_ready = false
+	brain_client.request_tournament_prepare(
+		str(p.get("alpha_path", "")), str(p.get("beta_path", "")),
+		str(p.get("tournament_id", "")), str(p.get("match", "")))
+	print("[Arena] Preloading next match %s (%s vs %s)..." % [
+		str(p.get("match", "")), str(p.get("a_name", "?")),
+		str(p.get("b_name", "?"))])
+
+
+func _on_prepared(reply_tid: String, reply_match: String) -> void:
+	# The server finished loading the prepared match. Echo-checked
+	# against what WE sent (a stale prepare ack from an earlier match
+	# never marks readiness).
+	if reply_tid != "" and reply_tid != str(_preload_params.get("tournament_id", "")):
+		print("[Arena] Ignoring stale prepared ack (%s/%s)" % [reply_tid, reply_match])
+		return
+	_preload_ready = true
+	print("[Arena] Next match preloaded and ready (%s)." % reply_match)
+
+
+func _on_brains_loaded(_alpha_info: Dictionary, _beta_info: Dictionary,
+		reply_tid: String = "", reply_match: String = "") -> void:
 	if not tournament_active:
 		return
 	if not tourney_awaiting_load and _seq_context != "load":
+		_arena_log("brains_loaded dropped: nothing awaited (context=%s)" % _seq_context)
+		return
+	# Match-echo validation: the reply must answer the CURRENT awaited
+	# load (same tournament file + match label). A stale/late reply
+	# from an earlier load is dropped loudly - it must never start a
+	# round on the wrong brains (the server's load may still be queued
+	# behind a 60 s battle bank). Old servers echo nothing: an empty
+	# reply passes (the latch + single-starter rule still hold).
+	if (reply_tid != "" or reply_match != "") \
+			and _seq_last_load.get("tournament_id", "") != "" \
+			and (reply_tid != str(_seq_last_load.get("tournament_id", ""))
+				or reply_match != str(_seq_last_load.get("match", ""))):
+		print("[Arena] Dropped stale brains_loaded (got %s/%s, want %s/%s)" % [
+			reply_tid, reply_match,
+			str(_seq_last_load.get("tournament_id", "")),
+			str(_seq_last_load.get("match", ""))])
+		_arena_log("dropped stale brains_loaded: got %s/%s want %s/%s (waited %.1fs)" % [
+			reply_tid, reply_match,
+			str(_seq_last_load.get("tournament_id", "")),
+			str(_seq_last_load.get("match", "")),
+			float(Time.get_ticks_msec() - _load_sent_msec) / 1000.0])
 		return
 	_clear_seq()
 	tourney_awaiting_load = false
-	_hide_loading()
+	_arena_log("brains loaded: %s vs %s (%s) in %.1fs" % [
+		str((_alpha_info as Dictionary).get("name", "?")),
+		str((_beta_info as Dictionary).get("name", "?")),
+		tourney_match_label,
+		float(Time.get_ticks_msec() - _load_sent_msec) / 1000.0])
+	# A clean load resets the self-heal cap (each match gets fresh
+	# recovery budget against server restarts) and consumes the
+	# in-flight marker (recovery complete; later errors act again).
+	_server_reloads = 0
+	_recover_in_flight = false
+	# Pending bank resend (recovery reload after a restart killed the
+	# bank): do NOT start a round - the match is over, its battles are
+	# tallied, and only the bank is missing. Re-arm from the STORED
+	# report (same nonce, idempotent) and resend: the fresh server
+	# banks it, or answers from disk if the old server finished the
+	# bank before dying.
+	if _pending_roundbank_resend and not _seq_last_round_report.is_empty():
+		_pending_roundbank_resend = false
+		var rr := _seq_last_round_report
+		_tourney_awaiting_roundbank = true
+		_seq_round_id = str(rr.get("round_nonce", ""))
+		_seq_forgive_roundbank = {"tournament_id": str(rr.get("tournament_id", "")),
+			"match": str(rr.get("match", "")), "battle": _seq_round_id}
+		_hide_wait_bracket()
+		_hide_loading()
+		brain_client.request_round_report(_seq_round_id,
+			str(rr.get("tournament_id", "")), str(rr.get("match", "")),
+			(rr.get("matches", []) as Array), bool(rr.get("group", false)))
+		_arm_seq("roundbank")
+		_bank_last_send_msec = Time.get_ticks_msec()
+		_bank_retries += 1
+		_bank_link_fails = 0
+		print("[Arena] Resent stored round report %s after reload." % _seq_round_id)
+		var rhead := _verdict_headline()
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header(str(rhead.get("text", "")),
+				str(rhead.get("sub", "")) + "\nsaving the round (resend)...",
+				rhead.get("color", Color(0.85, 0.85, 0.9)))
+		# A group seal may be owed on top of the round: resend it after
+		# the round (the round rebuilds the session the seal needs).
+		# Either resend suppresses the normal round start below.
+		_resend_stored_group_report()
+		return
+	if _resend_stored_group_report():
+		return
+	if _round_bank_pending or _group_bank_pending:
+		# Bypassed recovery load landed while a bank is still owed
+		# (match acks outstanding): park on the gate, never start a
+		# round on stale brains. The ack fires the parked load.
+		_load_gated_on_bank = true
+		if is_instance_valid(status_label):
+			status_label.text = "SAVING - round starting on confirmation..."
+		print("[Arena] Reload landed with a bank owed - parking on the gate.")
+		_arena_log("reload landed with bank owed - parked on gate")
+		return
 	_update_tourney_status("READY")
+	_arena_log("round starting: %s" % tourney_match_label)
 	_reset_round()
+
+
+func _resend_stored_group_report() -> bool:
+	# Recovery reload after a restart killed the group bank: re-arm
+	# from the STORED report (same nonce, idempotent) and resend: the
+	# fresh server rebuilds from the inputs journal and seals, or
+	# answers from disk if the old server finished before dying.
+	# Returns true when it acted (caller must not start a round).
+	if _pending_groupbank_resend and not _seq_last_group_report.is_empty():
+		_pending_groupbank_resend = false
+		var gr := _seq_last_group_report
+		_tourney_awaiting_groupbank = true
+		_seq_group_id = str(gr.get("group_nonce", ""))
+		_seq_forgive_groupbank = {"tournament_id": str(gr.get("tournament_id", "")),
+			"match": str(gr.get("match", "")), "battle": _seq_group_id}
+		_hide_wait_bracket()
+		_hide_loading()
+		brain_client.request_group_report(_seq_group_id,
+			str(gr.get("tournament_id", "")), str(gr.get("match", "")))
+		_arm_seq("groupbank")
+		_bank_last_send_msec = Time.get_ticks_msec()
+		_bank_retries += 1
+		_bank_link_fails = 0
+		print("[Arena] Resent stored group report %s after reload." % _seq_group_id)
+		if is_instance_valid(status_label):
+			status_label.text = "STALLED - RESENDING GROUP RESULTS ..."
+		return true
+	return false
 
 func _on_match_ready() -> void:
 	if not tournament_active:
 		return
 	if _seq_context != "reset":
 		return
+	# Stale-ack guard (Oct 2026 group-D phantom loop): a reset ack that
+	# arrives after the director moved past the battle (complete/OOB)
+	# must not start a ghost round. The director, not the seq context,
+	# has the final say - a refused ack parks loud instead of fighting.
+	var rdirector := _director()
+	if rdirector == null or (rdirector.current_match() as Dictionary).is_empty():
+		_arena_log("match_ready refused: director cannot place a battle (stale ack?) - parking loud")
+		_clear_seq()
+		_park_unplaceable_battle("", "stale-reset")
+		return
 	_clear_seq()
-	_hide_loading()
+	_update_tourney_status("READY")
 	_reset_round()
 
 func _on_server_error(error: String) -> void:
@@ -657,6 +1833,7 @@ func _on_server_error(error: String) -> void:
 	# repeats from its stored verdict, so this cannot double-count).
 	# Anything else stands the watchdog down so retry text never overwrites
 	# the real reason; a late battle reply is dropped, never applied twice.
+	_arena_log("server error: %s (awaiting %s)" % [error, _seq_context])
 	if _seq_context == "battle" and _tourney_awaiting_battle \
 			and not _seq_retried and not _seq_last_round.is_empty():
 		_seq_retried = true
@@ -664,18 +1841,128 @@ func _on_server_error(error: String) -> void:
 		var q := _seq_last_round
 		print("[Arena] Battle report errored (%s); retrying same id=" % error,
 			_seq_battle_id)
-		_show_loading("BATTLE REPORT ERRORED - RETRYING",
-			"Server error: %s. Re-sending the SAME report id %s " % [error, _seq_battle_id]
-			+ "(the server answers repeats from its stored verdict, no double count)...")
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("BATTLE RESULTS ERRORED - RETRYING",
+				"Server error: %s. Re-sending the SAME results %s " % [error, expand_battle_id(_seq_battle_id)]
+				+ "(the server answers repeats from its stored verdict, no double count)...",
+				Color(0.85, 0.85, 0.9))
+		else:
+			_show_loading("BATTLE RESULTS ERRORED - RETRYING",
+				"Server error: %s. Re-sending the SAME results %s " % [error, expand_battle_id(_seq_battle_id)]
+				+ "(the server answers repeats from its stored verdict, no double count)...")
 		if is_instance_valid(status_label):
-			status_label.text = "BATTLE ERROR - RETRYING %s ..." % _seq_battle_id
+			status_label.text = "BATTLE ERROR - RETRYING %s ..." % expand_battle_id(_seq_battle_id)
+		brain_client.reconnect()
 		brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 			bool(q.get("draw", false)), _seq_battle_id,
 			str(q.get("tournament_id", "")), str(q.get("match", "")),
-			q.get("flight_a", {}), q.get("flight_b", {}))
+			q.get("flight_a", {}), q.get("flight_b", {}),
+			bool(q.get("draw_penalty", false)),
+			str(q.get("end_reason", "")), q.get("verdict", {}))
 		return
+	# Wait state is cleared ONLY by the branch that owns it below
+	# (retry re-arms, recover reloads, overtake confirms, fail-loud
+	# parks). A blanket clear here once dropped a live load wait when
+	# an unrelated stale-bank refusal landed a millisecond before its
+	# brains_loaded reply - parking the game silently with no latch,
+	# no context, no timer. Late replies stay safe via the tid/match
+	# echo check in _on_brains_loaded, never via wiping the wait.
+	var err_context := _seq_context
+	# Self-healing reload BEFORE the fail-loud below: the server lost
+	# its tournament brains mid-match (restart/crash - the gate error
+	# the server sends for a brainless match_reset). Reloading the
+	# CURRENT match continues it in ~5-20 s instead of killing the
+	# tournament: the fresh load's _reset_round starts the next battle
+	# and the arena's cached battles still bank at match over. Capped
+	# (then the fail-loud below still lands).
+	if err_context == "reset" and tournament_active \
+			and error.begins_with("match_reset: no tournament brains loaded"):
+		# Server lost its tournament brains mid-match (restart/crash):
+		# the supervisor reloads the current match - the fresh load's
+		# _reset_round starts the next battle and the cached battles
+		# still bank at match over.
+		if _recover_server_state("server brain loss"):
+			return
+	# Same self-heal for a round bank interrupted by a restart: the
+	# fresh server refuses the report (FREE mode) with nothing banked.
+	# Reload, then resend the STORED report (same nonce) on
+	# brains_loaded - a new nonce here would risk double-banking if the
+	# old server actually finished before dying. Flag set only when the
+	# reload armed (a capped recovery leaves it clean for the fail-loud).
+	# A round retry that lands after its group already sealed: the
+	# round's learning is inside the group bank, so the round is
+	# CONFIRMED, not lost - stand the latches down with no resend and
+	# no recovery cycle.
+	if error.begins_with("round_report: group already banked") \
+			and tournament_active:
+		print("[Arena] Round overtaken by its group bank - round confirmed, standing down.")
+		_arena_log("round overtaken by group bank - confirmed, no resend")
+		_tourney_awaiting_roundbank = false
+		_round_bank_pending = false
+		_bank_ladder_reset()
+		if _seq_context == "roundbank":
+			_clear_seq()
+		_seq_forgive_roundbank = {}
+		# Confirmed like any ack: run the deferred chains and fire a
+		# parked load (an intermission that expired mid-stall parks on
+		# the gate; nothing else re-requests it after this return).
+		_hide_wait_bracket()
+		_hide_loading()
+		if not _pending_advance.is_empty():
+			var pa := _pending_advance
+			_pending_advance = {}
+			_handle_advance_result(pa)
+		if _load_gated_on_bank:
+			_load_gated_on_bank = false
+			_request_current_battle_load()
+		return
+	if err_context == "roundbank" and tournament_active \
+			and error.begins_with("round_report while in FREE mode") \
+			and not _seq_last_round_report.is_empty() \
+			and not _pending_roundbank_resend:
+		if _recover_server_state("round bank interrupted"):
+			_pending_roundbank_resend = true
+			return
+	if err_context == "groupbank" and tournament_active \
+			and error.begins_with("group_report: no pinned group session") \
+			and not _seq_last_group_report.is_empty() \
+			and not _pending_groupbank_resend:
+		if _recover_server_state("group bank interrupted"):
+			_pending_groupbank_resend = true
+			return
+	# Vanished fighter (vault file archived/deleted mid-event): the
+	# load/prepare can never succeed, so no recovery cycle - walk the
+	# bracket over it immediately. Deterministic, not transient.
+	# Placed before the in-flight attribution: even a recovery reload
+	# hitting the missing file resolves by walkover, never by retry.
+	if tournament_active and "not found in vault" in error \
+			and (error.begins_with("tournament_load:") \
+				or error.begins_with("tournament_prepare:")):
+		var gone := _missing_fighter_id()
+		print("[Arena] Server reports a vanished fighter: %s" % error)
+		_arena_log("vanished fighter refused: %s" % error)
+		if gone != "":
+			_on_fighter_vanished(gone, "server refused load")
+			return
+	# A recovery load is already in flight (the state poll or a prior
+	# error armed it): the refusal that motivated it can arrive now -
+	# attribute it, never re-trigger or park loud mid-recovery.
+	if _recover_in_flight:
+		print("[Arena] Recovery in flight - error attributed, no action: ", error)
+		return
+	# ANY other server error: the quit+resume recipe runs in place
+	# (fresh seq/latches/socket + re-issued load) before anything lands
+	# loud. Only a persistently broken server (cap exhausted) parks on
+	# the fail-loud screen.
+	if tournament_active and _recover_server_state("server error: " + error):
+		return
+	# Fail-loud parks: stand down every wait here, so no late reply
+	# (brains, battle, reset) can silently start a round on the
+	# stalled screen. Previously covered by a blanket entry clear.
 	_tourney_awaiting_battle = false
 	_clear_seq()
+	tourney_awaiting_load = false
+	_hide_wait_bracket()
 	_show_loading("SERVER ERROR",
 		"SERVER ERROR: %s. " % error
 		+ "See server_log.txt, then QUIT TO MENU + RESUME.")
@@ -690,7 +1977,9 @@ func _update_tourney_status(prefix: String) -> void:
 		if not m.is_empty():
 			score = "  [%d - %d]" % [int(m.get("wins_a", 0)), int(m.get("wins_b", 0))]
 	if is_instance_valid(status_label):
-		status_label.text = "%s %s: %s vs %s%s" % [tourney_match_label, prefix,
+		# Versus + score on their own centered row, below the round
+		# line (the column labels are centered since arena entry).
+		status_label.text = "%s %s:\n%s vs %s%s" % [expand_match_label(tourney_match_label), prefix,
 			tourney_a_name, tourney_b_name, score]
 	if is_instance_valid(gen_label) and director != null:
 		if director.is_quick():
@@ -808,6 +2097,11 @@ func _generate_forest() -> void:
 	var canopy_opaque_b := StandardMaterial3D.new()
 	canopy_opaque_b.albedo_color = Color(0.22, 0.44, 0.15)
 	canopy_opaque_b.roughness = 0.85
+	# Horizon ring baked into 5 MultiMeshes (was 1100 individual
+	# nodes): identical pixels, a handful of draws. Buckets split
+	# trunk/canopy by material (even/odd canopy hues). Distant trees
+	# never fade or collide, so static instancing is exact.
+	var h_buckets := {}
 	var h_made := 0
 	var h_tries := 0
 	while h_made < HORIZON_TREE_COUNT and h_tries < HORIZON_TREE_COUNT * 20:
@@ -816,16 +2110,57 @@ func _generate_forest() -> void:
 		var hrad = HORIZON_RING_MIN + (HORIZON_RING_MAX - HORIZON_RING_MIN) * sqrt(rng.randf())
 		var hp := Vector2(cos(hang) * hrad, sin(hang) * hrad)
 		var hs = rng.randf_range(1.0, 2.2)
-		var htree := Node3D.new()
-		htree.position = Vector3(hp.x, 0, hp.y)
-		htree.rotation.y = rng.randf_range(0.0, TAU)
-		htree.scale = Vector3(hs, hs, hs)
-		forest_root.add_child(htree)
-		_build_tree_visuals(htree, decor, bark_opaque,
-			canopy_opaque_a if h_made % 2 == 0 else canopy_opaque_b, false)
+		var hrot := rng.randf_range(0.0, TAU)
+		var tb := Basis(Vector3.UP, hrot).scaled(Vector3(hs, hs, hs))
+		var tp := Vector3(hp.x, 0, hp.y)
+		for spec in _tree_parts(decor, false):
+			var sd := spec as Dictionary
+			var pb: Basis = (sd["basis"] as Basis).scaled(sd["scl"] as Vector3)
+			var mat: Material
+			var key := str(sd.get("meshkey", "?"))
+			if bool(sd.get("wood", true)):
+				mat = bark_opaque
+				key = "wood:" + key
+			elif h_made % 2 == 0:
+				mat = canopy_opaque_a
+				key = "canA:" + key
+			else:
+				mat = canopy_opaque_b
+				key = "canB:" + key
+			if not h_buckets.has(key):
+				h_buckets[key] = {"mesh": sd["mesh"], "mat": mat,
+					"xforms": []}
+			((h_buckets[key] as Dictionary)["xforms"] as Array).append(
+				Transform3D(tb * pb, tp + tb * (sd["pos"] as Vector3)))
 		h_made += 1
+	for key in h_buckets.keys():
+		var bd := h_buckets[key] as Dictionary
+		_add_multimesh(forest_root, bd["mesh"] as Mesh,
+			bd["mat"] as Material, bd["xforms"] as Array,
+			AABB(Vector3(-200, -5, -200), Vector3(400, 45, 400)))
 	print("[Arena] Horizon forest: ", h_made, " distant trees.")
 	_build_underbrush(forest_root, decor, placed, spawn_a, spawn_b)
+
+
+func _add_multimesh(parent: Node3D, mesh: Mesh, mat: Material,
+		xforms: Array, bounds: AABB) -> void:
+	# One draw call for a static crowd sharing mesh + material.
+	# Explicit custom AABB: MultiMesh has no auto-bounds, and a wrong
+	# one culls the whole crowd at some camera angles.
+	if xforms.is_empty() or mesh == null:
+		return
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = mesh
+	mm.instance_count = xforms.size()
+	for i in range(xforms.size()):
+		mm.set_instance_transform(i, xforms[i])
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	mmi.custom_aabb = bounds
+	if mat != null:
+		mmi.material_override = mat
+	parent.add_child(mmi)
 
 
 # Shared procedural tree/dressing meshes, built once and reused by every
@@ -897,6 +2232,19 @@ func _tree_mesh(key: String) -> Mesh:
 	return m
 
 
+func _sway_material(base: Color, amp: float, bend: float, half_h: float) -> ShaderMaterial:
+	# One wind-sway instance per palette entry (bushes x2, grass x1);
+	# instances share the mesh + shader, phase comes from each node's
+	# origin hash in-shader.
+	var m := ShaderMaterial.new()
+	m.shader = preload("res://scripts/underbrush.gdshader")
+	m.set_shader_parameter("base_color", Vector3(base.r, base.g, base.b))
+	m.set_shader_parameter("sway_amp", amp)
+	m.set_shader_parameter("bend_amount", bend)
+	m.set_shader_parameter("mesh_half_height", half_h)
+	return m
+
+
 func _add_tree_part(parent: Node3D, pname: String, mesh: Mesh, pos: Vector3, mat: Material, scl: Vector3 = Vector3.ONE) -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	mi.name = pname
@@ -906,6 +2254,55 @@ func _add_tree_part(parent: Node3D, pname: String, mesh: Mesh, pos: Vector3, mat
 	mi.material_override = mat
 	parent.add_child(mi)
 	return mi
+
+
+func _tree_parts(decor: RandomNumberGenerator, full: bool) -> Array:
+	# Shared tree layout math as ordered part specs (pname, meshkey,
+	# mesh, pos, scl, basis, wood). _build_tree_visuals instantiates
+	# them (combat trees, fadeable); the horizon ring bakes the same
+	# specs into MultiMeshes instead. Decor draw ORDER is load-bearing
+	# (layout stream bit-identity) - keep every draw in place.
+	var parts: Array = []
+	parts.append({"pname": "Roots", "meshkey": "flare",
+		"mesh": _tree_mesh("flare"), "pos": Vector3(0, 0.9, 0),
+		"scl": Vector3.ONE, "basis": Basis.IDENTITY, "wood": true})
+	parts.append({"pname": "Trunk", "meshkey": "trunk_low",
+		"mesh": _tree_mesh("trunk_low"), "pos": Vector3(0, 5.8, 0),
+		"scl": Vector3.ONE, "basis": Basis.IDENTITY, "wood": true})
+	var tilt_ang := decor.randf_range(0.0, 0.07)
+	var tilt_az := decor.randf_range(0.0, TAU)
+	var tilt_dir := Vector3(cos(tilt_az), 0.0, sin(tilt_az))
+	var axis := Vector3.UP.cross(tilt_dir)
+	if axis.length() < 0.01:
+		axis = Vector3.RIGHT
+	var top_basis := Basis(axis.normalized(), tilt_ang)
+	var top_base := Vector3(0, 9.8, 0)
+	parts.append({"pname": "TrunkTop", "meshkey": "trunk_top",
+		"mesh": _tree_mesh("trunk_top"),
+		"pos": top_base + top_basis * Vector3(0, 4.0, 0),
+		"scl": Vector3.ONE, "basis": top_basis, "wood": true})
+	var top_pos: Vector3 = top_base + top_basis * Vector3(0, 8.0, 0)
+	# Main canopy blob (scaled half-height 1.98) tangent on the trunk top.
+	var canopy_main := top_pos + Vector3(0, 1.98, 0)
+	parts.append({"pname": "Canopy", "meshkey": "blob",
+		"mesh": _tree_mesh("blob"), "pos": canopy_main,
+		"scl": Vector3(1.15, 0.90, 1.15), "basis": Basis.IDENTITY,
+		"wood": false})
+	var a2 := decor.randf_range(0.0, TAU)
+	var side_dir := Vector3(cos(a2), 0.0, sin(a2))
+	parts.append({"pname": "Canopy2", "meshkey": "blob",
+		"mesh": _tree_mesh("blob"),
+		"pos": canopy_main + side_dir * 1.8 + Vector3(0, -1.0, 0),
+		"scl": Vector3(0.72, 0.58, 0.72), "basis": Basis.IDENTITY,
+		"wood": false})
+	if full:
+		# Crown blob (scaled half-height 1.35) tangent on the main mass.
+		parts.append({"pname": "Canopy3", "meshkey": "blob_small",
+			"mesh": _tree_mesh("blob_small"),
+			"pos": canopy_main + tilt_dir * 0.2 + Vector3(0, 3.33, 0),
+			"scl": Vector3(1.0, 0.90, 1.0), "basis": Basis.IDENTITY,
+			"wood": false})
+	return parts
 
 
 func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Material, cmat: Material, full: bool) -> void:
@@ -918,34 +2315,13 @@ func _build_tree_visuals(parent: Node3D, decor: RandomNumberGenerator, tmat: Mat
 	# Canopy side blobs stay merged foliage masses by design - only the
 	# wood-to-wood and wood-to-canopy joints abut. Mesh names feed the
 	# dynamic-fade system.
-	_add_tree_part(parent, "Roots", _tree_mesh("flare"), Vector3(0, 0.9, 0), tmat)
-	_add_tree_part(parent, "Trunk", _tree_mesh("trunk_low"), Vector3(0, 5.8, 0), tmat)
-	var tilt_ang := decor.randf_range(0.0, 0.07)
-	var tilt_az := decor.randf_range(0.0, TAU)
-	var tilt_dir := Vector3(cos(tilt_az), 0.0, sin(tilt_az))
-	var axis := Vector3.UP.cross(tilt_dir)
-	if axis.length() < 0.01:
-		axis = Vector3.RIGHT
-	var top_basis := Basis(axis.normalized(), tilt_ang)
-	var top_base := Vector3(0, 9.8, 0)
-	var top_part := _add_tree_part(parent, "TrunkTop", _tree_mesh("trunk_top"), top_base, tmat)
-	top_part.position = top_base + top_basis * Vector3(0, 4.0, 0)
-	top_part.basis = top_basis
-	var top_pos: Vector3 = top_base + top_basis * Vector3(0, 8.0, 0)
-	# Main canopy blob (scaled half-height 1.98) tangent on the trunk top.
-	var canopy_main := top_pos + Vector3(0, 1.98, 0)
-	_add_tree_part(parent, "Canopy", _tree_mesh("blob"), canopy_main, cmat,
-		Vector3(1.15, 0.90, 1.15))
-	var a2 := decor.randf_range(0.0, TAU)
-	var side_dir := Vector3(cos(a2), 0.0, sin(a2))
-	_add_tree_part(parent, "Canopy2", _tree_mesh("blob"),
-		canopy_main + side_dir * 1.8 + Vector3(0, -1.0, 0), cmat,
-		Vector3(0.72, 0.58, 0.72))
-	if full:
-		# Crown blob (scaled half-height 1.35) tangent on the main mass.
-		_add_tree_part(parent, "Canopy3", _tree_mesh("blob_small"),
-			canopy_main + tilt_dir * 0.2 + Vector3(0, 3.33, 0), cmat,
-			Vector3(1.0, 0.90, 1.0))
+	for spec in _tree_parts(decor, full):
+		var sd := spec as Dictionary
+		var mat = tmat if bool(sd.get("wood", true)) else cmat
+		var mi := _add_tree_part(parent, str(sd.get("pname", "?")),
+			sd["mesh"] as Mesh, sd["pos"] as Vector3, mat,
+			sd["scl"] as Vector3)
+		mi.basis = (sd["basis"] as Basis).scaled(sd["scl"] as Vector3)
 
 
 func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed: Array, spawn_a: Vector2, spawn_b: Vector2) -> void:
@@ -955,18 +2331,20 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 	var under := Node3D.new()
 	under.name = "Underbrush"
 	forest_root.add_child(under)
-	var bush_mat_a := StandardMaterial3D.new()
-	bush_mat_a.albedo_color = Color(0.13, 0.30, 0.11)
-	bush_mat_a.roughness = 0.9
-	var bush_mat_b := StandardMaterial3D.new()
-	bush_mat_b.albedo_color = Color(0.18, 0.36, 0.13)
-	bush_mat_b.roughness = 0.9
+	# Wind-swayed bushes + grass (trees keep StandardMaterials for the
+	# occlusion-fade system). Rocks stay still, exactly as before.
+	var bush_mat_a := _sway_material(Color(0.13, 0.30, 0.11), 0.05, 0.3, 0.85)
+	var bush_mat_b := _sway_material(Color(0.18, 0.36, 0.13), 0.05, 0.3, 0.85)
 	var rock_mat := StandardMaterial3D.new()
 	rock_mat.albedo_color = Color(0.45, 0.44, 0.42)
 	rock_mat.roughness = 0.95
-	var grass_mat := StandardMaterial3D.new()
-	grass_mat.albedo_color = Color(0.24, 0.47, 0.17)
-	grass_mat.roughness = 0.9
+	var grass_mat := _sway_material(Color(0.24, 0.47, 0.17), 0.15, 1.0, 0.55)
+	# MultiMesh instance transforms (one draw per crowd instead of one
+	# per bush/rock/blade). Draw ORDER below is untouched.
+	var bush_a_x: Array = []
+	var bush_b_x: Array = []
+	var rock_x: Array = []
+	var grass_x: Array = []
 	var spots: Array[Vector2] = []
 	var made_bush := 0
 	var tries := 0
@@ -984,14 +2362,16 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 			continue
 		spots.append(bp)
 		made_bush += 1
-		var bush := MeshInstance3D.new()
-		bush.mesh = _tree_mesh("bush")
-		bush.position = Vector3(bp.x, 0.55, bp.y)
-		bush.rotation.y = decor.randf_range(0.0, TAU)
+		var brot := decor.randf_range(0.0, TAU)
 		var bs := decor.randf_range(0.7, 1.5)
-		bush.scale = Vector3(bs, bs * decor.randf_range(0.60, 0.80), bs)
-		bush.material_override = bush_mat_a if made_bush % 2 == 0 else bush_mat_b
-		under.add_child(bush)
+		var bsq := decor.randf_range(0.60, 0.80)
+		var bxform := Transform3D(
+			Basis(Vector3.UP, brot).scaled(Vector3(bs, bs * bsq, bs)),
+			Vector3(bp.x, 0.55, bp.y))
+		if made_bush % 2 == 0:
+			bush_a_x.append(bxform)
+		else:
+			bush_b_x.append(bxform)
 	var made_rock := 0
 	tries = 0
 	while made_rock < 12 and tries < 400:
@@ -1007,13 +2387,11 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 		if not clear:
 			continue
 		made_rock += 1
-		var rock := MeshInstance3D.new()
-		rock.mesh = _tree_mesh("rock")
-		rock.position = Vector3(rp.x, 0.25, rp.y)
-		rock.rotation = Vector3(decor.randf_range(-0.2, 0.2), decor.randf_range(0.0, TAU), decor.randf_range(-0.2, 0.2))
-		rock.scale = Vector3(decor.randf_range(0.8, 1.8), decor.randf_range(0.5, 0.8), decor.randf_range(0.8, 1.6))
-		rock.material_override = rock_mat
-		under.add_child(rock)
+		var rrot := Vector3(decor.randf_range(-0.2, 0.2), decor.randf_range(0.0, TAU), decor.randf_range(-0.2, 0.2))
+		var rscl := Vector3(decor.randf_range(0.8, 1.8), decor.randf_range(0.5, 0.8), decor.randf_range(0.8, 1.6))
+		rock_x.append(Transform3D(
+			Basis.from_euler(rrot).scaled(rscl),
+			Vector3(rp.x, 0.25, rp.y)))
 	var made_grass := 0
 	for i in range(70):
 		var gp := Vector2(decor.randf_range(-38.0, 38.0), decor.randf_range(-38.0, 38.0))
@@ -1021,18 +2399,27 @@ func _build_underbrush(forest_root: Node3D, decor: RandomNumberGenerator, placed
 			continue
 		made_grass += 1
 		for b in range(3):
-			var blade := MeshInstance3D.new()
-			blade.mesh = _tree_mesh("grass")
-			blade.position = Vector3(gp.x + decor.randf_range(-0.4, 0.4), 0.45, gp.y + decor.randf_range(-0.4, 0.4))
-			blade.rotation = Vector3(decor.randf_range(-0.15, 0.15), decor.randf_range(0.0, TAU), decor.randf_range(-0.15, 0.15))
+			var bpos := Vector3(gp.x + decor.randf_range(-0.4, 0.4), 0.45, gp.y + decor.randf_range(-0.4, 0.4))
+			var brot := Vector3(decor.randf_range(-0.15, 0.15), decor.randf_range(0.0, TAU), decor.randf_range(-0.15, 0.15))
 			var gs := decor.randf_range(0.7, 1.3)
-			blade.scale = Vector3(gs, gs, gs)
-			blade.material_override = grass_mat
-			under.add_child(blade)
+			grass_x.append(Transform3D(
+				Basis.from_euler(brot).scaled(Vector3(gs, gs, gs)), bpos))
+	_add_multimesh(under, _tree_mesh("bush"), bush_mat_a, bush_a_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
+	_add_multimesh(under, _tree_mesh("bush"), bush_mat_b, bush_b_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
+	_add_multimesh(under, _tree_mesh("rock"), rock_mat, rock_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
+	_add_multimesh(under, _tree_mesh("grass"), grass_mat, grass_x,
+		AABB(Vector3(-45, -2, -45), Vector3(90, 12, 90)))
 	print("[Arena] Underbrush: ", made_bush, " bushes, ", made_rock, " rocks, ", made_grass, " grass tufts.")
 
 func _seq_timeout_for(context: String) -> int:
-	if context == "battle":
+	# The match bank replays every battle in order (dopamine per battle
+	# + one save pair): same cost class as a single long battle report.
+	# The group bank seals + saves every pinned brain: same class.
+	if context == "battle" or context == "roundbank" \
+			or context == "groupbank":
 		return SEQ_BATTLE_TIMEOUT_MSEC
 	return SEQ_TIMEOUT_MSEC
 
@@ -1046,6 +2433,90 @@ func _clear_seq() -> void:
 	_seq_battle_id = ""
 	_seq_last_round = {}
 
+
+func _fail_loud_server_silent() -> void:
+	_hide_wait_bracket()
+	_arena_log("STALLED - NO SERVER REPLY, parking loud (%s)" % _wait_state_line())
+	_show_loading("STALLED - NO SERVER REPLY",
+		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
+	if is_instance_valid(status_label):
+		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
+
+
+func _loading_supervise_tick() -> void:
+	# Dead-man's switch for the LOADING wait: a load was issued but no
+	# watchdog watches it (context lost without an answer) and no bank
+	# owns the stall. Normal loads arm the load context in the same
+	# call that sets the latch, so a sustained true-state is a wedge,
+	# never a slow server: run the capped in-place recovery once per
+	# episode (loud on exhaustion) instead of sitting on the wait view.
+	if not tournament_active or _recover_in_flight \
+			or not tourney_awaiting_load or _seq_context == "load" \
+			or _round_bank_pending or _group_bank_pending:
+		_load_stall_since_msec = 0
+		_load_stall_fired = false
+		return
+	if _load_stall_fired:
+		return
+	var now := Time.get_ticks_msec()
+	if _load_stall_since_msec == 0:
+		_load_stall_since_msec = now
+		return
+	if now - _load_stall_since_msec < LOAD_STALL_SUPERVISE_MSEC:
+		return
+	_load_stall_fired = true
+	print("[Arena] Loading stalled with no watch - recovering in place.")
+	_arena_log("loading stalled with no watch - recovering in place (%s)" % _wait_state_line())
+	_recover_server_state("loading stalled with no watch")
+
+
+func _wait_state_line() -> String:
+	# One-line stuck-state dump for forensics: every latch that gates
+	# progress plus the director position and the last load. Called on
+	# supervisor fire and fail-loud (the moments silence is suspicious).
+	var director := _director()
+	var pos := "?/?"
+	var tid := "?"
+	if director != null:
+		pos = "R%dM%d" % [int(director.tourney.get("current_round", -1)) + 1,
+			int(director.tourney.get("current_match", -1)) + 1]
+		tid = str(director.tourney.get("id", "?"))
+	return "ctx=%s load=%s roundbank=%s groupbank=%s matchbanks=%d recoveries=%d/%d dir=%s[%s] lastload=%s" % [
+		_seq_context, str(tourney_awaiting_load),
+		str(_round_bank_pending), str(_group_bank_pending),
+		_match_banks_pending.size(), _server_reloads, MAX_SERVER_RELOADS,
+		tid, pos, str(_seq_last_load.get("match", "-"))]
+
+
+func _bank_resend_tick() -> void:
+	# Owed-bank self-heal: while a round or group bank is owed, the
+	# STORED report re-sends every 30 s (same nonce, idempotent) so a
+	# lost ack heals in seconds, not watchdog cycles. Keyed on the
+	# pending latches - not the seq context, which a recovery may have
+	# cleared - and silent apart from the status counter. Suppressed
+	# mid-recovery (the reload's brains_loaded carries the resend).
+	if not tournament_active or _recover_in_flight:
+		return
+	# Per-match banks first (the live owed work): resend entries due
+	# for retry, never while a battle runs (a 10-30 s bank would stall
+	# its steps - gaps between battles carry the resends instead).
+	if not _match_banks_pending.is_empty() and not is_round_active:
+		for nonce in _match_banks_pending.keys():
+			var st: Dictionary = _match_banks_pending[nonce]
+			if Time.get_ticks_msec() - int(st.get("last_send", 0)) < BANK_RESEND_EVERY_MSEC:
+				continue
+			if not _match_bank_send(st, "tick"):
+				_fail_loud_server_silent()
+				return
+	if Time.get_ticks_msec() - _bank_last_send_msec < BANK_RESEND_EVERY_MSEC:
+		return
+	if _round_bank_pending and not _seq_last_round_report.is_empty():
+		if not _bank_resend_round("tick"):
+			_fail_loud_server_silent()
+	elif _group_bank_pending and not _seq_last_group_report.is_empty():
+		if not _bank_resend_group("tick"):
+			_fail_loud_server_silent()
+
 func _check_seq_watchdog() -> void:
 	if _seq_context == "":
 		return
@@ -1056,6 +2527,8 @@ func _check_seq_watchdog() -> void:
 		return
 	print("[Arena] Sequencing watchdog fired (context=", _seq_context,
 		" retry_sent=", _seq_retried, " battle_id=", _seq_battle_id, ")")
+	_arena_log("watchdog fired: context=%s retry_sent=%s battle_id=%s" % [
+		_seq_context, str(_seq_retried), _seq_battle_id])
 	if _seq_context == "battle":
 		# Safe retry: the server answers a resent round_over with the SAME
 		# battle id from its persisted verdict instead of banking twice,
@@ -1067,66 +2540,160 @@ func _check_seq_watchdog() -> void:
 			var q := _seq_last_round
 			print("[Arena] Retrying battle report id=", _seq_battle_id,
 				" (same id, idempotent)")
-			_show_loading("STALLED - RETRYING BATTLE REPORT",
-				"No confirmation for battle %s yet. Re-sending the SAME report id " % _seq_battle_id
-				+ "(the server answers repeats from its stored verdict, no double count)...")
+			var retry_sub := "No confirmation for battle %s yet. Re-sending the SAME results " % expand_battle_id(_seq_battle_id) \
+				+ "(the server answers repeats from its stored verdict, no double count)..."
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RESENDING BATTLE RESULTS",
+					retry_sub, Color(0.85, 0.85, 0.9))
+			else:
+				_show_loading("STALLED - RESENDING BATTLE RESULTS", retry_sub)
 			if is_instance_valid(status_label):
-				status_label.text = "STALLED - RETRYING BATTLE %s ..." % _seq_battle_id
+				status_label.text = "STALLED - RETRYING BATTLE %s ..." % expand_battle_id(_seq_battle_id)
+			# Heal a poisoned UDP socket before resending: the reply to
+			# the first send may be chasing a dead port already.
+			brain_client.reconnect()
 			brain_client.send_round_over(q.get("stats_a", {}), q.get("stats_b", {}),
 				bool(q.get("draw", false)), _seq_battle_id,
-				str(q.get("tournament_id", "")), str(q.get("match", "")))
+				str(q.get("tournament_id", "")), str(q.get("match", "")),
+				q.get("flight_a", {}), q.get("flight_b", {}),
+				bool(q.get("draw_penalty", false)),
+				str(q.get("end_reason", "")), q.get("verdict", {}))
 			return
 		_tourney_awaiting_battle = false
 		_clear_seq()
+		# The battle was sent twice with no confirmation. In batch mode
+		# this context cannot fire (battles carry no server round
+		# trip); free/legacy paths recover via the supervisor before
+		# parking loud (the reload re-plays the unbanked battle fresh).
+		if tournament_active and _recover_server_state("battle unconfirmed"):
+			return
+		_hide_wait_bracket()
 		_show_loading("SERVER SILENT - BATTLE NOT CONFIRMED",
-			"Battle %s was sent twice but the server never confirmed. " % tourney_match_label
+			"Battle %s was sent twice but the server never confirmed. " % expand_match_label(tourney_match_label)
 			+ "Nothing further will be re-sent. See server_log.txt, then QUIT TO MENU + RESUME.")
 		if is_instance_valid(status_label):
 			status_label.text = "SERVER SILENT - see server_log.txt - QUIT TO MENU + RESUME"
+		return
+	# Bank contexts never escalate to battle reloads: the owed report
+	# re-sends under its SAME nonce until the ack lands (the server
+	# answers repeats from its stored verdict, never double-banks).
+	# Uncapped on a live link; only a dead link parks loud. The
+	# single-retry flag below is for load/reset/battle only.
+	if _seq_context == "roundbank" and not _seq_last_round_report.is_empty():
+		print("[Arena] Retrying round report id=", _seq_round_id,
+			" (same id, idempotent)")
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("STALLED - RESENDING ROUND RESULTS",
+				"No confirmation for the round yet. Re-sending the SAME results "
+				+ "(the server answers repeats from its stored verdict, no double count)...",
+				Color(0.85, 0.85, 0.9))
+		if not _bank_resend_round("watchdog", false):
+			_fail_loud_server_silent()
+			return
+		if is_instance_valid(status_label):
+				status_label.text = "STALLED - RESENDING ROUND RESULTS (try %d) ..." % _bank_retries
+		return
+	if _seq_context == "groupbank" and not _seq_last_group_report.is_empty():
+		print("[Arena] Retrying group report id=", _seq_group_id,
+			" (same id, idempotent)")
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("STALLED - RESENDING GROUP RESULTS",
+				"No confirmation for the group yet. Re-sending the SAME results "
+				+ "(the server answers repeats from its stored verdict, no double count)...",
+				Color(0.85, 0.85, 0.9))
+		if not _bank_resend_group("watchdog", false):
+			_fail_loud_server_silent()
+			return
+		if is_instance_valid(status_label):
+				status_label.text = "STALLED - RESENDING GROUP RESULTS (try %d) ..." % _bank_retries
 		return
 	if not _seq_retried:
 		_seq_retried = true
 		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for(_seq_context)
 		if _seq_context == "load" and not _seq_last_load.is_empty():
 			var p := _seq_last_load
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RETRYING LOAD",
+					"%s vs %s - brains loading (retry sent)..." % [tourney_a_name, tourney_b_name],
+					Color(0.85, 0.85, 0.9))
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING LOAD %s vs %s ..." % [tourney_a_name, tourney_b_name]
+			# Heal a poisoned socket before the retry (the first send's
+			# reply may be chasing a dead port already).
+			brain_client.reconnect()
 			brain_client.request_tournament_load(
 				str(p.get("alpha_path", "")), str(p.get("beta_path", "")),
 				str(p.get("tournament_id", "")), str(p.get("match", "")),
 				float(p.get("lr_scale", 0.5)))
 		else:
+			if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+				_set_wait_header("STALLED - RETRYING RESET",
+					"waiting for server (match reset retry sent)...",
+					Color(0.85, 0.85, 0.9))
 			if is_instance_valid(status_label):
 				status_label.text = "STALLED - RETRYING RESET ..."
 			brain_client.request_match_reset(tourney_match_label)
 		return
-	# Second expiry: stay loud, stop touching the server.
+	# Second expiry: the quit+resume recipe runs in place before
+	# anything parks loud (a wedged load/reset un-wedges with
+	# a fresh seq/socket + re-issued load; a late reply can never
+	# silently start a round behind the recovery). Bank contexts never
+	# reach here (they resend above). Only a persistently
+	# broken server (cap exhausted) lands the fail-loud screen.
 	_clear_seq()
-	_show_loading("STALLED - NO SERVER REPLY",
-		"See server_log.txt - QUIT TO MENU + RESUME. Nothing was re-sent.")
-	if is_instance_valid(status_label):
-		status_label.text = "STALLED - see server_log.txt - QUIT TO MENU + RESUME"
+	tourney_awaiting_load = false
+	if tournament_active and _recover_server_state("no server reply"):
+		return
+	_hide_wait_bracket()
+	_fail_loud_server_silent()
+
+var _round_overtime := 1.0
+
 
 func _reset_round() -> void:
 	# New round waits for the landing ceremony (bounded inside).
 	await _await_landing()
 	current_round_time = round_time_limit
+	_round_overtime = 1.0
 	if tournament_active:
 		var director := _director()
 		if director != null:
 			current_round_time = float(director.tourney.get("round_time", round_time_limit))
+			# Overtime exactly once: the immediate replay after a DNF.
+			# Later battles in the same match run base time even with
+			# banked draws (no carry-over); new matches start clean.
+			_round_overtime = director.replay_scale(director.current_match())
+			current_round_time *= _round_overtime
 	is_round_active = true
 	stats_alpha = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
 	stats_beta  = { "kills": 0, "damage_dealt": 0.0, "damage_taken": 0.0, "tracking_time_s": 0.0, "tail_time_s": 0.0 }
+	_end_reason = ""
+	_ko_victim = ""
+	_time_winner = ""
+	_last_verdict = {}
 	flight_alpha = {}
 	flight_beta = {}
 	bv_cad_n = 0
 	bv_cad_dt_sum = 0.0
 	bv_cad_tau_sum = 0.0
 	bv_last_reply = -1.0
+	# A lost final reply must not wedge the next round's first send;
+	# the in-flight flag dies with the round (_ctrl_n stays
+	# cumulative - see its declaration).
+	_step_in_flight = false
+	_step_timeouts = 0
+	# Sequencing carries across rounds (cumulative like _ctrl_n); the
+	# round base marks this round's first send for the grace deadline,
+	# and the heard-back flag re-arms it. Cadence (bv_reply_ema)
+	# deliberately survives: the next round's brains cost about the
+	# same as this round's.
+	_step_round_base = _step_seq
+	_step_outstanding = 0
+	_step_round_reply = false
+	_last_strike_frame = -1
+	_last_strike_attacker = ""
 	bv_stream_alpha.clear()
 	bv_stream_beta.clear()
-	_exit_replay()
 	if is_instance_valid(bv_raster_alpha):
 		bv_raster_alpha.clear()
 	if is_instance_valid(bv_raster_beta):
@@ -1136,20 +2703,52 @@ func _reset_round() -> void:
 	# and yaw +90 faces -X (toward alpha). Previously swapped (back-to-back).
 	fly_alpha.reset_fly(Vector3(-14.0, 7.0, 0.0), deg_to_rad(-90.0))
 	fly_beta.reset_fly(Vector3(14.0, 7.0, 0.0), deg_to_rad(90.0))
+	# Overtime wander dock, gated on the same one-time replay scale:
+	# the last DNF's drift converts into missing starting health
+	# (farther ran = more docked), so the replay opens unequal and
+	# ties almost never repeat. First battles, post-decisive battles
+	# and free fights start whole.
+	if tournament_active and _round_overtime > 1.0:
+		var ddirector := _director()
+		if ddirector != null:
+			var dm: Dictionary = ddirector.current_match()
+			var dock_a := _wander_dock(float(dm.get("drift_a", 0.0)))
+			var dock_b := _wander_dock(float(dm.get("drift_b", 0.0)))
+			if is_instance_valid(fly_alpha):
+				fly_alpha.health = maxf(fly_alpha.health - dock_a, 1.0)
+			if is_instance_valid(fly_beta):
+				fly_beta.health = maxf(fly_beta.health - dock_b, 1.0)
+	_set_combat(true)
 
 	if is_instance_valid(status_label):
 		status_label.text = "AERIAL JOUST IN PROGRESS"
+	# The bracket drops exactly NOW (combat enabled): the landing
+	# ceremony and the whole load window played covered; the view
+	# opens straight into the live fight. Manual brackets survive
+	# (auto-opened waits only). Free battles no-op (nothing raised).
+	_hide_wait_bracket()
+	_hide_loading()
 
 func _physics_process(delta: float) -> void:
 	# Watchdog runs even between rounds: that limbo is exactly where a
-	# lost server reply would wedge the game.
+	# lost server reply would wedge the game. The owed-bank tick rides
+	# alongside so a lost bank ack heals without a watchdog cycle.
 	_check_seq_watchdog()
+	_bank_resend_tick()
+	_loading_supervise_tick()
+	_check_step_watchdog()
 	if not is_round_active:
 		return
 
 	current_round_time -= delta
-	if is_instance_valid(timer_label):
+	# Timer rewritten only on decisecond change (per-tick string builds
+	# and Label re-shapes were churn; 0.1 s granularity is the display).
+	var tenths := int(maxf(current_round_time, 0.0) * 10.0)
+	if is_instance_valid(timer_label) and tenths != _timer_last_tenths:
+		_timer_last_tenths = tenths
 		timer_label.text = "ROUND TIME: %04.1f s" % maxf(current_round_time, 0.0)
+		if _round_overtime > 1.0:
+			timer_label.text += " (OVERTIME x%.1f)" % _round_overtime
 
 	_update_health_hud()
 
@@ -1159,6 +2758,12 @@ func _physics_process(delta: float) -> void:
 		stats_alpha["tracking_time_s"] += delta
 	if sens_b.get("visual_target_visible", false):
 		stats_beta["tracking_time_s"] += delta
+	# Ground-scrape accumulation (fitness demerit): floor-band seconds
+	# per side, reported in the round stats.
+	if fly_alpha.global_position.y <= FlyPhysicsScript.FLOOR_Y + 0.3:
+		stats_alpha["scrape_time_s"] = float(stats_alpha.get("scrape_time_s", 0.0)) + delta
+	if fly_beta.global_position.y <= FlyPhysicsScript.FLOOR_Y + 0.3:
+		stats_beta["scrape_time_s"] = float(stats_beta.get("scrape_time_s", 0.0)) + delta
 	# Rear-aspect chase: on the victim's tail and facing it. This is the
 	# battle-level "who is winning the chase" score; evolution caps it so it
 	# can only decide equal-kill bouts, never outscore a kill.
@@ -1168,9 +2773,17 @@ func _physics_process(delta: float) -> void:
 		stats_beta["tail_time_s"] += delta
 
 	brain_tick_timer += delta
-	if brain_tick_timer >= BRAIN_TICK_DT:
+	if _should_send_step():
 		brain_tick_timer = 0.0
-		brain_client.send_sensory_step(sens_a, sens_b)
+		_step_seq += 1
+		_step_outstanding = _step_seq
+		brain_client.send_sensory_step(sens_a, sens_b, _step_seq)
+		_step_in_flight = true
+		_step_deadline_msec = Time.get_ticks_msec() + _step_timeout_msec()
+		# Dopamine-replay inputs: the sens refs land at send time (the
+		# dicts are fresh per step, so this is the last-sent context).
+		_last_sens_a = sens_a
+		_last_sens_b = sens_b
 
 	if is_instance_valid(arena_camera):
 		var midpoint = (fly_alpha.global_position + fly_beta.global_position) * 0.5
@@ -1179,23 +2792,661 @@ func _physics_process(delta: float) -> void:
 		arena_camera.global_position = arena_camera.global_position.lerp(target_cam_pos, delta * 3.0)
 		arena_camera.look_at(midpoint + Vector3(0, 1.5, 0), Vector3.UP)
 
-	_update_pip_view(pip_alpha_cam, fly_alpha, sens_a, pip_alpha_feat)
-	_update_pip_view(pip_beta_cam, fly_beta, sens_b, pip_beta_feat)
+	_update_pip_throttled(sens_a, sens_b)
 
 	if current_round_time <= 0.0:
-		# Stalemate verdict: time expired AND neither fly lost a point of
-		# health (catches strikes, wing tears via prior KO, and tree-clip
-		# damage). Free battle: a clean draw rematches the SAME brains with
-		# no champion and no evolution advance. Tournament: the draw is
-		# reported to the server (recorded, no dopamine) and replayed -
-		# unless sudden death is armed, when fitness must pick a winner.
-		var clean: bool = fly_alpha.health >= 99.99 and fly_beta.health >= 99.99
-		var director := _director()
-		var sudden: bool = tournament_active and director != null and director.sudden_death_armed
-		if clean and not sudden:
+		# Timeout decided by remaining health: most health wins no
+		# matter what dented the loser (strikes, wing tears via prior
+		# KO, tree rams, ground scrapes — bad flying is bad outcome).
+		# Near-equal health is a tie for the DNF/overtime ladder.
+		# Free battle: a tie rematches the SAME brains with no champion
+		# and no evolution advance. Tournament: ties report as draws
+		# (recorded, no dopamine) and replay; wins report for banking.
+		# The arena decides; the server only records and trains.
+		var decision := _timeout_winner(fly_alpha.health, fly_beta.health)
+		if decision == "draw":
+			_end_reason = "draw"
 			_handle_draw()
 		else:
+			_end_reason = "time"
+			_time_winner = decision
 			_end_round()
+
+func _should_send_step() -> bool:
+	# Fires at most every BRAIN_TICK_DT of physics time AND only when
+	# no reply is outstanding. The is_connected_server conjunct is
+	# load-bearing: send_sensory_step drops silently when disconnected,
+	# and flagging a dropped packet would wedge stepping until the
+	# step watchdog fires. If stepping ever wedges (no sends and no
+	# replies), check _step_in_flight/_step_deadline_msec here first.
+	return brain_tick_timer >= BRAIN_TICK_DT \
+		and not _step_in_flight \
+		and brain_client.is_connected_server
+
+
+func _step_timeout_msec() -> int:
+	# Adaptive step deadline: the floor plus ~3x the measured reply
+	# cadence, capped. A server that answers every 2.5 s gets a ~7.5 s
+	# deadline instead of a chronic false timeout every 2 s; a fast
+	# link keeps the 2 s floor, and a dead one still trips watchdogs
+	# (at most every 15 s). A round's first send always gets the flat
+	# grace (cold caches, post-load bursts). Pure (unit-tested).
+	if not _step_round_reply and _step_outstanding <= _step_round_base + 1:
+		return STEP_TIMEOUT_FIRST_MSEC
+	var ema_ms := int(STEP_TIMEOUT_EMA_MULT * bv_reply_ema * 1000.0)
+	return clampi(maxi(STEP_TIMEOUT_MSEC, ema_ms), STEP_TIMEOUT_MSEC,
+		STEP_TIMEOUT_MAX_MSEC)
+
+
+func _step_should_reconnect(now_msec: int) -> bool:
+	# Reconnect only on escalation: every fire used to rebind the UDP
+	# socket, widowing the in-flight reply (and feeding the server's
+	# 10054 storm) on what was merely a slow answer. First reconnect
+	# rides the CONTROL LINK SLOW escalation; after that at most one
+	# per 10 s while replies stay away. Pure (unit-tested).
+	if _step_timeouts < STEP_RECONNECT_EVERY:
+		return false
+	if _step_timeouts == STEP_RECONNECT_EVERY:
+		return true
+	return now_msec - _step_last_reconnect_msec > STEP_RECONNECT_MIN_GAP_MSEC
+
+
+func _check_step_watchdog() -> void:
+	# Lost-reply recovery for paced steps. Deliberately SILENT (no
+	# wait-bracket/modal): a missed step is routine and the next tick
+	# sends fresh state. We clear the flag rather than resend because
+	# fresh sensory state is strictly better than stale. Escalation
+	# policy lives here too: only 5+ consecutive timeouts (~10 s with
+	# zero control) earns status text, never a modal. To make step
+	# loss fail LOUD instead, hook _step_timeouts here. Deadline is
+	# adaptive (_step_timeout_msec): ~10 s on a fast link, longer on
+	# a throttled one - the COUNT is the escalation signal, not the
+	# wall time.
+	if not _step_in_flight:
+		return
+	if not is_round_active:
+		_step_in_flight = false
+		return
+	if Time.get_ticks_msec() < _step_deadline_msec:
+		return
+	_step_in_flight = false
+	_step_timeouts += 1
+	# Gated reconnect: a fresh socket heals a truly poisoned one, but
+	# rebinding on every fire widows the reply already in flight, so
+	# routine expiry just clears the flag for a fresh send (fresh
+	# sensory state is strictly better than stale).
+	var _now := Time.get_ticks_msec()
+	if _step_should_reconnect(_now):
+		_step_last_reconnect_msec = _now
+		brain_client.reconnect()
+	print("[Arena] Step watchdog: no control reply within %d ms (consecutive=%d)." % [_step_timeout_msec(), _step_timeouts])
+	_arena_log("step watchdog fired: consecutive=%d" % _step_timeouts)
+	if _step_timeouts >= 5 and is_instance_valid(status_label):
+		status_label.text = "CONTROL LINK SLOW - reflex holding..."
+
+const PIP_TICK_EVERY := 6
+func _make_pip_stats(parent: Node, left_side: bool) -> Label:
+	# Fly-stat card overlaying a PiP slot: name header in team color
+	# plus a full-word stat body. Top edge lines up with the health
+	# bar (y=8); same geometry both sides. A backing wash rect spans
+	# the whole card (normally transparent) so strike flashes cover
+	# the card area in team color, never just the text.
+	var is_alpha := left_side
+	var wash := ColorRect.new()
+	if left_side:
+		wash.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		wash.offset_left = 16.0
+		wash.offset_right = 316.0
+	else:
+		wash.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		wash.anchor_left = 1.0
+		wash.anchor_right = 1.0
+		wash.offset_left = -316.0
+		wash.offset_right = -16.0
+	wash.offset_top = 8.0
+	wash.offset_bottom = 320.0
+	wash.color = Color(1.0, 1.0, 1.0, 0.0)
+	wash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	wash.visible = false
+	parent.add_child(wash)
+	if is_alpha:
+		pip_flash_alpha = wash
+	else:
+		pip_flash_beta = wash
+	var nm := Label.new()
+	if left_side:
+		nm.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		nm.offset_left = 16.0
+		nm.offset_right = 316.0
+	else:
+		nm.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		nm.anchor_left = 1.0
+		nm.anchor_right = 1.0
+		nm.offset_left = -316.0
+		nm.offset_right = -16.0
+	nm.offset_top = 8.0
+	nm.offset_bottom = 36.0
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	nm.add_theme_font_size_override("font_size", 17)
+	nm.add_theme_color_override("font_color",
+		TEAM_ALPHA if is_alpha else TEAM_BETA)
+	nm.clip_text = true
+	nm.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	nm.visible = false
+	parent.add_child(nm)
+	if is_alpha:
+		pip_name_alpha = nm
+	else:
+		pip_name_beta = nm
+	var l := Label.new()
+	if left_side:
+		l.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		l.offset_left = 16.0
+		l.offset_right = 316.0
+	else:
+		l.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		l.anchor_left = 1.0
+		l.anchor_right = 1.0
+		l.offset_left = -316.0
+		l.offset_right = -16.0
+	l.offset_top = 38.0
+	l.offset_bottom = 320.0
+	l.add_theme_font_size_override("font_size", 12)
+	# Tight rows: the stat card carries ~14 rows in 282 px, several
+	# wrapping to two lines - default line spacing clipped the tail.
+	l.add_theme_constant_override("line_spacing", 1)
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.visible = false
+	parent.add_child(l)
+	# Bottom of the z-stack, card order kept (wash, name, body):
+	# popups appended later (e.g. the bracket overlay) must cover stat
+	# cards, never the reverse.
+	var wash_node: ColorRect = pip_flash_alpha if is_alpha else pip_flash_beta
+	if is_instance_valid(wash_node):
+		parent.move_child(wash_node, 0)
+	parent.move_child(nm, 1)
+	parent.move_child(l, 2)
+	return l
+
+
+func _make_pip_motors(parent: Node, left_side: bool) -> void:
+	# MOTORS-slot debug widgets in the same card rect: 4 bipolar
+	# command bars (thrust 0..1, yaw/pitch/roll -1..+1) plus a scrolling
+	# command-trace canvas below. Same geometry both sides; hidden
+	# unless the PiP slot is MOTORS.
+	var is_alpha := left_side
+	var bars: Array = []
+	var mins := [0.0, -1.0, -1.0, -1.0]
+	var fills := [TEAM_ALPHA if is_alpha else TEAM_BETA, Color(1, 1, 1),
+		Color(1.0, 0.85, 0.3), Color(0.35, 0.85, 1.0)]
+	for i in range(4):
+		var bar := ProgressBar.new()
+		if left_side:
+			bar.set_anchors_preset(Control.PRESET_TOP_LEFT)
+			bar.offset_left = 16.0
+			bar.offset_right = 316.0
+		else:
+			bar.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+			bar.anchor_left = 1.0
+			bar.anchor_right = 1.0
+			bar.offset_left = -316.0
+			bar.offset_right = -16.0
+		bar.offset_top = 165.0 + float(i) * 20.0
+		bar.offset_bottom = 181.0 + float(i) * 20.0
+		bar.min_value = mins[i]
+		bar.max_value = 1.0
+		bar.value = 0.0
+		bar.show_percentage = false
+		var bg := StyleBoxFlat.new()
+		bg.bg_color = Color(0, 0, 0, 0.45)
+		bar.add_theme_stylebox_override("background", bg)
+		var fill := StyleBoxFlat.new()
+		fill.bg_color = fills[i]
+		bar.add_theme_stylebox_override("fill", fill)
+		bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		bar.visible = false
+		parent.add_child(bar)
+		bars.append(bar)
+	if is_alpha:
+		pip_motor_bars_alpha = bars
+	else:
+		pip_motor_bars_beta = bars
+	var trace := Control.new()
+	if left_side:
+		trace.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		trace.offset_left = 16.0
+		trace.offset_right = 316.0
+	else:
+		trace.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		trace.anchor_left = 1.0
+		trace.anchor_right = 1.0
+		trace.offset_left = -316.0
+		trace.offset_right = -16.0
+	trace.offset_top = 246.0
+	trace.offset_bottom = 316.0
+	trace.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	trace.visible = false
+	parent.add_child(trace)
+	# Opaque scope backing: the trace rect overlaps the brain side
+	# panels - the dark card reads as a deliberate inset instead of
+	# trace lines crossing pool text. Added after the trace so it sits
+	# below it in z.
+	var scope := PanelContainer.new()
+	if left_side:
+		scope.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		scope.offset_left = 16.0
+		scope.offset_right = 316.0
+	else:
+		scope.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		scope.anchor_left = 1.0
+		scope.anchor_right = 1.0
+		scope.offset_left = -316.0
+		scope.offset_right = -16.0
+	scope.offset_top = 246.0
+	scope.offset_bottom = 316.0
+	var sbg := StyleBoxFlat.new()
+	sbg.bg_color = Color(0.06, 0.06, 0.09, 0.94)
+	sbg.set_border_width_all(1)
+	sbg.border_color = Color(0.4, 0.4, 0.46)
+	sbg.set_corner_radius_all(4)
+	scope.add_theme_stylebox_override("panel", sbg)
+	scope.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	scope.visible = false
+	parent.add_child(scope)
+	parent.move_child(scope, trace.get_index())
+	trace.draw.connect(_on_motor_trace_draw.bind("alpha" if is_alpha else "beta"))
+	if is_alpha:
+		pip_motor_trace_alpha = trace
+		pip_motor_scope_alpha = scope
+	else:
+		pip_motor_trace_beta = trace
+		pip_motor_scope_beta = scope
+	# Z-order: these build lazily on first MOTORS entry, long after the
+	# bracket overlay - without this they would draw ON TOP of it (the
+	# stat cards avoid this via move_child 0/1/2 at build). Tuck every
+	# widget just below the bracket overlay, which itself stays below
+	# the WinnerOverlay callouts.
+	if is_instance_valid(bracket_overlay):
+		var below := bracket_overlay.get_index()
+		for w in bars + [trace, scope]:
+			if is_instance_valid(w):
+				parent.move_child(w, below)
+
+
+func _format_fighter_rows(rec: Dictionary, gp: Dictionary, lin: Dictionary,
+		tr: Dictionary, parents: Dictionary, live: Dictionary,
+		st: Dictionary, match_draws: int = 0) -> PackedStringArray:
+	# Pure stat-row builder (no scene/director reads, so headless tests
+	# can pin it): identical full-word row order for both flies. Career
+	# figures ride the bracket snapshot (frozen at build, refreshed per
+	# match load); live figures update on change.
+	var lines := PackedStringArray()
+	# Training score rides the ELO row: recent form (mean over the
+	# last RECENT_EPISODES training episodes), so post-training
+	# improvement shows instead of the lifetime average. 0.00 = no
+	# stamped recent form yet (pre-ring brains populate on their next
+	# training stamp); the Schooling row below carries context.
+	lines.append("ELO %d | Training score %.2f/ep" % [
+		int(rec.get("elo", 1200.0)), float(tr.get("recent_avg", 0.0))])
+	lines.append("Battles: %d (Wins %d, Losses %d)" % [
+		int(rec.get("battles", 0)), int(rec.get("wins", 0)),
+		int(rec.get("losses", 0))])
+	lines.append("Did not finish: %d" % [
+		int(rec.get("draws", 0)) + maxi(match_draws, 0)])
+	lines.append("Wandered: %d" % int(rec.get("wander", 0)))
+	lines.append("Knockouts: %d (%d this match)" % [
+		int(rec.get("ko", 0)), int(st.get("kills", 0))])
+	lines.append("Matches: %d (Won %d), Titles: %d" % [
+		int(rec.get("matches", 0)), int(rec.get("matches_won", 0)),
+		int(rec.get("tournaments_won", 0))])
+	lines.append("Schooling: %d episodes" % int(tr.get("episodes", 0)))
+	var src := str(lin.get("source", "generated"))
+	var peds: Array = lin.get("parent_ids", [])
+	var ped := src
+	if src.begins_with("clone:"):
+		var pn := str(parents.get(str(peds[0]) if not peds.is_empty() else "", "?"))
+		ped = "junior of %s (junior %d)" % [pn, int(lin.get("jr", 0))] \
+			if int(lin.get("jr", 0)) > 0 \
+			else "clone of %s" % pn
+		if int(lin.get("kin", 0)) > 0 and int(lin.get("jr", 0)) <= 0:
+			ped += " (kin %d)" % int(lin.get("kin", 0))
+	elif src.begins_with("crossover:"):
+		var an := str(parents.get(str(peds[0]) if peds.size() > 0 else "", "?"))
+		var bn := str(parents.get(str(peds[1]) if peds.size() > 1 else "", "?"))
+		ped = "crossover %s x %s" % [an, bn]
+		if int(lin.get("jr", 0)) > 0:
+			ped += " (junior %d)" % int(lin.get("jr", 0))
+	elif src == "reference":
+		ped = "reference stock"
+	elif src == "evo-random" or src == "generated":
+		ped = "wild" if src == "evo-random" else "generated"
+	lines.append("Pedigree: %s" % ped)
+	var gid := str(gp.get("genome_id", ""))
+	if gid == "":
+		var exp = gp.get("experiment", null)
+		gid = "mix" if exp is Array else (str(exp) if exp != null and str(exp) != "" else "base")
+	lines.append("Evasion: %.2f, Learning rate: %.4f, Wiring: %s" % [
+		float(gp.get("evasion", 0.0)), float(gp.get("learning_rate", 0.0)), gid])
+	lines.append("Speed: %.1f, Thrust: %.2f, Health: %.0f" % [
+		float(live.get("spd", 0.0)), float(live.get("thr", 0.0)),
+		float(live.get("hp", 0.0))])
+	lines.append("Beyond arena: %.1f m" % float(live.get("drift", 0.0)))
+	return lines
+
+
+func _pip_stats_text(side: String) -> String:
+	# Live fly stat card body (the name rides its own team-colored
+	# label): record, traits, pedigree, and live flight numbers.
+	# Record/traits ride the bracket snapshot (no vault shell-outs at
+	# 10 Hz); row order/shape comes from _format_fighter_rows so both
+	# flies always read identically.
+	var fly: CharacterBody3D = fly_alpha if side == "alpha" else fly_beta
+	var rec := {}
+	var gp := {}
+	var lin := {}
+	var tr := {}
+	var director := _director()
+	var match_draws := 0
+	if director != null:
+		var m: Dictionary = director.current_match()
+		match_draws = int(m.get("draws", 0))
+		var pid := str(m.get("a_id" if side == "alpha" else "b_id", ""))
+		for p in director.tourney.get("players", []):
+			if str((p as Dictionary).get("id", "")) == pid:
+				rec = (p as Dictionary).get("record", {})
+				gp = (p as Dictionary).get("generator_params", {})
+				lin = (p as Dictionary).get("lineage", {})
+				tr = (p as Dictionary).get("training", {})
+				break
+	var parents := {}
+	for ppid in (lin.get("parent_ids", []) as Array):
+		parents[str(ppid)] = _nextgen_parent_name(str(ppid))
+	var live := {"spd": 0.0, "thr": 0.0, "hp": 0.0, "drift": 0.0}
+	if is_instance_valid(fly):
+		live["spd"] = (fly as CharacterBody3D).velocity.length()
+		var _t = fly.get("current_thrust")
+		live["thr"] = float(_t) if _t != null else 0.0
+		var _h = fly.get("health")
+		live["hp"] = float(_h) if _h != null else 0.0
+		var _flat := Vector2(
+			(fly as CharacterBody3D).global_position.x,
+			(fly as CharacterBody3D).global_position.z)
+		live["drift"] = maxf(_flat.length() - ARENA_RING_R, 0.0)
+	var st: Dictionary = stats_alpha if side == "alpha" else stats_beta
+	return "\n".join(_format_fighter_rows(rec, gp, lin, tr, parents,
+		live, st, match_draws))
+
+
+func _park_pip_on_cloud(cam: Camera3D, cloud: Node3D) -> void:
+	# Frame a spinning brain cloud in a PiP viewport (shared world, so
+	# no reparenting: just point the existing eye camera at it).
+	if is_instance_valid(cam) and is_instance_valid(cloud):
+		var cp: Vector3 = (cloud as Node3D).global_position
+		cam.global_transform = Transform3D(Basis(), cp + Vector3(0.6, 0.9, 2.6))
+		cam.look_at(cp)
+
+
+func _apply_pip_slot() -> void:
+	# Immediate visibility/label/cloud work for a slot change (the
+	# per-tick pump below handles cameras and stat refresh).
+	var eyes := pip_slot_mode == "EYES"
+	var brain := pip_slot_mode == "BRAIN"
+	var motors := pip_slot_mode == "MOTORS"
+	if pip_stats_alpha == null and is_instance_valid(pip_alpha_box):
+		pip_stats_alpha = _make_pip_stats(pip_alpha_box.get_parent(), true)
+	if pip_stats_beta == null and is_instance_valid(pip_beta_box):
+		pip_stats_beta = _make_pip_stats(pip_beta_box.get_parent(), false)
+	# STATS and MOTORS hide the viewport boxes outright (otherwise the
+	# last eye frame sits frozen behind the cards).
+	var show_views := perf_pip and pip_slot_mode != "STATS" and not motors
+	for n in [pip_alpha_box, pip_beta_box]:
+		if is_instance_valid(n):
+			(n as Control).visible = show_views
+	for n in [pip_alpha_label, pip_beta_label, pip_alpha_feat, pip_beta_feat]:
+		if is_instance_valid(n):
+			(n as Control).visible = perf_pip and eyes
+	# STATS/MOTORS cards, name rows, and motor widgets are cheap
+	# labels/canvas - they follow the slot mode even when eye renders
+	# are disabled (render saver, not stats killer). Only the viewport
+	# boxes and eye labels follow perf_pip.
+	if is_instance_valid(pip_stats_alpha):
+		pip_stats_alpha.visible = not eyes and (pip_slot_mode == "STATS" or motors)
+	if is_instance_valid(pip_stats_beta):
+		pip_stats_beta.visible = not eyes and (pip_slot_mode == "STATS" or motors)
+	if is_instance_valid(pip_name_alpha):
+		pip_name_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
+	if is_instance_valid(pip_name_beta):
+		pip_name_beta.visible = pip_stats_beta.visible if is_instance_valid(pip_stats_beta) else false
+	if is_instance_valid(pip_flash_alpha):
+		pip_flash_alpha.visible = pip_stats_alpha.visible if is_instance_valid(pip_stats_alpha) else false
+	if is_instance_valid(pip_flash_beta):
+		pip_flash_beta.visible = pip_stats_beta.visible if is_instance_valid(pip_stats_beta) else false
+	# Motor debug widgets (bars + trace per side): built lazily like
+	# the stat cards, shown only in MOTORS mode.
+	if pip_motor_bars_alpha.is_empty() and is_instance_valid(pip_alpha_box):
+		_make_pip_motors(pip_alpha_box.get_parent(), true)
+	if pip_motor_bars_beta.is_empty() and is_instance_valid(pip_beta_box):
+		_make_pip_motors(pip_beta_box.get_parent(), false)
+	for bar in pip_motor_bars_alpha + pip_motor_bars_beta:
+		if is_instance_valid(bar):
+			(bar as Control).visible = motors
+	if is_instance_valid(pip_motor_trace_alpha):
+		pip_motor_trace_alpha.visible = motors
+	if is_instance_valid(pip_motor_trace_beta):
+		pip_motor_trace_beta.visible = motors
+	if is_instance_valid(pip_motor_scope_alpha):
+		pip_motor_scope_alpha.visible = motors
+	if is_instance_valid(pip_motor_scope_beta):
+		pip_motor_scope_beta.visible = motors
+	if eyes:
+		if is_instance_valid(pip_alpha_label):
+			pip_alpha_label.text = _slot_name("alpha") + " EYES - raw (pre-brain)"
+		if is_instance_valid(pip_beta_label):
+			pip_beta_label.text = _slot_name("beta") + " EYES - raw (pre-brain)"
+	elif brain:
+		if is_instance_valid(pip_alpha_label):
+			pip_alpha_label.text = _slot_name("alpha") + " BRAIN 3D"
+		if is_instance_valid(pip_beta_label):
+			pip_beta_label.text = _slot_name("beta") + " BRAIN 3D"
+	# Clouds: forced on in BRAIN mode, canonical layer visibility else.
+	if brain:
+		if is_instance_valid(bv_cloud_alpha):
+			bv_cloud_alpha.visible = true
+		if is_instance_valid(bv_cloud_beta):
+			bv_cloud_beta.visible = true
+	else:
+		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
+
+
+static func _motor_debug_text(ctrl: Dictionary, spike_rate: float, silent_n: int) -> String:
+	# Pure builder for the MOTORS card text: command values with a sign
+	# legend (+yaw=right, +pitch=climb, +roll=bank-right), spike rate,
+	# and the silence badge once the quiet streak passes the threshold.
+	# Unit-tested.
+	var t := float(ctrl.get("thrust", 0.0))
+	var y := float(ctrl.get("yaw_torque", 0.0))
+	var p := float(ctrl.get("pitch_torque", 0.0))
+	var r := float(ctrl.get("roll_torque", 0.0))
+	var sp := float(ctrl.get("spear_thrust", 0.0))
+	var ram := float(ctrl.get("ram_drive", 0.0))
+	var ev := "EVADE" if bool(ctrl.get("emergency_evade", false)) else "-"
+	var yd := "R" if y > 0.05 else ("L" if y < -0.05 else "")
+	var text := "THR %.2f   SPK %.0f/s\nYAW %+.2f%s\nPITCH %+.2f\nROLL %+.2f\nSPEAR %.2f RAM %.1f %s\nY+:right P+:climb R+:bankR" % [
+		t, spike_rate, y, yd, p, r, sp, ram, ev]
+	if silent_n >= MOTOR_SILENT_REPLIES:
+		text += "\nSILENT (reflex only)"
+	return text
+
+
+func _set_motor_bars(bars: Array, ctrl: Dictionary) -> void:
+	# Pushes the latest command into the 4 bipolar meters (thrust 0..1,
+	# yaw/pitch/roll -1..+1). Guards the build order.
+	if bars.size() < 4:
+		return
+	var vals := [float(ctrl.get("thrust", 0.0)),
+		float(ctrl.get("yaw_torque", 0.0)),
+		float(ctrl.get("pitch_torque", 0.0)),
+		float(ctrl.get("roll_torque", 0.0))]
+	for i in range(4):
+		var bar = bars[i]
+		if is_instance_valid(bar):
+			(bar as ProgressBar).value = clampf(vals[i],
+				0.0 if i == 0 else -1.0, 1.0)
+
+
+func _on_motor_trace_draw(side: String) -> void:
+	# Scrolling command traces: thrust 0..1 (top-down) + yaw/pitch/roll
+	# -1..+1 around the zero line, over the last MOTOR_TRACE_MAX
+	# replies. Drawn only while the MOTORS slot shows the canvas.
+	var trace_ctl: Control = pip_motor_trace_alpha if side == "alpha" else pip_motor_trace_beta
+	if not is_instance_valid(trace_ctl):
+		return
+	var buf: Array = _motor_trace_alpha if side == "alpha" else _motor_trace_beta
+	var w := trace_ctl.size.x
+	var h := trace_ctl.size.y
+	if w <= 0.0 or h <= 0.0 or buf.is_empty():
+		return
+	trace_ctl.draw_line(Vector2(0, h * 0.5), Vector2(w, h * 0.5),
+		Color(1, 1, 1, 0.25))
+	var cols := {"t": Color(0.45, 0.85, 0.5), "y": Color(1, 1, 1),
+		"p": Color(1.0, 0.85, 0.3), "r": Color(0.35, 0.85, 1.0)}
+	var n := buf.size()
+	for key in ["t", "y", "p", "r"]:
+		var pts := PackedVector2Array()
+		for i in range(n):
+			var v := float((buf[i] as Dictionary).get(key, 0.0))
+			var yn := h - (v * h) if key == "t" else h * 0.5 - (v * h * 0.5)
+			pts.append(Vector2(w * float(i) / float(maxi(n - 1, 1)),
+				clampf(yn, 0.0, h)))
+		if pts.size() > 1:
+			trace_ctl.draw_polyline(pts, cols[key], 1.0)
+
+
+func _push_motor_sample(side: String, ctrl: Dictionary, st: Dictionary) -> void:
+	# Per-reply motor telemetry: command snapshot onto the trace ring,
+	# silence streak + spike EMA for the badge/readout. A few floats
+	# per reply - always on, drawing gated on MOTORS visibility.
+	var trace: Array = _motor_trace_alpha if side == "alpha" else _motor_trace_beta
+	trace.append({"t": float(ctrl.get("thrust", 0.0)),
+		"y": float(ctrl.get("yaw_torque", 0.0)),
+		"p": float(ctrl.get("pitch_torque", 0.0)),
+		"r": float(ctrl.get("roll_torque", 0.0))})
+	while trace.size() > MOTOR_TRACE_MAX:
+		trace.pop_front()
+	var spikes := int(st.get("spikes", 0))
+	if side == "alpha":
+		_motor_spike_ema_alpha = lerpf(_motor_spike_ema_alpha, float(spikes), 0.35)
+		if spikes == 0:
+			_motor_silent_alpha += 1
+			if _motor_silent_alpha == MOTOR_SILENT_REPLIES \
+					and is_instance_valid(status_label):
+				status_label.text = "%s BRAIN SILENT (reflex only)" % _slot_name("alpha")
+		else:
+			_motor_silent_alpha = 0
+	else:
+		_motor_spike_ema_beta = lerpf(_motor_spike_ema_beta, float(spikes), 0.35)
+		if spikes == 0:
+			_motor_silent_beta += 1
+			if _motor_silent_beta == MOTOR_SILENT_REPLIES \
+					and is_instance_valid(status_label):
+				status_label.text = "%s BRAIN SILENT (reflex only)" % _slot_name("beta")
+		else:
+			_motor_silent_beta = 0
+
+
+func _update_motor_cards() -> void:
+	# MOTORS slot refresh (10 Hz tick): debug text + bar values +
+	# trace redraw per side. Silence badge state lives in the text.
+	# Reply-rate guard mirrors _update_ctrl_label (no replies yet ->
+	# 0 Hz, never an exploded rate).
+	var hz := 0.0
+	if bv_reply_ema > 0.001:
+		hz = 1.0 / bv_reply_ema
+	for side in ["alpha", "beta"]:
+		var ctrl: Dictionary = _last_ctrl_a if side == "alpha" else _last_ctrl_b
+		var ema := _motor_spike_ema_alpha if side == "alpha" else _motor_spike_ema_beta
+		var silent := _motor_silent_alpha if side == "alpha" else _motor_silent_beta
+		var body: Label = pip_stats_alpha if side == "alpha" else pip_stats_beta
+		if is_instance_valid(body):
+			body.text = _motor_debug_text(ctrl, ema * hz, silent)
+		_set_motor_bars(pip_motor_bars_alpha if side == "alpha" else pip_motor_bars_beta, ctrl)
+		var trace: Control = pip_motor_trace_alpha if side == "alpha" else pip_motor_trace_beta
+		if is_instance_valid(trace):
+			trace.queue_redraw()
+
+
+func _refresh_pip_cards() -> void:
+	# Cheap label pump shared by the perf-on tick and the perf-off
+	# path: stat/motor cards stay live even when eye renders are
+	# disabled. Render updates live with the callers, never here.
+	if pip_slot_mode == "STATS":
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+		if is_instance_valid(pip_stats_alpha):
+			pip_stats_alpha.text = _pip_stats_text("alpha")
+		if is_instance_valid(pip_stats_beta):
+			pip_stats_beta.text = _pip_stats_text("beta")
+		if is_instance_valid(pip_name_alpha):
+			pip_name_alpha.text = _slot_name("alpha")
+		if is_instance_valid(pip_name_beta):
+			pip_name_beta.text = _slot_name("beta")
+	elif pip_slot_mode == "MOTORS":
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+		_update_motor_cards()
+
+
+func _update_pip_throttled(sens_a: Dictionary, sens_b: Dictionary) -> void:
+	# Eye views re-render the whole forest per viewport (scene + shadow
+	# maps, twice): throttle to every 6th physics tick (~10 Hz, plenty
+	# for eye views). Renders-off hides the heavy nodes once; the label
+	# cards keep refreshing on their normal schedule either way.
+	_pip_tick += 1
+	if not perf_pip:
+		if not _pip_hidden:
+			_pip_hidden = true
+			for n in [pip_alpha_box, pip_beta_box, pip_alpha_label,
+					pip_beta_label, pip_alpha_feat, pip_beta_feat]:
+				if is_instance_valid(n):
+					(n as Control).visible = false
+		if _pip_tick % PIP_TICK_EVERY == 0:
+			_refresh_pip_cards()
+		return
+	if _pip_hidden:
+		_pip_hidden = false
+		_apply_pip_slot()
+	if _pip_tick % PIP_TICK_EVERY == 0:
+		if pip_slot_mode == "STATS" or pip_slot_mode == "MOTORS":
+			_refresh_pip_cards()
+		elif pip_slot_mode == "BRAIN":
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
+			_park_pip_on_cloud(pip_alpha_cam, bv_cloud_alpha)
+			_park_pip_on_cloud(pip_beta_cam, bv_cloud_beta)
+			if is_instance_valid(bv_cloud_alpha):
+				bv_cloud_alpha.visible = true
+			if is_instance_valid(bv_cloud_beta):
+				bv_cloud_beta.visible = true
+		elif pip_slot_mode == "MOTORS":
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+			_update_motor_cards()
+		else:
+			for v in [pip_alpha_view, pip_beta_view]:
+				if is_instance_valid(v):
+					(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_ONCE
+			_update_pip_view(pip_alpha_cam, fly_alpha, sens_a, pip_alpha_feat)
+			_update_pip_view(pip_beta_cam, fly_beta, sens_b, pip_beta_feat)
+	else:
+		for v in [pip_alpha_view, pip_beta_view]:
+			if is_instance_valid(v):
+				(v as SubViewport).render_target_update_mode = SubViewport.UPDATE_DISABLED
+
 
 func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, feat: Label) -> void:
 	# Park the PiP camera on the fly's head, looking where it looks.
@@ -1206,7 +3457,7 @@ func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, fea
 	# Feature readout: the exact pre-brain values about to be sent north.
 	if is_instance_valid(feat):
 		var vis = "Y" if sens.get("visual_target_visible", false) else "-"
-		feat.text = "AZ %+.0f EL %+.0f RIV %.2f TR %.2f (L%.2f R%.2f) VIS %s PH L%.2f R%.2f TAIL %.0f" % [
+		feat.text = "AZ %+.0f EL %+.0f RIV %.2f TR %.2f (L%.2f R%.2f) VIS %s PH L%.2f R%.2f LOST %.0fs SURGE %.2f TAIL %.0f" % [
 			float(sens.get("visual_target_azimuth", 0.0)),
 			float(sens.get("visual_target_elevation", 0.0)),
 			float(sens.get("visual_rival_looming", 0.0)),
@@ -1216,6 +3467,8 @@ func _update_pip_view(cam: Camera3D, fly: CharacterBody3D, sens: Dictionary, fea
 			vis,
 			float(sens.get("pheromone_conc_left", 0.0)),
 			float(sens.get("pheromone_conc_right", 0.0)),
+			float(sens.get("scent_lost", 0.0)),
+			float(sens.get("scent_surge", 0.0)),
 			float(sens.get("tail_chase", 0.0))]
 
 func _build_health_hud() -> void:
@@ -1292,12 +3545,25 @@ func _make_wing_label(text: String) -> Label:
 func _update_health_hud() -> void:
 	if alpha_health_bar == null:
 		return
-	alpha_health_bar.value = fly_alpha.health
-	beta_health_bar.value = fly_beta.health
-	_update_wing_label(alpha_wing_l, fly_alpha.left_wing_intact)
-	_update_wing_label(alpha_wing_r, fly_alpha.right_wing_intact)
-	_update_wing_label(beta_wing_l, fly_beta.left_wing_intact)
-	_update_wing_label(beta_wing_r, fly_beta.right_wing_intact)
+	# Health bars written every tick (bar re-shape churn); wing labels
+	# only rebuilt on change. Change-gated on rounded health (the bar
+	# itself is continuous; 1-point granularity is the display).
+	var ha := int(fly_alpha.health)
+	var hb := int(fly_beta.health)
+	if ha != _health_last_a or hb != _health_last_b:
+		_health_last_a = ha
+		_health_last_b = hb
+		alpha_health_bar.value = fly_alpha.health
+		beta_health_bar.value = fly_beta.health
+	var wing_now := "%d%d%d%d" % [int(fly_alpha.left_wing_intact),
+		int(fly_alpha.right_wing_intact), int(fly_beta.left_wing_intact),
+		int(fly_beta.right_wing_intact)]
+	if wing_now != _wing_last_state:
+		_wing_last_state = wing_now
+		_update_wing_label(alpha_wing_l, fly_alpha.left_wing_intact)
+		_update_wing_label(alpha_wing_r, fly_alpha.right_wing_intact)
+		_update_wing_label(beta_wing_l, fly_beta.left_wing_intact)
+		_update_wing_label(beta_wing_r, fly_beta.right_wing_intact)
 
 func _update_wing_label(label: Label, intact: bool) -> void:
 	if label == null:
@@ -1310,18 +3576,19 @@ func _layout_match_hud() -> void:
 	# hide it outright (updates stay guarded no-ops).
 	if is_instance_valid(gen_label):
 		gen_label.visible = false
-	# Round time + wins move to a centered top strip, clear of the
-	# side brain-view panels (reparented scene labels, same nodes).
+	# Round time + wins + control cadence move to a centered top
+	# strip, clear of the side brain-view panels (reparented scene
+	# labels, same nodes) - stacked vertically, one readout per row.
 	var hud: CanvasLayer = $HUD
-	var strip := HBoxContainer.new()
+	var strip := VBoxContainer.new()
 	strip.name = "MatchStrip"
 	strip.set_anchors_preset(Control.PRESET_CENTER_TOP)
 	strip.offset_left = -320.0
 	strip.offset_right = 320.0
-	strip.offset_top = 64.0
-	strip.offset_bottom = 96.0
+	strip.offset_top = 56.0
+	strip.offset_bottom = 170.0
 	strip.alignment = BoxContainer.ALIGNMENT_CENTER
-	strip.add_theme_constant_override("separation", 40)
+	strip.add_theme_constant_override("separation", 4)
 	hud.add_child(strip)
 	for lbl in [timer_label, win_label]:
 		if is_instance_valid(lbl):
@@ -1360,7 +3627,7 @@ func _layout_match_hud() -> void:
 
 func _build_brainview() -> void:
 	# L0 pool-rate bars: one slim panel per fly, screen edges, always-on
-	# capable. 23 rows x 2 panels of tiny bars is trivial draw load; the
+	# capable. 31 rows x 2 panels of tiny bars is trivial draw load; the
 	# values arrive inside the existing motor reply (no extra packets).
 	var hud: CanvasLayer = $HUD
 	bv_panel_alpha = _make_bv_panel(hud, "BrainAlpha", Control.PRESET_BOTTOM_LEFT,
@@ -1374,7 +3641,6 @@ func _build_brainview() -> void:
 	bv_flow_alpha.set("title", "ALPHA FLOW")
 	bv_flow_beta.set("title", "BETA FLOW")
 	_build_brain_clouds()
-	_build_replay_panel(hud)
 	_apply_brainview_settings()
 
 
@@ -1413,131 +3679,6 @@ func _make_bv_cloud(cname: String, campos: Vector3) -> Node3D:
 	return holder
 
 
-func _build_replay_panel(hud: CanvasLayer) -> void:
-	# Post-battle scrubber: play/pause + slider over the banked
-	# pool-rate stream, rendered through the same bars + diagram.
-	bv_replay_panel = PanelContainer.new()
-	bv_replay_panel.name = "ReplayPanel"
-	bv_replay_panel.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
-	bv_replay_panel.offset_left = -320.0
-	bv_replay_panel.offset_right = 320.0
-	bv_replay_panel.offset_top = -104.0
-	bv_replay_panel.offset_bottom = -56.0
-	bv_replay_panel.visible = false
-	hud.add_child(bv_replay_panel)
-	var hb := HBoxContainer.new()
-	hb.add_theme_constant_override("separation", 8)
-	bv_replay_panel.add_child(hb)
-	var tag := Label.new()
-	tag.text = "REPLAY"
-	tag.add_theme_font_size_override("font_size", 12)
-	hb.add_child(tag)
-	bv_replay_playbtn = Button.new()
-	bv_replay_playbtn.text = "Play"
-	bv_replay_playbtn.pressed.connect(_on_replay_play)
-	hb.add_child(bv_replay_playbtn)
-	bv_replay_slider = HSlider.new()
-	bv_replay_slider.min_value = 0.0
-	bv_replay_slider.max_value = 1.0
-	bv_replay_slider.step = 1.0
-	bv_replay_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	bv_replay_slider.value_changed.connect(_on_replay_scrub)
-	hb.add_child(bv_replay_slider)
-	bv_replay_label = Label.new()
-	bv_replay_label.text = "0/0"
-	bv_replay_label.add_theme_font_size_override("font_size", 12)
-	hb.add_child(bv_replay_label)
-	var close_b := Button.new()
-	close_b.text = "X"
-	close_b.pressed.connect(_exit_replay)
-	hb.add_child(close_b)
-
-
-func _toggle_replay() -> void:
-	if bv_replay_mode:
-		_exit_replay()
-		return
-	if is_round_active:
-		if is_instance_valid(status_label):
-			status_label.text = "REPLAY available between battles."
-		return
-	if bv_stream_alpha.is_empty():
-		if is_instance_valid(status_label):
-			status_label.text = "No recorded stream (menu record toggle?)."
-		return
-	bv_replay_mode = true
-	bv_replay_idx = 0
-	bv_replay_playing = false
-	bv_replay_playbtn.text = "Play"
-	bv_replay_slider.max_value = float(bv_stream_alpha.size() - 1)
-	bv_replay_slider.value = 0.0
-	bv_replay_panel.visible = true
-	# Replay forces the bars visible; prior state restores on exit.
-	bv_replay_prior_bars = [
-		is_instance_valid(bv_panel_alpha) and bv_panel_alpha.visible,
-		is_instance_valid(bv_panel_beta) and bv_panel_beta.visible]
-	if is_instance_valid(bv_panel_alpha):
-		bv_panel_alpha.visible = true
-	if is_instance_valid(bv_panel_beta):
-		bv_panel_beta.visible = true
-	_render_replay_frame()
-
-
-func _exit_replay() -> void:
-	bv_replay_mode = false
-	bv_replay_playing = false
-	if is_instance_valid(bv_replay_panel):
-		bv_replay_panel.visible = false
-	if bv_replay_prior_bars.size() == 2:
-		if is_instance_valid(bv_panel_alpha):
-			bv_panel_alpha.visible = bool(bv_replay_prior_bars[0])
-		if is_instance_valid(bv_panel_beta):
-			bv_panel_beta.visible = bool(bv_replay_prior_bars[1])
-		bv_replay_prior_bars.clear()
-
-
-func _on_replay_play() -> void:
-	bv_replay_playing = not bv_replay_playing
-	bv_replay_playbtn.text = "Pause" if bv_replay_playing else "Play"
-
-
-func _on_replay_scrub(value: float) -> void:
-	if not bv_replay_mode:
-		return
-	bv_replay_idx = int(value)
-	_render_replay_frame()
-
-
-func _render_replay_frame() -> void:
-	var n := bv_stream_alpha.size()
-	if n == 0:
-		return
-	bv_replay_idx = clampi(bv_replay_idx, 0, n - 1)
-	bv_replay_label.text = "%d/%d" % [bv_replay_idx + 1, n]
-	var keys: Array = []
-	for spec in BV_POOLS:
-		keys.append(str(spec[0]))
-	_render_replay_side(bv_rows_alpha, bv_ema_alpha, bv_stream_alpha[bv_replay_idx], keys)
-	_render_replay_side(bv_rows_beta, bv_ema_beta, bv_stream_beta[bv_replay_idx], keys)
-	if is_instance_valid(bv_flow_alpha):
-		bv_flow_alpha.refresh(_replay_emas(bv_stream_alpha[bv_replay_idx], keys),
-			bv_caps, bv_wiring_alpha, bv_mapping_alpha)
-	if is_instance_valid(bv_flow_beta):
-		bv_flow_beta.refresh(_replay_emas(bv_stream_beta[bv_replay_idx], keys),
-			bv_caps, bv_wiring_beta, bv_mapping_beta)
-
-
-func _replay_emas(row: Array, keys: Array) -> Dictionary:
-	var emas := {}
-	for i in range(mini(row.size(), keys.size())):
-		emas[keys[i]] = float(row[i])
-	return emas
-
-
-func _render_replay_side(rows: Dictionary, _live_emas: Dictionary, row: Array, keys: Array) -> void:
-	_render_bv_side(rows, _replay_emas(row, keys))
-
-
 func _make_bv_flow(hud: CanvasLayer, vname: String, anchor: Control.LayoutPreset,
 		tint: Color) -> Control:
 	# Flow diagram overlay (L1): same side as its bar panel, wider and
@@ -1549,7 +3690,9 @@ func _make_bv_flow(hud: CanvasLayer, vname: String, anchor: Control.LayoutPreset
 	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
 	view.offset_left = 204.0 if left_side else -560.0
 	view.offset_right = 560.0 if left_side else -204.0
-	view.offset_top = -520.0
+	# Same top as the bar panels: every brainview layer starts just
+	# below the PiP eye views (raster copies these offsets).
+	view.offset_top = -488.0
 	view.offset_bottom = -60.0
 	view.tint = tint
 	view.mouse_filter = Control.MOUSE_FILTER_STOP
@@ -1638,18 +3781,22 @@ func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPrese
 	var panel := VBoxContainer.new()
 	panel.name = pname
 	panel.set_anchors_preset(anchor)
-	# Bottom-anchored: sits above the menu bar, clear of the top-corner
-	# PiP eye views on every resolution.
+	# Bottom-anchored: sits above the menu bar with its top tucked just
+	# below the top-corner PiP eye views (feat text ends ~226px; panel
+	# top lands ~232px at 720p).
 	var left_side := anchor == Control.PRESET_CENTER_LEFT or anchor == Control.PRESET_BOTTOM_LEFT
-	panel.offset_left = 8.0 if left_side else -196.0
-	panel.offset_right = 196.0 if left_side else -8.0
-	panel.offset_top = -470.0
-	panel.offset_bottom = -60.0
+	# Compact chart: 46 label + 64 bar + 26 count = 140px wide; ~385px
+	# tall for all 31 pool rows, top tucked just below the PiP eye
+	# views, bottom clear of the menu bar (and a smaller mouse rect).
+	panel.offset_left = 8.0 if left_side else -148.0
+	panel.offset_right = 148.0 if left_side else -8.0
+	panel.offset_top = -488.0
+	panel.offset_bottom = -103.0
 	panel.add_theme_constant_override("separation", 1)
 	hud.add_child(panel)
 	var head := Label.new()
 	head.text = title + " BRAIN"
-	head.add_theme_font_size_override("font_size", 12)
+	head.add_theme_font_size_override("font_size", 10)
 	head.add_theme_color_override("font_color", tint)
 	panel.add_child(head)
 	if pname == "BrainAlpha":
@@ -1660,25 +3807,25 @@ func _make_bv_panel(hud: CanvasLayer, pname: String, anchor: Control.LayoutPrese
 		bv_caps[str(spec[0])] = float(spec[2])
 	for spec in BV_POOLS:
 		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 3)
+		row.add_theme_constant_override("separation", 2)
 		panel.add_child(row)
 		var nm := Label.new()
 		nm.text = spec[1]
-		nm.custom_minimum_size = Vector2(52, 0)
-		nm.add_theme_font_size_override("font_size", 10)
+		nm.custom_minimum_size = Vector2(46, 0)
+		nm.add_theme_font_size_override("font_size", 9)
 		nm.add_theme_color_override("font_color", tint)
 		row.add_child(nm)
 		var bar := ProgressBar.new()
 		bar.min_value = 0.0
 		bar.max_value = 100.0
 		bar.show_percentage = false
-		bar.custom_minimum_size = Vector2(80, 12)
+		bar.custom_minimum_size = Vector2(64, 8)
 		bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 		row.add_child(bar)
 		var num := Label.new()
 		num.text = "0"
-		num.custom_minimum_size = Vector2(30, 0)
-		num.add_theme_font_size_override("font_size", 10)
+		num.custom_minimum_size = Vector2(26, 0)
+		num.add_theme_font_size_override("font_size", 9)
 		row.add_child(num)
 		rows[str(spec[0])] = [bar, num, float(spec[2])]
 	return panel
@@ -1713,7 +3860,7 @@ func _apply_brainview_settings() -> void:
 
 func _apply_bv_layer(layer: String) -> void:
 	# Bars always ride along when enabled. Flow shows on "flow", or on
-	# "raster" until a pool is selected ??then the raster takes its
+	# "raster" until a pool is selected — then the raster takes its
 	# rect (click again to deselect and return to the diagram).
 	_apply_bv_side_layer("alpha", layer)
 	_apply_bv_side_layer("beta", layer)
@@ -1739,8 +3886,14 @@ func _apply_bv_side_layer(side: String, layer: String) -> void:
 		cloud.visible = on and layer == "brain3d"
 
 
+static func pip_slot_next(cur: String) -> String:
+	# Pure slot rotation (unknown states reset to EYES).
+	var i := PIP_SLOT_MODES.find(cur)
+	return PIP_SLOT_MODES[(i + 1) % PIP_SLOT_MODES.size()] if i >= 0 else "EYES"
+
+
 func _on_brain_button() -> void:
-	# BRAIN button cycles every representation (bars/flow/raster/3D)
+	# STATS VIEW button cycles every representation (bars/flow/raster/3D)
 	# so the views are discoverable without knowing the keys; B
 	# still toggles visibility outright.
 	var any_hidden := false
@@ -1756,7 +3909,13 @@ func _on_brain_button() -> void:
 		# Spike readout lines stay hidden (see _apply_brainview_settings).
 		_apply_bv_layer(str(_director().brainview_layer) if _director() != null else "bars")
 	else:
-		_cycle_bv_layer()
+		# Panels already up: advance the PiP slot instead (EYES ->
+		# BRAIN 3D -> fly STATS -> MOTORS debug). Diagram layers still
+		# cycle on N.
+		pip_slot_mode = pip_slot_next(pip_slot_mode)
+		_apply_pip_slot()
+		if is_instance_valid(status_label):
+			status_label.text = "PiP slot: %s (STATS VIEW cycles, N diagrams)" % pip_slot_mode
 
 
 func _toggle_brainview() -> void:
@@ -1913,30 +4072,103 @@ func _render_bv_side(rows: Dictionary, emas: Dictionary) -> void:
 		(slot[0] as ProgressBar).value = clampf(ema / float(slot[2]), 0.0, 1.0) * 100.0
 		(slot[1] as Label).text = str(int(ema))
 
-func _build_hit_flash() -> void:
-	# Full-height left/right low-alpha overlays for instant hit feedback.
-	var hud: CanvasLayer = $HUD
-	alpha_hit_flash = ColorRect.new()
-	alpha_hit_flash.name = "AlphaHitFlash"
-	alpha_hit_flash.color = Color(1.0, 0.2, 0.15, 0.0)
-	alpha_hit_flash.set_anchors_preset(Control.PRESET_LEFT_WIDE)
-	alpha_hit_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(alpha_hit_flash)
+func _flash_stats_label(lbl: Label, tint: Color) -> void:
+	# Strike flash for HUD labels: instant tint, fade back to white
+	# over 0.4 s (same timing as the old half-screen flash). The tween
+	# starts only inside the tree, so headless tests can drive the
+	# routing (tint lands synchronously either way). One tween per
+	# label (previous killed on re-flash), so a KO clear can stop the
+	# fade dead instead of leaving it running.
+	if not is_instance_valid(lbl):
+		return
+	var old: Tween = _label_flash_tween.get(lbl)
+	if old != null and old.is_valid():
+		old.kill()
+	lbl.modulate = tint
+	if lbl.is_inside_tree():
+		var tw := lbl.create_tween()
+		tw.tween_property(lbl, "modulate", Color.WHITE, 0.4)
+		_label_flash_tween[lbl] = tw
 
-	beta_hit_flash = ColorRect.new()
-	beta_hit_flash.name = "BetaHitFlash"
-	beta_hit_flash.color = Color(1.0, 0.2, 0.15, 0.0)
-	beta_hit_flash.anchor_left = 0.5
-	beta_hit_flash.anchor_right = 1.0
-	beta_hit_flash.anchor_top = 0.0
-	beta_hit_flash.anchor_bottom = 1.0
-	beta_hit_flash.offset_right = 0.0
-	beta_hit_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(beta_hit_flash)
+
+func _flash_card_wash(side: String, strength: float) -> void:
+	# Team-color wash over the whole stat-card area (the strike flash
+	# the viewer actually sees). Fades over 0.4 s; new strikes restart
+	# it (previous tween killed, so flashes never stack and a KO clear
+	# can stop the fade dead).
+	if side != "alpha" and side != "beta":
+		return
+	var rect: ColorRect = pip_flash_alpha if side == "alpha" else pip_flash_beta
+	if not is_instance_valid(rect):
+		return
+	var old: Tween = _pip_wash_tween.get(side)
+	if old != null and old.is_valid():
+		old.kill()
+	var team: Color = TEAM_ALPHA if side == "alpha" else TEAM_BETA
+	rect.color = Color(team.r, team.g, team.b, strength)
+	if rect.is_inside_tree():
+		var tw := rect.create_tween()
+		tw.tween_property(rect, "color:a", 0.0, 0.4)
+		_pip_wash_tween[side] = tw
+
+
+func _clear_fighter_card(side: String) -> void:
+	# Stops a side's card flash dead: wash tween + label tint tweens
+	# killed, wash alpha zeroed, labels back to white, body glow zeroed
+	# (flash_hit is max-only, so the clear sets flash_energy directly).
+	# The KO presentation calls this for the surviving attacker: only
+	# the fly that got hurt keeps flashing.
+	if side != "alpha" and side != "beta":
+		return
+	var rect: ColorRect = pip_flash_alpha if side == "alpha" else pip_flash_beta
+	var old: Tween = _pip_wash_tween.get(side)
+	if old != null and old.is_valid():
+		old.kill()
+	if is_instance_valid(rect):
+		rect.color = Color(rect.color.r, rect.color.g, rect.color.b, 0.0)
+	var nm: Label = pip_name_alpha if side == "alpha" else pip_name_beta
+	var body: Label = pip_stats_alpha if side == "alpha" else pip_stats_beta
+	var row: Label = alpha_row_name if side == "alpha" else beta_row_name
+	for lbl in [nm, body, row]:
+		if is_instance_valid(lbl):
+			var lt: Tween = _label_flash_tween.get(lbl)
+			if lt != null and lt.is_valid():
+				lt.kill()
+			lbl.modulate = Color.WHITE
+	var fly = fly_alpha if side == "alpha" else fly_beta
+	if is_instance_valid(fly):
+		fly.set("flash_energy", 0.0)
+
+
+func _flash_fighter_card(side: String, tint: Color, strength: float = 0.5) -> void:
+	# Strike flash that never blocks the central view: the fighter's
+	# stat card area washes in team color plus a text tint when
+	# visible, else the always-visible health-row name tints.
+	# Unknown sides no-op.
+	if side != "alpha" and side != "beta":
+		return
+	var nm: Label = pip_name_alpha if side == "alpha" else pip_name_beta
+	var body: Label = pip_stats_alpha if side == "alpha" else pip_stats_beta
+	var flashed := false
+	for lbl in [nm, body]:
+		if is_instance_valid(lbl) and (lbl as Label).visible:
+			_flash_stats_label(lbl, tint)
+			flashed = true
+	if flashed:
+		_flash_card_wash(side, strength)
+		return
+	var row: Label = alpha_row_name if side == "alpha" else beta_row_name
+	_flash_stats_label(row, tint)
+
 
 func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void:
-	_flash_victim(victim_id, 0.5)
-	_flash_attacker(attacker_id, 0.22)
+	_flash_fighter_card(victim_id, Color(1.0, 0.35, 0.35), 0.5)
+	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
+	_flash_fighter_card(attacker_id, Color(1.0, 0.95, 0.75), 0.22)
+	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, 0.6)
+	var victim := fly_alpha if victim_id == "alpha" else fly_beta
+	if is_instance_valid(victim):
+		_fire_burst(hit_bursts.get(victim_id, null), victim.global_position)
 	# Don't clobber the KO/win message if the wing-loss already ended the round.
 	if is_instance_valid(status_label) and is_round_active:
 		if part == "spike_clash":
@@ -1944,39 +4176,143 @@ func _hit_feedback(attacker_id: String, victim_id: String, part: String) -> void
 				+ _slot_name(victim_id) + " spike each other!"
 		else:
 			status_label.text = _slot_name(attacker_id) + " STRIKES " + _slot_name(victim_id) + " (" + part + ")!"
+	# Sound the blow: clash tick, wing-tear rip, everything else a
+	# body thump (unknown parts fall through to thump - callers need
+	# no audio awareness).
+	_play_sfx("clash" if part == "spike_clash" else ("tear" if part == "wing_tear" else "thump"))
 
-func _flash_victim(victim_id: String, strength: float) -> void:
-	var rect := alpha_hit_flash if victim_id == "alpha" else beta_hit_flash
-	if rect != null:
-		_flash_rect(rect, Color(1.0, 0.2, 0.15), strength)
-	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, Color(1.0, 0.3, 0.2))
 
-func _flash_attacker(attacker_id: String, strength: float) -> void:
-	var rect := alpha_hit_flash if attacker_id == "alpha" else beta_hit_flash
-	if rect != null:
-		_flash_rect(rect, Color(1.0, 1.0, 0.8), strength)
-	_flash_body(fly_alpha if attacker_id == "alpha" else fly_beta, Color(1.0, 0.9, 0.6))
 
-func _flash_rect(rect: ColorRect, color: Color, strength: float) -> void:
-	rect.color = Color(color.r, color.g, color.b, strength)
-	var tw := create_tween()
-	tw.tween_property(rect, "color:a", 0.0, 0.4)
+# Combat readability FX: ground-projected health rings (in-world health
+# bars with seizure/KO states + KO shockwave) and per-fly ember bursts
+# for hits and KOs. Each fly bleeds its own team color (orange/blue),
+# so mid-clash hits read instantly. Visual only; sim state untouched.
+const TEAM_ALPHA := Color(1.0, 0.55, 0.30)
+const TEAM_BETA := Color(0.4, 0.75, 1.0)
+var ring_alpha: MeshInstance3D
+var ring_beta: MeshInstance3D
+var ring_mat_alpha: ShaderMaterial
+var ring_mat_beta: ShaderMaterial
+var ring_shock_alpha := 0.0
+var ring_shock_beta := 0.0
+var hit_bursts := {"alpha": null, "beta": null}
+var ko_bursts := {"alpha": null, "beta": null}
 
-func _flash_body(fly: CharacterBody3D, color: Color) -> void:
+
+func _ring_material(team: Color) -> ShaderMaterial:
+	var m := ShaderMaterial.new()
+	m.shader = preload("res://scripts/health_ring.gdshader")
+	m.set_shader_parameter("team_color", Vector3(team.r, team.g, team.b))
+	return m
+
+
+func _build_combat_fx() -> void:
+	ring_mat_alpha = _ring_material(TEAM_ALPHA)
+	ring_mat_beta = _ring_material(TEAM_BETA)
+	for slot in [["alpha", ring_mat_alpha], ["beta", ring_mat_beta]]:
+		var quad := QuadMesh.new()
+		quad.size = Vector2(4.4, 4.4)
+		var mi := MeshInstance3D.new()
+		mi.mesh = quad
+		mi.material_override = slot[1]
+		mi.rotation_degrees.x = -90.0
+		mi.position = Vector3(0, 0.06, 0)
+		add_child(mi)
+		if str(slot[0]) == "alpha":
+			ring_alpha = mi
+		else:
+			ring_beta = mi
+	hit_bursts["alpha"] = _make_burst(14, 0.07, TEAM_ALPHA)
+	hit_bursts["beta"] = _make_burst(14, 0.07, TEAM_BETA)
+	ko_bursts["alpha"] = _make_burst(42, 0.10, TEAM_ALPHA.lightened(0.2))
+	ko_bursts["beta"] = _make_burst(42, 0.10, TEAM_BETA.lightened(0.2))
+
+
+func _make_burst(amount: int, size: float, color: Color) -> GPUParticles3D:
+	# Glowing ember sparks: tiny unshaded spheres need no textures and
+	# stay crisp on the Mobile renderer.
+	var p := GPUParticles3D.new()
+	p.amount = amount
+	p.lifetime = 0.55
+	p.one_shot = true
+	p.explosiveness = 0.9
+	p.emitting = false
+	var pm := ParticleProcessMaterial.new()
+	pm.direction = Vector3(0, 1, 0)
+	pm.spread = 180.0
+	pm.initial_velocity_min = 4.0
+	pm.initial_velocity_max = 8.0
+	pm.gravity = Vector3(0, -6, 0)
+	pm.damping_min = 1.0
+	pm.damping_max = 2.0
+	p.process_material = pm
+	var spark := SphereMesh.new()
+	spark.radius = size
+	spark.height = size * 2.0
+	spark.radial_segments = 6
+	spark.rings = 4
+	var sm := StandardMaterial3D.new()
+	sm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sm.albedo_color = color
+	spark.material = sm
+	p.draw_pass_1 = spark
+	add_child(p)
+	return p
+
+
+func _fire_burst(p: GPUParticles3D, pos: Vector3) -> void:
+	if not is_instance_valid(p):
+		return
+	p.global_position = pos
+	p.restart()
+
+
+func _update_combat_fx(delta: float) -> void:
+	for slot in [["alpha", fly_alpha, ring_alpha, ring_mat_alpha, "ring_shock_alpha"],
+			["beta", fly_beta, ring_beta, ring_mat_beta, "ring_shock_beta"]]:
+		var fly: CharacterBody3D = slot[1]
+		var mi: MeshInstance3D = slot[2]
+		var mat: ShaderMaterial = slot[3]
+		if not is_instance_valid(fly) or mi == null or mat == null:
+			continue
+		mi.global_position = Vector3(fly.global_position.x, 0.06, fly.global_position.z)
+		mat.set_shader_parameter("hp", clampf(float(fly.get("health")) / 100.0, 0.0, 1.0))
+		mat.set_shader_parameter("seizing", 1.0 if bool(fly.get("seizing")) else 0.0)
+		mat.set_shader_parameter("ko", 1.0 if bool(fly.get("is_disabled")) else 0.0)
+		var key := str(slot[4])
+		var sh := float(get(key))
+		if sh > 0.0:
+			sh += delta * 1.5
+			if sh >= 1.0:
+				sh = 0.0
+			set(key, sh)
+		mat.set_shader_parameter("shock", sh)
+
+
+func _build_vignette() -> void:
+	# Cinematic frame: layer 0 sits under the HUD CanvasLayer (layer 1)
+	# and above the 3D view, so labels and overlays stay undarkened.
+	var layer := CanvasLayer.new()
+	layer.layer = 0
+	layer.name = "VignetteLayer"
+	add_child(layer)
+	var rect := ColorRect.new()
+	rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var smat := ShaderMaterial.new()
+	smat.shader = preload("res://scripts/vignette.gdshader")
+	rect.material = smat
+	layer.add_child(rect)
+
+
+func _flash_body(fly: CharacterBody3D, strength: float) -> void:
+	# Chitin-shader flash: the fly owns a decaying flash_energy uniform
+	# (FlyPhysics.flash_hit); the old StandardMaterial3D emission poke
+	# died with the flat team-blob material.
 	if not is_instance_valid(fly):
 		return
-	var mesh := fly.get_node_or_null("VisualModel/BodyMesh") as MeshInstance3D
-	if mesh == null:
-		return
-	var mat := mesh.get_active_material(0) as StandardMaterial3D
-	if mat == null:
-		return
-	mat.emission_enabled = true
-	mat.emission = color
-	mat.emission_energy_multiplier = 3.0
-	var tw := create_tween()
-	tw.tween_property(mat, "emission_energy_multiplier", 0.0, 0.45)
-	tw.tween_callback(func(): mat.emission_enabled = false)
+	if fly.has_method("flash_hit"):
+		fly.call("flash_hit", strength)
 
 func _build_winner_overlay() -> void:
 	# Full-screen dim + big centered winner callout + countdown. Hidden by
@@ -2012,8 +4348,8 @@ func _build_winner_overlay() -> void:
 	winner_label.name = "WinnerLabel"
 	winner_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	winner_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	winner_label.custom_minimum_size = Vector2(900, 0)
-	winner_label.add_theme_font_size_override("font_size", 88)
+	winner_label.custom_minimum_size = Vector2(1100, 0)
+	winner_label.add_theme_font_size_override("font_size", CALLOUT_TITLE_FS)
 	winner_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
 	winner_label.add_theme_constant_override("outline_size", 10)
 	vbox.add_child(winner_label)
@@ -2029,11 +4365,51 @@ func _build_winner_overlay() -> void:
 	countdown_label.add_theme_constant_override("outline_size", 5)
 	vbox.add_child(countdown_label)
 
-func _current_battle_id() -> String:
-	# Correlation-only id, echoed by the server for log matching.
-	return "%s-B%d" % [tourney_match_label, _battle_count() + 1]
+static var _RX_MATCH: RegEx = null
+static var _RX_BATTLE: RegEx = null
 
-func _show_loading(title: String, sub: String) -> void:
+
+static func expand_match_label(code: String) -> String:
+	# "R1M1" -> "Round 1, Match 1". Anything else (FREE, "", junk)
+	# passes through untouched. Display only: wire ids, server keys,
+	# logs and retry matching keep the compact form. RegEx compiled
+	# once (called per status update / report / retry).
+	if _RX_MATCH == null:
+		_RX_MATCH = RegEx.new()
+		_RX_MATCH.compile("^R(\\d+)M(\\d+)$")
+	var m := _RX_MATCH.search(code.strip_edges())
+	if m == null:
+		return code
+	return "Round %s, Match %s" % [m.get_string(1), m.get_string(2)]
+
+
+static func expand_battle_id(code: String) -> String:
+	# "R1M1-B1[-<msec>-<rand>]" -> "Round 1, Match 1, Battle 1".
+	# Display only: the report nonce (uniqueness) strips here.
+	if _RX_BATTLE == null:
+		_RX_BATTLE = RegEx.new()
+		_RX_BATTLE.compile("^(.*)-B(\\d+)(?:-\\d+-\\d+)?$")
+	var m := _RX_BATTLE.search(code.strip_edges())
+	if m == null:
+		return expand_match_label(code)
+	var inner := expand_match_label(m.get_string(1))
+	if inner == "":
+		return "Battle %s" % m.get_string(2)
+	return "%s, Battle %s" % [inner, m.get_string(2)]
+
+
+func _current_battle_id() -> String:
+	# Globally unique per report: base R1M1-B7 plus msec + random nonce,
+	# so group A's R1M1-B7 and group C's R1M1-B7 (or a QUIT+RESUME
+	# replay) never share an id string. Retries resend the STORED id
+	# (exact resend -> server dedups); a genuinely new report for the
+	# same battle slot replays via the base triple (tournament, match,
+	# base) server-side instead of double-banking. Display strips the
+	# nonce (expand_battle_id); matcher compares full strings.
+	return "%s-B%d-%d-%d" % [tourney_match_label, _battle_count() + 1,
+		Time.get_ticks_msec(), randi() % 100000]
+
+func _show_loading(title: String, sub: String, title_color: Color = Color(0.85, 0.85, 0.9)) -> void:
 	# Persistent overlay (no countdown): proves the game is waiting on the
 	# server, not frozen. Hidden by _hide_loading on the matching reply.
 	# Smaller fonts than the winner callout so multi-line status text
@@ -2041,7 +4417,7 @@ func _show_loading(title: String, sub: String) -> void:
 	if is_instance_valid(winner_label):
 		winner_label.text = title
 		winner_label.add_theme_font_size_override("font_size", 44)
-		winner_label.add_theme_color_override("font_color", Color(0.85, 0.85, 0.9))
+		winner_label.add_theme_color_override("font_color", title_color)
 	if is_instance_valid(countdown_label):
 		countdown_label.text = sub
 		countdown_label.add_theme_font_size_override("font_size", 24)
@@ -2058,14 +4434,160 @@ func _hide_loading() -> void:
 func _show_winner_and_countdown(title: String, title_color: Color, sub: String, countdown_prefix: String) -> void:
 	_show_callout(title, title_color, sub, countdown_prefix, true)
 
-func _show_callout(title: String, title_color: Color, sub: String, countdown_prefix: String, auto_reset: bool) -> void:
+# -- Sound: clip-pack announcer + procedural battle SFX ------------
+# The announcer is 14 pre-recorded voice clips (fixed orange/blue
+# phrases, no names) under res://audio/voice: zero runtime synthesis,
+# zero network, zero deadlock class (the Oct 2026 SAPI freeze is
+# architecturally gone - local WAV playback cannot block). SFX are
+# synthesized once at boot into AudioStreamWAV buffers. Render path
+# untouched: buffers build once, playback engine-mixed, zero
+# per-frame GDScript cost. To re-voice the pack, replace the WAVs
+# (same names, mono) - no code changes.
+const SFX_POOL := 4 # overlapping one-shot players (strike + KO +
+	# beeps can coincide). Raise to 6 if fast exchanges audibly cut
+	# each other; lower to 2 on thin audio drivers.
+const SFX_GAIN_DB := -6.0 # master trim for all effects; per-effect
+	# balance lives in the SfxSynth recipes, not here.
+const VOICE_DIR := "res://audio/voice"
+const VOICE_GAIN_DB := -3.0 # voice sits above the effects; trim here.
+# Every announcer clip. Single source of truth: boot preloads exactly
+# these, and the sound suite asserts each resolves to a real file.
+const VOICE_CLIPS := ["knockout_orange", "knockout_blue",
+	"battle_orange", "battle_blue", "match_orange", "match_blue",
+	"exhibition_orange", "exhibition_blue", "exhibition",
+	"champion_orange", "champion_blue", "champion",
+	"event_champion", "generation_champion"]
+# Preloaded (not class_name-referenced): a fresh script has no global
+# class cache entry yet, and cache state varies per machine - preload
+# resolves deterministically everywhere, including headless suites.
+const SfxSynthLib = preload("res://scripts/SfxSynth.gd")
+var _voice_on := true
+var _sfx_on := true
+var _sfx_palette := "classic" # SfxSynth.PALETTES; persisted [audio].
+# Master mute (M key / MUTE button): overrides both toggles without
+# destroying them - unmute restores voice/sfx exactly. Session-only,
+# never persisted: boot always starts from the menu toggles, so a
+# forgotten mute cannot mysteriously survive a restart.
+var _sound_muted := false
+var mute_button: Button
+var _sfx_players: Array = []
+var _sfx_streams := {}
+var _voice_player: AudioStreamPlayer
+var _voice_clips := {}
+
+
+func _init_sound() -> void:
+	# Boot wiring (called from _apply_beauty_pass, same place perf
+	# video flags load). Order matters: toggles first (menu
+	# persisted), then voice pack, then synth.
+	var director := _director()
+	if director != null and director.has_method("perf_get"):
+		_voice_on = bool(director.call("perf_get", "voice"))
+		_sfx_on = bool(director.call("perf_get", "sfx"))
+	if director != null and director.has_method("audio_opt_get"):
+		_sfx_palette = str(director.call("audio_opt_get", "sfx_palette", "classic"))
+	_build_voice()
+	_build_sfx()
+
+
+func _set_muted(muted: bool) -> void:
+	# Master mute flip: stops every player NOW (the current boom/line
+	# cuts, not just future ones), updates the button, posts status.
+	_sound_muted = muted
+	if muted:
+		for p in _sfx_players:
+			if is_instance_valid(p):
+				(p as AudioStreamPlayer).stop()
+		if is_instance_valid(_voice_player):
+			_voice_player.stop()
+	if is_instance_valid(mute_button):
+		mute_button.text = "UNMUTE" if muted else "MUTE"
+	if is_instance_valid(status_label):
+		status_label.text = "SOUND MUTED (M to unmute)" if muted else "SOUND ON"
+
+
+func _on_mute_button() -> void:
+	_set_muted(not _sound_muted)
+
+
+func _build_voice() -> void:
+	# Preload the whole clip pack at boot (~1 MB). Missing files log
+	# and skip - a partial pack still announces what it has, never
+	# crashes. Idempotent like _build_sfx (frees the old player first).
+	if is_instance_valid(_voice_player):
+		_voice_player.stop()
+		(_voice_player as Node).queue_free()
+	_voice_clips.clear()
+	for key in VOICE_CLIPS:
+		var stream := AudioStreamWAV.load_from_file("%s/%s.wav" % [VOICE_DIR, key])
+		if stream == null:
+			_arena_log("voice clip missing at boot: %s/%s.wav" % [VOICE_DIR, key])
+			continue
+		_voice_clips[key] = stream
+	_voice_player = AudioStreamPlayer.new()
+	_voice_player.volume_db = VOICE_GAIN_DB
+	add_child(_voice_player)
+
+
+func _announce_clip(clip: String) -> void:
+	# Single announcer entry point: fixed-phrase clip pack, never live
+	# synthesis. Latest wins via stop+play; a missing clip logs and
+	# skips, never crashes. Errors and stalls stay visual-only by
+	# policy: never announce them. To silence a single call site,
+	# delete its call (never add per-site flags).
+	if not _voice_on or _sound_muted:
+		return
+	if not _voice_clips.has(clip):
+		_arena_log("announce clip missing: %s" % clip)
+		return
+	_arena_log("announce: %s" % clip)
+	if is_instance_valid(_voice_player):
+		_voice_player.stop()
+		_voice_player.stream = _voice_clips[clip]
+		_voice_player.play()
+
+
+func _build_sfx() -> void:
+	# (Re)builds every effect buffer from the active SfxSynth palette
+	# plus a fresh player pool. Idempotent: frees the old pool first
+	# so palette switches and test rebuilds never stack players.
+	for p in _sfx_players:
+		if is_instance_valid(p):
+			(p as AudioStreamPlayer).stop()
+			(p as Node).queue_free()
+	_sfx_players.clear()
+	_sfx_streams = SfxSynthLib.build(_sfx_palette)
+	for i in SFX_POOL:
+		var p := AudioStreamPlayer.new()
+		p.volume_db = SFX_GAIN_DB
+		add_child(p)
+		_sfx_players.append(p)
+
+
+func _play_sfx(sfx_name: String) -> void:
+	# First free player wins; all busy = drop (a dropped blip beats a
+	# cut-off boom). Unknown names no-op - callers need no guards.
+	# Master mute silences here (toggle state untouched underneath).
+	if not _sfx_on or _sound_muted or not _sfx_streams.has(sfx_name):
+		return
+	var stream: AudioStreamWAV = _sfx_streams[sfx_name]
+	for p in _sfx_players:
+		if not (p as AudioStreamPlayer).playing:
+			(p as AudioStreamPlayer).stream = stream
+			(p as AudioStreamPlayer).play()
+			return
+
+
+func _show_callout(title: String, title_color: Color, sub: String, countdown_prefix: String, auto_reset: bool, hold_secs: float = 0.0) -> void:
 	# Centered callout (win, draw, restart) with a 3-2-1 countdown. When
 	# auto_reset is false the caller sequences the next step itself
 	# (tournament battles wait for the server's match_reset instead).
+	# hold_secs keeps the callout up past its beat (event-champion
+	# coronation) - callers needing the delay await the same span.
 	# Restore winner-callout sizes (loading states shrink them).
 	if is_instance_valid(winner_label):
 		winner_label.text = title
-		winner_label.add_theme_font_size_override("font_size", 88)
+		winner_label.add_theme_font_size_override("font_size", CALLOUT_TITLE_FS)
 		winner_label.add_theme_color_override("font_color", title_color)
 	if is_instance_valid(countdown_label):
 		countdown_label.text = sub
@@ -2076,17 +4598,28 @@ func _show_callout(title: String, title_color: Color, sub: String, countdown_pre
 	tw.tween_property(winner_overlay, "modulate:a", 1.0, 0.35)
 
 	# Let the callout land before the countdown starts.
-	await get_tree().create_timer(1.2).timeout
+	await _wait(1.2).timeout
 
-	for i in range(3, 0, -1):
+	# Informational banners (empty prefix: GROUP COMPLETE, CHAMPION,
+	# quick-battle) hold statically - only a real next step counts
+	# down. An empty prefix used to play a phantom " IN 3... FIGHT!"
+	# over the incoming bracket view.
+	if countdown_prefix != "":
+		for i in range(3, 0, -1):
+			if is_instance_valid(countdown_label):
+				countdown_label.text = "%s IN %d..." % [countdown_prefix, i]
+			_play_sfx("beep")
+			await _wait(1.0).timeout
+
 		if is_instance_valid(countdown_label):
-			countdown_label.text = "%s IN %d..." % [countdown_prefix, i]
-		await get_tree().create_timer(1.0).timeout
+			countdown_label.text = "FIGHT!"
+		_play_sfx("fight")
+		await _wait(0.8).timeout
+	else:
+		await _wait(0.8).timeout
 
-	if is_instance_valid(countdown_label):
-		countdown_label.text = "FIGHT!"
-	await get_tree().create_timer(0.8).timeout
-
+	if hold_secs > 0.0:
+		await _wait(hold_secs).timeout
 	winner_overlay.visible = false
 	if auto_reset:
 		_reset_round()
@@ -2097,46 +4630,211 @@ func _tourney_id() -> String:
 		return ""
 	return str(director.tourney.get("id", ""))
 
-func _report_battle(draw: bool) -> void:
+const BLOW_NAMES := {
+	"thorax_puncture": "THORAX PUNCTURE",
+	"wing_tear": "WING TEAR (forfeit)",
+	"spike_wound": "spike wound",
+	"spike_clash": "spike clash",
+	"tree_slam": "tree slam",
+	"tree_clip": "tree clip",
+	"seizure": "seizure drain",
+}
+
+
+func _killing_blow(victim_slot: String) -> Dictionary:
+	var fly: CharacterBody3D = fly_alpha if victim_slot == "alpha" else fly_beta
+	if not is_instance_valid(fly):
+		return {"source": "", "amount": 0.0}
+	return {"source": str(fly.get("last_damage_source")),
+		"amount": float(fly.get("last_damage_amount"))}
+
+
+func _compose_verdict(draw: bool) -> Dictionary:
+	# Who/how the battle ended, for the server report, callout, and
+	# retry. Timeout winners arrive decided (_time_winner); legacy
+	# undecided timeouts keep the empty slot and the old line.
+	var v := {"end_reason": "draw" if draw else _end_reason,
+		"winner_slot": "", "loser_slot": "", "blow_source": "",
+		"blow_amount": 0.0, "time_left": maxf(current_round_time, 0.0),
+		"dmg_a": float(stats_alpha.get("damage_dealt", 0.0)),
+		"dmg_b": float(stats_beta.get("damage_dealt", 0.0)), "line": ""}
+	if draw:
+		v["line"] = "DNF - time expired, nobody bled (%.1f m / %.1f m off arena)" % [
+			float((stats_alpha as Dictionary).get("center_drift", 0.0)),
+			float((stats_beta as Dictionary).get("center_drift", 0.0))]
+	elif _end_reason == "ko" and (_ko_victim == "alpha" or _ko_victim == "beta"):
+		var winner_slot := "beta" if _ko_victim == "alpha" else "alpha"
+		var blow := _killing_blow(_ko_victim)
+		v["winner_slot"] = winner_slot
+		v["loser_slot"] = _ko_victim
+		v["blow_source"] = str(blow["source"])
+		v["blow_amount"] = float(blow["amount"])
+		var blow_src := str(v["blow_source"])
+		var blow_name := str(BLOW_NAMES[blow_src]) if BLOW_NAMES.has(blow_src) else blow_src
+		v["line"] = "%s WINS by KO - killing blow: %s %.1f on %s" % [
+			_slot_name(winner_slot), blow_name, v["blow_amount"],
+			_slot_name(_ko_victim)]
+	else:
+		v["end_reason"] = "time"
+		if _time_winner == "alpha" or _time_winner == "beta":
+			v["winner_slot"] = _time_winner
+			v["loser_slot"] = "beta" if _time_winner == "alpha" else "alpha"
+			v["line"] = "TIME - %s wins on health (damage %.0f-%.0f)" % [
+				_slot_name(_time_winner), v["dmg_a"], v["dmg_b"]]
+		else:
+			v["line"] = "TIME - damage %.0f-%.0f, server decides on fitness" % [
+				v["dmg_a"], v["dmg_b"]]
+	print("[Arena] Verdict: ", v["line"])
+	return v
+
+
+func _verdict_short() -> String:
+	# One-line verdict for the battle callout (full line went to the
+	# server report + console at report time).
+	var reason := str(_last_verdict.get("end_reason", ""))
+	if reason == "ko":
+		var bsrc := str(_last_verdict.get("blow_source", ""))
+		var blow := str(BLOW_NAMES[bsrc]) if BLOW_NAMES.has(bsrc) else "?"
+		var amt := float(_last_verdict.get("blow_amount", 0.0))
+		return "KO - %s %s" % [blow,
+			("%.1f" % amt) if amt > 0.0 else "finisher"]
+	if reason == "time":
+		return "TIME - dmg %.0f-%.0f" % [
+			float(_last_verdict.get("dmg_a", 0.0)),
+			float(_last_verdict.get("dmg_b", 0.0))]
+	return ""
+
+
+func _draw_title() -> String:
+	# Numbered DNFs (did-not-finish timeout ties): the banked count
+	# doesn't include the latest one yet, so +1 (a third DNF resolves
+	# the match instead of replaying).
+	var director := _director()
+	var draws := 0
+	if director != null:
+		draws = int(director.current_match().get("draws", 0))
+	return "DNF" if draws + 1 <= 1 else "DNF x%d" % (draws + 1)
+
+
+func _verdict_headline() -> Dictionary:
+	# Big-overlay headline for the reporting screen: the outcome first
+	# (winner + killing blow), the reporting detail beneath it.
+	var reason := str(_last_verdict.get("end_reason", ""))
+	if reason == "ko":
+		var winner_slot := str(_last_verdict.get("winner_slot", "alpha"))
+		var blow_src := str(_last_verdict.get("blow_source", ""))
+		var blow := str(BLOW_NAMES[blow_src]) if BLOW_NAMES.has(blow_src) else blow_src
+		var amt := float(_last_verdict.get("blow_amount", 0.0))
+		var detail := "%s %s" % [blow, ("%.1f" % amt)] if amt > 0.0 else blow
+		return {"text": "%s WINS BY KO" % _slot_name(winner_slot),
+			"sub": "Killing blow: %s" % detail,
+			"color": Color(1.0, 0.55, 0.3) if winner_slot == "alpha" else Color(0.4, 0.75, 1.0)}
+	if reason == "time":
+		var twinner := str(_last_verdict.get("winner_slot", ""))
+		if twinner == "alpha" or twinner == "beta":
+			return {"text": "%s WINS ON HEALTH" % _slot_name(twinner),
+				"sub": "Damage %.0f-%.0f" % [float(_last_verdict.get("dmg_a", 0.0)),
+					float(_last_verdict.get("dmg_b", 0.0))],
+				"color": Color(1.0, 0.55, 0.3) if twinner == "alpha" else Color(0.4, 0.75, 1.0)}
+		return {"text": "TIME - SERVER DECIDES",
+			"sub": "Damage %.0f-%.0f" % [float(_last_verdict.get("dmg_a", 0.0)),
+				float(_last_verdict.get("dmg_b", 0.0))],
+			"color": Color(0.78, 0.78, 0.85)}
+	return {"text": _draw_title(),
+		"sub": "Did not finish - nobody bled",
+		"color": Color(0.78, 0.78, 0.82)}
+
+
+func _report_battle(draw: bool, draw_penalty: bool = false) -> void:
 	# Single choke point for tournament battle reports: stamps the same
 	# (tournament, match, battle) id used as the server's idempotency key,
 	# keeps a copy for one safe retry, and arms the battle watchdog.
+	# draw_penalty marks a 3rd draw so the server docks both ELOs.
 	_seq_battle_id = _current_battle_id()
 	_tourney_awaiting_battle = true
+	_seq_forgive_match = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "battle": _seq_battle_id}
 	var fa := _flight_summary(flight_alpha, fly_alpha)
 	var fb := _flight_summary(flight_beta, fly_beta)
+	_last_verdict = _compose_verdict(draw)
 	_seq_last_round = {
 		"stats_a": stats_alpha.duplicate(), "stats_b": stats_beta.duplicate(),
-		"draw": draw, "tournament_id": _tourney_id(), "match": tourney_match_label,
-		"flight_a": fa, "flight_b": fb}
+		"draw": draw, "draw_penalty": draw_penalty,
+		"tournament_id": _tourney_id(), "match": tourney_match_label,
+		"flight_a": fa, "flight_b": fb,
+		"end_reason": str(_last_verdict.get("end_reason", "")),
+		"verdict": _last_verdict.duplicate()}
 	brain_client.send_round_over(stats_alpha, stats_beta, draw, _seq_battle_id,
-		_tourney_id(), tourney_match_label, fa, fb)
+		_tourney_id(), tourney_match_label, fa, fb, draw_penalty,
+		str(_last_verdict.get("end_reason", "")), _last_verdict)
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
 	_arm_seq("battle")
-	var kind := "DRAW - " if draw else ""
-	_show_loading("%s %sREPORTING" % [tourney_match_label, kind],
-		"Battle %s sent, waiting for server..." % _seq_battle_id)
+	# Verdict headlines big on top (winner + killing blow); the
+	# reporting detail sits beneath in smaller type. Shown squeezed
+	# into the bracket (same strings/colors); fullscreen only when no
+	# bracket can render.
+	var head := _verdict_headline()
+	var head_text := str(head.get("text", ""))
+	var head_sub := "%s\n%s - battle %s sent, waiting for server..." % [
+		str(head.get("sub", "")), expand_match_label(tourney_match_label), expand_battle_id(_seq_battle_id)]
+	var head_color: Color = head.get("color", Color(0.85, 0.85, 0.9))
+	# Live-card preview: the just-decided winner reads on its bracket
+	# card during the report wait (draws bank nothing - skip them).
+	if not draw and is_instance_valid(arena_bracket):
+		var pslot := str(_last_verdict.get("winner_slot", ""))
+		if pslot == "alpha" or pslot == "beta":
+			var rdir := _director()
+			if rdir != null:
+				arena_bracket.live_preview = {"round": int(rdir.tourney.get("current_round", 0)),
+					"match": int(rdir.tourney.get("current_match", 0)),
+					"winner_slot": pslot}
+	if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+		_set_wait_header(head_text, head_sub, head_color)
+	else:
+		_show_loading(head_text, head_sub, head_color)
 	if is_instance_valid(status_label):
-		status_label.text = "%s %sREPORTING" % [tourney_match_label, kind]
+		status_label.text = "%s - %s (%s REPORTING)" % [
+			str(head.get("text", "")), str(head.get("sub", "")),
+			expand_match_label(tourney_match_label)]
 
 func _handle_draw() -> void:
-	print("[Arena] Stalemate! Time expired with zero damage - DRAW, rematch same brains.")
+	# Wander reading (positions valid until landing below): meters
+	# past the arena ring per fly, gated on separation (a chase out
+	# past the ring is engagement, not wandering). Rides stats_alpha/
+	# beta to the server (career wander mark) and into the match record
+	# (the overtime health dock reads the freshest pair).
+	var drift_a := _wander_overshoot(fly_alpha)
+	var drift_b := _wander_overshoot(fly_beta)
+	var gated := _gate_drift(drift_a, drift_b, _flat_separation())
+	drift_a = float(gated[0])
+	drift_b = float(gated[1])
+	stats_alpha["center_drift"] = drift_a
+	stats_beta["center_drift"] = drift_b
+	print("[Arena] DNF! Time expired with zero damage - did not finish, rematch same brains. (drift A %.1f m / B %.1f m past arena)" % [drift_a, drift_b])
 	is_round_active = false
+	_set_combat(false)
 	# Both walk away: land upright for the rematch.
 	_begin_landing("")
 	if tournament_active:
-		# Server records the draw (no dopamine) and replies tournament_battle
-		# "draw"; sequencing continues in _on_tournament_battle.
-		_report_battle(true)
+		# Batched match reporting: cache this draw and continue locally
+		# (_battle_done_local -> _battle_post_sequence); the draw banks
+		# with the rest of the match at match over. A draw reported
+		# while two are already banked is the 3rd: flag it so the
+		# server docks both ELOs for stalling the match out.
+		var third := false
+		var director := _director()
+		if director != null:
+			third = int(director.current_match().get("draws", 0)) >= 2
+		_battle_done_local(true, third)
 		return
 	_show_winner_and_countdown(
-		"DRAW",
+		"DNF",
 		Color(0.78, 0.78, 0.82),
 		"TIME UP - NOBODY BLED - REMATCH",
 		"REMATCH")
 
-# ?�?� Dynamic tree fade ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ── Dynamic tree fade ──────────────────────────────────────────────────
 # Every combat-area tree gets its own StandardMaterial3D (so alpha can
 # be set per-tree). Each frame the camera->fly ray is tested against
 # each tree's XZ position; occluding trees go translucent instantly,
@@ -2183,22 +4881,135 @@ func _setup_dynamic_tree_opacity() -> void:
 func _evo_watcher_tick(delta: float) -> void:
 	# Background pipeline pump, throttled: adopts finished breeds,
 	# launches queued specs when the shared slot is free, refreshes
-	# the bottom-left status line. No-ops unless evo is active.
+	# the bottom-left status line. No-ops unless evo is active. New
+	# worker spawns wait for open air between battles (process boot
+	# spikes frame pacing); adoptions run any time.
+	var wdirector := _director()
+	if wdirector != null:
+		# Queue pumps (trains/scores) only boot workers in open air,
+		# in every arena mode; the flag clears itself here every tick
+		# batch, plus on quit. Evo breeds pipeline independently.
+		wdirector.hold_spawns = is_round_active
+		wdirector.pump_train_queue()
+		wdirector.pump_score_queue()
 	if not _evo_active():
 		if is_instance_valid(evo_status_line):
 			evo_status_line.visible = false
 		return
 	_evo_adopt_finished()
 	var director := _director()
-	if director != null and not evo_waiting and director.pending_async.is_empty():
+	if director != null and not evo_waiting and director.pending_async.is_empty() \
+			and not is_round_active:
 		for spec in _evo_pending():
-			if not bool((spec as Dictionary).get("launched", false)):
+			var s := spec as Dictionary
+			if not bool(s.get("launched", false)) \
+					and _evo_blocking_spec(str(s.get("kind", ""))).is_empty():
 				_evo_spawn_spec(spec)
 				break
 	evo_status_tick += delta
 	if evo_status_tick < EVO_STATUS_EVERY:
 		return
 	evo_status_tick = 0.0
+	if _event_active():
+		_event_drain_done_to_pool()
+		_event_maintain_pool()
+		_event_topup_tick()
+	_update_evo_status_line()
+
+
+func _event_topup_tick() -> void:
+	# Automatic top-up trainer: when the TRAINING slot is idle, school
+	# the least-trained bench brain toward POOL_TRAIN_TARGET (own
+	# stored wiring/rates + school curriculum, same as a menu school
+	# retrain). Throttled to every 30 s. Breeds (pending_async) and
+	# score probes (score_job) no longer gate it: they are separate
+	# workers on isolated cores (affinity + BelowNormal + single-thread
+	# BLAS), so schooling runs parallel to them and to live battles —
+	# the old all-slots-idle gate starved the bench for entire events
+	# whenever a breed was running. Boot spikes stay fenced by
+	# hold_spawns in the pump; running workers are never touched. The
+	# queue naturally rotates through the bench as each graduate
+	# outgrows the bottom slot.
+	if not _event_active():
+		return
+	_event_topup_cd += EVO_STATUS_EVERY
+	if _event_topup_cd < EVENT_TOPUP_EVERY:
+		return
+	var director := _director()
+	if director == null:
+		return
+	_event_topup_cd = 0.0
+	if not (director.train_queue as Array).is_empty():
+		return
+	if not (director.active_job as Dictionary).is_empty():
+		return
+	var pick: Dictionary = director.event_topup_pick(_event_id(), POOL_TRAIN_TARGET)
+	if not bool(pick.get("ok", false)):
+		return
+	var worst := str(pick.get("id", ""))
+	var worst_eps := int(pick.get("episodes", 0))
+	var deficit := int(pick.get("deficit", 0))
+	var worst_rec := {}
+	for b in director.list_brains_cached():
+		if str((b as Dictionary).get("id", "")) == worst:
+			worst_rec = b as Dictionary
+			break
+	if (worst_rec as Dictionary).is_empty():
+		return
+	var gp: Dictionary = (worst_rec as Dictionary).get("generator_params", {})
+	var params := {}
+	for k in ["variant", "seed", "learning_rate", "dist_gain", "evasion",
+			"align_bonus", "experiment", "genome", "genome_id",
+			"mapping", "yaw_bias"]:
+		if gp.has(k):
+			params[k] = gp[k]
+	params["curriculum"] = {}
+	director.enqueue_training(worst, str(worst_rec.get("name", "?")), deficit, params)
+	director.pump_train_queue()
+	print("[Arena] Event top-up: schooling %s +%d eps (had %d)" % [
+		str(worst_rec.get("name", "?")), deficit, worst_eps])
+
+
+func _train_queue_parts(queue: Array, job: Dictionary, done: Array,
+		ep: int, total: int) -> Array:
+	# Pure builder for the training half of the EVO status line: active
+	# job, queue head (+N overflow), most recent DONE. Narrow caps keep
+	# the joined line inside its 800 px band.
+	var out: Array = []
+	if not job.is_empty():
+		var aname := str(job.get("name", job.get("brain_id", "?")))
+		if ep >= 0 and total > 0:
+			out.append("TRAIN %s %d/%d" % [aname.left(14), ep, total])
+		else:
+			out.append("TRAIN %s warming up" % aname.left(14))
+	if not queue.is_empty():
+		var head: Dictionary = queue[0] if queue[0] is Dictionary else {}
+		var qp := "QUEUED %s" % str(head.get("name", "?")).left(14)
+		if queue.size() > 1:
+			qp += " +%d" % (queue.size() - 1)
+		out.append(qp)
+	if not done.is_empty():
+		var last := done[done.size() - 1] as Dictionary
+		if last != null and not last.is_empty():
+			out.append("DONE %s +%dep" % [str(last.get("name", "?")).left(14),
+				int(last.get("episodes", 0))])
+	return out
+
+
+func _on_train_progress(ep: int, total: int) -> void:
+	# Instant half of the training HUD: progress bar + last-known
+	# counts (the text line refreshes immediately - 4 Hz max, same cost
+	# class as the menu's job_bar).
+	_train_prog_ep = ep
+	_train_prog_total = total
+	if is_instance_valid(train_prog_bar):
+		train_prog_bar.max_value = maxi(1, total)
+		train_prog_bar.value = ep
+		train_prog_bar.visible = true
+	_update_evo_status_line()
+
+
+func _on_train_queue_changed() -> void:
 	_update_evo_status_line()
 
 
@@ -2212,31 +5023,115 @@ func _update_evo_status_line() -> void:
 	var evo: Dictionary = director.tourney.get("evo", {})
 	var gen := int(evo.get("generation", 1))
 	var parts: Array = []
-	for spec in _evo_pending():
+	# Fresh job (or none): drop stale counts from the previous one so a
+	# new train reads "warming up" instead of the old ep/total.
+	var job_id := str(director.active_job.get("brain_id", ""))
+	if job_id != _train_prog_job:
+		_train_prog_job = job_id
+		_train_prog_ep = -1
+		_train_prog_total = -1
+		if is_instance_valid(train_prog_bar):
+			train_prog_bar.value = 0.0
+	# Visibility sweep on ground truth: a crashed job never emits its
+	# final progress, so the 5 s tick clears a bar the handler left up.
+	if is_instance_valid(train_prog_bar):
+		train_prog_bar.visible = not director.active_job.is_empty()
+	# The awaited spec is detached from pending: without the fallback
+	# this line flatlines for the whole (long) await, same as the strip.
+	for spec in _evo_pending() + [evo_await_spec]:
 		var s := spec as Dictionary
+		if s.is_empty():
+			continue
 		var label := str(s.get("name", ""))
 		if label == "":
-			label = "wild G%d" % int(s.get("gen", gen + 1))
+			label = "wild"
+		var smode := str(s.get("mode", ""))
+		if smode != "":
+			label += " [%s]" % smode
 		if bool(s.get("launched", false)):
 			var prog := _evo_poll_file(str(s.get("progress", "")))
 			if prog.is_empty():
 				parts.append("%s warming up" % label)
 			else:
 				parts.append("%s ep %d/%d" % [label,
-					int(prog.get("episode", 0)), EVO_EPISODES])
+					int(prog.get("episode", 0)), int(_prog_total(prog))])
 		else:
 			parts.append("%s queued" % label)
 	for kind in (evo.get("done", {}) as Dictionary).keys():
 		parts.append("%s done" % _evo_done_name(str(kind)))
+	parts.append_array(_train_queue_parts(director.train_queue,
+		director.active_job, director.completed_trains,
+		_train_prog_ep, _train_prog_total))
 	if parts.is_empty():
 		evo_status_line.visible = false
 		return
-	evo_status_line.text = "EVO G%d • %s" % [gen, " • ".join(parts)]
+	evo_status_line.text = "CONTINUOUS G%d • %s" % [gen, " • ".join(parts)]
 	evo_status_line.visible = true
 
 
+var _shot_path := ""
+var _shot_frames := 0
+var _shot_done := false
+var _shot_scanned := false
+var _timer_last_tenths := -1
+var _health_last_a := -1
+var _health_last_b := -1
+var _wing_last_state := ""
+
+
+const HITCH_SECS := 0.15
+func _log_hitch(delta: float) -> void:
+	# Frame-spike census: slow frames log which tracked workers were
+	# alive, so hitch reports point at CPU contention (or exonerate
+	# it toward GPU). Fires rarely by construction.
+	if delta < HITCH_SECS:
+		return
+	var director := _director()
+	var busy := PackedStringArray()
+	if director != null:
+		for slot in ["active_job", "score_job", "pending_async"]:
+			var job = director.get(slot)
+			if job is Dictionary and not (job as Dictionary).is_empty():
+				var pid := int((job as Dictionary).get("pid", 0))
+				var alive := pid > 0 and OS.is_process_running(pid)
+				busy.append("%s:%d(%s)" % [slot, pid, "alive" if alive else "gone"])
+	print("[Arena] Frame hitch %.0f ms (tracked workers: %s)" % [
+		delta * 1000.0, ", ".join(busy) if not busy.is_empty() else "none"])
+
+
 func _process(delta: float) -> void:
+	_log_hitch(delta)
+	_update_combat_fx(delta)
+	# Dev screenshot hook: `--shot=C:/path/out.png` saves one viewport
+	# frame ~1 s after boot. Untouched in normal runs. Cmdline scanned
+	# once (per-frame user-args scans were churn).
+	if not _shot_done:
+		if _shot_path == "" and not _shot_scanned:
+			_shot_scanned = true
+			for a in OS.get_cmdline_user_args():
+				if str(a).begins_with("--shot="):
+					_shot_path = str(a).get_slice("=", 1)
+					_shot_frames = 0
+					break
+		if _shot_path != "":
+			_shot_frames += 1
+			if _shot_frames >= 500:
+				var img := get_viewport().get_texture().get_image()
+				var err := img.save_png(_shot_path)
+				print("[Arena] Screenshot -> %s (err=%s)" % [_shot_path, str(err)])
+				_shot_done = true
 	_evo_watcher_tick(delta)
+	# Next-gen waiting room ticks (gallery rotation + training strip).
+	if nextgen_visible or _event_gallery_active:
+		nextgen_gallery_tick += delta
+		if nextgen_gallery_tick >= NEXTGEN_GALLERY_EVERY:
+			nextgen_gallery_tick = 0.0
+			_gallery_advance()
+	if nextgen_visible:
+		nextgen_strip_tick += delta
+		if nextgen_strip_tick >= NEXTGEN_STRIP_EVERY:
+			nextgen_strip_tick = 0.0
+			_update_nextgen_strip()
 	# Evo spinner animation while the phase panel is up.
 	if is_instance_valid(evo_panel) and evo_panel.visible:
 		evo_spin_tick += delta
@@ -2250,19 +5145,6 @@ func _process(delta: float) -> void:
 		bv_cloud_alpha.rotate_y(0.25 * delta)
 	if is_instance_valid(bv_cloud_beta) and bv_cloud_beta.visible:
 		bv_cloud_beta.rotate_y(0.25 * delta)
-	# Replay playback: 5 Hz frame advance through the banked stream.
-	if bv_replay_mode and bv_replay_playing and not bv_stream_alpha.is_empty():
-		bv_replay_accum += delta
-		while bv_replay_accum >= 0.2:
-			bv_replay_accum -= 0.2
-			if bv_replay_idx < bv_stream_alpha.size() - 1:
-				bv_replay_idx += 1
-				bv_replay_slider.value = float(bv_replay_idx)
-				_render_replay_frame()
-			else:
-				bv_replay_playing = false
-				bv_replay_playbtn.text = "Play"
-				break
 	# Update tree transparency every rendered frame.
 	if tree_sight_entries.is_empty():
 		return
@@ -2291,12 +5173,17 @@ func _process(delta: float) -> void:
 				target = TREE_FADE_ALPHA
 				break
 		var k: float = clampf(TREE_FADE_SMOOTH * delta, 0.0, 1.0)
+		# Skip the material writes at rest (per-frame lerpf writes on
+		# ~40 materials were churn when nothing moves).
+		if absf((entry["trunk_mats"][0] as StandardMaterial3D).albedo_color.a - target) < 0.003 \
+				and absf((entry["canopy_mats"][0] as StandardMaterial3D).albedo_color.a - target) < 0.003:
+			continue
 		for tm in entry["trunk_mats"]:
 			(tm as StandardMaterial3D).albedo_color.a = lerpf((tm as StandardMaterial3D).albedo_color.a, target, k)
 		for cm in entry["canopy_mats"]:
 			(cm as StandardMaterial3D).albedo_color.a = lerpf((cm as StandardMaterial3D).albedo_color.a, target, k)
 
-# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ──────────────────────────────────────────────────────────────────
 
 func _update_ctrl_label() -> void:
 	if not is_instance_valid(ctrl_label):
@@ -2304,10 +5191,45 @@ func _update_ctrl_label() -> void:
 	var hz := 0.0
 	if bv_reply_ema > 0.001:
 		hz = 1.0 / bv_reply_ema
-	ctrl_label.text = "CTRL %.1fHz t%.2f" % [hz, bv_shared_tau]
+	# HUD shows applied pairs (n) vs server-integrated steps (srv):
+	# srv - n == replies lost in flight. To shorten this label, drop
+	# srv (keep n + t); srv stays in the flight log line regardless.
+	ctrl_label.text = "CTRL %.1fHz n=%d srv=%d t%.2f" % [hz, _ctrl_n, _ctrl_srv_seq, bv_shared_tau]
 
 
 func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int, stats: Dictionary = {}) -> void:
+	# Dead-round replies drop: steps stop with the round, so any reply
+	# landing now is a straggler - applying it would replant fresh
+	# commands into finished flies (the post-timeout drift into trees)
+	# and pollute the banked flight accumulators. The flag dies with
+	# the round already; nothing else here may run post-round.
+	if not is_round_active:
+		_step_in_flight = false
+		return
+	# Sequenced replies: the server echoes the send's seq. A reply to
+	# an older send is a widowed straggler (its successor already owns
+	# the flag) - applying it would replant ancient commands and feed
+	# the cadence tracker a lie. It drops without touching the flag,
+	# the counters, or the streak. Echo 0/absent means untracked (old
+	# server or untagged send): always applied, as before.
+	var _echo := int(stats.get("step_echo", 0))
+	if _echo > 0 and _echo < _step_outstanding:
+		return
+	_step_round_reply = true
+	# A reply landed: the link is free for the next step. Cleared
+	# first (before any application below) so a slow frame can never
+	# leave the flag set past the reply that frees it.
+	_step_in_flight = false
+	_step_timeouts = 0
+	# Cumulative control pairs applied (both sides per reply, by
+	# construction - a single reply carries both dicts, so per-side
+	# counters could never diverge; what CAN diverge is applied (n)
+	# vs server-integrated (srv) when a reply is lost). Reset policy:
+	# cumulative per session to match the server's cumulative
+	# step_count; do NOT reset per round or srv-n drifts by the
+	# round's step count.
+	_ctrl_n += 1
+	_ctrl_srv_seq = int(stats.get("step_seq", 0))
 	# Shared cadence tracking: reply interval EMA -> shared hold tau
 	# (0.75x, clamped 0.10-0.40), set identically on both flies.
 	var now := Time.get_ticks_msec() / 1000.0
@@ -2319,6 +5241,13 @@ func _on_motor_controls(ctrl_alpha: Dictionary, ctrl_beta: Dictionary, gen: int,
 		bv_cad_dt_sum += dt
 		bv_cad_tau_sum += bv_shared_tau
 	bv_last_reply = now
+	# Dopamine-replay inputs: the reply's ctrl dicts are exactly what
+	# the server used to capture per battle (last_ctrl); storing refs
+	# here is one assignment per reply, no copies.
+	_last_ctrl_a = ctrl_alpha
+	_last_ctrl_b = ctrl_beta
+	_push_motor_sample("alpha", ctrl_alpha, stats.get("alpha", {}))
+	_push_motor_sample("beta", ctrl_beta, stats.get("beta", {}))
 	if is_instance_valid(fly_alpha):
 		fly_alpha.hold_tau = bv_shared_tau
 	if is_instance_valid(fly_beta):
@@ -2401,16 +5330,29 @@ func _flight_summary(acc: Dictionary, fly: CharacterBody3D) -> Dictionary:
 func _print_flight_line(slot: String, f: Dictionary) -> void:
 	if f.is_empty() or int(f.get("samples", 0)) == 0:
 		return
-	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples) ctrl %.1fHz t%.3f" % [
+	# n/srv are session link totals (not per-round): the post-hoc
+	# link-quality record for this battle's control pairing.
+	print("[Arena] Flight %s: alt mean %.1f [%.1f-%.1f] thrust %.2f pitch %+.3f yaw|.| %.3f evade %.1f%% ram %.1f%% spear_max %.2f lunges %d (%d samples) ctrl %.1fHz t%.3f n=%d srv=%d" % [
 		slot, float(f.get("alt_mean", 0.0)), float(f.get("alt_min", 0.0)),
 		float(f.get("alt_max", 0.0)), float(f.get("thrust_mean", 0.0)),
 		float(f.get("pitch_mean", 0.0)), float(f.get("yaw_abs_mean", 0.0)),
 		100.0 * float(f.get("evade_frac", 0.0)), 100.0 * float(f.get("ram_frac", 0.0)),
 		float(f.get("spear_max", 0.0)), int(f.get("lunges", 0)), int(f.get("samples", 0)),
-		float(f.get("ctrl_hz", 0.0)), float(f.get("tau", 0.0))])
+		float(f.get("ctrl_hz", 0.0)), float(f.get("tau", 0.0)), _ctrl_n, _ctrl_srv_seq])
 
 
 func _on_strike_landed(attacker_id: String, target_part: String) -> void:
+	# One strike per physics frame: a mutual pass (both flies' sensors
+	# fire in the same tick) resolves the FIRST report only - the
+	# second drops (no double damage, no double KO credit). The
+	# physics-side instance-id dedup handles the same-pair case; this
+	# guards the cross-pair case.
+	var frame := Engine.get_physics_frames()
+	if frame == _last_strike_frame:
+		print("[Arena] Strike dropped (same frame as ", _last_strike_attacker, ").")
+		return
+	_last_strike_frame = frame
+	_last_strike_attacker = attacker_id
 	# Wing hits pay 60 (plus the tear + 15 wound in FlyPhysics): hits register
 	# in fitness even without a kill. Thorax stays 80 (lethal regardless).
 	# A spike clash already wounded BOTH bodies in FlyPhysics; credit the
@@ -2429,17 +5371,33 @@ func _on_wing_torn(fly_id: String, side: String) -> void:
 	# Refresh HUD now - the round ends immediately, so physics-driven updates
 	# would never show the torn wing / dried-up health bar.
 	_update_health_hud()
-	_flash_victim(fly_id, 0.6)
+	_flash_fighter_card(fly_id, Color(1.0, 0.3, 0.3), 0.6)
+	_flash_body(fly_alpha if fly_id == "alpha" else fly_beta, 1.0)
 	if is_instance_valid(status_label):
 		status_label.text = _slot_name(fly_id) + " LOST " + side.to_upper() + " WING!"
 
 func _on_fly_knocked_out(victim_id: String) -> void:
 	if not is_round_active:
 		return
+	_end_reason = "ko"
+	_ko_victim = victim_id
 
 	# Draw the final state (health floor, torn wing) BEFORE the winner text.
 	_update_health_hud()
-	_flash_victim(victim_id, 0.75)
+	_flash_fighter_card(victim_id, Color(1.0, 0.25, 0.25), 0.75)
+	_flash_body(fly_alpha if victim_id == "alpha" else fly_beta, 1.0)
+	# Single-sided KO read: the killing strike's _hit_feedback already
+	# flashed the attacker (cream wash + body glow). The KO shows ONLY
+	# the fly that got hurt - the attacker's card flash and glow are
+	# cleared dead here (tween killed, not left fading).
+	_clear_fighter_card("beta" if victim_id == "alpha" else "alpha")
+	var victim := fly_alpha if victim_id == "alpha" else fly_beta
+	if is_instance_valid(victim):
+		_fire_burst(ko_bursts.get(victim_id, null), victim.global_position)
+		if victim_id == "alpha":
+			ring_shock_alpha = 0.01
+		else:
+			ring_shock_beta = 0.01
 
 	if victim_id == "alpha":
 		stats_beta["kills"] += 1
@@ -2449,11 +5407,42 @@ func _on_fly_knocked_out(victim_id: String) -> void:
 		stats_alpha["kills"] += 1
 		if is_instance_valid(status_label):
 			status_label.text = _ko_text("alpha")
+	# Sound the finish before the landing ceremony unfolds behind the
+	# banner: cannon boom + fixed-phrase winner clip (scores and names
+	# stay visual-only - the battle callout follows seconds later).
+	_play_sfx("boom")
+	var ko_winner := "beta" if victim_id == "alpha" else "alpha"
+	_announce_clip("knockout_orange" if ko_winner == "alpha" else "knockout_blue")
 
 	# Landing ceremony instead of a frozen frame: loser drops
 	# belly-up, winner lowers onto its feet (runs behind the banner).
 	_begin_landing("beta" if victim_id == "alpha" else "alpha")
+	# Damage gates close now (no corpse hits during the replay), then
+	# the slow-motion finish plays before the round is banked.
+	_set_combat(false)
+	await _play_slowmo_finish()
 	_end_round()
+
+
+func _play_slowmo_finish() -> void:
+	# Quarter-speed beat on the final blow: clean fight view, landing
+	# unfolding slowly. Restores, holds one real second, and returns;
+	# the caller then banks the round and the winner text lands.
+	# Re-entry safe (a second KO inside the window is a no-op wait).
+	if _slowmo_active:
+		return
+	_slowmo_active = true
+	Engine.time_scale = SLOWMO_SCALE
+	await get_tree().create_timer(SLOWMO_SECS, true, false, true).timeout
+	_restore_timescale()
+	await get_tree().create_timer(WINNER_BEAT_SECS, true, false, true).timeout
+
+
+func _restore_timescale() -> void:
+	# Timescale is global: any early exit (quit, stop, new load) must
+	# leave it at 1.0 or the whole game runs in slow motion.
+	_slowmo_active = false
+	Engine.time_scale = 1.0
 
 
 func _begin_landing(winner_slot: String) -> void:
@@ -2477,7 +5466,7 @@ func _await_landing() -> void:
 			b_down = bool(fly_beta.landing_done())
 		if a_down and b_down:
 			return
-		await get_tree().create_timer(0.25).timeout
+		await _wait(0.25).timeout
 		waited += 0.25
 
 # Knockout banner: free battle keeps the classic "FLY ALPHA" phrasing;
@@ -2510,82 +5499,834 @@ func _check_speed_violations() -> void:
 			status_label.text = msg
 
 
+func _set_combat(on: bool) -> void:
+	# Opens/closes the flies' damage gate alongside the round flag.
+	# Every is_round_active=false site below must call _set_combat(false)
+	# or intermission clinches bleed into the next round's health bars.
+	for fly in [fly_alpha, fly_beta]:
+		if is_instance_valid(fly) and fly.has_method("set_combat_enabled"):
+			fly.call("set_combat_enabled", on)
+
+
+func _close_round_for_wait() -> void:
+	# Bracket-countdown safety: every pre-battle wait view (tip-off,
+	# resume, between groups, before the final, pool wait) opens with
+	# the round CLOSED. The scene default is_round_active=true would
+	# otherwise run the full round pipeline behind the countdown -
+	# steps go out, the 0 s timer times out on the first tick, and a
+	# phantom battle is reported before the official start.
+	# brains_loaded -> _reset_round is the only official starter.
+	is_round_active = false
+	_set_combat(false)
+
+
 func _end_round() -> void:
 	is_round_active = false
+	# Paced stepping ends with the round: a late reply after this
+	# clears an already-false flag (harmless), and the next round
+	# re-arms from clean state in _reset_round.
+	_step_in_flight = false
+	_set_combat(false)
 	_check_speed_violations()
 	print("[Arena] Round concluded! Sending battle stats to evolution engine...")
 	if tournament_active:
-		_report_battle(false)
+		# Batched match reporting: cache this battle and run the
+		# post-battle sequence locally - matches accumulate into the
+		# round cache, and the whole round banks once at the round
+		# boundary. No per-battle bank wait.
+		_battle_done_local(false)
 		return
 	var fa := _flight_summary(flight_alpha, fly_alpha)
 	var fb := _flight_summary(flight_beta, fly_beta)
 	_print_flight_line("alpha", fa)
 	_print_flight_line("beta", fb)
-	brain_client.send_round_over(stats_alpha, stats_beta, false, "", "", "", fa, fb)
+	_last_verdict = _compose_verdict(false)
+	# Free battles carry a unique id (no vault records to key on, so the
+	# server dedups on this): a lost reply is simply lost, but a retry
+	# can never advance two generations.
+	var free_id := "FREE-%d" % Time.get_ticks_msec()
+	brain_client.send_round_over(stats_alpha, stats_beta, false, free_id, "", "", fa, fb,
+		false, str(_last_verdict.get("end_reason", "")), _last_verdict)
+
+func _forgivable_reply(battle_id: String) -> bool:
+	# True when a post-fail-loud reply is the still-owed battle (same
+	# full nonce id, same tournament file, same match label, still in
+	# a tournament): applying it heals a false-positive SERVER SILENT.
+	# Pure (unit-tested).
+	if _seq_forgive_match.is_empty():
+		return false
+	if battle_id != str(_seq_forgive_match.get("battle", "")):
+		return false
+	if str(_seq_forgive_match.get("tournament_id", "")) != _tourney_id():
+		return false
+	if str(_seq_forgive_match.get("match", "")) != tourney_match_label:
+		return false
+	return tournament_active
+
+
+func _on_battle_progress(battle_id: String) -> void:
+	# Server proof-of-life while banking: extend the deadline a full
+	# window from each heartbeat instead of firing a duplicate report
+	# that doubles the server's work. Stray ids never move it. In
+	# roundbank context the server heartbeats the ROUND nonce (per
+	# match stage) - matched against _seq_round_id, not battle ids.
+	# Group banks heartbeat the GROUP nonce the same way.
+	if _seq_context == "battle" and battle_id != "" \
+			and battle_id == _seq_battle_id:
+		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("battle")
+	elif _seq_context == "roundbank" and battle_id != "" \
+			and battle_id == _seq_round_id:
+		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("roundbank")
+		_bank_link_fails = 0
+	elif _seq_context == "groupbank" and battle_id != "" \
+			and battle_id == _seq_group_id:
+		_seq_deadline_msec = Time.get_ticks_msec() + _seq_timeout_for("groupbank")
+		_bank_link_fails = 0
+	# Match-bank heartbeats land outside any seq context (the pending
+	# table owns those waits): refresh the entry's cadence so a slow
+	# bank isn't re-sent mid-work, and clear the link trip.
+	if battle_id != "" and _match_banks_pending.has(battle_id):
+		var mst: Dictionary = _match_banks_pending[battle_id]
+		mst["last_send"] = Time.get_ticks_msec()
+		_match_banks_pending[battle_id] = mst
+		_bank_link_fails = 0
+
 
 func _on_tournament_battle(battle_winner: String, _fit_a: float, _fit_b: float, _battle_id: String) -> void:
-	# Server already banked dopamine + records + weights to the vault.
-	# Late replies after a fail-loud battle timeout are dropped here so a
-	# battle is never applied twice.
+	# (Retired for tournaments in batch mode: per-battle replies no
+	# longer fire; kept as a safe fallback - unmatched echoes drop with
+	# a log, matched echoes still apply the sequence.)
 	if not _tourney_awaiting_battle:
-		print("[Arena] Ignoring late/duplicate tournament_battle (id=", _battle_id, ")")
-		return
+		if _battle_id != "" and _forgivable_reply(_battle_id):
+			print("[Arena] Forgiving late tournament_battle (id=",
+				_battle_id, "): banked but unconfirmed, applying now.")
+		else:
+			print("[Arena] Ignoring late/duplicate tournament_battle (id=",
+				_battle_id, ")")
+			return
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
 	if _battle_id != "" and _seq_battle_id != "" and _battle_id != _seq_battle_id:
 		print("[Arena] Ignoring tournament_battle id mismatch: got ", _battle_id,
 			" want ", _seq_battle_id)
 		return
+	_battle_post_sequence(battle_winner)
+
+
+func _battle_accepted(res: Dictionary) -> bool:
+	# Only these director actions advance a battle. Anything else
+	# (idle = unplaceable, broken, unknown) must park loud, never
+	# loop: feeding idle into match_reset spun ~300 phantom battles
+	# across 5 hours once (Oct 2026 group-D: every idle response
+	# reads 0-0 and re-arms the next reset).
+	return str(res.get("action", "")) in ["next_battle", "replay", "match_over"]
+
+
+func _log_battle(winner: String, res: Dictionary) -> void:
+	# One arena-log line per battle (action + score + label): the
+	# signature the group-D investigation was missing - an idle loop
+	# reads as repeated 0-0s here and diagnoses in minutes.
+	_arena_log("battle: winner=%s action=%s score=%d-%d (%s)" % [winner,
+		str(res.get("action", "?")), int(res.get("score_a", 0)),
+		int(res.get("score_b", 0)), expand_match_label(tourney_match_label)])
+
+
+func _park_unplaceable_battle(battle_winner: String, action: String) -> void:
+	# A finished battle the director cannot place (tournament
+	# complete, pointer past end, desync): drop it - never cache,
+	# never count, never reset - and park LOUD on the bracket. Only
+	# a human decision (QUIT TO MENU + RESUME) is safe from here;
+	# anything automatic risks the phantom loop.
+	_arena_log("phantom battle dropped: winner=%s action=%s (%s)" % [
+		battle_winner, action, expand_match_label(tourney_match_label)])
+	print("[Arena] STALLED - battle unplaceable (director %s); phantom dropped, no reset sent." % action)
+	_hide_loading()
+	_show_arena_bracket("STALLED - BATTLE UNPLACEABLE (director %s)" % action)
+	if is_instance_valid(status_label):
+		status_label.text = "STALLED - %s result unplaceable (director %s) - QUIT TO MENU + RESUME" % [
+			expand_match_label(tourney_match_label), action]
+
+
+func _battle_done_local(draw: bool, draw_penalty: bool = false) -> void:
+	# Batched match reporting, battle-end choke point: cache the
+	# battle's sync payload (the whole match banks once at match over)
+	# and run the post-battle sequence LOCALLY - the arena owns every
+	# outcome (KO victim, health-timeout, draws), so no server round
+	# trip is needed between battles. Between battles only the ms
+	# match_reset runs; battles flow back-to-back on identical weights.
+	# The director is consulted BEFORE caching: an unplaceable battle
+	# (idle) is dropped + parked here, never cached (banking a phantom
+	# later would corrupt records), never counted, never reset.
+	_last_verdict = _compose_verdict(draw)
+	var wslot := str(_last_verdict.get("winner_slot", ""))
+	var winner := "draw" if draw else (wslot if (wslot == "alpha" or wslot == "beta") else "alpha")
+	var director := _director()
+	var res := {}
+	if not draw and director != null:
+		res = director.on_battle_result(winner,
+			_flight_summary(flight_alpha, fly_alpha),
+			_flight_summary(flight_beta, fly_beta),
+			_bv_stream_packet(),
+			int((stats_alpha as Dictionary).get("kills", 0)),
+			int((stats_beta as Dictionary).get("kills", 0)))
+		_log_battle(winner, res)
+		if not _battle_accepted(res):
+			_park_unplaceable_battle(winner, str(res.get("action", "idle")))
+			return
+	_match_battle_cache.append({
+		"battle_id": _current_battle_id(),
+		"draw": draw, "draw_penalty": draw_penalty,
+		"end_reason": str(_last_verdict.get("end_reason", "")),
+		"verdict": _last_verdict.duplicate(),
+		"stats_a": stats_alpha.duplicate(), "stats_b": stats_beta.duplicate(),
+		"sens_a": _last_sens_a.duplicate(), "sens_b": _last_sens_b.duplicate(),
+		"ctrl_a": _last_ctrl_a.duplicate(), "ctrl_b": _last_ctrl_b.duplicate()})
+	# Tripwire bound: a real match never exceeds single-digit battles.
+	# An unbounded cache means phantom flow - cap it LOUD instead of
+	# growing memory and a future giant bank replay.
+	while _match_battle_cache.size() > 200:
+		_match_battle_cache.pop_front()
+		_arena_log("match cache over 200 - dropping oldest battle (phantom flow?)")
+	print("[Arena] Battle cached for match bank: %s (%d cached)" % [
+		str(_last_verdict.get("line", "")), _match_battle_cache.size()])
+	_battle_post_sequence(winner, res)
+
+
+func _battle_post_sequence(battle_winner: String, res: Dictionary = {}) -> void:
+	# The post-battle sequence, run locally at battle end in batch mode
+	# (and by any accepted battle reply): clears the wait, tallies the
+	# win, shows the verdict callout, advances the bracket, and queues
+	# the next battle (ms match_reset) or the match report.
+	# res rides along from _battle_done_local (single director consult
+	# per battle); the legacy server-reply entry passes none and it is
+	# computed below. Either way only an ACCEPTED response proceeds -
+	# idle parks loud via the same guard as the cache path.
 	_tourney_awaiting_battle = false
 	_clear_seq()
+	_seq_forgive_match = {}
+	if arena_bracket != null:
+		arena_bracket.live_preview = {}
 	_hide_loading()
 	var director := _director()
 	if director == null:
 		return
 	_update_health_hud()
-	# Session wins tally: _record_win previously only ran on the
-	# free-battle paths, so tournament/quick battle wins never moved the
-	# WINS label. Draws record nothing (no winner).
-	if battle_winner == "alpha" or battle_winner == "beta":
-		_record_win(battle_winner)
 	if battle_winner == "draw":
+		var draw_title := _draw_title()
 		if is_instance_valid(status_label):
-			status_label.text = "%s DRAW - REPLAYING" % tourney_match_label
+			status_label.text = "%s %s - REPLAYING" % [expand_match_label(tourney_match_label), draw_title]
 		_begin_landing("")
-		_show_callout("DRAW", Color(0.78, 0.78, 0.82),
-			"%s STALEMATE - REPLAY" % tourney_match_label, "REMATCH", false)
-		await get_tree().create_timer(5.0).timeout
-		director.on_battle_result("draw",
+		# Replay preview: the banked draw about to land makes the next
+		# battle overtime — show its scale and wander dock up front so
+		# the viewer knows why health will differ.
+		var _next_draws := 1
+		if director != null:
+			_next_draws = int(director.current_match().get("draws", 0)) + 1
+		var _scale := 1.5
+		if director != null:
+			_scale = director.overtime_scale(_next_draws)
+		var _da := float((stats_alpha as Dictionary).get("center_drift", 0.0))
+		var _db := float((stats_beta as Dictionary).get("center_drift", 0.0))
+		_show_callout(draw_title, Color(0.78, 0.78, 0.82),
+			"%s STALEMATE - REPLAY  •  OVERTIME x%.1f: %s -%d HP (%.1f m), %s -%d HP (%.1f m)" % [
+				expand_match_label(tourney_match_label), _scale,
+				_slot_name("alpha"), int(_wander_dock(_da)), _da,
+				_slot_name("beta"), int(_wander_dock(_db)), _db],
+			"REMATCH", false)
+		await _wait(5.0).timeout
+		var draw_adv: Dictionary = director.on_battle_result("draw",
 			_flight_summary(flight_alpha, fly_alpha),
 			_flight_summary(flight_beta, fly_beta),
-			_bv_stream_packet())
+			_bv_stream_packet(),
+			int((stats_alpha as Dictionary).get("kills", 0)),
+			int((stats_beta as Dictionary).get("kills", 0)),
+			float((stats_alpha as Dictionary).get("center_drift", -1.0)),
+			float((stats_beta as Dictionary).get("center_drift", -1.0)))
+		# Third draw resolves the match outright (higher ELO advances)
+		# instead of replaying forever.
+		_log_battle("draw", draw_adv)
+		if str(draw_adv.get("action", "")) == "match_over":
+			var draw_score := "%d - %d" % [int(draw_adv.get("score_a", 0)), int(draw_adv.get("score_b", 0))]
+			_on_match_over(str(draw_adv.get("match_winner", "alpha")), draw_score)
+			return
+		if not _battle_accepted(draw_adv):
+			_park_unplaceable_battle("draw", str(draw_adv.get("action", "idle")))
+			return
+		var rhead := _verdict_headline()
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header(str(rhead.get("text", "")),
+				str(rhead.get("sub", "")) + "\nwaiting for server (match reset)...",
+				rhead.get("color", Color(0.85, 0.85, 0.9)))
+		else:
+			_show_loading(str(rhead.get("text", "")),
+				str(rhead.get("sub", "")) + "\nwaiting for server (match reset)...")
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
 		return
 	var winner_name := tourney_a_name if battle_winner == "alpha" else tourney_b_name
-	var res: Dictionary = director.on_battle_result(battle_winner,
-		_flight_summary(flight_alpha, fly_alpha),
-		_flight_summary(flight_beta, fly_beta),
-		_bv_stream_packet())
-	var action := str(res.get("action", "next_battle"))
-	print("[Arena] Battle result: winner=", battle_winner, " action=", action)
-	var score := "%d - %d" % [int(res.get("score_a", 0)), int(res.get("score_b", 0))]
+	# Timeout wins land like KOs and draws: without this the flies
+	# kept flying on their last commands through the callout and the
+	# match-reset wait (the post-timeout drift into trees).
+	_begin_landing(battle_winner)
+	# Legacy server-reply entry passes no response: consult once here
+	# (the _battle_done_local entry already did and passes it in).
+	# Either way the response is validated before anything advances.
+	var res_here := res
+	if res_here.is_empty() and battle_winner != "draw":
+		res_here = director.on_battle_result(battle_winner,
+			_flight_summary(flight_alpha, fly_alpha),
+			_flight_summary(flight_beta, fly_beta),
+			_bv_stream_packet(),
+			int((stats_alpha as Dictionary).get("kills", 0)),
+			int((stats_beta as Dictionary).get("kills", 0)))
+		_log_battle(battle_winner, res_here)
+	if not _battle_accepted(res_here):
+		_park_unplaceable_battle(battle_winner, str(res_here.get("action", "idle")))
+		return
+	# Session wins tally: tournament/quick battle wins move the WINS
+	# label, but ONLY for director-accepted battles - phantom wins
+	# once inflated it for hours. Draws record nothing (no winner).
+	if battle_winner == "alpha" or battle_winner == "beta":
+		_record_win(battle_winner)
+	var action := str(res_here.get("action", "next_battle"))
+	print("[Arena] Battle result: winner=", battle_winner, " action=", action,
+		" verdict=", str(_last_verdict.get("line", "")))
+	var score := "%d - %d" % [int(res_here.get("score_a", 0)), int(res_here.get("score_b", 0))]
 	if action == "match_over":
-		var match_winner := str(res.get("match_winner", battle_winner))
-		var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
-		brain_client.request_tournament_match(match_winner)
-		# The bracket overlay carries the result: gold connectors show the
-		# path, the loser is grayed out, next lineup is visible.
-		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, tourney_match_label, score])
-		await get_tree().create_timer(6.0).timeout
-		_hide_arena_bracket()
-		_advance_tournament()
+		var match_winner := str(res_here.get("match_winner", battle_winner))
+		_on_match_over(match_winner, score)
 	else:
+		var sub := "%s  BATTLE %d" % [expand_match_label(tourney_match_label), _battle_count() + 1]
+		var vshort := _verdict_short()
+		if vshort != "":
+			sub += "  |  " + vshort
 		_show_callout("%s TAKES BATTLE (%s)" % [winner_name, score],
 			Color(1.0, 0.55, 0.3) if battle_winner == "alpha" else Color(0.4, 0.75, 1.0),
-			"%s  BATTLE %d" % [tourney_match_label, _battle_count() + 1], "NEXT BATTLE", false)
-		await get_tree().create_timer(5.0).timeout
+			sub, "NEXT BATTLE", false)
+		_announce_clip("battle_orange" if battle_winner == "alpha" else "battle_blue")
+		await _wait(5.0).timeout
 		_update_tourney_status("BATTLE %d" % (_battle_count() + 1))
+		var whead := _verdict_headline()
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header(str(whead.get("text", "")),
+				str(whead.get("sub", "")) + "\nwaiting for server (match reset)...",
+				whead.get("color", Color(0.85, 0.85, 0.9)))
+		else:
+			_show_loading(str(whead.get("text", "")),
+				str(whead.get("sub", "")) + "\nwaiting for server (match reset)...")
 		brain_client.request_match_reset(tourney_match_label)
 		_arm_seq("reset")
+
+func _on_match_over(match_winner: String, score: String) -> void:
+	# Round-batch reporting: this match's battles join the round cache
+	# (no server send); the bracket advances LOCALLY right away; only a
+	# round boundary sends the ONE round_report, and the next round
+	# overlaps the bank (intermission first, loads gate on the ack).
+	# A drawn split (group play) banks no title-side slot: the batch
+	# carries the draw ELO, no match winner is credited.
+	_last_match_winner = match_winner
+	_last_match_score = score
+	# The round is OVER: freeze the sim now. Steps, the round timer and
+	# the timeout verdicts must never keep running through the result
+	# overlay and the next load on the finished match's brains (the
+	# old "game runs / flying before ready" hole - steps also flowed
+	# into the NEXT match's battle cache on a stray timeout).
+	is_round_active = false
+	_set_combat(false)
+	# The decision owns the status NOW: a draw's REPLAYING must die
+	# here, or it sits stale through the result, the group-complete
+	# record and the whole next-bracket intermission (a ~2 min lie
+	# on the group-D-to-final handoff).
+	if is_instance_valid(status_label):
+		if match_winner == "draw":
+			status_label.text = "%s DRAW %s (point split) - match decided" % [expand_match_label(tourney_match_label), score]
+		else:
+			var _mwname := tourney_a_name if match_winner == "alpha" else tourney_b_name
+			status_label.text = "%s DECIDED - %s TAKES IT %s" % [expand_match_label(tourney_match_label), _mwname, score]
+	var director := _director()
+	if director == null:
+		return
+	var round_before := int(director.tourney.get("current_round", 0))
+	var match_pathed := _match_bank_round()
+	var round_size := 0
+	var rounds_now: Array = director.tourney.get("rounds", [])
+	if round_before >= 0 and round_before < rounds_now.size():
+		round_size = (rounds_now[round_before] as Array).size()
+	var entry := _current_match_entry(match_winner)
+	_round_match_cache.append(entry)
+	_match_battle_cache.clear()
+	if match_pathed:
+		# Per-match bank while the next match runs (small datagram);
+		# the cache entry already rode along for flush visibility.
+		_send_match_report(entry)
+		_round_match_cache.pop_back()
+	var adv: Dictionary = director.advance_after_match()
+	var round_after := int(director.tourney.get("current_round", 0))
+	# Advance synchronously BEFORE the overlay wait: advance_after_match
+	# is pure logic + save, while the 6 s await below dies with the scene
+	# if the user quits to menu mid-overlay - which used to swallow the
+	# title request (and the evo chain) after the match was already
+	# banked. Banking requests are fire-and-forget; only the ack display
+	# below is allowed to depend on the wait.
+	_preload_next_match()
+	# The bracket overlay carries the result: gold connectors show the
+	# path, the loser is grayed out, next lineup is visible. A drawn
+	# split announces the shared point instead of a winner.
+	if match_winner == "draw":
+		_show_arena_bracket("%s DRAW %s  (point split)" % [expand_match_label(tourney_match_label), score])
+	else:
+		var match_name := tourney_a_name if match_winner == "alpha" else tourney_b_name
+		_show_arena_bracket("%s TAKES %s  (%s)" % [match_name, expand_match_label(tourney_match_label), score])
+		# Decisive matches get the voice; drawn splits stay silent
+		# (no winner to name - the bracket shows the shared point).
+		_announce_clip("match_orange" if match_winner == "alpha" else "match_blue")
+	await _wait(6.0).timeout
+	# The bracket STAYS UP (result display): the round-ended branch
+	# re-titles it to the banking view, the mid-round path re-titles
+	# it to LOADING - no bare-arena moment between result and load.
+	# Round boundary: the current round's index moved, or the file
+	# completed (group_complete / tournament_end). Mid-round matches
+	# just flow to the next load; the bank waits for the boundary.
+	var round_ended := round_after != round_before \
+		or str(adv.get("action", "")) != "next_match"
+	if round_ended:
+		# Review FIRST: the finished round's bracket goes up before
+		# any banking or loading, and the bank runs under it.
+		# Wait-bracket ownership carries the sequence: the bank ack
+		# auto-hides the review, then the parked load shows its own
+		# LOADING view - no moment shows an empty arena, no moment
+		# banks or loads unseen.
+		if _show_wait_bracket("%s  %s vs %s" % [expand_match_label(tourney_match_label), tourney_a_name, tourney_b_name]):
+			_set_wait_header("ROUND COMPLETE - REVIEWING BRACKET",
+				"saving the finished round - next round loads on confirmation...",
+				Color(0.85, 0.85, 0.9))
+		else:
+			_show_loading("ROUND COMPLETE - REVIEWING BRACKET",
+				"saving the finished round...")
+		if match_pathed:
+			# No round payload exists (matches banked individually);
+			# the latch clears when every match acked, then the
+			# parked next round fires like any round ack.
+			_open_round_bank(round_size)
+		else:
+			_send_round_report()
+	_handle_advance_result(adv)
+
+
+func _current_match_entry(match_winner: String) -> Dictionary:
+	# One round-cache entry for the just-finished (or in-progress)
+	# match: winner (or "pending" for the quit-flush strays), fighter
+	# ids + vault paths for the round-end reloads, and the cached
+	# battles. Read BEFORE advance_after_match (current position is
+	# still this match).
+	var director := _director()
+	var cm: Dictionary = director.current_match() if director != null else {}
+	var aid := str(cm.get("a_id", ""))
+	var bid := str(cm.get("b_id", ""))
+	return {"match_id": _current_match_nonce(),
+		"match_winner": match_winner,
+		"round": int(director.tourney.get("current_round", 0)) if director != null else 0,
+		"match": int(director.tourney.get("current_match", 0)) if director != null else 0,
+		"label": tourney_match_label,
+		"alpha_id": aid, "beta_id": bid,
+		"alpha_path": director.brain_path(aid) if director != null else "",
+		"beta_path": director.brain_path(bid) if director != null else "",
+		"battles": _match_battle_cache.duplicate(true)}
+
+
+func _current_match_nonce() -> String:
+	# Deterministic per match (tournament file + round index + label):
+	# recomputable across resume and quit-flush, so a re-sent report
+	# hits the same server dedup key instead of banking twice. The
+	# round index keeps main and consolation labels distinct.
+	var director := _director()
+	var tid := str(director.tourney.get("id", "")) if director != null else ""
+	var r := int(director.tourney.get("current_round", 0)) if director != null else 0
+	return "%s|R%d%s" % [tid, r, tourney_match_label]
+
+
+func _match_bank_round() -> bool:
+	# Multi-match bracket rounds bank per match (small datagrams that
+	# fit UDP, overlapping the next match). Everything else keeps the
+	# round report: group files (pin/journal server model), quick
+	# battles and single-match rounds (tiny, proven). Pure over the
+	# director position (unit-tested); call BEFORE advance_after_match.
+	if _tourney_is_group():
+		return false
+	var director := _director()
+	if director == null:
+		return false
+	var rounds: Array = director.tourney.get("rounds", [])
+	var ri := int(director.tourney.get("current_round", 0))
+	if ri < 0 or ri >= rounds.size():
+		return false
+	return (rounds[ri] as Array).size() > 1
+
+
+func _send_round_report() -> void:
+	# ONE bank per round: every cached match rides one message; the
+	# server replays matches in order (per-match vault reload, battles in
+	# order, ELO chains, records), then journals once + saves each brain
+	# once. The bank runs UNDER the intermission/review (pipelined);
+	# loads gate on the ack, never on the send. Group files flag the
+	# report: the server pins brains in RAM and journals without
+	# saving (the group seal saves once at group completion).
+	if _round_match_cache.is_empty():
+		return
+	_seq_round_id = "RND-%d-%d" % [Time.get_ticks_msec(), randi() % 100000]
+	_tourney_awaiting_roundbank = true
+	_round_bank_pending = true
+	_seq_forgive_roundbank = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "battle": _seq_round_id}
+	var group_mode := _tourney_is_group()
+	_seq_last_round_report = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "round_nonce": _seq_round_id,
+		"matches": _round_match_cache.duplicate(true),
+		"group": group_mode}
+	brain_client.request_round_report(_seq_round_id, _tourney_id(),
+		tourney_match_label, _round_match_cache, group_mode)
+	_round_match_cache.clear()
+	_arm_seq("roundbank")
+	_bank_ladder_reset()
+
+
+func _send_match_report(entry: Dictionary) -> void:
+	# ONE bank per match (multi-match bracket rounds): the just-finished
+	# match reports while the next match runs (small datagram, overlaps
+	# the round). Same nonce/verdict contract as round reports: the
+	# server answers repeats from its stored verdict, never double-banks.
+	var nonce := str(entry.get("match_id", ""))
+	if nonce == "":
+		return
+	var stored := {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "match_nonce": nonce,
+		"winner": str(entry.get("match_winner", "")),
+		"round": int(entry.get("round", -1)),
+		"match_idx": int(entry.get("match", -1)),
+		"entry": entry.duplicate(true)}
+	_match_banks_pending[nonce] = stored
+	_match_bank_retries[nonce] = 0
+	_match_bank_send(stored, "send")
+
+
+func _match_bank_send(stored: Dictionary, reason: String) -> bool:
+	# Same-nonce resend of a STORED match report. True = sent (or
+	# safely skipped); false = link dead-tripped, fail loud. Never
+	# call while a battle is live (a 10-30 s bank would stall steps).
+	var nonce := str(stored.get("match_nonce", ""))
+	if nonce == "" or not _match_banks_pending.has(nonce):
+		return true
+	if not _bank_link_alive():
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	var entry: Dictionary = stored.get("entry", {})
+	_bank_link_fails = 0
+	brain_client.request_match_report(
+		str(entry.get("match_winner", "pending")), str(stored.get("tournament_id", "")),
+		str(stored.get("match", "")), nonce,
+		(entry.get("battles", []) as Array),
+		str(entry.get("alpha_id", "")), str(entry.get("beta_id", "")),
+		str(entry.get("alpha_path", "")), str(entry.get("beta_path", "")),
+		str(entry.get("match_winner", "")) == "pending")
+	_match_bank_retries[nonce] = int(_match_bank_retries.get(nonce, 0)) + 1
+	stored["last_send"] = Time.get_ticks_msec()
+	_match_banks_pending[nonce] = stored
+	print("[Arena] Sent match report %s (%s, try %d)." % [nonce, reason,
+		int(_match_bank_retries.get(nonce, 0))])
+	_arena_log("match report sent: %s (%s)" % [nonce, reason])
+	return true
+
+
+func _open_round_bank(expecting: int) -> void:
+	# Multi-match bracket round completed: no round payload exists
+	# (matches banked individually); the latch + nonce exist so the
+	# next round gates + parks exactly like a round report, clearing
+	# when every match acked. Stale round state is cleared (a prior
+	# round-pathed round's stored report must never resend here).
+	_seq_round_id = "RND-%d-%d" % [Time.get_ticks_msec(), randi() % 100000]
+	_round_bank_pending = true
+	_round_match_banked = true
+	_seq_last_round_report = {}
+	_bank_ladder_reset()
+	_arena_log("round bank opened (per-match): %s awaiting %d/%d matches" % [
+		_seq_round_id, _match_banks_pending.size(), expecting])
+
+
+func _close_round_bank() -> void:
+	# Round confirmed (ack or all matches acked): shared tail - clear
+	# the latches, refresh the roster cache (vault turned), drain
+	# deferred chains, fire a parked load.
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
+	_tourney_awaiting_roundbank = false
+	_round_bank_pending = false
+	_round_match_banked = false
+	_bank_ladder_reset()
+	_clear_seq()
+	_seq_forgive_roundbank = {}
+	_hide_wait_bracket()
+	_hide_loading()
+	if not _pending_advance.is_empty():
+		var pa := _pending_advance
+		_pending_advance = {}
+		_handle_advance_result(pa)
+	if _load_gated_on_bank:
+		_load_gated_on_bank = false
+		_request_current_battle_load()
+
+
+func _tourney_is_group() -> bool:
+	# True when the live tournament file runs group round-robin (the
+	# only format that banks per group instead of per round).
+	var director := _director()
+	if director == null:
+		return false
+	return str(director.tourney.get("format", "bracket")) == "groups"
+
+
+func _send_group_report() -> void:
+	# ONE bank per group (group files only): the server seals the
+	# journal and saves each pinned brain once. Sent at group
+	# completion; runs UNDER the group-to-final intermission while
+	# final loads gate on the ack. Same nonce/verdict contract as
+	# round reports (exact resend, forgive window, watchdog).
+	_seq_group_id = "GRP-%d-%d" % [Time.get_ticks_msec(), randi() % 100000]
+	_tourney_awaiting_groupbank = true
+	_group_bank_pending = true
+	_seq_forgive_groupbank = {"tournament_id": _tourney_id(),
+		"match": tourney_match_label, "battle": _seq_group_id}
+	_seq_last_group_report = {"tournament_id": _tourney_id(),
+		"group_nonce": _seq_group_id, "match": tourney_match_label}
+	brain_client.request_group_report(_seq_group_id, _tourney_id(),
+		tourney_match_label)
+	_arm_seq("groupbank")
+	_arena_log("group report sent: %s (%s)" % [_seq_group_id, tourney_match_label])
+	_bank_ladder_reset()
+
+
+func _bank_ladder_reset() -> void:
+	_bank_retries = 0
+	_bank_link_fails = 0
+	_bank_last_send_msec = Time.get_ticks_msec()
+
+
+func _bank_link_alive() -> bool:
+	# Reconnect only when the socket is down (recreating it every
+	# resend would widow in-flight replies on a new local port).
+	# Counts consecutive dead-link resends; the caller fails loud at
+	# BANK_LINK_FAIL_LOUD. A silent-but-connected server never trips.
+	if brain_client.is_connected_server:
+		return true
+	if brain_client.reconnect():
+		_bank_link_fails = 0
+		return true
+	_bank_link_fails += 1
+	print("[Arena] Bank resend skipped - link down (%d/%d)." % [_bank_link_fails, BANK_LINK_FAIL_LOUD])
+	_arena_log("bank resend link down %d/%d" % [_bank_link_fails, BANK_LINK_FAIL_LOUD])
+	return _bank_link_fails < BANK_LINK_FAIL_LOUD
+
+
+func _bank_resend_round(reason: String, announce: bool = true) -> bool:
+	# Same-nonce resend of the STORED round report (the server answers
+	# repeats from its stored verdict, never double-banks). True =
+	# sent (or safely skipped); false = link dead-tripped, fail loud.
+	if _seq_last_round_report.is_empty():
+		return true
+	if not _bank_link_alive():
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	var mr := _seq_last_round_report
+	_seq_round_id = str(mr.get("round_nonce", ""))
+	_tourney_awaiting_roundbank = true
+	_bank_link_fails = 0
+	brain_client.request_round_report(_seq_round_id,
+		str(mr.get("tournament_id", "")), str(mr.get("match", "")),
+		(mr.get("matches", []) as Array), bool(mr.get("group", false)))
+	_bank_last_send_msec = Time.get_ticks_msec()
+	_bank_retries += 1
+	_arm_seq("roundbank")
+	print("[Arena] Resent round report %s (%s, try %d)." % [_seq_round_id, reason, _bank_retries])
+	_arena_log("resent round report %s (%s, try %d)" % [_seq_round_id, reason, _bank_retries])
+	if announce and is_instance_valid(status_label):
+			status_label.text = "SAVING ROUND - retry %d (same results, no double count)..." % _bank_retries
+	return true
+
+
+func _bank_resend_group(reason: String, announce: bool = true) -> bool:
+	# Group-seal twin of _bank_resend_round: same nonce, idempotent,
+	# true = sent (or safely skipped), false = link dead-tripped.
+	if _seq_last_group_report.is_empty():
+		return true
+	if not _bank_link_alive():
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	var gr := _seq_last_group_report
+	_seq_group_id = str(gr.get("group_nonce", ""))
+	_tourney_awaiting_groupbank = true
+	_bank_link_fails = 0
+	brain_client.request_group_report(_seq_group_id,
+		str(gr.get("tournament_id", "")), str(gr.get("match", "")))
+	_bank_last_send_msec = Time.get_ticks_msec()
+	_bank_retries += 1
+	_arm_seq("groupbank")
+	print("[Arena] Resent group report %s (%s, try %d)." % [_seq_group_id, reason, _bank_retries])
+	_arena_log("resent group report %s (%s, try %d)" % [_seq_group_id, reason, _bank_retries])
+	if announce and is_instance_valid(status_label):
+			status_label.text = "SAVING GROUP - retry %d (same results, no double count)..." % _bank_retries
+	return true
+
+
+func _forgivable_groupbank(group_nonce: String) -> bool:
+	# Group-level twin of _forgivable_roundbank: a post-fail-loud bank
+	# ack applies only for the still-owed group (same nonce id, same
+	# tournament file, still in a tournament). Pure (unit-tested).
+	if _seq_forgive_groupbank.is_empty():
+		return false
+	if group_nonce != str(_seq_forgive_groupbank.get("battle", "")):
+		return false
+	if str(_seq_forgive_groupbank.get("tournament_id", "")) != _tourney_id():
+		return false
+	return tournament_active
+
+
+func _forgivable_roundbank(round_nonce: String) -> bool:
+	# Round-level twin of _forgivable_reply: a post-fail-loud bank ack
+	# applies only for the still-owed round (same nonce id, same
+	# tournament file, still in a tournament). Pure (unit-tested).
+	if _seq_forgive_roundbank.is_empty():
+		return false
+	if round_nonce != str(_seq_forgive_roundbank.get("battle", "")):
+		return false
+	if str(_seq_forgive_roundbank.get("tournament_id", "")) != _tourney_id():
+		return false
+	return tournament_active
+
+
+func _on_group_banked(group_nonce: String, tid: String) -> void:
+	# The server sealed the whole group (journal sealed, every pinned
+	# brain saved once, records flushed). Guards mirror the round
+	# reply; then: clear the pending flag, refresh the roster cache,
+	# fire any load parked on the gate, and run a deferred final
+	# build. Round acks never touch group waits (separate state).
+	if not _tourney_awaiting_groupbank:
+		if group_nonce != "" and _forgivable_groupbank(group_nonce):
+			print("[Arena] Forgiving late group_banked (id=",
+				group_nonce, "): banked but unconfirmed, applying now.")
+		else:
+			print("[Arena] Ignoring late/duplicate group_banked (id=",
+				group_nonce, ")")
+			return
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
+	if group_nonce != "" and _seq_group_id != "" and group_nonce != _seq_group_id:
+		print("[Arena] Ignoring group_banked id mismatch: got ", group_nonce,
+			" want ", _seq_group_id)
+		return
+	_tourney_awaiting_groupbank = false
+	_group_bank_pending = false
+	_bank_ladder_reset()
+	_clear_seq()
+	# Consuming the owed ack closes the forgive window.
+	_seq_forgive_groupbank = {}
+	_hide_wait_bracket()
+	_hide_loading()
+	if not _pending_final_group.is_empty():
+		var fgev := _pending_final_group
+		_pending_final_group = {}
+		print("[Arena] Group banked - building the queued final now.")
+		if _event_build_final(fgev):
+			_event_gallery_update()
+			# QF1 is known now: warm the slot under the rest of the
+			# countdown instead of loading cold post-ack.
+			_preload_next_match()
+		_show_arena_bracket("EVENT %s · FINAL" % str(fgev.get("id", "")))
+		# Name the reveal on the status line too: the bracket retitle
+		# alone is easy to miss mid-countdown, and the bar may still
+		# read the last battle (or a stale REPLAYING).
+		if is_instance_valid(status_label):
+			var _qf1 := ""
+			for _ln in _event_preview_sub("final").split("\n"):
+				if str(_ln).begins_with("QF:"):
+					_qf1 = str(_ln)
+					break
+			if _qf1 != "":
+				status_label.text = "EVENT %s · FINAL BRACKET SET - opening %s" % [str(fgev.get("id", "")), _qf1]
+			else:
+				status_label.text = "EVENT %s · FINAL BRACKET SET" % str(fgev.get("id", ""))
+	if _load_gated_on_bank:
+		_load_gated_on_bank = false
+		_request_current_battle_load()
+
+
+func _on_round_banked(round_nonce: String, tid: String, match_label: String) -> void:
+	# The server banked the whole round (replays, records, weights, one
+	# save set). Guards mirror the per-battle reply; then: clear the
+	# pending flag, refresh the roster cache, fire any load parked on
+	# the gate, run a deferred final-build, and run a deferred
+	# tournament-end chain.
+	if not _tourney_awaiting_roundbank:
+		if round_nonce != "" and _forgivable_roundbank(round_nonce):
+			print("[Arena] Forgiving late round_banked (id=",
+				round_nonce, "): banked but unconfirmed, applying now.")
+		else:
+			print("[Arena] Ignoring late/duplicate round_banked (id=",
+				round_nonce, ")")
+			return
+	var bdirector := _director()
+	if bdirector != null and bdirector.has_method("invalidate_brains_cache"):
+		bdirector.call("invalidate_brains_cache")
+	if round_nonce != "" and _seq_round_id != "" and round_nonce != _seq_round_id:
+		print("[Arena] Ignoring round_banked id mismatch: got ", round_nonce,
+			" want ", _seq_round_id)
+		return
+	_close_round_bank()
+
+
+func _on_match_banked(match_winner: String, _fit_a: float, _fit_b: float, match_id: String) -> void:
+	# Context-free (no seq dependency): the pending table IS the
+	# matcher, so a late ack always applies and an unknown one drops.
+	# When the last match of a match-pathed round acks, the round
+	# completes through the shared tail (drains + parked load).
+	if match_id == "" or not _match_banks_pending.has(match_id):
+		print("[Arena] Ignoring unknown match_banked (id=", match_id, ")")
+		return
+	var stored: Dictionary = _match_banks_pending[match_id]
+	_match_banks_pending.erase(match_id)
+	_match_bank_retries.erase(match_id)
+	_bank_link_fails = 0
+	print("[Arena] Match banked: %s (%s)." % [match_id, match_winner])
+	_arena_log("match banked: %s (%s)" % [match_id, match_winner])
+	_stamp_match_banked(stored)
+	if _round_bank_pending and _round_match_banked and _match_banks_pending.is_empty():
+		print("[Arena] Round complete - all matches banked.")
+		_arena_log("round complete - all matches banked")
+		_close_round_bank()
+
+
+func _stamp_match_banked(stored: Dictionary) -> void:
+	# Persist the banked flag on the director match (resume honesty:
+	# decided-but-unbanked matches stay visible instead of silently
+	# dropped). Position rides the pending entry (pre-advance); the
+	# nonce guard refuses a recycled position under another report.
+	var director := _director()
+	if director == null:
+		return
+	var rounds: Array = director.tourney.get("rounds", [])
+	var ri := int(stored.get("round", -1))
+	var mi := int(stored.get("match_idx", -1))
+	if ri < 0 or ri >= rounds.size():
+		return
+	var rms: Array = rounds[ri]
+	if mi < 0 or mi >= rms.size():
+		return
+	var m: Dictionary = rms[mi]
+	if str(m.get("bank_nonce", "")) != "" \
+			and str(m.get("bank_nonce", "")) != str(stored.get("match_nonce", "")):
+		return
+	m["banked"] = true
+	m["bank_nonce"] = str(stored.get("match_nonce", ""))
+	director.save_state()
+
 
 func _battle_count() -> int:
 	var director := _director()
@@ -2594,17 +6335,14 @@ func _battle_count() -> int:
 	var m: Dictionary = director.current_match()
 	return int(m.get("battles", 0))
 
-func _advance_tournament() -> void:
-	var director := _director()
-	if director == null:
-		return
-	_handle_advance_result(director.advance_after_match())
-
 func _handle_advance_result(res: Dictionary) -> void:
 	var director := _director()
 	if director == null:
 		return
 	var action := str(res.get("action", "next_match"))
+	if action == "group_complete":
+		await _event_group_done(res)
+		return
 	if action == "tournament_end":
 		var champ_id := str(res.get("champion_id", ""))
 		if director.is_quick():
@@ -2613,17 +6351,37 @@ func _handle_advance_result(res: Dictionary) -> void:
 			var quick_name: String = director.champion_name()
 			_show_callout("%s WINS THE QUICK BATTLE" % quick_name,
 				Color(1.0, 0.85, 0.3), "EXHIBITION COMPLETE", "MENU", false)
-			await get_tree().create_timer(5.0).timeout
+			var qslot := _slot_of(champ_id)
+			_announce_clip("exhibition_orange" if qslot == "alpha"
+				else ("exhibition_blue" if qslot == "beta" else "exhibition"))
+			await _wait(5.0).timeout
 			director.quit_to_menu()
+			return
+		if _round_bank_pending:
+			# Bank still running: review NOW (display-only bracket),
+			# crown + handoff proceed on the ack (_on_round_banked
+			# re-dispatches the stashed chain). The crown loads the
+			# champion BY ID from the vault, which turns post-round only
+			# when the bank's saves land.
+			_pending_advance = res.duplicate(true)
+			_hide_wait_bracket()
+			_hide_loading()
+			winner_overlay.visible = false
+			_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET (saving round...)" % director.champion_name())
+			if is_instance_valid(status_label):
+				status_label.text = "TOURNAMENT COMPLETE - saving round, crown follows..."
 			return
 		var champ_slot := _slot_of(champ_id)
 		_tourney_close_ack = false
-		brain_client.request_tournament_end(champ_slot)
+		brain_client.request_tournament_end(champ_slot, champ_id)
 		var champ_name: String = director.champion_name()
-		# Evolution mode: skip the review-wait and breed the next
+		# Continuous mode: skip the review-wait and breed the next
 		# generation instead (champion display happens inside).
 		if _evo_active():
-			_run_evo_generation()
+			if _event_active():
+				await _run_event_handoff()
+			else:
+				_run_evo_generation()
 			return
 		var last_line := ""
 		var last_id := str(res.get("last_place_id", ""))
@@ -2633,25 +6391,28 @@ func _handle_advance_result(res: Dictionary) -> void:
 		# quit. The user leaves via QUIT TO MENU in the bottom bar when
 		# done (the bracket CLOSE button only hides the overlay; BRACKET
 		# re-opens it).
+		_hide_wait_bracket()
 		_hide_loading()
 		winner_overlay.visible = false
 		_show_arena_bracket("CHAMPION: %s - REVIEWING BRACKET" % champ_name)
 		_save_bracket_record(true)
 		if is_instance_valid(status_label):
 			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s - review, then QUIT TO MENU" % [champ_name, last_line]
+		_announce_clip("champion_orange" if champ_slot == "alpha"
+			else ("champion_blue" if champ_slot == "beta" else "champion"))
 		# Wait for the server's title write in the background (no leaving
 		# until it lands, so the menu never shows a stale pre-title vault).
 		# Bounded so a dead server can never hang the game here.
 		var waited := 0.0
 		while not _tourney_close_ack and waited < 60.0:
-			await get_tree().create_timer(0.25).timeout
+			await _wait(0.25).timeout
 			waited += 0.25
 		if not _tourney_close_ack:
 			push_warning("[Arena] tournament_closed ack timeout; menu stats may lag the vault file.")
 			if is_instance_valid(status_label):
 				status_label.text += " (title may lag - see server_log.txt)"
 		elif is_instance_valid(status_label):
-			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s (title banked) - review, then QUIT TO MENU" % [champ_name, last_line]
+			status_label.text = "TOURNAMENT COMPLETE - CHAMPION %s%s (title saved) - review, then QUIT TO MENU" % [champ_name, last_line]
 	else:
 		if bool(res.get("consolation_started", false)):
 			_show_arena_bracket("LOSERS BRACKET - LOSER ADVANCES TO LAST PLACE")
@@ -2665,13 +6426,15 @@ func _handle_advance_result(res: Dictionary) -> void:
 				var evo: Dictionary = director.tourney.get("evo", {})
 				var gen := int(evo.get("generation", 1))
 				var champ_name: String = director.champion_name()
-				_evo_queue_clone(gen + 1, str(director.tourney.get("champion_id", "")),
-					champ_name)
+				var champ_id := str(director.tourney.get("champion_id", ""))
+				_evo_queue_clone(gen + 1, champ_id, champ_name,
+					_evo_clone_parent2(gen + 1, champ_id))
 				_update_evo_status_line()
 				if is_instance_valid(status_label):
-					status_label.text = "EVO GEN %d begun - training G%d-%s-kin + wild in background..." % [gen + 1, gen + 1, champ_name]
-			await get_tree().create_timer(3.0).timeout
-			_hide_arena_bracket()
+					status_label.text = "CONTINUOUS GEN %d begun - training %s + wild in background..." % [gen + 1, director.kin_base_name(champ_name)]
+			await _wait(3.0).timeout
+			# The bracket STAYS UP: the load re-titles it to LOADING
+			# (same frame) - no bare-arena moment before the fight.
 		_request_current_battle_load()
 
 func _evo_active() -> bool:
@@ -2681,8 +6444,1051 @@ func _evo_active() -> bool:
 	return bool(director.tourney.get("evo", {}).get("active", false))
 
 
+# ── Group-stage events (evolution size-16) ──────────────────────────
+# One event = group files A-D + final, chained by the event manifest.
+# Brackets are fixed at event start; bred offspring stock the manifest
+# pool bench and never enter a live bracket directly.
+
+
+func _event_id() -> String:
+	var director := _director()
+	if director == null:
+		return ""
+	return str(director.tourney.get("event_id", ""))
+
+
+func _event_active() -> bool:
+	return _evo_active() and _event_id() != ""
+
+
+func _event_manifest() -> Dictionary:
+	var director := _director()
+	if director == null:
+		return {}
+	return director.event_load(_event_id())
+
+
+func _event_evo_carry() -> Dictionary:
+	# Pipeline continuity across brackets of one event: pending specs
+	# keep training (absolute result paths), done entries keep their
+	# dedup. Fresh dicts only at event boundaries (see handoff).
+	var director := _director()
+	if director == null:
+		return {"active": true, "generation": 1, "episodes": EVO_EPISODES,
+			"mutate_traits": 1, "pending": [], "done": {}}
+	return (director.tourney.get("evo", {}) as Dictionary).duplicate(true)
+
+
+func _on_intermission_skip() -> void:
+	_event_skip = true
+
+
+func _on_intermission_stop() -> void:
+	_on_evo_stop()
+
+
+func _standings_text() -> String:
+	var director := _director()
+	if director == null:
+		return ""
+	var group := str(director.tourney.get("group", "?"))
+	var lines := PackedStringArray()
+	lines.append("GROUP %s — top 2 advance" % group)
+	var rows: Array = director.group_standings()
+	# Booster marks banked at group completion (manifest): show the tag
+	# when reviewing a recorded group; live tables show DNF counts only.
+	var booster: Array = []
+	if _event_active():
+		var gev: Dictionary = director.event_load_cached(_event_id())
+		booster = ((gev.get("groups", {}) as Dictionary).get(group, {}) as Dictionary).get("booster", [])
+	var top_w := -1.0
+	var top_k := -1
+	for row in rows:
+		var rd := row as Dictionary
+		top_w = maxf(top_w, float(rd.get("wins", 0)))
+		top_k = maxi(top_k, int(rd.get("kos", 0)))
+	var i := 0
+	for row in rows:
+		i += 1
+		var rd := row as Dictionary
+		var w := float(rd.get("wins", 0))
+		var played := int(rd.get("matches", 0))
+		var mark := "★" if i <= 2 else " "
+		var tags := ""
+		if w >= top_w and top_w > 0.0:
+			tags += "  •  WINS LEADER"
+		if int(rd.get("kos", 0)) >= top_k and top_k > 0:
+			tags += "  •  KO LEADER"
+		if str(rd.get("id", "")) in booster:
+			tags += "  •  BOOSTER"
+		lines.append("%s%d. %s  —  Wins: %s, Losses: %s, Knockouts: %d, DNF: %d%s" % [mark, i,
+			str(rd.get("name", "?")),
+			director._fmt_wins(w), director._fmt_wins(float(played) - w),
+			int(rd.get("kos", 0)), int(rd.get("dnf", 0)), tags])
+	return "\n".join(lines)
+
+
+func _refresh_standings() -> void:
+	var director := _director()
+	if director == null or not is_instance_valid(standings_label):
+		return
+	if _event_active():
+		# The 2x2 overview carries per-group tables; the strip label
+		# would just duplicate them.
+		standings_label.visible = false
+		return
+	if str(director.tourney.get("format", "bracket")) == "groups":
+		standings_label.text = _standings_text()
+		standings_label.visible = true
+	else:
+		standings_label.visible = false
+
+
+func _pool_text(ev: Dictionary) -> String:
+	var director := _director()
+	var names := PackedStringArray()
+	if director != null:
+		var by_id := {}
+		for b in director.list_brains_cached():
+			by_id[str((b as Dictionary).get("id", ""))] = str((b as Dictionary).get("name", "?"))
+		for pid in (ev.get("pool", []) as Array):
+			names.append(str(by_id.get(str(pid), str(pid))))
+	return "POOL: " + (", ".join(names) if names.size() > 0 else "empty")
+
+
+const POOL_MIN_TRAIN := 50
+
+func _event_maintain_pool() -> void:
+	# Breed-ahead: keep wilds training toward the bench while the
+	# event plays (clones need the champion, so they queue post-final).
+	# Qualified bench + pipeline below target queues another wild.
+	# Round-guarded (mirrors _event_topup_tick): the qualified-count
+	# shells the roster when the cache is cold, and that refresh must
+	# never fire mid-fight. Per-battle invalidation (see
+	# _on_tournament_battle) keeps the next gap tick fresh instead.
+	if not _event_active():
+		return
+	if is_round_active:
+		return
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	var ev: Dictionary = director.event_load_cached(eid)
+	if ev.is_empty():
+		return
+	var evo: Dictionary = director.tourney.get("evo", {})
+	var gen := int(evo.get("generation", 1))
+	var st: Dictionary = ev.get("settings", {})
+	var q: Dictionary = director.event_pool_qualified(eid, POOL_MIN_TRAIN,
+		float(st.get("elo_cutoff", 0.0)))
+	var busy := (q.get("qualified", []) as Array).size()
+	for spec in _evo_pending():
+		var sk := str((spec as Dictionary).get("kind", ""))
+		if sk == "wild" or sk == "clone":
+			busy += 1
+	for kind in (evo.get("done", {}) as Dictionary).keys():
+		if str(kind) == "wild" or str(kind) == "clone":
+			busy += 1
+	if busy < EVENT_POOL_TARGET and not _evo_has_kind("wild"):
+		_evo_queue_wild(gen + 1)
+
+
+func _event_drain_done_to_pool() -> void:
+	# Banked offspring belong on the bench, not in a bracket. Runs on
+	# every watcher tick, so it stays silent unless the bench actually
+	# gains a brain (otherwise the log drowns in repeats).
+	if not _event_active():
+		return
+	var director := _director()
+	if director == null:
+		return
+	var bench: Array = director.event_load_cached(_event_id()).get("pool", [])
+	var ids: Array = []
+	for kind in ["clone", "wild"]:
+		var bid := _evo_done_id(kind)
+		if bid != "" and not (bid in bench):
+			ids.append(bid)
+	if ids.is_empty():
+		return
+	var res: Dictionary = director.event_pool_add(_event_id(), ids)
+	if bool(res.get("ok", false)):
+		print("[Arena] Event pool stocked: ", str(res.get("pool", [])))
+
+
+static func _gallery_cache_key(eid: String, target: String) -> String:
+	# Gallery cache keys carry the event id: chained generations reuse
+	# group letters ("B" this event is not "B" last event).
+	return eid + ":" + target
+
+
+func _event_gallery_update(all_fighters: bool = false) -> void:
+	# Bracket-view gallery: every fighter pre-event, else the next
+	# pending group's cards (hidden once nothing is pending, e.g. the
+	# final). Records refetch only when the target changes; rotation
+	# rides the shared gallery tick.
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	if eid == "":
+		return
+	var ev: Dictionary = director.event_load(eid)
+	if ev.is_empty():
+		return
+	# Keyed by event: chained generations reuse group letters, so a
+	# bare letter would serve the previous event's cards forever.
+	var key := _gallery_cache_key(eid, "ALL")
+	var ids: Array = []
+	if all_fighters:
+		for g in (ev.get("group_order", []) as Array):
+			var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				if not (str(pid) in ids):
+					ids.append(str(pid))
+	else:
+		# Upcoming bracket's fighters, from the loaded tourney (the
+		# switch/build already ran): group letter for group files,
+		# FINAL for the final. The old event_next_group routing showed
+		# the group-after-next (B-intermission galleried C) — never
+		# the bout about to be fought.
+		var tplayers: Array = director.tourney.get("players", [])
+		if tplayers.is_empty():
+			_event_gallery_active = false
+			if is_instance_valid(gallery_box):
+				gallery_box.visible = false
+			return
+		var tkey := "FINAL"
+		if str(director.tourney.get("format", "")) == "groups":
+			tkey = str(director.tourney.get("group", ""))
+			if tkey == "":
+				tkey = "UNGROUPED"
+		key = _gallery_cache_key(eid, tkey)
+		for p in tplayers:
+			if not (p is Dictionary):
+				continue
+			var ps := str((p as Dictionary).get("id", ""))
+			if ps != "" and not (ps in ids):
+				ids.append(ps)
+	if key == _event_gallery_key and _event_gallery_active:
+		if is_instance_valid(gallery_box):
+			gallery_box.visible = true
+		return
+	_event_gallery_key = key
+	var by_id := {}
+	for b in director.list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	nextgen_brains.clear()
+	var cards: Array = []
+	for pid in ids:
+		if by_id.has(pid):
+			var bd := by_id[pid] as Dictionary
+			nextgen_brains[pid] = bd
+			cards.append({"id": pid, "name": str(bd.get("name", "?"))})
+	if cards.is_empty():
+		_event_gallery_active = false
+		return
+	_event_gallery_active = true
+	# Right column in event mode (the legacy waiting room keeps left).
+	if not _event_gallery_moved and is_instance_valid(bracket_row) \
+			and is_instance_valid(gallery_box):
+		bracket_row.move_child(gallery_box, 1)
+		_event_gallery_moved = true
+	if is_instance_valid(gallery_box):
+		gallery_box.visible = true
+	_build_gallery_entries(cards)
+
+
+func _event_resume_intermission() -> bool:
+	# Relaunch into a live event: same bracket wait as live play (60 s
+	# groups, 120 s final) with the upcoming fighters in the gallery —
+	# resumes never jump straight into battle. SKIP/STOP keep their
+	# usual meaning; false means quit to menu.
+	var director := _director()
+	if director == null:
+		return false
+	var eid := _event_id()
+	var is_final := str(director.tourney.get("format", "")) != "groups"
+	var label := "final" if is_final else str(director.tourney.get("group", "?"))
+	var title := "EVENT %s · %s" % [eid, "FINAL" if is_final else "GROUP " + label]
+	_event_gallery_update()
+	var wait_secs := EVENT_FINAL_SECS if is_final else EVENT_INTERMISSION_SECS
+	return await _event_intermission(title, _event_preview_sub(label), wait_secs, true)
+
+
+func _event_pre_showcase() -> void:
+	# Brand-new event tip-off (runs once): 60 s bracket overview with
+	# all sixteen fighters rotating through the gallery, then Group A
+	# loads normally below.
+	var director := _director()
+	if director == null:
+		return
+	_event_gallery_update(true)
+	var eid := _event_id()
+	if not await _event_intermission("EVENT %s · TIP-OFF" % eid,
+			"Group A starts in", EVENT_TIPOFF_SECS, true):
+		director.quit_to_menu()
+		return
+
+
+func _event_next_phase(ev: Dictionary) -> String:
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		if not bool(gd.get("done", false)):
+			return str(g)
+	return "final"
+
+
+func _event_build_group(ev: Dictionary, letter: String) -> bool:
+	var director := _director()
+	if director == null:
+		return false
+	var carry := _event_evo_carry()
+	var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+	var by_id := {}
+	for b in director.list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var dicts: Array = []
+	for pid in (g.get("players", []) as Array):
+		if not by_id.has(str(pid)):
+			_evo_abort("event short: %s missing from vault" % str(pid))
+			return false
+		dicts.append(by_id[str(pid)])
+	var st: Dictionary = ev.get("settings", {})
+	var res: Dictionary = director.build_group_bracket(dicts, letter,
+		str(ev.get("id", "")), int(st.get("best_of", 7)),
+		float(st.get("lr_scale", 0.5)), float(st.get("round_time", 40.0)))
+	if not bool(res.get("ok", false)):
+		_evo_abort("next group failed: " + str(res.get("error", "?")))
+		return false
+	director.tourney["evo"] = carry
+	director.save_state()
+	director.event_note_bracket(str(ev.get("id", "")), letter,
+		str(director.tourney.get("id", "")))
+	director.event_set_phase(str(ev.get("id", "")), "groups_" + letter)
+	return true
+
+
+func _event_build_all_groups(ev: Dictionary) -> bool:
+	# Fixtures for the whole event up front: every quadrant renders
+	# real versus cards from the first minute (no "No tournament"
+	# panels). The chain only switches between prebuilt files after.
+	for letter in (ev.get("group_order", []) as Array):
+		if not _event_build_group(ev, str(letter)):
+			return false
+	return true
+
+
+func _event_switch_group(ev: Dictionary, letter: String) -> bool:
+	# Enter a prebuilt group file: ghost-check the roster, load it,
+	# carry the pipeline evo over. Falls back to building when no
+	# file was recorded (older events).
+	var director := _director()
+	if director == null:
+		return false
+	var eid := str(ev.get("id", ""))
+	var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+	var by_id: Dictionary = {}
+	for b in director.list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	for pid in (g.get("players", []) as Array):
+		if not by_id.has(str(pid)):
+			_evo_abort("event short: %s missing from vault" % str(pid))
+			return false
+	var carry: Dictionary = _event_evo_carry()
+	var bid := str(g.get("bracket_id", ""))
+	if bid == "":
+		return _event_build_group(ev, letter)
+	if not director.load_state_file(director.tournament_dir.path_join(bid + ".json")):
+		_evo_abort("event file missing: " + bid)
+		return false
+	if not director.tournament_active():
+		_evo_abort("event file not running: " + bid)
+		return false
+	director.tourney["evo"] = carry
+	director.save_state()
+	director.event_set_phase(eid, "groups_" + letter)
+	return true
+
+
+func _event_build_final(ev: Dictionary) -> bool:
+	var director := _director()
+	if director == null:
+		return false
+	var eid := str(ev.get("id", ""))
+	var adv: Dictionary = director.event_advancers(eid)
+	if not bool(adv.get("ok", false)):
+		_evo_abort("finalists undecided: " + str(adv.get("error", "?")))
+		return false
+	var by_id := {}
+	for b in director.list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	for pid in (adv.get("advancers", []) as Array):
+		if not by_id.has(str(pid)):
+			_evo_abort("event short: finalist %s missing" % str(pid))
+			return false
+	var carry := _event_evo_carry()
+	var st: Dictionary = ev.get("settings", {})
+	var res: Dictionary = director.build_final_bracket(adv.get("advancers", []), eid,
+		int(st.get("best_of", 7)), float(st.get("lr_scale", 0.5)),
+		float(st.get("round_time", 40.0)))
+	if not bool(res.get("ok", false)):
+		_evo_abort("final failed: " + str(res.get("error", "?")))
+		return false
+	director.tourney["evo"] = carry
+	director.save_state()
+	var ev2: Dictionary = director.event_load(eid)
+	ev2["final_id"] = str(director.tourney.get("id", ""))
+	director.event_save(ev2)
+	director.event_set_phase(eid, "final")
+	return true
+
+
+func _event_preview_sub(upcoming: String) -> String:
+	# One glance at what's next: group card or final QF pairs + bench.
+	# Group fighters render side-by-side in one row (a vertical stack
+	# squeezed the bracket); final QF pairings keep one line per pair
+	# (short, structured).
+	var director := _director()
+	if director == null:
+		return ""
+	var ev: Dictionary = _event_manifest()
+	var lines := PackedStringArray()
+	if upcoming == "final":
+		var adv: Dictionary = director.event_advancers(str(ev.get("id", "")))
+		var qf: Array = adv.get("advancers", []) if bool(adv.get("ok", false)) else []
+		var names := {}
+		for b in director.list_brains_cached():
+			names[str((b as Dictionary).get("id", ""))] = str((b as Dictionary).get("name", "?"))
+		var i := 0
+		while i + 1 < qf.size():
+			lines.append("QF: %s v %s" % [str(names.get(str(qf[i]), "?")),
+				str(names.get(str(qf[i + 1]), "?"))])
+			i += 2
+	else:
+		var g: Dictionary = (ev.get("groups", {}) as Dictionary).get(upcoming, {})
+		var by_id := {}
+		for b in director.list_brains_cached():
+			var bd := b as Dictionary
+			by_id[str(bd.get("id", ""))] = "%s (%d)" % [str(bd.get("name", "?")),
+				int((bd.get("record", {}) as Dictionary).get("elo", 1200.0))]
+		var row := _preview_group_row(
+			(g.get("players", []) as Array), by_id)
+		if row != "":
+			lines.append(row)
+	lines.append(_pool_text(ev))
+	return "\n".join(lines)
+
+
+static func _preview_group_row(players: Array, by_id: Dictionary) -> String:
+	# One horizontal roster row for the intermission header: every
+	# fighter side-by-side ("Name (elo) | ..."), never stacked. Pure
+	# (unit-tested); unknown ids pass through raw like before.
+	var row := PackedStringArray()
+	for pid in players:
+		row.append(str(by_id.get(str(pid), str(pid))))
+	return " | ".join(row)
+
+
+func _event_is_fresh() -> bool:
+	# Brand-new event tip-off: group A file untouched (0,0, no battles
+	# banked) AND no group done anywhere in the manifest. The manifest
+	# clause matters: quitting during a later group's intermission (or
+	# before its first battle banks) leaves a fresh-looking group file,
+	# and without it the resume would play the 30 s tip-off (mislabeled
+	# "Group A starts in") instead of the 60 s resume intermission for
+	# the right group.
+	var director := _director()
+	if director == null or not _event_active():
+		return false
+	if str(director.tourney.get("format", "")) != "groups":
+		return false
+	if int(director.tourney.get("current_round", -1)) != 0 \
+			or int(director.tourney.get("current_match", -1)) != 0:
+		return false
+	var ev := _event_manifest()
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		if bool(gd.get("done", false)):
+			return false
+	var m: Dictionary = director.current_match()
+	return int(m.get("battles", 0)) == 0
+
+
+func _event_intermission(title: String, sub: String, secs: float = EVENT_INTERMISSION_SECS, gallery_all: bool = false) -> bool:
+	# Bracket preview + standings + 60 s countdown between event
+	# brackets. SKIP starts now; STOP aborts the event (quit to menu
+	# follows in the caller). Returns true when the next bracket may
+	# start (the file is already built, so quit/resume always lands).
+	var director := _director()
+	if director == null:
+		return false
+	_event_skip = false
+	# The countdown is a wait view: no round may run behind it, even
+	# one left live by an unexpected entry path.
+	_close_round_for_wait()
+	bracket_title.text = title
+	if _event_active() and str(director.tourney.get("format", "bracket")) == "groups":
+		var ov: Dictionary = director.event_overview_data(_event_id())
+		arena_bracket.render_event_groups(ov, str(ov.get("current", "")))
+		if not gallery_all:
+			_event_gallery_update()
+	else:
+		arena_bracket.render_bracket(director.tourney, 0, 0)
+	_refresh_standings()
+	intermission_label.text = sub
+	intermission_row.visible = true
+	# Preload under the countdown: the director points at the next
+	# match's file (post-switch/post-advance) - the ~5-20 s load hides
+	# inside the 30/60/120 s wait, so the post-countdown load is an
+	# O(1) activation.
+	_preload_next_match()
+	if is_instance_valid(bracket_scroll):
+		bracket_scroll.scroll_horizontal = 0
+		bracket_scroll.scroll_vertical = 0
+	bracket_overlay.visible = true
+	_sync_bracket_button()
+	# Ownership transfer: the countdown owns this view now. The
+	# match-over review acquired the wait flag, and neither it nor
+	# the group-done record released it - so a bank ack landing
+	# mid-countdown (_on_group_banked / _close_round_bank) would
+	# _hide_wait_bracket the whole overlay and strand the viewer on
+	# the bare arena for the rest of the wait. Clearing here makes
+	# those hides no-op; the post-countdown load re-acquires.
+	_wait_bracket = false
+	# The intermission owns the status line for its whole run: the
+	# overlay counts down, but the bottom bar kept whatever the last
+	# battle left (a draw's REPLAYING survived the entire group-D to
+	# final handoff). Static text - the overlay carries the ticking.
+	if is_instance_valid(status_label):
+		status_label.text = "%s - Next bracket in %ds (SKIP to start)" % [title, int(secs)]
+	# Countdown provenance: title carries the caller (TIP-OFF / GROUP
+	# A..D / FINAL), so any "wrong length" report is attributable.
+	print("[Arena] Intermission '%s' for %ds" % [title, int(secs)])
+	_arena_log("intermission '%s' for %ds" % [title, int(secs)])
+	var left := secs
+	while left > 0.0 and not _event_skip:
+		if not _event_active():
+			print("[Arena] Intermission '%s' broke early (%.0fs left): event inactive" % [title, left])
+			break
+		intermission_label.text = "%s\nNext bracket in %d s — SKIP to start now" % [sub, int(ceil(left))]
+		await _wait(1.0).timeout
+		left -= 1.0
+	intermission_row.visible = false
+	if not _event_active():
+		_sync_bracket_button()
+		return false
+	# The bracket STAYS UP into the next flow: the caller's load
+	# re-titles the visible view to LOADING (same frame), so no moment
+	# shows the bare arena between countdown and load.
+	_sync_bracket_button()
+	return true
+
+
+func _event_group_done(res: Dictionary) -> void:
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	var group := str(res.get("group", "?"))
+	var rec: Dictionary = director.event_record_group(eid, group)
+	if not bool(rec.get("ok", false)):
+		_evo_abort("event record failed: " + str(rec.get("error", "?")))
+		return
+	# Group record: keep the finished bracket up and AWAIT the capture.
+	# Un-awaited, the record's 2-frame PNG delay resumed AFTER the
+	# intermission raised the countdown overlay and its auto-hide
+	# yanked it - leaving a text-only screen for the whole 60 s wait
+	# (and the PNG captured the wrong view). Pre-showing makes
+	# showed=false (no auto-hide possible); awaiting lands the capture
+	# before group B re-renders. The callout below plays over the live
+	# bracket, so the view runs seamlessly into the intermission.
+	_show_arena_bracket("GROUP %s COMPLETE - FINAL RECORD" % group)
+	await _save_bracket_record(true)
+	var _bset: Array = (rec.get("booster", []) as Array)
+	var _bsub := "STANDINGS SAVED"
+	if not _bset.is_empty():
+		_bsub += "  •  BOOSTER: %d (post-event +50 school)" % _bset.size()
+		print("[Arena] Group %s booster-marked: %s" % [group, str(_bset)])
+	_show_callout("GROUP %s COMPLETE" % group, Color(0.6, 0.85, 1.0),
+		_bsub, "", false)
+	var ev: Dictionary = director.event_load(eid)
+	var nxt := _event_next_phase(ev)
+	if nxt == "":
+		_evo_abort("event chain broken after group " + group)
+		return
+	var title := "EVENT %s · %s" % [eid, "FINAL" if nxt == "final" else "GROUP " + nxt]
+	var sub := _event_preview_sub(nxt)
+	var wait_secs := EVENT_FINAL_SECS if nxt == "final" else EVENT_INTERMISSION_SECS
+	# Group seal first: it runs UNDER the intermission while final
+	# loads gate on its ack (vault files turn post-group only when
+	# the seal's saves land). Round reports already acked fast (they
+	# only journal); the seal carries the weights.
+	_send_group_report()
+	if _round_bank_pending:
+		print("[Arena] Bank %s still owed at intermission - countdown runs under it; loads gate on the ack." % _seq_round_id)
+	# The final's player ELO snapshots must come post-bank: stash the
+	# build while EITHER bank is owed and let the group ack build it
+	# (round acks never consume this stash - only _on_group_banked).
+	if nxt == "final" and (_round_bank_pending or _group_bank_pending):
+		_pending_final_group = ev.duplicate(true)
+		title += " (saving round...)"
+		_event_gallery_update()
+		if not await _event_intermission(title, sub, wait_secs, true):
+			director.quit_to_menu()
+			return
+	else:
+		var built := _event_build_final(ev) if nxt == "final" else _event_switch_group(ev, nxt)
+		if not built:
+			return
+		# Gallery primed before the wait (the intermission renders it):
+		# upcoming bracket's fighters in both cases, final included.
+		_event_gallery_update()
+		if not await _event_intermission(title, sub, wait_secs, true):
+			director.quit_to_menu()
+			return
+	_request_current_battle_load()
+
+
+func _event_pool_ready_count(include_current: bool = false) -> int:
+	# Promotion-ready brains vault-wide (schooled + above the demotion
+	# line, outside the current event): the draw pool, not the bench.
+	# Redraw mode counts the current roster too (nobody is excluded
+	# from a fresh draw).
+	var director := _director()
+	if director == null:
+		return 0
+	var ev: Dictionary = director.event_load(_event_id())
+	if ev.is_empty():
+		return 0
+	var st: Dictionary = ev.get("settings", {})
+	var q: Dictionary = director.event_draw_candidates(_event_id(),
+		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)), {}, [], include_current)
+	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
+
+
+func _event_body_count(redraw: bool) -> int:
+	# Vault BODIES for the next draw regardless of schooling: the ELO
+	# floor and the participant exclusion still apply, only the
+	# episode bar drops to 0. The handoff waits on breeding only when
+	# even bodies run short; an unqualified bench fields green
+	# debutants now (backfill) while school runs in parallel.
+	var director := _director()
+	if director == null:
+		return 0
+	var ev: Dictionary = director.event_load(_event_id())
+	if ev.is_empty():
+		return 0
+	var st: Dictionary = ev.get("settings", {})
+	var q: Dictionary = director.event_draw_candidates(_event_id(), 0,
+		float(st.get("elo_cutoff", 0.0)), {}, [], redraw)
+	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
+
+
+func _announce_backfill_fielded(eid: String, count: int) -> void:
+	# Draw-first messaging: the strict bench was short, so green
+	# debutants field now and school tops them up in parallel. The
+	# GROUP A intermission re-titles the status right after; the
+	# console + session log keep this line.
+	var msg := "EVENT %s fielded %d (green backfill - school tops up in parallel)" % [eid, count]
+	print("[Arena] ", msg)
+	_arena_log(msg)
+	if is_instance_valid(status_label):
+		status_label.text = msg
+
+
+func _event_pool_wait(need: int = EVENT_POOL_TARGET, include_current: bool = false) -> String:
+	# Last resort: the vault itself is short of BODIES at handoff
+	# (not just schooled brains - an unqualified bench backfills
+	# green debutants instead of waiting). Waits on the FINAL review
+	# screen (bracket visible, queue status live) while the background
+	# queue works - never a bare progress bar. STOP aborts. Returns ""
+	# when the bench filled, else the reason (the caller parks on
+	# FINAL REVIEW with it, never a bare return).
+	var director := _director()
+	if director == null:
+		return "no director"
+	_close_round_for_wait()
+	_show_arena_bracket("FINAL REVIEW - PROMOTION READY (%d/%d qualified)" % [
+		_event_pool_ready_count(include_current), need])
+	var waited := 0.0
+	while _evo_active() and waited < EVO_AWAIT_TIMEOUT:
+		await _wait(5.0).timeout
+		waited += 5.0
+		_evo_adopt_finished()
+		_event_drain_done_to_pool()
+		_event_maintain_pool()
+		var ready := _event_pool_ready_count(include_current)
+		if is_instance_valid(status_label):
+			status_label.text = "Promotion-ready %d/%d - queue breeding..." % [ready, need]
+		if ready >= need:
+			_hide_arena_bracket()
+			return ""
+	# Failure paths leave FINAL REVIEW up for the caller's failure
+	# view (hiding into nothing was the bare-arena stall).
+	if not _evo_active():
+		return "stopped by user"
+	_evo_abort("pool short - refusing a short-bench event")
+	return "pool short - refusing a short-bench event"
+
+
+var session_log_path := "user://arena_log.txt"
+
+
+func _arena_log(msg: String) -> void:
+	# Persistent client-side session log (user://arena_log.txt): the
+	# wedge/recovery timeline stdout never captures (the game window
+	# owns it). Rare events only - open/append/close per line.
+	# Headless runs (test suites, probes) never touch the live file:
+	# suite noise once wiped a live forensic record mid-incident.
+	# Tests needing the writer set session_log_path to an isolated file.
+	var path := session_log_path
+	if path == "user://arena_log.txt" \
+			and DisplayServer.get_name() == "headless":
+		return
+	var mode := FileAccess.READ_WRITE if FileAccess.file_exists(path) else FileAccess.WRITE
+	var f := FileAccess.open(path, mode)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line("%s  %s" % [
+		Time.get_datetime_string_from_system().replace("T", " "), msg])
+	f.close()
+
+
+func _recover_server_state(reason: String) -> bool:
+	# The quit+resume recipe, in place (no scene change): fresh
+	# seq/latches, fresh UDP socket, re-issued load from the current
+	# director position. Stored payloads resend under their SAME nonce
+	# where one is owed (callers set the pending-resend flag BEFORE
+	# calling, and an owed bank arms it here too; consumed in
+	# _on_brains_loaded). The reload bypasses the bank gate (it
+	# re-establishes server state for a resend, not a fight) and an
+	# owed bank keeps its forgive window. Capped: MAX_SERVER_RELOADS
+	# between clean loads; past the cap the caller parks loud (a
+	# persistently broken server is not automatable). Status line only
+	# - silent healing otherwise.
+	if tournament_active and _server_reloads >= MAX_SERVER_RELOADS:
+		_arena_log("RECOVERY CAP EXHAUSTED: %s (reloads %d/%d)" % [reason,
+			_server_reloads, MAX_SERVER_RELOADS])
+		return false
+	_server_reloads += 1
+	_arena_log("AUTO-RECOVER (%s): reloading %s (attempt %d/%d)" % [reason,
+		tourney_match_label, _server_reloads, MAX_SERVER_RELOADS])
+	_restore_timescale()
+	_clear_seq()
+	tourney_awaiting_load = false
+	_tourney_awaiting_battle = false
+	_tourney_awaiting_roundbank = false
+	_seq_forgive_match = {}
+	# A still-owed bank keeps its forgive window: the ack that resolves
+	# the deadlock may land after this recovery, and it must apply
+	# (the window closes on the ack, never here).
+	if not _round_bank_pending:
+		_seq_forgive_roundbank = {}
+	if not _group_bank_pending:
+		_seq_forgive_groupbank = {}
+	# A bank owed across this recovery must ride along: arm its
+	# stored-report resend so the reload below lands it (same nonce)
+	# instead of starting a round on stale brains.
+	if _round_bank_pending and not _seq_last_round_report.is_empty():
+		_pending_roundbank_resend = true
+	if _group_bank_pending and not _seq_last_group_report.is_empty():
+		_pending_groupbank_resend = true
+	_hide_wait_bracket()
+	_hide_loading()
+	brain_client.reconnect()
+	print("[Arena] AUTO-RECOVER (%s): reloading %s (attempt %d/%d)..." % [
+		reason, expand_match_label(tourney_match_label),
+		_server_reloads, MAX_SERVER_RELOADS])
+	if is_instance_valid(status_label):
+		status_label.text = "RECOVERING: %s - reloading %s..." % [reason,
+			expand_match_label(tourney_match_label)]
+	_recover_in_flight = true
+	# Bypass the bank gate: this reload re-establishes server brains
+	# for an armed bank resend (consumed in _on_brains_loaded), never
+	# a fight (the resend suppresses the round start).
+	_request_current_battle_load(true)
+	return true
+
+
+func _on_server_state(mode: bool, tid: String, match_label: String) -> void:
+	# State-poll reply: attribution log at every wait, and one proactive
+	# recovery - a FREE-mode server while a match bank is owed means it
+	# restarted mid-bank: reload + stored-report resend NOW instead of
+	# after the 240 s watchdog cycle.
+	print("[Arena] Server state: mode=%s tourney=%s match=%s (awaiting %s)" % [
+		mode, tid, match_label, _seq_context])
+	_arena_log("server state poll: mode=%s tourney=%s match=%s (awaiting %s)" % [
+		mode, tid, match_label, _seq_context])
+	if _seq_context == "roundbank" and not mode and tournament_active \
+			and not _recover_in_flight and not _pending_roundbank_resend \
+			and not _seq_last_round_report.is_empty():
+		# FREE-mode server while a bank is owed: it restarted mid-bank.
+		# Arm the stored-report resend and reload NOW - the in-flight
+		# report is about to be refused anyway, and this skips the whole
+		# 240 s watchdog cycle. (The refusal error that follows is
+		# attributed silently: recovery already in flight.)
+		if _recover_server_state("round bank interrupted (state poll)"):
+			_pending_roundbank_resend = true
+
+
+func _show_handoff_failure(title: String, reason: String) -> void:
+	# Handoff/start_next failures park here, never on a bare arena:
+	# freeze like an abort, then raise FINAL REVIEW carrying the reason.
+	# Callers quit to menu after a short review (show-then-quit), so the
+	# viewer reads what broke instead of staring at an empty field.
+	_evo_abort(reason)
+	_show_arena_bracket(title)
+
+
+func _run_event_handoff() -> void:
+	# Final's tournament_end: the title request already went out above.
+	# Bank the record, eliminate two, queue the next bench generation,
+	# and chain the next event WITHOUT blocking on training: breeds
+	# ride the background queue (their specs carry into the new event
+	# file, so no verdict ever orphans). Only a short bench parks on
+	# the review screen until the queue delivers.
+	var director := _director()
+	if director == null:
+		return
+	var eid := _event_id()
+	var champ_id := str(director.tourney.get("champion_id", ""))
+	# The handoff runs bracket-first: every build/queue step below shows
+	# on FINAL REVIEW, so a stall or failure never strands the viewer on
+	# a bare arena. Awaited capture: an un-awaited record's delayed
+	# hide would yank a later overlay (same race as group intermissions).
+	_show_arena_bracket("EVENT %s - BUILDING NEXT EVENT" % eid)
+	await _save_bracket_record(true)
+	_show_arena_bracket("EVENT %s - BUILDING NEXT EVENT" % eid)
+	_show_callout("EVENT %s CHAMPION: %s" % [eid, director.champion_name()],
+		Color(1.0, 0.85, 0.3), "ELIMINATION + BREEDING", "", false,
+		EVENT_CHAMPION_HOLD_SECS)
+	_announce_clip("event_champion")
+	if is_instance_valid(status_label):
+		status_label.text = "EVENT %s CHAMPION %s - coronation, next event builds in %ds" % [eid, director.champion_name(), int(EVENT_CHAMPION_HOLD_SECS)]
+	# Coronation beat: the winner screen holds (callout + status)
+	# while the viewer reads it - the handoff builds only after.
+	await _wait(EVENT_CHAMPION_HOLD_SECS).timeout
+	_event_drain_done_to_pool()
+	var ev0: Dictionary = director.event_load(eid)
+	var st0: Dictionary = ev0.get("settings", {})
+	# Booster schooling first (marked brains train +50 with school
+	# curriculum): elimination archives brains out of the vault, so
+	# queueing after it would ghost-skip the eliminated. Best-effort,
+	# never blocks the handoff.
+	var boost: Dictionary = director.event_booster_queue(eid)
+	if not (boost.get("queued", []) as Array).is_empty():
+		print("[Arena] Event %s booster schooling queued: %s" % [
+			eid, str(boost.get("queued", []))])
+	var elim: Dictionary = director.event_eliminate(eid,
+		int(st0.get("min_matches", EVENT_MIN_MATCHES)),
+		float(st0.get("elo_cutoff", 0.0)))
+	# Green-roster tolerance: fewer than 2 career-eligible brains means
+	# nobody has the matches to demote, so elimination is WAIVED this
+	# generation (the green-protection promise holds; the event simply
+	# refights without fresh blood) instead of aborting the chain.
+	# Loud, never silent - a stalled composition must read somewhere.
+	var gone: Array = []
+	if not bool(elim.get("ok", false)):
+		if str(elim.get("error", "")) == "fewer than 2 eligible brains":
+			print("[Arena] Event %s: green roster, elimination waived (no fresh blood this generation)." % eid)
+			if is_instance_valid(status_label):
+				status_label.text = "EVENT %s: GREEN ROSTER - NO ELIMINATION THIS GENERATION" % eid
+		else:
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+				"elimination failed: " + str(elim.get("error", "?")))
+			await _wait(8.0).timeout
+			director.quit_to_menu()
+			return
+	else:
+		gone = elim.get("eliminated", [])
+		print("[Arena] Event %s eliminated %s" % [eid, str(gone)])
+	# The elimination just archived brains out of the vault: force the
+	# roster cache fresh BEFORE the pool gate + draw read it (a stale
+	# cache once drafted an archived fighter into the next event,
+	# stalling its first load on a missing file).
+	director.invalidate_brains_cache()
+	director.event_finish(eid, champ_id)
+	var ev: Dictionary = director.event_load(eid)
+	var gen := int(ev.get("generation", 1))
+	if not _evo_has_kind("clone"):
+		_evo_queue_clone(gen + 1, champ_id, director.champion_name(),
+			_evo_clone_parent2(gen + 1, champ_id))
+	if not _evo_has_kind("wild"):
+		_evo_queue_wild(gen + 1)
+	_event_drain_done_to_pool()
+	# Redraw mode needs a full 16 vault bodies (roster included);
+	# survivor mode only needs the top-up pair. Draw-first: bodies,
+	# not schooled - an unqualified bench fields green debutants now
+	# (backfill in _event_start_next) while school tops them up in
+	# parallel mid-event. Only a true empty vault waits on breeding.
+	var redraw := bool(st0.get("redraw_roster", false))
+	var pool_need := 16 if redraw else EVENT_POOL_TARGET
+	if _event_body_count(redraw) < pool_need:
+		var why := await _event_pool_wait(pool_need, redraw)
+		if why != "":
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid, why)
+			await _wait(8.0).timeout
+			director.quit_to_menu()
+			return
+	_event_start_next(ev, gone)
+
+
+func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
+	var director := _director()
+	if director == null:
+		return
+	var eid := str(ev_old.get("id", ""))
+	var gen := int(ev_old.get("generation", 1)) + 1
+	var st: Dictionary = ev_old.get("settings", {})
+	var roster: Array = []
+	if bool(st.get("redraw_roster", false)):
+		# Fresh roster every iteration: all 16 drawn green-weighted
+		# from the vault (no survivors carry over). Draw-first: a
+		# short schooled bench backfills greenest-first and fields
+		# NOW (school tops picks up in parallel); only a true empty
+		# vault aborts here.
+		var full: Dictionary = director.event_draw_roster(eid, 16,
+			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+		if bool(full.get("ok", false)) \
+				and (full.get("drawn", []) as Array).size() == 16:
+			roster = full.get("drawn", [])
+		else:
+			var back: Dictionary = director.event_draw_backfill(eid, 16,
+				float(st.get("elo_cutoff", 0.0)), [], true)
+			roster = back.get("drawn", [])
+			if roster.size() != 16:
+				_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+					"fresh draw failed: " + str(back.get("error", "short bench")))
+				await _wait(8.0).timeout
+				director.quit_to_menu()
+				return
+			_announce_backfill_fielded(eid, roster.size())
+		print("[Arena] Event %s fresh roster drawn: %d brains" % [eid, roster.size()])
+	else:
+		var survivors: Array = []
+		for g in (ev_old.get("group_order", []) as Array):
+			var gd: Dictionary = (ev_old.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				if not (str(pid) in gone) and not (str(pid) in survivors):
+					survivors.append(str(pid))
+		# Normally 14 (16 minus 2 eliminated); a waived elimination leaves
+		# 15-16 and the draw shrinks to fit - the roster still lands on 16.
+		# Anything else is a corrupt manifest, not a stall: show it, quit.
+		var need := 16 - survivors.size()
+		if need < 0 or need > 2:
+			_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+				"event survivors %d (need 14-16)" % survivors.size())
+			await _wait(8.0).timeout
+			director.quit_to_menu()
+			return
+		var draw: Dictionary = director.event_draw_pool(eid, need,
+			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+		var picked: Array = []
+		if bool(draw.get("ok", false)) \
+				and (draw.get("drawn", []) as Array).size() == need:
+			picked = draw.get("drawn", [])
+		else:
+			# Draw-first backfill: short schooled bench fields the
+			# greenest vault bodies now (school tops them up in
+			# parallel); only a true empty vault aborts here.
+			var back: Dictionary = director.event_draw_backfill(eid, need,
+				float(st.get("elo_cutoff", 0.0)), [], false)
+			picked = back.get("drawn", [])
+			if picked.size() != need:
+				_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+					"pool draw failed: " + str(back.get("error", "short bench")))
+				await _wait(8.0).timeout
+				director.quit_to_menu()
+				return
+			_announce_backfill_fielded(eid, 16)
+		roster = survivors + picked
+	var beg: Dictionary = director.event_begin(roster, st, gen)
+	if not bool(beg.get("ok", false)):
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"next event failed: " + str(beg.get("error", "?")))
+		await _wait(8.0).timeout
+		director.quit_to_menu()
+		return
+	var new_eid := str(beg.get("event_id", ""))
+	# Bind pre-warm for the whole roster: genome compiles land under
+	# the group builds + GROUP A countdown instead of post-ack loads.
+	brain_client.request_warm_wirings(director.vault_paths_for(roster))
+	# Bench remainder rides into the new event; in-flight breed specs
+	# ride along too (absolute result paths), so no verdict ever
+	# orphans across the boundary. Banked done entries stay behind:
+	# they already drained into the old pool.
+	var carried: Array = []
+	for spec in _evo_pending():
+		carried.append((spec as Dictionary).duplicate(true))
+	director.event_pool_add(new_eid,
+		(director.event_load(eid).get("pool", []) as Array))
+	var ev_new: Dictionary = director.event_load(new_eid)
+	# Full four-group setup at start (menu parity): every bracket file
+	# built + noted now, so the overview renders real fixtures for all
+	# quadrants from the first minute. The old single-A build left B/C/D
+	# lazy - the next event's overview showed unpopulated groups.
+	# Switch back to A after: the build loop leaves the last-built
+	# file (D) and its phase loaded.
+	if not _event_build_all_groups(ev_new):
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"next event brackets failed to build")
+		await _wait(8.0).timeout
+		director.quit_to_menu()
+		return
+	if not _event_switch_group(ev_new, "A"):
+		_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
+			"next event group A failed to load")
+		await _wait(8.0).timeout
+		director.quit_to_menu()
+		return
+	director.tourney["evo"] = {"active": true, "generation": gen,
+		"episodes": EVO_EPISODES,
+		"mutate_traits": int(st.get("mutate_traits", 1)),
+		"pending": carried, "done": {}}
+	director.save_state()
+	if not await _event_intermission("EVENT %s · GROUP A (GEN %d)" % [new_eid, gen],
+			_event_preview_sub("A"), EVENT_INTERMISSION_SECS):
+		director.quit_to_menu()
+		return
+	_request_current_battle_load()
+
+
 const EVO_EPISODES := 50
-const EVO_NOISE := 0.05
+# Legacy regime default: every breed's training recipe (episode total,
+# stage split, weight noise, structural changes) now inherits ± a delta
+# from its parent (wilds draw fresh), so EVO_EPISODES is only the
+# display fallback. MAX_EVO_EPISODES mirrors TRAINING_RANGES upstairs.
+const MAX_EVO_EPISODES := 80
+# Await/slot-wait ceiling: two-stage breeds (25+25 eps) run ~40+ min on
+# this hardware (single-stage wild already took 22 min). The old fixed
+# 20-min timeout aborted generations mid-training while the worker was
+# still legitimately burning CPU - the log showed only the banner
+# (buffered) and the verdict never landed. Episodes-proportional to the
+# recipe cap: 80 eps x 80 s + loader headroom.
+const EVO_AWAIT_TIMEOUT := MAX_EVO_EPISODES * 80.0
+# Two-step evo breeding: half the episodes pre-train, half Advanced
+# Flight School (default school curriculum; school code selects stages).
+# NOTE: this JSON must NEVER ride argv (--params2): Godot strips embedded
+# double-quotes when joining argv on Windows, corrupting it exactly like
+# the old empty --name bug. _evo_params2_file writes it to disk and the
+# spawns pass --params2-file instead (same pattern as generate_brain_async).
+const EVO_SCHOOL_PARAMS := '{"curriculum": {}}'
+
+
+func _evo_params2_file(result_file: String) -> String:
+	# Writes the school params JSON next to the result file; returns the
+	# path for --params2-file, or "" when unwritable (caller then omits
+	# stage 2 and the breed degrades to single-stage instead of aborting).
+	var path := result_file.get_base_dir().path_join(
+		result_file.get_file().get_basename() + "_params2.json")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return ""
+	f.store_string(EVO_SCHOOL_PARAMS)
+	f.close()
+	return path
 var evo_waiting := false
 var evo_wait_result := {}
 var evo_breed_pid := 0
@@ -2700,7 +7506,15 @@ var evo_last_spawn_error := ""
 # (evo_breeder.wild_name, deterministic from seed); the arena passes
 # name "" + --gen and reads the christened name back from the result.
 var evo_status_line: Label
+# Training-queue HUD state: background-fill bar under the EVO line plus
+# last-known progress counts (the director's job_progress signal feeds
+# both; the 5 s EVO tick re-derives visibility from ground truth).
+var train_prog_bar: ProgressBar
+var _train_prog_ep := -1
+var _train_prog_total := -1
+var _train_prog_job := ""
 var evo_status_tick := 0.0
+var _adopt_last_sweep := 0.0
 const EVO_STATUS_EVERY := 5.0
 
 
@@ -2721,6 +7535,30 @@ func _build_evo_status() -> void:
 	evo_status_line.offset_bottom = -50.0
 	evo_status_line.visible = false
 	hud.add_child(evo_status_line)
+	evo_status_line.clip_text = true
+	# Training progress: same rect as the status line, drawn UNDER the
+	# text as a subtle green wash - zero new chrome, so it can never
+	# collide with the menubar below or StatusCorner above.
+	train_prog_bar = ProgressBar.new()
+	train_prog_bar.name = "TrainProgBar"
+	train_prog_bar.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	train_prog_bar.offset_left = -400.0
+	train_prog_bar.offset_right = 400.0
+	train_prog_bar.offset_top = -74.0
+	train_prog_bar.offset_bottom = -50.0
+	train_prog_bar.min_value = 0.0
+	train_prog_bar.max_value = 100.0
+	train_prog_bar.show_percentage = false
+	var prog_bg := StyleBoxFlat.new()
+	prog_bg.bg_color = Color(0, 0, 0, 0)
+	train_prog_bar.add_theme_stylebox_override("background", prog_bg)
+	var prog_fill := StyleBoxFlat.new()
+	prog_fill.bg_color = Color(0.45, 0.85, 0.5, 0.18)
+	prog_fill.set_corner_radius_all(4)
+	train_prog_bar.add_theme_stylebox_override("fill", prog_fill)
+	train_prog_bar.visible = false
+	hud.add_child(train_prog_bar)
+	hud.move_child(train_prog_bar, evo_status_line.get_index())
 # Centered evolution phase overlay: big title + status + progress bar
 # + spinner, so long breed/train waits read as a loading phase.
 var evo_panel: ColorRect
@@ -2773,6 +7611,11 @@ func _build_evo_panel() -> void:
 
 
 func _show_evo_phase(title: String, status: String) -> void:
+	# The next-gen waiting room owns the screen while visible: phase
+	# popups would hide underneath the bracket overlay, so their
+	# progress lives in the strip instead (status_label keeps updating).
+	if nextgen_visible:
+		return
 	if is_instance_valid(evo_title):
 		evo_title.text = title
 	_update_evo_phase(status, -1.0)
@@ -2781,6 +7624,8 @@ func _show_evo_phase(title: String, status: String) -> void:
 
 
 func _update_evo_phase(status: String, pct: float) -> void:
+	if nextgen_visible:
+		return
 	if is_instance_valid(evo_status):
 		evo_status.text = status
 	if is_instance_valid(evo_bar) and pct >= 0.0:
@@ -2793,7 +7638,7 @@ func _hide_evo_phase() -> void:
 
 
 func _on_evo_async(op: String, result: Dictionary) -> void:
-	# Catches breed completions for the evolution loop (only while a
+	# Catches breed completions for the continuous tournament loop (only while a
 	# breed is awaited; training jobs use their own signalling).
 	if evo_waiting and op == "evo_breed":
 		evo_wait_result = result
@@ -2810,6 +7655,12 @@ func _evo_poll_file(path: String) -> Dictionary:
 		if parsed is Dictionary:
 			return parsed
 	return {}
+
+
+func _prog_total(prog: Dictionary) -> float:
+	# Per-breed episode total from its progress file (recipes vary the
+	# regime per child); legacy EVO_EPISODES as the fallback.
+	return maxf(float(prog.get("total", EVO_EPISODES)), 1.0)
 
 
 func _evo_breed(strategy: String, brain_name: String, parent_id: String,
@@ -2840,18 +7691,23 @@ func _evo_breed_attempt(strategy: String, brain_name: String, parent_id: String,
 		return ""
 	var log_path := result_file.get_base_dir().path_join(
 		result_file.get_file().get_basename() + ".log")
-	var display := brain_name if brain_name != "" else ("wild G%d" % target_gen)
+	var display := brain_name if brain_name != "" else "wild"
+	# No --episodes/--episodes2/--noise: the breeder deals each child a
+	# recipe inherited ± a delta from its parent (fresh for wilds).
 	var args := ["breed", "--strategy", strategy,
-		"--episodes", str(EVO_EPISODES), "--seed", str(seed),
-		"--noise", str(EVO_NOISE), "--progress", progress_path,
+		"--seed", str(seed),
+		"--progress", progress_path,
 		"--gen", str(target_gen),
 		"--log-file", log_path]
+	var p2 := _evo_params2_file(result_file)
+	if p2 != "":
+		args += ["--params2-file", p2]
 	if brain_name != "":
 		args += ["--name", brain_name]
 	if parent_id != "":
 		args += ["--parent", parent_id]
 	_show_evo_phase("BREEDING " + display,
-		"Spawning worker (attempt %d)... ep 0/%d" % [attempt, EVO_EPISODES])
+		"Spawning worker (attempt %d)... dealing training recipe" % attempt)
 	var res: Dictionary = director.run_cli_async(
 		"evo_breed", args, result_file)
 	if not bool(res.get("ok", false)):
@@ -2876,8 +7732,8 @@ func _evo_await_result(display: String, progress_path: String,
 	evo_waiting = true
 	evo_wait_result = {}
 	var waited := 0.0
-	while evo_waiting and waited < 1200.0:
-		await get_tree().create_timer(2.0).timeout
+	while evo_waiting and waited < EVO_AWAIT_TIMEOUT:
+		await _wait(2.0).timeout
 		waited += 2.0
 		if not _evo_active():
 			_evo_kill_job()
@@ -2891,15 +7747,15 @@ func _evo_await_result(display: String, progress_path: String,
 			var last := _evo_poll_file(progress_path)
 			_show_evo_phase("BREEDING " + display,
 				"Worker died at ep %d/%d - failing fast." % [
-				int(last.get("episode", 0)), EVO_EPISODES])
+					int(last.get("episode", 0)), int(_prog_total(last))])
 			evo_waiting = false
 			break
 		var prog := _evo_poll_file(progress_path)
 		if not prog.is_empty():
 			var pct := 100.0 * float(prog.get("episode", 0)) / maxf(float(prog.get("total", EVO_EPISODES)), 1.0)
 			_show_evo_phase("BREEDING " + display,
-				"Training ep %d/%d ..." % [int(prog.get("episode", 0)), EVO_EPISODES])
-			_update_evo_phase("Training ep %d/%d ..." % [int(prog.get("episode", 0)), EVO_EPISODES], pct)
+				"Training ep %d/%d ..." % [int(prog.get("episode", 0)), int(_prog_total(prog))])
+			_update_evo_phase("Training ep %d/%d ..." % [int(prog.get("episode", 0)), int(_prog_total(prog))], pct)
 		# Verdicts are accepted from our own result file only. The shared
 		# async signal can carry another pipelined job's verdict while we
 		# wait, so a signal value with no corroborating file of our own is
@@ -2925,7 +7781,9 @@ func _evo_await_result(display: String, progress_path: String,
 				or _evo_verdict_seed(late) == expect_seed):
 			evo_wait_result = late
 	if evo_wait_result.is_empty():
-		# Timed out with no verdict: free the shared async slot now
+		# Timed out with no verdict: the worker may STILL be training
+		# legitimately (buffered log hides progress) - kill it here so
+		# it stops burning CPU, free the shared async slot now
 		# instead of leaving _poll_async's 30-minute timeout to hold
 		# every other vault op hostage. Waiting flag clears too, or
 		# every later gate misreads this dead wait as live.
@@ -2970,6 +7828,36 @@ func _evo_pending() -> Array:
 	if director == null:
 		return []
 	return director.tourney.get("evo", {}).get("pending", [])
+
+
+func _evo_spec_alive(spec: Dictionary) -> bool:
+	# True while a launched, unadopted spec is still working. The pid
+	# check covers the normal case; a launched spec with no verdict and
+	# no live pid proof still counts as running, so a silently cleared
+	# slot (30-min poll timeout, stale-verdict delete) can never
+	# double-launch the pipeline into parallel breeds.
+	if not bool(spec.get("launched", false)):
+		return false
+	var pid := int(spec.get("pid", 0))
+	if pid > 0 and OS.is_process_running(pid):
+		return true
+	if pid > 0:
+		return false
+	return _evo_read_result(str(spec.get("result", ""))).is_empty()
+
+
+func _evo_blocking_spec(except_kind: String) -> Dictionary:
+	# The sibling breed still in flight ({} when the lane is clear).
+	# Launch gates use this - not just the shared-slot flag - so the
+	# clone stays QUEUED behind a running wild instead of training
+	# alongside it at 0%.
+	for spec in _evo_pending():
+		var s := spec as Dictionary
+		if str(s.get("kind", "")) == except_kind:
+			continue
+		if _evo_spec_alive(s):
+			return s
+	return {}
 
 
 func _evo_done() -> Dictionary:
@@ -3018,32 +7906,182 @@ func _evo_has_kind(kind: String) -> bool:
 	return _evo_done().has(kind)
 
 
+# Exploration rotation for wilds: graft -> shuffle -> novelty across
+# generations (crossover rides the clone slot every 4th gen instead).
+const WILD_MODE_CYCLE := ["graft", "shuffle", "novelty"]
+
+
 func _evo_queue_spec(kind: String, brain_name: String, parent_id: String,
-		seed: int, target_gen: int) -> void:
+		seed: int, target_gen: int, mode: String = "") -> void:
 	var pending := _evo_pending()
 	for spec in pending:
 		if str((spec as Dictionary).get("kind", "")) == kind:
 			return
+	# A real queue event re-arms the threshold-skip log (state changed).
+	_pool_skip_logged = false
 	var paths := _evo_spec_paths(kind, target_gen)
 	pending.append({"kind": kind, "name": brain_name, "parent": parent_id,
 		"seed": seed, "gen": target_gen, "progress": paths[0],
-		"result": paths[1], "pid": 0, "launched": false})
+		"result": paths[1], "pid": 0, "launched": false, "mode": mode})
 	_evo_save_queue(pending, _evo_done())
 
 
-func _evo_queue_wild(target_gen: int) -> void:
+func _evo_wild_mode(target_gen: int) -> String:
+	return WILD_MODE_CYCLE[(maxi(target_gen, 1) - 1) % WILD_MODE_CYCLE.size()]
+
+
+func _evo_pool_threshold() -> int:
+	# Smart-pool threshold: new wilds/breed-kins queue only while the
+	# pool (whole vault roster) sits below this. Menu-settable
+	# (tournament page, default 25); <= 0 disables the gate (legacy
+	# always-breed). Carried across generations in the evo dict.
+	var director := _director()
+	if director == null:
+		return 25
+	return int((director.tourney.get("evo", {}) as Dictionary).get("pool_threshold", 25))
+
+
+func _evo_pool_size() -> int:
+	# The pool is the whole vault roster: everyone eligible to fight.
+	var director := _director()
+	if director == null:
+		return 0
+	return (director.list_brains_cached() as Array).size()
+
+
+func _evo_breeding_wanted() -> bool:
+	# Instance wrapper: pool size and threshold off the live director.
+	var director := _director()
+	var threshold := 25
+	var pool := 0
+	if director != null:
+		threshold = int((director.tourney.get("evo", {}) as Dictionary).get("pool_threshold", 25))
+		pool = (director.list_brains_cached() as Array).size()
+	return _evo_pool_wants_breeding(pool, threshold)
+
+
+static func _evo_pool_wants_breeding(pool_size: int, threshold: int) -> bool:
+	# Central gate (pure, unit-tested): every present and future queue
+	# site inherits it. Strictly below threshold breeds; at/above
+	# fights the pool as-is; threshold <= 0 disables the gate (legacy
+	# always-breed).
+	if threshold <= 0:
+		return true
+	return pool_size < threshold
+
+
+func _evo_queue_wild(target_gen: int, mode: String = "") -> void:
 	# Random needs nothing but a generation: name "" lets Python
 	# christen it deterministically (wild_name from seed).
 	if _evo_has_kind("wild"):
 		return
-	_evo_queue_spec("wild", "", "", randi(), target_gen)
+	if not _evo_breeding_wanted():
+		if not _pool_skip_logged:
+			_pool_skip_logged = true
+			print("[Arena] Pool %d/%d - wild breed skipped (pool at threshold)." % [
+				_evo_pool_size(), _evo_pool_threshold()])
+		return
+	if mode == "":
+		mode = _evo_wild_mode(target_gen)
+	_evo_queue_spec("wild", "", "", randi(), target_gen, mode)
 
 
-func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String) -> void:
+func _evo_pool_fill(roster: Array, gone: Array, size: int) -> Array:
+	# Complete a short bracket from the pool (established fighters
+	# first). Pure roster math (no breeding, no saves) - the caller
+	# builds the bracket from the result.
+	var director := _director()
+	if director == null or not director.has_method("evo_ranking"):
+		return roster
+	return _evo_pool_fill_ranked(roster, gone, size,
+		director.evo_ranking())
+
+
+static func _evo_pool_fill_ranked(roster: Array, gone: Array, size: int,
+		ranking: Array) -> Array:
+	# ranking arrives worst-first (evo_ranking's order): draft from
+	# the best end so brackets fill with proven fighters. Skips ids
+	# already fighting and freshly archived losers.
+	var filled: Array = roster.duplicate()
+	for i in range(ranking.size() - 1, -1, -1):
+		if filled.size() >= size:
+			break
+		var id := str(ranking[i])
+		if id != "" and not (id in filled) and not (id in gone):
+			filled.append(id)
+	return filled
+
+
+func _evo_queue_clone(target_gen: int, champ_id: String, champ_name: String,
+		parent2_id: String = "") -> void:
 	if champ_id == "" or _evo_has_kind("clone"):
 		return
-	_evo_queue_spec("clone", "G%d-%s-kin" % [target_gen, champ_name],
-		champ_id, randi(), target_gen)
+	if not _evo_breeding_wanted():
+		if not _pool_skip_logged:
+			_pool_skip_logged = true
+			print("[Arena] Pool %d/%d - kin breed skipped (pool at threshold)." % [
+				_evo_pool_size(), _evo_pool_threshold()])
+		return
+	# Spec carries the pedigree BASE for display; the worker appends
+	# -kin/-jr with the lineage counters at banking (counters are
+	# never parsed). --name is withheld at spawn so the worker
+	# auto-composes from the parent record.
+	var director := _director()
+	var base := champ_name
+	if director != null:
+		base = director.kin_base_name(champ_name)
+	_evo_queue_spec("clone", base, champ_id, randi(), target_gen, "")
+	if parent2_id != "":
+		# Crossover child: same clone slot/done-key, second parent noted.
+		for spec in _evo_pending():
+			var s := spec as Dictionary
+			if str(s.get("kind", "")) == "clone":
+				s["parent2"] = parent2_id
+				break
+		_evo_save_queue(_evo_pending(), _evo_done())
+
+
+func _evo_crossover_partner(champ_id: String) -> String:
+	# Highest-ELO crossable roster rival (director owns the bearing
+	# check; base/legacy/multi-mix parents would fail breeding and
+	# abort the generation, so they never qualify here).
+	var director := _director()
+	if director == null or not director.has_method("is_genome_bearing"):
+		return ""
+	var best := ""
+	var best_elo := -1.0
+	for p in director.tourney.get("players", []):
+		if not (p is Dictionary):
+			continue
+		var pd := p as Dictionary
+		var pid := str(pd.get("id", ""))
+		if pid == "" or pid == champ_id:
+			continue
+		if not bool(director.call("is_genome_bearing", pid)):
+			continue
+		var rec = pd.get("record", {})
+		var elo := 1200.0
+		if rec is Dictionary:
+			elo = float((rec as Dictionary).get("elo", 1200.0))
+		if elo > best_elo:
+			best_elo = elo
+			best = pid
+	return best
+
+
+func _evo_clone_parent2(target_gen: int, champ_id: String) -> String:
+	# Crossover every 4th generation: champion x strongest crossable
+	# rival - but only when the CHAMPION itself can cross (a
+	# base/legacy/multi-mix champion killed gen 4 this way). Anything
+	# else clones asexually as before.
+	if target_gen % 4 != 0:
+		return ""
+	var director := _director()
+	if director == null or not director.has_method("is_genome_bearing"):
+		return ""
+	if not bool(director.call("is_genome_bearing", champ_id)):
+		return ""
+	return _evo_crossover_partner(champ_id)
 
 
 func _evo_spawn_spec(spec: Dictionary) -> bool:
@@ -3056,17 +8094,35 @@ func _evo_spawn_spec(spec: Dictionary) -> bool:
 	var rf := str(spec.get("result", ""))
 	var log_path := rf.get_base_dir().path_join(
 		rf.get_file().get_basename() + ".log")
-	var args := ["breed", "--strategy",
-		"clone" if kind == "clone" else "random",
-		"--episodes", str(EVO_EPISODES), "--seed", str(int(spec.get("seed", 0))),
-		"--noise", str(EVO_NOISE), "--progress", str(spec.get("progress", "")),
+	var parent2 := str(spec.get("parent2", ""))
+	var strategy := "random"
+	if kind == "clone":
+		strategy = "crossover" if parent2 != "" else "clone"
+	# No --episodes/--episodes2/--noise: the breeder deals each child a
+	# recipe inherited ± a delta from its parent (fresh for wilds).
+	var args := ["breed", "--strategy", strategy,
+		"--seed", str(int(spec.get("seed", 0))),
+		"--progress", str(spec.get("progress", "")),
 		"--gen", str(int(spec.get("gen", 1))),
+		"--explore-mode", str(spec.get("mode", "")) if str(spec.get("mode", "")) != "" else "graft",
 		"--log-file", log_path]
+	if parent2 != "":
+		args += ["--parent2", parent2]
+	var p2 := _evo_params2_file(rf)
+	if p2 != "":
+		args += ["--params2-file", p2]
+	# Kin trait mutation rides the tournament's evo settings (menu
+	# toggle at START CONTINUOUS, preserved across generations).
+	var evod: Dictionary = director.tourney.get("evo", {})
+	args += ["--mutate-traits", str(int(evod.get("mutate_traits", 1)))]
 	# Never emit an empty argv element: Godot drops it on Windows, so
 	# `--name ""` arrives as a bare `--name` and argparse aborts the
-	# worker (this killed every wild breed). Empty = wild auto-christen.
+	# worker (this killed every wild breed). Empty = auto-compose:
+	# wilds christen from stems, clones/crossovers from the parent
+	# record (base + lineage counters + mutation outcome). Explicit
+	# spec names forward only for other strategies.
 	var sname := str(spec.get("name", ""))
-	if sname != "":
+	if sname != "" and not (kind in ["clone", "crossover"]):
 		args += ["--name", sname]
 	if str(spec.get("parent", "")) != "":
 		args += ["--parent", str(spec.get("parent", ""))]
@@ -3110,14 +8166,37 @@ func _evo_verdict_seed(verdict: Dictionary) -> int:
 	return int(gp.get("seed", -1))
 
 
-func _evo_adopt_finished() -> Dictionary:
+func _evo_adopt_finished(force: bool = false) -> Dictionary:
 	# Sweeps queued specs for completed result files: banks {kind: id},
 	# drops failed specs (re-bred at tournament end), cleans litter.
-	# Returns ids adopted this sweep.
+	# Returns ids adopted this sweep. Throttled (per-frame result-file
+	# re-opens were churn); rescue paths pass force=true so a just-
+	# landed verdict is never missed and a finished breed never aborted.
+	var now := Time.get_ticks_msec() / 1000.0
+	if not force and now - _adopt_last_sweep < 1.0:
+		return {}
+	_adopt_last_sweep = now
 	var got := {}
 	var pending := _evo_pending()
 	var done := _evo_done()
 	var director := _director()
+	# Detached-await rescue (quit/resume mid-handoff): a spec trailed
+	# in tourney.evo.awaiting rejoins pending once (deduped by kind)
+	# so the normal sweep adopts its verdict instead of orphaning it.
+	if director != null:
+		var evo: Dictionary = director.tourney.get("evo", {})
+		var awaiting: Dictionary = evo.get("awaiting", {})
+		if not awaiting.is_empty():
+			var akind := str(awaiting.get("kind", ""))
+			var dup := akind == ""
+			for spec in pending:
+				if str((spec as Dictionary).get("kind", "")) == akind:
+					dup = true
+			if not dup:
+				pending.append(awaiting.duplicate(true))
+				print("[Arena] Re-adopted detached %s breed from a prior session." % akind)
+			evo.erase("awaiting")
+			_evo_save_queue(pending, done)
 	var keep: Array = []
 	for spec in pending:
 		var sd := spec as Dictionary
@@ -3135,7 +8214,7 @@ func _evo_adopt_finished() -> Dictionary:
 					var log_path := rf.get_base_dir().path_join(
 						rf.get_file().get_basename() + ".log")
 					print("[Arena] EVO background worker died at ep %d/%d (%s) - dropping; see %s" % [
-						int(last.get("episode", 0)), EVO_EPISODES,
+						int(last.get("episode", 0)), int(_prog_total(last)),
 						str(sd.get("kind", "?")), log_path])
 					if director != null and str(director.pending_async.get("result_file", "")) == rf:
 						director.pending_async = {}
@@ -3173,7 +8252,7 @@ func _evo_adopt_finished() -> Dictionary:
 
 
 func _run_evo_generation() -> void:
-	# Tournament-end handoff for the evolution loop. Adopts any breeds
+	# Tournament-end handoff for the continuous tournament loop. Adopts any breeds
 	# that finished in the background (wild from tourney start, clone
 	# from consolation start), awaits stragglers via the shared slot,
 	# then rebuilds the bracket at constant roster size. STOP (menu
@@ -3188,19 +8267,20 @@ func _run_evo_generation() -> void:
 	var gen := int(evo.get("generation", 1))
 	var champ_id := str(director.tourney.get("champion_id", ""))
 	var champ_name: String = director.champion_name()
-	_show_callout("EVO GEN %d CHAMPION: %s" % [gen, champ_name],
+	_show_callout("CONTINUOUS GEN %d CHAMPION: %s" % [gen, champ_name],
 		Color(1.0, 0.85, 0.3), "BREEDING NEXT GENERATION", "", false)
-	_show_evo_phase("EVO GENERATION %d" % [gen + 1],
+	_announce_clip("generation_champion")
+	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
 		"Champion %s - ranking bottom two..." % champ_name)
 	if is_instance_valid(status_label):
-		status_label.text = "EVO gen %d champion %s - ranking bottom two..." % [gen, champ_name]
+		status_label.text = "CONTINUOUS gen %d champion %s - ranking bottom two..." % [gen, champ_name]
 	# --- Archive bottom two ---
 	var bottom: Dictionary = director.evo_bottom_two()
 	var last_id := str((bottom.get("last", {}) as Dictionary).get("id", ""))
 	var second_id := str((bottom.get("second", {}) as Dictionary).get("id", ""))
 	var via := str((bottom.get("last", {}) as Dictionary).get("via", "ranking"))
 	if via == "ranking" and is_instance_valid(status_label):
-		status_label.text = "EVO gen %d: no consolation ran - bottom two by ranking fallback." % gen
+		status_label.text = "CONTINUOUS gen %d: no consolation ran - bottom two by ranking fallback." % gen
 	if last_id == "":
 		_evo_abort("no loser found - bracket empty?")
 		return
@@ -3208,28 +8288,56 @@ func _run_evo_generation() -> void:
 		if str(pair[0]) == "":
 			continue
 		var ares: Dictionary = director.evo_archive(
-			str(pair[0]), "evo gen %d %s (%s)" % [gen, str(pair[1]), via])
+			str(pair[0]), "continuous gen %d %s (%s)" % [gen, str(pair[1]), via])
 		if not bool(ares.get("ok", false)):
 			_evo_abort("archive failed: %s" % str(ares.get("error", "?")))
 			return
-		print("[Arena] EVO gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
-	# --- Adopt background breeds + await stragglers ---
+		print("[Arena] CONTINUOUS gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
+	# --- Next-gen waiting room: preview bracket + gallery + strip ---
+	# Survivor context is frozen here; offspring cards refresh live as
+	# breeds adopt (synthetic "training" names until then).
 	var target_gen := gen + 1
+	nextgen_gen = target_gen
+	nextgen_size = int(director.tourney.get("size", 8))
+	nextgen_gone = [last_id, second_id]
+	nextgen_survivors = []
+	for p in director.tourney.get("players", []):
+		var pid := str((p as Dictionary).get("id", ""))
+		if pid != "" and not (pid in nextgen_gone):
+			nextgen_survivors.append(pid)
+	nextgen_champ_id = champ_id
+	nextgen_champ_name = champ_name
+	nextgen_clone_name = director.kin_base_name(champ_name)
+	nextgen_brains = {}
+	for b in director.list_brains_cached():
+		var bd := b as Dictionary
+		nextgen_brains[str(bd.get("id", ""))] = bd
+	_show_nextgen_overlay("NEXT GENERATION %d" % target_gen)
+	# --- Adopt background breeds + await stragglers ---
 	_evo_adopt_finished()
+	_refresh_nextgen_preview()
 	var id1 := _evo_done_id("clone")
 	var id2 := _evo_done_id("wild")
-	# Queue missing specs (watcher will launch them when the slot is free)
+	# Queue missing specs under the pool gate (watcher will launch
+	# them when the slot is free); a full pool skips breeding
+	# entirely and the bracket refills from established fighters.
+	# _evo_queue_* no-op internally when the gate is shut.
+	var want_breed := _evo_breeding_wanted()
+	if not want_breed:
+		print("[Arena] Pool %d/%d - generation %d breeds no replacements." % [
+			_evo_pool_size(), _evo_pool_threshold(), target_gen])
 	if id1 == "" and not _evo_has_kind("clone"):
-		_evo_queue_clone(target_gen, champ_id, champ_name)
+		_evo_queue_clone(target_gen, champ_id, champ_name,
+			_evo_clone_parent2(target_gen, champ_id))
 	if id2 == "" and not _evo_has_kind("wild"):
 		_evo_queue_wild(target_gen)
 	# Tournament is over: show whatever is left in training before
 	# blocking on stragglers (names for the done, ep counts for the
 	# live, queued for the rest).
-	_show_evo_phase("EVO GENERATION %d" % target_gen,
+	_show_evo_phase("CONTINUOUS GENERATION %d" % target_gen,
 		_evo_offspring_summary(target_gen))
 	if is_instance_valid(status_label):
-		status_label.text = "EVO gen %d over - breeding gen %d..." % [gen, target_gen]
+		status_label.text = "CONTINUOUS gen %d over - breeding gen %d..." % [gen, target_gen]
 	# Await any still-pending specs one by one via the shared slot.
 	# done is re-read between awaits: the watcher may bank the wild
 	# breed while the clone await is in flight.
@@ -3238,22 +8346,41 @@ func _run_evo_generation() -> void:
 		if id1 == "":
 			# Last-chance rescue: a verdict adopted by a concurrent
 			# sweep between the await's last tick and this line.
-			_evo_adopt_finished()
+			_evo_adopt_finished(true)
 			id1 = _evo_done_id("clone")
 		if id1 == "" and _evo_active():
 			_evo_abort("clone breeding failed - %s" % _evo_spawn_why())
 			return
+		_refresh_nextgen_preview()
 	if id2 == "":
 		id2 = _evo_done_id("wild")
 	if id2 == "" and _evo_has_kind("wild"):
 		id2 = await _evo_await_queued("wild")
 		if id2 == "":
-			_evo_adopt_finished()
+			_evo_adopt_finished(true)
 			id2 = _evo_done_id("wild")
 		if id2 == "" and _evo_active():
 			_evo_abort("random breeding failed - %s" % _evo_spawn_why())
 			return
+		_refresh_nextgen_preview()
+	# STOP/quit during the handoff must freeze the loop, never emit a
+	# short bracket: the 15-roster cascade came from an empty id
+	# appended after a stop, then reactivated at rebuild below.
+	# A missing offspring on a live loop is equally fatal: abort
+	# instead of a TBA bracket (7 round-0 losers can never start
+	# consolation, so the shortness would self-perpetuate).
+	if not _evo_active():
+		return
+	# Offspring required only when the gate bred (or found) them: a
+	# full pool plays on without replacements instead of aborting on
+	# young it never asked for.
+	if want_breed and (id1 == "" or id2 == ""):
+		_evo_abort("missing offspring - refusing a short bracket")
+		return
 	# --- Rebuild bracket at constant roster size ---
+	# Survivors plus adopted offspring (if the gate bred any); a full
+	# pool completes from established fighters by ranking instead of
+	# breeding newcomers for the slot.
 	var size := int(director.tourney.get("size", 8))
 	var gone := [last_id, second_id]
 	var present: Array = director.evo_vault_ids()
@@ -3262,8 +8389,31 @@ func _run_evo_generation() -> void:
 		var pid := str((p as Dictionary).get("id", ""))
 		if pid != "" and not (pid in gone) and pid in present:
 			roster.append(pid)
-	roster.append(id1)
-	roster.append(id2)
+	for oid in [id1, id2]:
+		if str(oid) != "" and not (str(oid) in roster):
+			roster.append(str(oid))
+	roster = _evo_pool_fill(roster, gone, size)
+	# Self-heal for short rosters the pool cannot fill (weird configs
+	# like bracket size above pool size, or a vanished vault file):
+	# breed wild top-ups until the bracket is full. Bounded; failure
+	# aborts instead of a TBA bracket. This is necessity breeding,
+	# not pipeline breeding - the threshold gate yields to it.
+	var topups := 0
+	while roster.size() < size and topups < 2 and _evo_active():
+		var tkind := "topup%d" % topups
+		_evo_queue_spec(tkind, "", "", randi(), target_gen)
+		_show_evo_phase("CONTINUOUS GENERATION %d" % target_gen,
+			"Short roster (%d/%d) - breeding top-up %d..." % [roster.size(), size, topups + 1])
+		var tid := await _evo_await_queued(tkind)
+		if tid == "" or tid in roster:
+			_evo_abort("top-up breeding failed - %s" % _evo_spawn_why())
+			return
+		roster.append(tid)
+		topups += 1
+		_refresh_nextgen_preview()
+	if roster.size() < size:
+		_evo_abort("roster still short after top-ups - refusing a TBA bracket")
+		return
 	while roster.size() > size:
 		var extra := ""
 		for pid in director.evo_ranking():
@@ -3284,16 +8434,25 @@ func _run_evo_generation() -> void:
 	if not bool(res.get("ok", false)):
 		_evo_abort("next bracket failed: %s" % str(res.get("error", "?")))
 		return
+	# The evo dict rebuilds from scratch each generation: carry the
+	# pool threshold forward or the gate silently resets to default.
+	var carried := director.tourney.get("evo", {}) as Dictionary
 	director.tourney["evo"] = {"active": true, "generation": gen + 1,
-		"episodes": EVO_EPISODES}
+		"episodes": EVO_EPISODES,
+		"pool_threshold": int(carried.get("pool_threshold", 25)),
+		"mutate_traits": int(carried.get("mutate_traits", 1))}
 	director.save_state()
 	# Pipeline: kick off the next generation's wild breed immediately
+	# (gated: a full pool skips it and plays on).
 	_evo_queue_wild(gen + 2)
-	_show_evo_phase("EVO GENERATION %d" % [gen + 1],
-		"Roster ready (%d fighters) - loading first battle..." % roster.size())
+	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
+		"Roster ready (%d fighters, pool %d/%d) - loading first battle..." % [
+			roster.size(), _evo_pool_size(), _evo_pool_threshold()])
 	if is_instance_valid(status_label):
-		status_label.text = "EVO gen %d ready (%d fighters)." % [gen + 1, roster.size()]
-	await get_tree().create_timer(2.0).timeout
+		status_label.text = "CONTINUOUS gen %d ready (%d fighters, pool %d/%d)." % [
+			gen + 1, roster.size(), _evo_pool_size(), _evo_pool_threshold()]
+	await _wait(2.0).timeout
+	_hide_nextgen()
 	_hide_evo_phase()
 	_request_current_battle_load()
 
@@ -3315,18 +8474,26 @@ func _evo_offspring_summary(target_gen: int) -> String:
 			found = true
 			var label := str(s.get("name", ""))
 			if label == "":
-				label = "wild G%d" % int(s.get("gen", target_gen))
+				label = "wild"
 			if bool(s.get("launched", false)):
 				var prog := _evo_poll_file(str(s.get("progress", "")))
 				if prog.is_empty():
 					lines.append("%s - warming up" % label)
 				else:
 					lines.append("%s - training ep %d/%d" % [label,
-						int(prog.get("episode", 0)), EVO_EPISODES])
+						int(prog.get("episode", 0)), int(_prog_total(prog))])
 			else:
 				lines.append("%s - queued" % label)
 		if not found:
 			lines.append("%s - queued" % kind)
+	# Top-up heals (short-roster repair) ride the same queue machinery.
+	for spec in _evo_pending():
+		var sk := str((spec as Dictionary).get("kind", ""))
+		if sk != "" and not (sk in ["clone", "wild"]):
+			lines.append("%s - training (top-up)" % sk)
+	for dk in _evo_done().keys():
+		if not (str(dk) in ["clone", "wild"]):
+			lines.append("%s - done" % _evo_done_name(str(dk)))
 	return "\n".join(lines)
 
 
@@ -3336,6 +8503,457 @@ func _evo_spawn_why() -> String:
 	if evo_last_spawn_error != "":
 		return evo_last_spawn_error
 	return "check brains/jobs log"
+
+
+# ── Next-generation waiting room ────────────────────────────────
+# Preview bracket + rotating fighter gallery + training strip shown
+# during the handoff wait. Display-only throughout: the real bracket
+# is built later by the existing rebuild path (never-TBA guarantee
+# untouched), and the overlay closes on first-battle load.
+
+
+func _nextgen_wild_label(target_gen: int) -> String:
+	return "wild (training)"
+
+
+func _nextgen_offspring_slots() -> Array:
+	# [{key, id, kind, name, elo, placeholder}] for clone/wild/topups
+	# from live done state; the unbred ride stable "offspring:<kind>"
+	# placeholder keys (never bare "" twice) so the bracket, gallery
+	# and strip all address the same training card until adoption.
+	var out: Array = []
+	var cid := _evo_done_id("clone")
+	if cid != "":
+		var rec: Dictionary = nextgen_brains.get(cid, {})
+		out.append({"key": cid, "id": cid, "kind": "clone",
+			"name": str(rec.get("name", _evo_done_name("clone"))),
+			"elo": float((rec.get("record", {}) as Dictionary).get("elo", 1200.0)),
+			"placeholder": false})
+	else:
+		var champ_elo := 1200.0
+		var director := _director()
+		if director != null:
+			for p in director.tourney.get("players", []):
+				var pd := p as Dictionary
+				if str(pd.get("id", "")) == nextgen_champ_id:
+					champ_elo = float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))
+		out.append({"key": "offspring:clone", "id": "offspring:clone",
+			"kind": "clone", "name": nextgen_clone_name, "elo": champ_elo,
+			"placeholder": true})
+	var wid := _evo_done_id("wild")
+	if wid != "":
+		var wrec: Dictionary = nextgen_brains.get(wid, {})
+		out.append({"key": wid, "id": wid, "kind": "wild",
+			"name": str(wrec.get("name", _evo_done_name("wild"))),
+			"elo": float((wrec.get("record", {}) as Dictionary).get("elo", 1200.0)),
+			"placeholder": false})
+	else:
+		out.append({"key": "offspring:wild", "id": "offspring:wild",
+			"kind": "wild", "name": _nextgen_wild_label(nextgen_gen),
+			"elo": 1200.0, "placeholder": true})
+	for kind in _evo_done().keys():
+		var ks := str(kind)
+		if ks.begins_with("topup"):
+			var tid := _evo_done_id(ks)
+			if tid != "":
+				var trec: Dictionary = nextgen_brains.get(tid, {})
+				out.append({"key": tid, "id": tid, "kind": ks,
+					"name": str(trec.get("name", _evo_done_name(ks))),
+					"elo": float((trec.get("record", {}) as Dictionary).get("elo", 1200.0)),
+					"placeholder": false})
+	return out
+
+
+func _build_nextgen_preview() -> Dictionary:
+	var director := _director()
+	if director == null or nextgen_survivors.is_empty():
+		return {}
+	var names := {}
+	for p in director.tourney.get("players", []):
+		var pd := p as Dictionary
+		names[str(pd.get("id", ""))] = pd
+	var entries: Array = []
+	for pid in nextgen_survivors:
+		var spid := str(pid)
+		if spid in nextgen_gone:
+			continue
+		var rec: Dictionary = nextgen_brains.get(spid, {})
+		if rec.is_empty() and names.has(spid):
+			var npd: Dictionary = names[spid]
+			entries.append({"id": spid, "name": str(npd.get("name", spid)),
+				"record": npd.get("record", {})})
+		elif not rec.is_empty():
+			entries.append({"id": spid, "name": str(rec.get("name", spid)),
+				"record": rec.get("record", {})})
+		# Vault-missing survivors drop out (rebuild trims/aborts the same).
+	for off in _nextgen_offspring_slots():
+		var od := off as Dictionary
+		entries.append({"id": str(od.get("id", "")),
+			"name": str(od.get("name", "?")),
+			"record": {"elo": float(od.get("elo", 1200.0))}})
+	while entries.size() > nextgen_size:
+		# Degenerate overshoot (second-last missing, trim territory):
+		# drop the lowest-ELO non-champion, mirroring the rebuild trim
+		# instead of blindly popping offspring off the end.
+		var drop := -1
+		var drop_elo := INF
+		for i in range(entries.size()):
+			var ed := entries[i] as Dictionary
+			if str(ed.get("id", "")) == nextgen_champ_id:
+				continue
+			var e := float((ed.get("record", {}) as Dictionary).get("elo", 1200.0))
+			if e < drop_elo:
+				drop_elo = e
+				drop = i
+		if drop < 0:
+			break
+		entries.remove_at(drop)
+	if entries.size() < 2:
+		return {}
+	return director.preview_bracket(entries, nextgen_size,
+		bool(director.tourney.get("random_draw", false)))
+
+
+func _show_nextgen_overlay(title_text: String) -> void:
+	nextgen_visible = true
+	nextgen_gallery_tick = 0.0
+	nextgen_strip_tick = NEXTGEN_STRIP_EVERY
+	if is_instance_valid(gallery_box):
+		gallery_box.visible = true
+	if is_instance_valid(strip_box):
+		strip_box.visible = true
+	_refresh_nextgen_preview()
+	if is_instance_valid(bracket_title):
+		bracket_title.text = title_text
+	if is_instance_valid(bracket_overlay):
+		bracket_overlay.visible = true
+	_sync_bracket_button()
+	_hide_evo_phase()
+
+
+func _hide_nextgen() -> void:
+	nextgen_visible = false
+	if is_instance_valid(arena_bracket):
+		arena_bracket.clear_spotlight()
+		arena_bracket.clear_showcase()
+	if is_instance_valid(gallery_box):
+		gallery_box.visible = false
+	if is_instance_valid(strip_box):
+		strip_box.visible = false
+	if is_instance_valid(bracket_overlay):
+		bracket_overlay.visible = false
+	_sync_bracket_button()
+
+
+func _refresh_nextgen_preview() -> void:
+	# Re-fetch vault records (adoptions land new files), rebuild the
+	# preview, gallery and strip. Rare by design: handoff milestones
+	# only, never the per-frame path (list_brains shells out).
+	if not nextgen_visible:
+		return
+	var director := _director()
+	if director != null:
+		var fresh := {}
+		for b in director.list_brains_cached():
+			var bd := b as Dictionary
+			fresh[str(bd.get("id", ""))] = bd
+		if not fresh.is_empty():
+			nextgen_brains = fresh
+	nextgen_preview = _build_nextgen_preview()
+	if director == null or not is_instance_valid(arena_bracket):
+		return
+	if nextgen_preview.is_empty():
+		return
+	arena_bracket.render_bracket(nextgen_preview, -1, -1)
+	if is_instance_valid(bracket_scroll):
+		bracket_scroll.scroll_horizontal = 0
+		bracket_scroll.scroll_vertical = 0
+	_build_gallery_entries(nextgen_preview.get("players", []))
+	_update_nextgen_strip()
+
+
+func _offspring_kind_title(kind: String, pname: String) -> String:
+	# Placeholder cards announce themselves as the incoming breed, so
+	# the queue reads "new breed / new wild is here" at a glance.
+	if kind == "clone":
+		return "NEW BREED — %s" % pname
+	if kind == "wild":
+		return "NEW WILD — %s" % pname
+	if kind.begins_with("topup"):
+		return "TOP-UP — %s" % pname
+	return pname
+
+
+func _gallery_card(pid: String, pname: String) -> Dictionary:
+	var rec: Dictionary = nextgen_brains.get(pid, {}) if pid != "" else {}
+	if rec.is_empty():
+		# Training card: ep progress from the matching pending spec
+		# (or the awaited-detached one, same blind spot as the strip).
+		# Placeholders arrive under "offspring:<kind>" keys, so kind
+		# matching is exact; name matching stays as legacy fallback.
+		var want := ""
+		if pid.begins_with("offspring:"):
+			want = pid.trim_prefix("offspring:")
+		var detail := "queued"
+		var found_kind := want
+		for spec in _evo_pending() + [evo_await_spec]:
+			var s := spec as Dictionary
+			if s.is_empty():
+				continue
+			var sk := str(s.get("kind", ""))
+			var m := (want != "" and sk == want) \
+				or (str(s.get("name", "")) != "" and str(s.get("name", "")) == pname) \
+				or (sk == "wild" and (pname == "wild" or pname.begins_with("wild ")))
+			if not m and not (sk.begins_with("topup") and pname == sk):
+				continue
+			found_kind = sk
+			if bool(s.get("launched", false)):
+				var prog := _evo_poll_file(str(s.get("progress", "")))
+				if prog.is_empty():
+					detail = "warming up"
+				else:
+					detail = "ep %d/%d" % [int(prog.get("episode", 0)), int(_prog_total(prog))]
+			else:
+				detail = "queued"
+			detail += " [%s]" % sk if sk != "" else detail
+			break
+		return {"key": pid, "title": _offspring_kind_title(found_kind, pname),
+			"elo": "--", "rows": "training...\n%s" % detail}
+	var r: Dictionary = rec.get("record", {})
+	var gp: Dictionary = rec.get("generator_params", {})
+	var t: Dictionary = rec.get("training", {})
+	var wiring := str(gp.get("genome_id", ""))
+	if wiring == "":
+		var exp = gp.get("experiment", null)
+		if exp is Array:
+			var parts := PackedStringArray()
+			for e in (exp as Array):
+				parts.append(str(e))
+			wiring = "mix " + "+".join(parts) if parts.size() > 0 else "base"
+		elif exp != null and str(exp) != "":
+			wiring = str(exp)
+		else:
+			wiring = "base"
+	else:
+		wiring = "genome " + wiring
+	wiring += " · " + str(gp.get("explore_mode", "legacy"))
+	var mp = gp.get("mapping", null)
+	if mp is Array:
+		wiring += " · %d rules" % (mp as Array).size()
+	var traits := "evasion %s · dist_gain %s · lr %s" % [
+		_fmt_stat(gp.get("evasion", 0.0)), _fmt_stat(gp.get("dist_gain", 0.0)),
+		_fmt_stat(gp.get("learning_rate", 0.0))]
+	var yb = gp.get("yaw_bias", null)
+	if yb != null:
+		traits += " · yaw %s" % _fmt_bias(yb)
+	# Evolved reflex authority: only deviations from the legacy
+	# operating point (mirrors sensory_motor.BLEND_DEFAULTS).
+	var bldefs := {"yaw_blend": 0.3, "evade_backup": 1.0,
+		"flow_authority": 1.0, "search_blend": 0.5, "pitch_blend": 1.0}
+	var blnames := {"yaw_blend": "yaw", "evade_backup": "evbk",
+		"flow_authority": "flow", "search_blend": "srch",
+		"pitch_blend": "ptch"}
+	var blparts := PackedStringArray()
+	for bk in bldefs.keys():
+		var bv := float(gp.get(bk, bldefs[bk]))
+		if absf(bv - float(bldefs[bk])) > 0.001:
+			blparts.append("%s %.2f" % [str(blnames[bk]), bv])
+	if blparts.size() > 0:
+		traits += " · ctl " + " ".join(blparts)
+	var teps := int(t.get("episodes", 0))
+	var tscore := float(t.get("score", 0.0))
+	var fights := "Battles %d (W%d L%d D%d) · Matches %d (W%d L%d) · Titles %d · Wandered %d" % [
+		int(r.get("battles", 0)), int(r.get("wins", 0)),
+		int(r.get("losses", 0)), int(r.get("draws", 0)),
+		int(r.get("matches", 0)), int(r.get("matches_won", 0)),
+		int(r.get("matches_lost", 0)), int(r.get("tournaments_won", 0)),
+		int(r.get("wander", 0))]
+	var schooled := "Episodes %d · Recent %.2f/ep (total %.1f)" % [
+		teps, float(t.get("recent_avg", 0.0)), tscore]
+	var rows := "%s\n%s\n%s\n%s\n%s" % [fights, schooled, wiring,
+		traits, _inheritance_line(rec)]
+	var rear := _rearing_line(rec)
+	if rear != "":
+		rows += "\n" + rear
+	return {"key": pid, "title": pname,
+		"elo": "%d" % int(r.get("elo", 1200.0)), "rows": rows}
+
+
+func _rearing_line(rec: Dictionary) -> String:
+	# Heritable training recipe: how long/hard this brain was
+	# schooled (episodes inherit ± a delta, wilds draw fresh).
+	var tr: Dictionary = (rec.get("lineage", {}) as Dictionary).get("training", {})
+	if tr.is_empty():
+		return ""
+	return "reared %dep · split %.2f · noise %.3f · struct %d" % [
+		int(tr.get("episodes_total", 0)), float(tr.get("stage_split", 0.5)),
+		float(tr.get("noise", 0.0)), int(tr.get("max_changes", 0))]
+
+
+func _fmt_stat(v) -> String:
+	return "%.2f" % float(v)
+
+
+func _fmt_bias(yb) -> String:
+	if yb is Array:
+		var parts := PackedStringArray()
+		for b in (yb as Array):
+			parts.append("%.2f" % float(b))
+		return "[" + ", ".join(parts) + "]"
+	return str(yb)
+
+
+func _nextgen_parent_name(pid: String) -> String:
+	# Resolve a lineage parent id to its vault name; archived/gone
+	# parents fall back to the id itself (never blank, never "?").
+	var rec: Dictionary = nextgen_brains.get(pid, {})
+	if not rec.is_empty():
+		return str(rec.get("name", pid))
+	var director := _director()
+	if director != null:
+		for p in director.tourney.get("players", []):
+			var pd := p as Dictionary
+			if str(pd.get("id", "")) == pid:
+				return str(pd.get("name", pid))
+	return pid
+
+
+func _inheritance_line(rec: Dictionary) -> String:
+	# "clone of X · traits: evasion 0.40→0.53" / "crossover A × B" /
+	# "wild (evo-random · novelty)" / "reference stock" / "generated".
+	var lin: Dictionary = rec.get("lineage", {})
+	var src := str(lin.get("source", "?"))
+	var line := src
+	if src.begins_with("clone:"):
+		line = "clone"
+	elif src.begins_with("crossover:"):
+		line = "crossover"
+	elif src == "evo-random":
+		line = "wild"
+	elif src == "reference":
+		line = "reference stock"
+	elif src == "generated":
+		line = "generated"
+	var parents: Array = lin.get("parent_ids", [])
+	if not parents.is_empty():
+		var names := PackedStringArray()
+		for pp in parents:
+			names.append(_nextgen_parent_name(str(pp)))
+		line += " of " + " × ".join(names)
+	var mode := str(lin.get("explore_mode", ""))
+	if mode != "" and line in ["wild", "crossover", "clone"]:
+		line += " · " + mode
+	var tm = lin.get("trait_mutations", {})
+	if tm is Dictionary and not (tm as Dictionary).is_empty():
+		var bits := PackedStringArray()
+		for k in (tm as Dictionary).keys():
+			var pair = (tm as Dictionary)[k]
+			if pair is Array and (pair as Array).size() >= 2:
+				bits.append("%s %s→%s" % [str(k),
+					_fmt_stat((pair as Array)[0]), _fmt_stat((pair as Array)[1])])
+		if bits.size() > 0:
+			line += " · traits: " + ", ".join(bits)
+	return line
+
+
+func _build_gallery_entries(players: Array) -> void:
+	nextgen_gallery.clear()
+	for p in players:
+		var pd := p as Dictionary
+		nextgen_gallery.append(_gallery_card(str(pd.get("id", "")),
+			str(pd.get("name", "?"))))
+	nextgen_gallery_idx = 0
+	if not nextgen_gallery.is_empty():
+		_render_gallery_card(nextgen_gallery[0])
+
+
+func _render_gallery_card(entry: Dictionary) -> void:
+	if is_instance_valid(gallery_title):
+		gallery_title.text = str(entry.get("title", "?"))
+	# Same marker as the bracket rows: the gallery's own showcased
+	# name carries the red star whenever the card names a fighter -
+	# the exact key condition that showcases the bracket below, so
+	# the two can never disagree.
+	if is_instance_valid(gallery_star):
+		gallery_star.visible = str(entry.get("key", "")) != ""
+	if is_instance_valid(gallery_elo):
+		gallery_elo.text = "ELO " + str(entry.get("elo", "--"))
+	if is_instance_valid(gallery_rows):
+		gallery_rows.text = str(entry.get("rows", ""))
+	# The showcased fighter's bracket slot spotlights in sync, and
+	# every bracket row spelling the name paints cyan with the gallery
+	# title (cleared when the card carries no key).
+	if is_instance_valid(arena_bracket):
+		var k := str(entry.get("key", ""))
+		if k != "":
+			arena_bracket.set_spotlight(k)
+			arena_bracket.set_showcase(k)
+		else:
+			arena_bracket.clear_spotlight()
+			arena_bracket.clear_showcase()
+
+
+func _gallery_advance() -> void:
+	if nextgen_gallery.is_empty():
+		return
+	nextgen_gallery_idx = (nextgen_gallery_idx + 1) % nextgen_gallery.size()
+	_render_gallery_card(nextgen_gallery[nextgen_gallery_idx])
+	if is_instance_valid(gallery_box):
+		var tw := create_tween()
+		gallery_box.modulate.a = 0.25
+		tw.tween_property(gallery_box, "modulate:a", 1.0, 0.4)
+
+
+func _offspring_progress(kind: String) -> Array:
+	# [label, pct]: 100 when done, live ep percent while training,
+	# 0 queued/warming, -1 when the kind is entirely absent.
+	var label := ""
+	if _evo_done().has(kind):
+		return [_evo_done_name(kind), 100.0]
+	var cands: Array = []
+	for spec in _evo_pending():
+		cands.append(spec)
+	var aw := _evo_awaited_spec(kind)
+	if not aw.is_empty():
+		cands.append(aw)
+	for spec in cands:
+		var s := spec as Dictionary
+		if str(s.get("kind", "")) != kind:
+			continue
+		label = str(s.get("name", ""))
+		if label == "":
+			label = "wild"
+		if not bool(s.get("launched", false)):
+			return [label + " queued", 0.0]
+		var prog := _evo_poll_file(str(s.get("progress", "")))
+		if prog.is_empty():
+			return [label + " warming up", 0.0]
+		return [label, 100.0 * float(prog.get("episode", 0)) / _prog_total(prog)]
+	return ["", -1.0]
+
+
+func _update_nextgen_strip() -> void:
+	if not nextgen_visible:
+		return
+	for slot in [["clone", strip_clone_label, strip_clone_bar],
+			["wild", strip_wild_label, strip_wild_bar]]:
+		var key := str(slot[0])
+		var res: Array = _offspring_progress(key)
+		var lab: Label = slot[1]
+		var bar: ProgressBar = slot[2]
+		if not is_instance_valid(lab) or not is_instance_valid(bar):
+			continue
+		var tag := key
+		if key == "clone":
+			tag = "new breed"
+		elif key == "wild":
+			tag = "new wild"
+		if float(res[1]) < 0.0:
+			lab.text = "%s: --" % tag
+			bar.value = 0.0
+		else:
+			lab.text = "%s: %s" % [tag, str(res[0])]
+			bar.value = clampf(float(res[1]), 0.0, 100.0)
 
 
 func _evo_await_queued(kind: String) -> String:
@@ -3352,40 +8970,60 @@ func _evo_await_queued(kind: String) -> String:
 			continue
 		pending.remove_at(i)
 		_evo_save_queue(pending, _evo_done())
+		_evo_await_remember(s)
 		var sname0 := str(s.get("name", ""))
-		var display0 := sname0 if sname0 != "" else ("wild G%d" % int(s.get("gen", 1)))
+		var display0 := sname0 if sname0 != "" else "wild"
 		if not bool(s.get("launched", false)):
-			# The shared slot may still be held by the sibling breed
-			# (e.g. wild head-start unfinished at tournament end).
-			# Spawning into a busy slot fails instantly ("another
-			# operation is already running"), so wait for it instead,
-			# sweeping adoptions meanwhile. STOP aborts the wait.
+			# The lane may still be held by the sibling breed (e.g. wild
+			# head-start unfinished at tournament end): it trains on
+			# while this one shows QUEUED. Spawning into a busy slot
+			# fails instantly ("another operation is already running"),
+			# so wait for it instead, sweeping adoptions meanwhile.
+			# STOP aborts the wait.
 			var tdir := _director()
 			var swait := 0.0
-			while tdir != null and not tdir.pending_async.is_empty() and swait < 1200.0:
+			while tdir != null and (not tdir.pending_async.is_empty() \
+					or not _evo_blocking_spec(kind).is_empty()) \
+					and swait < EVO_AWAIT_TIMEOUT:
 				if not _evo_active():
+					_evo_await_forget()
 					return ""
-				_show_evo_phase("BREEDING " + display0,
-					"Waiting for the training slot (%s in progress)..." % str(tdir.pending_async.get("op", "?")))
-				await get_tree().create_timer(2.0).timeout
+				var blk := _evo_blocking_spec(kind)
+				if blk.is_empty():
+					_show_evo_phase("BREEDING " + display0,
+						"Waiting for the training slot (%s in progress)..." % str(tdir.pending_async.get("op", "?")))
+				else:
+					var blabel := str(blk.get("name", ""))
+					if blabel == "":
+						blabel = "wild"
+					var bprog := _evo_poll_file(str(blk.get("progress", "")))
+					var bep := "warming up"
+					if not bprog.is_empty():
+						bep = "ep %d/%d" % [int(bprog.get("episode", 0)), int(_prog_total(bprog))]
+					_show_evo_phase("BREEDING " + display0,
+						"Queued behind %s (%s)..." % [blabel, bep])
+				await _wait(2.0).timeout
 				swait += 2.0
 				_evo_adopt_finished()
 				tdir = _director()
 			if tdir == null:
+				_evo_await_forget()
 				return ""
 			if not tdir.pending_async.is_empty():
 				_show_evo_phase("BREEDING " + display0,
 					"Training slot never freed - check brains/jobs log")
+				_evo_await_forget()
 				return ""
 			if not _evo_spawn_spec(s):
 				_show_evo_phase("BREEDING " + display0,
 					"Breed failed to start: %s" % evo_last_spawn_error)
+				_evo_await_forget()
 				return ""
 		# Fresh spawns and watcher-launched jobs alike: the await loop's
 		# liveness gate and kill path key off evo_breed_pid.
 		evo_breed_pid = int(s.get("pid", 0))
 		var sname := str(s.get("name", ""))
-		var display := sname if sname != "" else ("wild G%d" % int(s.get("gen", 1)))
+		var display := sname if sname != "" else "wild"
 		var bred := await _evo_await_result(display,
 			str(s.get("progress", "")), str(s.get("result", "")),
 			int(s.get("seed", -1)))
@@ -3393,6 +9031,7 @@ func _evo_await_queued(kind: String) -> String:
 			var done := _evo_done()
 			done[kind] = {"id": bred, "name": evo_last_bred_name}
 			_evo_save_queue(_evo_pending(), done)
+		_evo_await_forget()
 		return bred
 	return ""
 
@@ -3400,20 +9039,28 @@ func _evo_await_queued(kind: String) -> String:
 func _evo_abort(reason: String) -> void:
 	var director := _director()
 	if director != null:
-		director.tourney["evo"] = {"active": false}
+		# Freeze, don't wipe: pending/done stay as forensic evidence
+		# (a wiped queue once hid a whole failed generation).
+		if not director.tourney.has("evo"):
+			director.tourney["evo"] = {}
+		var evo: Dictionary = director.tourney["evo"]
+		evo["active"] = false
 		director.save_state()
+	_evo_await_forget()
+	_hide_nextgen()
 	_hide_evo_phase()
 	if is_instance_valid(status_label):
-		status_label.text = "EVOLUTION STOPPED: %s" % reason
-	print("[Arena] EVOLUTION STOPPED: %s" % reason)
+		status_label.text = "CONTINUOUS STOPPED: %s" % reason
+	print("[Arena] CONTINUOUS STOPPED: %s" % reason)
 
 
 func _on_evo_stop() -> void:
 	if not _evo_active() and not evo_waiting:
 		if is_instance_valid(status_label):
-			status_label.text = "Evolution loop is not running."
+			status_label.text = "Continuous tournament loop is not running."
 		return
 	_evo_kill_job()
+	_restore_timescale()
 	evo_waiting = false
 	# Kill watcher-launched pipelined workers too: they hold no global
 	# pid, so _evo_kill_job can't reach them. Otherwise they keep
@@ -3430,6 +9077,7 @@ func _on_evo_stop() -> void:
 		director.pending_async = {}
 	# Clear pipeline queue so the watcher stops trying to spawn/adopt.
 	_evo_save_queue([], {})
+	_evo_await_forget()
 	_evo_abort("stopped by user")
 
 
@@ -3449,9 +9097,28 @@ func _slot_of(brain_id: String) -> String:
 	return "alpha"
 
 func _on_generation_advanced(new_gen: int, winner: String) -> void:
+	if tournament_active:
+		# Wrong-mode reply mid-tournament (server lost tournament state:
+		# restart, or a stray free_mode): NEVER self-advance here. The old
+		# code reset + refought the same battle id, multi-banking one
+		# fight into many generations. Hold the battle watchdog instead;
+		# if the real verdict never comes it fails loud (QUIT TO MENU +
+		# RESUME re-sends tournament_load, which heals the server).
+		print("[Arena] Ignoring generation_advanced during tournament ",
+			"(server desync, would-be gen ", new_gen, ")")
+		if is_instance_valid(status_label):
+			status_label.text = "SERVER DESYNC - QUIT TO MENU + RESUME TO RELOAD BRAINS"
+		return
 	print("[Arena] Champion: ", winner.to_upper(), "! Evolving Generation ", new_gen, "...")
 	current_generation = new_gen
 	_record_win(winner)
+	# Land like every other round end: without this the free-battle
+	# winner kept drifting on its last commands through the champion
+	# callout and countdown. Unknown slots land both upright.
+	if winner == "alpha" or winner == "beta":
+		_begin_landing(winner)
+	else:
+		_begin_landing("")
 	if is_instance_valid(gen_label):
 		gen_label.text = "GENERATION: %04d" % new_gen
 	if is_instance_valid(status_label):
@@ -3477,16 +9144,22 @@ func _on_restart_pressed() -> void:
 	if not is_round_active:
 		return
 	is_round_active = false
+	_set_combat(false)
+	# Freeze now: the bank wait below runs a full second with no
+	# brain in the loop - stale commands must not fly it.
+	for fly in [fly_alpha, fly_beta]:
+		if is_instance_valid(fly) and fly.has_method("neutralize"):
+			fly.call("neutralize")
 	if is_instance_valid(status_label):
-		status_label.text = "ROUND RESTARTED - banking battle rewards..."
+		status_label.text = "ROUND RESTARTED - saving battle rewards..."
 	print("[Arena] Restart requested! Sending battle stats for dopamine banking...")
 	brain_client.request_restart(stats_alpha, stats_beta)
 
 func _on_restarted(round_winner: String) -> void:
 	_record_win(round_winner)
 	if is_instance_valid(status_label):
-		status_label.text = "RESTART BANKED: " + _slot_name(round_winner) + " LED - fresh round"
-	await get_tree().create_timer(1.0).timeout
+		status_label.text = "RESTART SAVED: " + _slot_name(round_winner) + " LED - fresh round"
+	await _wait(1.0).timeout
 	_reset_round()
 
 func _record_win(winner: String) -> void:

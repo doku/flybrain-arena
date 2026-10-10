@@ -1,3 +1,11 @@
+import os
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BRAIN_ENGINE_DIR = os.path.join(PROJECT_ROOT, "brain_engine")
+if BRAIN_ENGINE_DIR not in sys.path:
+    sys.path.insert(0, BRAIN_ENGINE_DIR)
+
 import numpy as np
 from lif_brain import FlyBrain
 from connectome_loader import load_or_build_csr, load_or_extract_populations
@@ -6,7 +14,8 @@ from sensory_motor import SensoryEncoder, MotorDecoder
 csr = load_or_build_csr()
 pops = load_or_extract_populations()
 
-chk = np.load('../checkpoints/trained_homing_A.npz')
+chk_path = os.path.join(PROJECT_ROOT, "checkpoints", "trained_homing_A.npz")
+chk = np.load(chk_path)
 brain = FlyBrain(csr.indptr, csr.indices, chk['weights'])
 encoder = SensoryEncoder(pops)
 decoder = MotorDecoder(pops)
@@ -37,13 +46,37 @@ scenarios = [
         'pheromone_conc_left': 0.0, 'pheromone_conc_right': 0.0,
         'visual_target_visible': False, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0
     }),
+    ('Floor baseline (far trace, symmetric)', {
+        'pheromone_conc_left': 0.06, 'pheromone_conc_right': 0.06,
+        'visual_target_visible': False, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 0.0, 'scent_cast': 0.0, 'scent_surge': 0.0
+    }),
+    ('Glued on (saturated symmetric)', {
+        'pheromone_conc_left': 0.95, 'pheromone_conc_right': 0.95,
+        'visual_target_visible': True, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 0.0, 'scent_cast': 0.0, 'scent_surge': 0.0
+    }),
+    ('Lost 10s, cast right (search)', {
+        'pheromone_conc_left': 0.05, 'pheromone_conc_right': 0.05,
+        'visual_target_visible': False, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 10.0, 'scent_cast': 1.0, 'scent_surge': 0.0
+    }),
+    ('Closing surge (rising scent)', {
+        'pheromone_conc_left': 0.6, 'pheromone_conc_right': 0.6,
+        'visual_target_visible': True, 'visual_target_azimuth': 0.0, 'visual_looming_rate': 0.0,
+        'scent_lost': 0.0, 'scent_cast': 0.0, 'scent_surge': 1.0
+    }),
 ]
 
 for name, senses in scenarios:
     brain.reset_state()
+    encoder.reset_odor()
     stim = encoder.encode(senses)
     spikes = brain.integrate_50ms(stim)
-    ctrl = decoder.decode(spikes)
+    # Scenarios carrying scent dynamics get the full hint path (reflex
+    # contrast, lost-search, surge); legacy ones stay brain-only.
+    hint = senses if any(k.startswith("scent_") for k in senses) else None
+    ctrl = decoder.decode(spikes, sensory_hint=hint)
     spk_list = list(spikes)
     dnp09_spk = sum(1 for s in spk_list if s in dn09_set)
     dnp20_l_spk = sum(1 for s in spk_list if s in dn20_l_set)

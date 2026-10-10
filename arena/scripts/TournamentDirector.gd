@@ -28,25 +28,97 @@ var brainview_layer: String = "bars"
 var brainview_detail: int = 1
 var brainview_replay: bool = false
 
+# Performance settings (menu -> arena bus, persisted user://perf.cfg):
+# pip = eye-view PiPs on/off, glow = bloom chain, shadows = sun shadow
+# pass, voice = TTS announcements, sfx = battle sound effects. Arena
+# reads them at boot; all default true (current look + new sound on).
+const PERF_PATH := "user://perf.cfg"
+const PERF_KEYS := ["pip", "glow", "shadows", "voice", "sfx"]
+var _perf_cache := {}
+
+
+func perf_get(key: String, default: bool = true) -> bool:
+	if _perf_cache.is_empty():
+		var cfg := ConfigFile.new()
+		if cfg.load(PERF_PATH) == OK:
+			for k in PERF_KEYS:
+				_perf_cache[k] = bool(cfg.get_value("video", k, true))
+	if _perf_cache.has(key):
+		return bool(_perf_cache[key])
+	return default
+
+
+func perf_set(key: String, value: bool) -> void:
+	if _perf_cache.is_empty():
+		perf_get(key)
+	_perf_cache[key] = bool(value)
+	var cfg := ConfigFile.new()
+	cfg.load(PERF_PATH)
+	cfg.set_value("video", key, bool(value))
+	cfg.save(PERF_PATH)
+
+
+func audio_opt_get(key: String, default: String = "") -> String:
+	# Generic [audio]-section string option (voice_id, sfx_palette,
+	# ...): the perf_* functions only speak bool, so string options
+	# live here. Never route strings through perf_set.
+	var cfg := ConfigFile.new()
+	if cfg.load(PERF_PATH) != OK:
+		return default
+	return str(cfg.get_value("audio", key, default))
+
+
+func audio_opt_set(key: String, value: String) -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(PERF_PATH)
+	cfg.set_value("audio", key, value)
+	cfg.save(PERF_PATH)
+
 # Tournament state (empty dict = inactive).
 var tourney: Dictionary = {}
 var sudden_death_armed: bool = false
 
 # Background training job: {pid, progress_path, result_file, brain_id,
-# episodes} or {}.
+# episodes, school} or {}.
 var active_job: Dictionary = {}
+# Eval restamp job after a school train: {pid, result_file, brain_id}
+# or {}. Separate slot from training (read-only probe).
+var score_job: Dictionary = {}
 
 # One-shot async vault op (e.g. generate): {pid, result_file, op} or {}.
 var pending_async: Dictionary = {}
+
+# Menu training queue: FIFO of {id, name, episodes, params}. The menu
+# enqueues while a job runs; the pump starts the head whenever the
+# shared worker slot frees up. Persisted to brains/jobs/queues.json
+# on every mutation (quit/menu restart resumes it); a running worker
+# keeps going and is reattached by boot adopt.
+var train_queue: Array = []
+# Last finished trainings (ring of {name, episodes}, newest last, cap
+# 5): the arena HUD shows the most recent DONE so finished work stays
+# visible instead of vanishing silently. Persisted with the queues.
+var completed_trains: Array = []
+# Spawn hold (arena sets from is_round_active): queue pumps refuse to
+# boot workers mid-battle (process-boot spikes frame pacing); queued
+# work drains in the gaps. Never drops anything, only defers.
+var hold_spawns := false
 
 signal vault_changed()
 signal job_progress(episode: int, total: int)
 signal job_failed(error: String)
 signal async_done(op: String, result: Dictionary)
+signal train_queue_changed()
+signal score_stamped(brain_id: String, score: float)
+signal score_progress(episode: int, total: int)
+signal score_queue_changed()
 
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	# Roster cache self-invalidates on every vault change, so hot
+	# paths can serve it without shelling Python onto the game thread.
+	if not vault_changed.is_connected(invalidate_brains_cache):
+		vault_changed.connect(invalidate_brains_cache)
 	_resolve_python()
 	var env_cli := OS.get_environment("FO_VAULT_CLI")
 	if env_cli != "":
@@ -59,6 +131,8 @@ func _ready() -> void:
 	job_dir = brains_dir.path_join(JOB_DIRNAME)
 	DirAccess.make_dir_recursive_absolute(tournament_dir)
 	DirAccess.make_dir_recursive_absolute(job_dir)
+	_load_queues()
+	_adopt_boot_queues()
 
 
 func _resolve_python() -> void:
@@ -92,8 +166,15 @@ func python_status() -> Dictionary:
 		"extra": python_extra_args, "probe": python_probe_error}
 
 
+var _project_root_cache := ""
+
+
 func project_root() -> String:
-	return ProjectSettings.globalize_path("res://../")
+	# Memoized: path globalization is a per-click cost on export/import/
+	# breed; the res:// root never changes within a session.
+	if _project_root_cache == "":
+		_project_root_cache = ProjectSettings.globalize_path("res://../")
+	return _project_root_cache
 
 
 # ── Vault operations (via vault_cli.py) ─────────────────────────────
@@ -136,21 +217,72 @@ func _run_cli(args: Array) -> Dictionary:
 	return _parse_cli_output(out, code)
 
 
-func run_cli_async(op: String, args: Array, result_file: String) -> Dictionary:
+func _worker_affinity_mask_for(n: int) -> int:
+	# Bitmask keeping workers off the game's cores: reserve CPU 0 on
+	# small machines, CPUs 0-1 on roomy ones. Pure (unit-tested).
+	if n <= 2:
+		return (1 << n) - 1  # Nowhere to hide; priority alone must do.
+	var full := -1 if n >= 63 else (1 << n) - 1
+	if n <= 4:
+		return full & ~1
+	return full & ~3
+
+
+func _soften_worker(pid: int) -> void:
+	# Background workers (breeds/trains/probes) run long CPU-heavy jobs
+	# beside the live fight: drop them below normal priority AND pin them
+	# off the game's cores, so frame pacing never contends with them.
+	# Fire-and-forget helper process; any failure (exited pid,
+	# non-Windows host) is silently ignored.
+	if pid <= 0 or OS.get_name() != "Windows":
+		return
+	var mask := _worker_affinity_mask_for(maxi(OS.get_processor_count(), 1))
+	OS.create_process("powershell.exe", ["-NoProfile", "-NonInteractive",
+		"-WindowStyle", "Hidden", "-Command",
+		"try { $p=[System.Diagnostics.Process]::GetProcessById(%d); $p.PriorityClass='BelowNormal'; $p.ProcessorAffinity=[Int64]%d } catch {}" % [pid, mask]],
+		false)
+
+
+func _spawn_worker(argv: Array) -> int:
+	# Spawn a background Python worker confined to the non-game cores:
+	# single-threaded BLAS (numpy would otherwise fan OpenBLAS/MKL
+	# threads across every core) + below-normal priority + affinity
+	# (see _soften_worker). Env is restored right after spawn; the
+	# child already inherited its copy.
+	var saved := {}
+	for key in ["OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"]:
+		saved[key] = OS.get_environment(key) if OS.has_environment(key) else null
+		OS.set_environment(key, "1")
+	var pid := OS.create_process(python_exe, argv, false)
+	for key in saved.keys():
+		if saved[key] == null:
+			OS.set_environment(key, "")
+		else:
+			OS.set_environment(key, str(saved[key]))
+	if pid > 0:
+		_soften_worker(pid)
+	return pid
+
+
+func run_cli_async(op: String, args: Array, result_file: String,
+		timeout_msec: int = 1800000) -> Dictionary:
 	# Non-blocking vault op: the CLI writes its result JSON to result_file;
 	# _process polls it and emits async_done(op, result). Keeps the menu alive.
+	# timeout_msec bounds the wait (default 30 min); long breeds pass an
+	# episodes-proportional budget so a still-training worker is never
+	# reported timed-out while it keeps working.
 	if not python_ready:
 		return {"ok": false, "error": "no working python found (%s)" % python_probe_error}
 	if not pending_async.is_empty():
 		return {"ok": false, "error": "another operation is already running"}
 	if FileAccess.file_exists(result_file):
 		DirAccess.remove_absolute(result_file)
-	var pid := OS.create_process(python_exe,
-		_cli_argv(args + ["--result-file", result_file]), false)
+	var pid := _spawn_worker(_cli_argv(args + ["--result-file", result_file]))
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
 	pending_async = {"pid": pid, "result_file": result_file, "op": op,
-		"started": Time.get_ticks_msec()}
+		"started": Time.get_ticks_msec(), "timeout_msec": timeout_msec}
+	_save_queues()
 	return {"ok": true, "pid": pid}
 
 
@@ -172,13 +304,44 @@ func _poll_async() -> void:
 				return  # Partial write; retry next frame.
 		var op := str(pending_async.get("op", ""))
 		pending_async = {}
+		_save_queues()
 		if result.get("ok", false):
 			vault_changed.emit()
 		async_done.emit(op, result)
-	elif Time.get_ticks_msec() - int(pending_async.get("started", 0)) > 1800000:
+	elif get_tree() != null and get_tree().paused:
+		# Paused (arena overlay): the wall-clock timeout must not fire
+		# while suspended — the worker keeps running and its result
+		# file still adopts (the branch above) the moment it lands.
+		return
+	elif Time.get_ticks_msec() - int(pending_async.get("started", 0)) \
+			> int(pending_async.get("timeout_msec", 1800000)):
 		var op2 := str(pending_async.get("op", ""))
 		pending_async = {}
-		async_done.emit(op2, {"ok": false, "error": "operation timed out (30 min)"})
+		_save_queues()
+		async_done.emit(op2, {"ok": false, "error": "operation timed out"})
+
+
+const BRAINS_CACHE_TTL_MSEC := 60000
+var brains_cache: Array = []
+var brains_cache_msec: int = 0
+# Event-manifest cache (mtime-gated): the 5 s watcher tick re-parsed the
+# manifest 3x per tick mid-battle. Writers write through; handoff code
+# keeps the forcing (uncached) path.
+var event_cache: Dictionary = {}
+var event_cache_mtime: int = 0
+# Progress emit-once tracking (job + score slots): signals fire only on
+# (episode, total) change, never per poll tick.
+var _last_job_ep := -1
+var _last_job_total := -1
+var _last_job_text := ""
+var _last_job_res := {}
+var _last_score_ep := -1
+var _last_score_total := -1
+var _last_score_text := ""
+
+
+func invalidate_brains_cache() -> void:
+	brains_cache = []
 
 
 func list_brains() -> Array:
@@ -187,6 +350,22 @@ func list_brains() -> Array:
 		return res.get("brains", [])
 	push_warning("[Director] vault list failed: %s" % res.get("error", "?"))
 	return []
+
+
+func list_brains_cached(ttl_msec: int = BRAINS_CACHE_TTL_MSEC) -> Array:
+	# Hot-path roster (topup tick, gallery, previews): serves the cache
+	# instead of booting a Python interpreter on the game thread (~1-2 s
+	# freeze per call). Self-invalidates on vault_changed; a backend
+	# hiccup serves stale rather than empty.
+	if not brains_cache.is_empty() \
+			and Time.get_ticks_msec() - brains_cache_msec < ttl_msec:
+		return brains_cache
+	var fresh := list_brains()
+	if fresh.is_empty() and not brains_cache.is_empty():
+		return brains_cache
+	brains_cache = fresh
+	brains_cache_msec = Time.get_ticks_msec()
+	return brains_cache
 
 
 func archive_list() -> Array:
@@ -199,7 +378,17 @@ func archive_list() -> Array:
 
 
 func restore_archived(arch_id: String) -> Dictionary:
-	return _run_cli(["restore", "--id", arch_id])
+	var res := _run_cli(["restore", "--id", arch_id])
+	if res.get("ok", false):
+		vault_changed.emit()
+	return res
+
+
+func delete_archived(arch_id: String) -> Dictionary:
+	var res := _run_cli(["archive-delete", "--id", arch_id])
+	if res.get("ok", false):
+		vault_changed.emit()
+	return res
 
 
 func generate_brain_async(brain_name: String, params: Dictionary) -> Dictionary:
@@ -214,10 +403,23 @@ func generate_brain_async(brain_name: String, params: Dictionary) -> Dictionary:
 		"--params-file", params_file], result_file)
 
 
+func derive_mapping(genome_seed: int, genome_rules: int) -> Dictionary:
+	# Resolves a wiring genome seed to its mapping without touching the
+	# CSR (pure rule-table lookup, ~100 ms): returns {ok, mapping,
+	# genome_id, genome_label, n_rules}. Menus call this to display a
+	# genome before generating; records always carry concrete stacks.
+	return _run_cli(["derive-mapping", "--genome-seed", str(genome_seed),
+		"--genome-rules", str(genome_rules)])
+
+
 func delete_brain(brain_id: String) -> Dictionary:
 	var res := _run_cli(["delete", "--id", brain_id])
 	if res.get("ok", false):
 		vault_changed.emit()
+		# A queued entry for a deleted brain would burn at launch
+		# (worker fails instantly, fail-path pump eats the next) and
+		# look exactly like vanishing queue items. Purge up front.
+		purge_queued(brain_id)
 	return res
 
 
@@ -239,7 +441,85 @@ func import_brain(npz_path: String, brain_name: String) -> Dictionary:
 	return res
 
 
-func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dictionary:
+const QUEUES_FILENAME := "queues.json"
+
+
+func _queues_path() -> String:
+	# Empty when job_dir was never configured (bare test doubles):
+	# callers treat that as stay-in-memory.
+	if str(job_dir) == "":
+		return ""
+	return job_dir.path_join(QUEUES_FILENAME)
+
+
+func _save_queues() -> void:
+	# Persists train/score queues, active jobs and the done ring: quit
+	# to menu (or app restart) resumes them instead of dropping work.
+	# Cheap small file, best-effort (a failed write only loses the
+	# file, never the in-memory queues).
+	var path := _queues_path()
+	if path == "":
+		return
+	DirAccess.make_dir_recursive_absolute(job_dir)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		print("[Director] queues save failed (continuing in-memory).")
+		return
+	f.store_string(JSON.stringify({"train_queue": train_queue,
+		"score_queue": score_queue, "active_job": active_job,
+		"score_job": score_job, "completed_trains": completed_trains,
+		"pending_async": pending_async,
+		"saved_at_unix": Time.get_unix_time_from_system()}))
+	f.close()
+
+
+func _load_queues() -> void:
+	# Restores persisted queues at boot; corrupt/missing file starts
+	# empty (log, never crash). Shape-checked field by field.
+	train_queue = []
+	score_queue = []
+	active_job = {}
+	score_job = {}
+	completed_trains = []
+	pending_async = {}
+	var f := FileAccess.open(_queues_path(), FileAccess.READ)
+	if f == null:
+		return
+	var text := f.get_as_text().strip_edges()
+	f.close()
+	if not (text.begins_with("{") and text.ends_with("}")):
+		print("[Director] queues file unreadable - starting empty.")
+		return
+	var parsed = JSON.parse_string(text)
+	if not (parsed is Dictionary):
+		print("[Director] queues file unreadable - starting empty.")
+		return
+	if parsed.get("train_queue", []) is Array:
+		for item in (parsed.get("train_queue", []) as Array):
+			if item is Dictionary and str((item as Dictionary).get("id", "")) != "":
+				train_queue.append(item)
+	if parsed.get("score_queue", []) is Array:
+		for item in (parsed.get("score_queue", []) as Array):
+			if item is Dictionary and str((item as Dictionary).get("id", "")) != "":
+				score_queue.append(item)
+	if parsed.get("active_job", {}) is Dictionary:
+		active_job = parsed.get("active_job", {})
+	if parsed.get("score_job", {}) is Dictionary:
+		score_job = parsed.get("score_job", {})
+	if parsed.get("completed_trains", []) is Array:
+		completed_trains = parsed.get("completed_trains", [])
+		while completed_trains.size() > 5:
+			completed_trains.pop_front()
+	if parsed.get("pending_async", {}) is Dictionary:
+		pending_async = parsed.get("pending_async", {})
+	print("[Director] queues restored: %d train + %d score waiting%s%s." % [
+		train_queue.size(), score_queue.size(),
+		" +active train" if not active_job.is_empty() else "",
+		" +active score" if not score_job.is_empty() else ""])
+
+
+func start_training(brain_id: String, episodes: int, params: Dictionary,
+	snapshot: bool = true, brain_name: String = "") -> Dictionary:
 	if not python_ready:
 		return {"ok": false, "error": "no working python found (%s)" % python_probe_error}
 	if not active_job.is_empty():
@@ -263,12 +543,18 @@ func start_training(brain_id: String, episodes: int, params: Dictionary) -> Dict
 		DirAccess.remove_absolute(result_file)
 	var args: Array = _cli_argv(["train", "--id", brain_id,
 		"--episodes", str(episodes), "--params-file", params_file,
-		"--progress", progress_path, "--result-file", result_file])
-	var pid := OS.create_process(python_exe, args, false)
+		"--progress", progress_path, "--result-file", result_file]
+		+ (["--snapshot"] if snapshot else []))
+	var pid := _spawn_worker(args)
 	if pid <= 0:
 		return {"ok": false, "error": "could not spawn '%s'" % python_exe}
 	active_job = {"pid": pid, "progress_path": progress_path,
-		"result_file": result_file, "brain_id": brain_id, "episodes": episodes}
+		"result_file": result_file, "brain_id": brain_id,
+		"episodes": episodes, "school": params.has("curriculum"),
+		"name": brain_name, "params": params}
+	_last_job_text = ""
+	_last_job_res = {}
+	_save_queues()
 	return {"ok": true, "pid": pid}
 
 
@@ -283,24 +569,299 @@ func poll_job() -> Dictionary:
 		var text := f.get_as_text().strip_edges()
 		f.close()
 		if text.begins_with("{") and text.ends_with("}"):
-			var parsed = JSON.parse_string(text)
-			if parsed is Dictionary:
-				res = parsed
-	job_progress.emit(int(res.get("episode", 0)), int(res.get("total", 0)))
+			# Skip the parse when the text is unchanged (the poller
+			# re-reads between episode writes); reuse the last parsed
+			# dict so the emit check below never fires on a zero
+			# default (progress-bar flicker to 0 between episodes).
+			if text != _last_job_text:
+				_last_job_text = text
+				var parsed = JSON.parse_string(text)
+				if parsed is Dictionary:
+					res = parsed
+					_last_job_res = res
+			else:
+				res = _last_job_res
+	var ep_now := int(res.get("episode", 0))
+	var total_now := int(res.get("total", 0))
+	if ep_now != _last_job_ep or total_now != _last_job_total:
+		_last_job_ep = ep_now
+		_last_job_total = total_now
+		job_progress.emit(ep_now, total_now)
 	if float(res.get("pct", 0.0)) >= 100.0:
-		active_job = {}
-		vault_changed.emit()
-		return res
+		return _finish_train_job(res)
 	# Fail loud: the backend writes its result file on success AND on
 	# error. If the process is gone without reaching 100%, the job
 	# crashed (e.g. arity mismatch before episode 1) - report the backend
 	# error instead of hanging at episode 0/50 forever.
 	var pid := int(active_job.get("pid", 0))
 	if pid > 0 and not OS.is_process_running(pid):
-		var err_text := _read_job_result_error(str(active_job.get("result_file", "")))
-		active_job = {}
-		job_failed.emit(err_text)
+		_fail_train_job(_read_job_result_error(str(active_job.get("result_file", ""))))
 	return res
+
+
+func _finish_train_job(res: Dictionary) -> Dictionary:
+	# Banks a completed train (shared by the poller and boot adopt):
+	# done ring, vault refresh, queue pump, school probe follow-up.
+	print("[Director] Job done: %s (%d/%d)" % [
+		str(active_job.get("brain_id", "?")),
+		int(res.get("episode", 0)), int(res.get("total", 0))])
+	var done_school := bool(active_job.get("school", false))
+	var done_id := str(active_job.get("brain_id", ""))
+	var done_name := str(active_job.get("name", ""))
+	if done_name == "":
+		done_name = done_id
+	_record_train_done(done_name, int(res.get("episode", 0)))
+	active_job = {}
+	_save_queues()
+	vault_changed.emit()
+	_pump_train_queue()
+	if done_school and done_id != "":
+		# Via the queue (never silently dropped when a batch
+		# probe holds the slot; id doubles as display name).
+		enqueue_score(done_id, done_id)
+	return res
+
+
+func _fail_train_job(err_text: String) -> void:
+	# Banks a crashed train (shared by the poller and boot adopt).
+	print("[Director] Job failed: %s - %s" % [
+		str(active_job.get("brain_id", "?")), err_text])
+	active_job = {}
+	_save_queues()
+	job_failed.emit(err_text)
+	_pump_train_queue()
+
+
+func _record_train_done(brain_name: String, episodes: int) -> void:
+	# Remembers a finished training for the HUD DONE flash: a ring of
+	# the last 5 {name, episodes}, newest last.
+	completed_trains.append({"name": brain_name, "episodes": episodes})
+	while completed_trains.size() > 5:
+		completed_trains.pop_front()
+
+
+func enqueue_training(brain_id: String, brain_name: String, episodes: int,
+		params: Dictionary) -> int:
+	# Appends a training job; returns its 1-based queue position. The
+	# caller decides start-now vs queue (see _pump_train_queue).
+	train_queue.append({"id": brain_id, "name": brain_name,
+		"episodes": maxi(1, episodes), "params": params})
+	print("[Director] Queued %s x%d (#%d, depth %d)" % [brain_name,
+		maxi(1, episodes), train_queue.size(), train_queue.size()])
+	train_queue_changed.emit()
+	_save_queues()
+	return train_queue.size()
+
+
+func move_queued(index: int, direction: int) -> bool:
+	# Reorders the train queue (Up/Down): swaps with the neighbor in
+	# the given direction. Pure array op + signal + save.
+	if index < 0 or index >= train_queue.size():
+		return false
+	var j := index + direction
+	if j < 0 or j >= train_queue.size():
+		return false
+	var item: Dictionary = train_queue[index]
+	train_queue.remove_at(index)
+	train_queue.insert(j, item)
+	print("[Director] Queue moved: %s to #%d." % [
+		str(item.get("name", "?")), j + 1])
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func move_queued_top(index: int) -> bool:
+	# Promotes a queued train to the head (runs next).
+	if index <= 0 or index >= train_queue.size():
+		return false
+	var item: Dictionary = train_queue[index]
+	train_queue.remove_at(index)
+	train_queue.push_front(item)
+	print("[Director] Queue promoted: %s to #1." % [
+		str(item.get("name", "?"))])
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func set_queued_episodes(index: int, episodes: int) -> bool:
+	# Edits a queued train's episode count (1-500, clamped) before it
+	# launches. The running job is untouched (edit that one by
+	# requeueing: cancel + re-add).
+	if index < 0 or index >= train_queue.size():
+		return false
+	var eps := maxi(1, mini(500, episodes))
+	(train_queue[index] as Dictionary)["episodes"] = eps
+	print("[Director] Queue episodes: %s now x%d." % [
+		str((train_queue[index] as Dictionary).get("name", "?")), eps])
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func cancel_queued(index: int) -> bool:
+	if index < 0 or index >= train_queue.size():
+		return false
+	print("[Director] Queue cancel: %s (had %d waiting)" % [
+		str((train_queue[index] as Dictionary).get("name", "?")),
+		train_queue.size()])
+	train_queue.remove_at(index)
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func purge_queued(brain_id: String) -> int:
+	# Drops every queued entry for a deleted brain. Returns the count
+	# removed (0 = nothing to do, no signal).
+	var kept: Array = []
+	for spec in train_queue:
+		if str((spec as Dictionary).get("id", "")) != brain_id:
+			kept.append(spec)
+	var dropped := train_queue.size() - kept.size()
+	if dropped > 0:
+		print("[Director] Queue purge: dropped %d entr%s for deleted %s" % [
+			dropped, "y" if dropped == 1 else "ies", brain_id])
+		train_queue = kept
+		train_queue_changed.emit()
+		_save_queues()
+	return dropped
+
+
+func clear_train_queue() -> void:
+	if train_queue.is_empty():
+		return
+	train_queue.clear()
+	train_queue_changed.emit()
+	_save_queues()
+
+
+func pump_train_queue() -> bool:
+	# Starts the queue head when the worker slot is free. Returns true
+	# when a job launched. A failed launch keeps the head (transient
+	# spawn trouble must not eat the queue).
+	return _pump_train_queue()
+
+
+func _pump_train_queue() -> bool:
+	if hold_spawns:
+		return false
+	if not active_job.is_empty() or train_queue.is_empty():
+		return false
+	var head: Dictionary = train_queue[0]
+	# Queued/top-up trains skip the pre-train snapshot (opt-in backups):
+	# a full 19-100 MB copy per queued episode batch is disk-safety only.
+	var res: Dictionary = start_training(str(head.get("id", "")),
+		int(head.get("episodes", 0)), head.get("params", {}), false,
+		str(head.get("name", "")))
+	if not bool(res.get("ok", false)):
+		print("[Director] Queued training deferred for %s: %s" % [
+			str(head.get("name", "?")), str(res.get("error", "?"))])
+		return false
+	print("[Director] Auto-starting queued %s (%d left waiting)" % [
+		str(head.get("name", "?")), train_queue.size() - 1])
+	train_queue.pop_front()
+	train_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func _adopt_boot_queues() -> void:
+	# Boot recovery for persisted queues: live pids reattach (the
+	# poller resumes), completed result files adopt immediately, dead
+	# pids with no result requeue (train/score) or free the slot
+	# (async). Never kills: a crash must not eat work. Runs once.
+	if not active_job.is_empty():
+		var pid := int(active_job.get("pid", 0))
+		var res := _read_job_result(str(active_job.get("result_file", "")))
+		if pid > 0 and OS.is_process_running(pid):
+			print("[Director] Reattached running train job %s (pid %d)." % [
+				str(active_job.get("brain_id", "?")), pid])
+			_last_job_text = ""
+			_last_job_ep = -1
+			_last_job_total = -1
+		elif float(res.get("pct", 0.0)) >= 100.0:
+			_finish_train_job(res)
+		elif res.get("ok", null) == false:
+			_fail_train_job(str(res.get("error", "training process exited")))
+		else:
+			_requeue_active_train_job()
+	if not score_job.is_empty():
+		var spid := int(score_job.get("pid", 0))
+		var sres := _read_job_result(str(score_job.get("result_file", "")))
+		if spid > 0 and OS.is_process_running(spid):
+			print("[Director] Reattached running score probe %s (pid %d)." % [
+				str(score_job.get("brain_id", "?")), spid])
+			_last_score_text = ""
+			_last_score_ep = -1
+			_last_score_total = -1
+		elif not sres.is_empty():
+			_finish_score_job(sres)
+		else:
+			_requeue_active_score_job()
+	if not pending_async.is_empty():
+		var apid := int(pending_async.get("pid", 0))
+		var arf := str(pending_async.get("result_file", ""))
+		if (apid <= 0 or not OS.is_process_running(apid)) \
+				and _read_job_result(arf).is_empty() \
+				and not FileAccess.file_exists(arf):
+			# Stale slot (dead worker, no verdict coming): free it now
+			# instead of wedging every spawn for 30 minutes.
+			print("[Director] Dropping stale async slot (%s, pid gone)." % [
+				str(pending_async.get("op", "?"))])
+			pending_async = {}
+			_save_queues()
+
+
+func _read_job_result(path: String) -> Dictionary:
+	# Parsed result verdict or {} (missing/partial/unparsable).
+	if path == "":
+		return {}
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return {}
+	var text := f.get_as_text().strip_edges()
+	f.close()
+	if not (text.begins_with("{") and text.ends_with("}")):
+		return {}
+	var parsed = JSON.parse_string(text)
+	return parsed if parsed is Dictionary else {}
+
+
+func _requeue_active_train_job() -> void:
+	# Crashed train with no verdict: back to the head with its exact
+	# recipe (params rode along in the job dict), then pump.
+	var bid := str(active_job.get("brain_id", ""))
+	var bname := str(active_job.get("name", ""))
+	if bid == "":
+		active_job = {}
+		_save_queues()
+		return
+	if bname == "":
+		bname = bid
+	print("[Director] Requeueing crashed train job %s." % bname)
+	train_queue.push_front({"id": bid, "name": bname,
+		"episodes": maxi(1, int(active_job.get("episodes", 50))),
+		"params": active_job.get("params", {})})
+	active_job = {}
+	_save_queues()
+	train_queue_changed.emit()
+	_pump_train_queue()
+
+
+func _requeue_active_score_job() -> void:
+	var bid := str(score_job.get("brain_id", ""))
+	if bid == "":
+		score_job = {}
+		_save_queues()
+		return
+	print("[Director] Requeueing crashed score probe %s." % bid)
+	score_queue.push_front({"id": bid, "name": bid})
+	score_job = {}
+	_save_queues()
+	score_queue_changed.emit()
+	_pump_score_queue()
 
 
 func _read_job_result_error(result_file: String) -> String:
@@ -318,11 +879,212 @@ func _read_job_result_error(result_file: String) -> String:
 	return "training process exited before episode 1 (see brains/jobs log)"
 
 
-func _process(_delta: float) -> void:
+const POLL_EVERY_SEC := 0.25
+var _poll_accum := 0.0
+
+
+func _process(delta: float) -> void:
+	# Job-slot polling throttled to ~4 Hz: per-frame file opens + JSON
+	# parses were pure syscall churn; a 0.25 s delay is invisible on a
+	# progress bar and pushes completion detection by at most one tick.
+	_poll_accum += delta
+	if _poll_accum < POLL_EVERY_SEC:
+		return
+	_poll_accum = 0.0
 	if not active_job.is_empty():
 		poll_job()
+	if not score_job.is_empty():
+		_poll_score()
 	if not pending_async.is_empty():
 		_poll_async()
+
+
+# Menu scoring queue: FIFO of {id, name}. Batch eval probes run one
+# at a time in the score slot; persisted with the train queue.
+var score_queue: Array = []
+
+
+func enqueue_score(brain_id: String, brain_name: String) -> int:
+	# Appends unless empty/already active/queued; pumps immediately.
+	# Returns 1-based queue position (0 = refused).
+	if brain_id == "":
+		return 0
+	if str(score_job.get("brain_id", "")) == brain_id:
+		return 0
+	for item in score_queue:
+		if str((item as Dictionary).get("id", "")) == brain_id:
+			return 0
+	score_queue.append({"id": brain_id, "name": brain_name})
+	var pos := score_queue.size()
+	print("[Director] Queued scoring %s (#%d)" % [brain_name, pos])
+	score_queue_changed.emit()
+	_save_queues()
+	pump_score_queue()
+	return pos
+
+
+func move_score_queued(index: int, direction: int) -> bool:
+	# Reorders the scoring queue (Up/Down). Pure array op + signal.
+	if index < 0 or index >= score_queue.size():
+		return false
+	var j := index + direction
+	if j < 0 or j >= score_queue.size():
+		return false
+	var item: Dictionary = score_queue[index]
+	score_queue.remove_at(index)
+	score_queue.insert(j, item)
+	print("[Director] Score queue moved: %s to #%d." % [
+		str(item.get("name", "?")), j + 1])
+	score_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func move_score_queued_top(index: int) -> bool:
+	if index <= 0 or index >= score_queue.size():
+		return false
+	var item: Dictionary = score_queue[index]
+	score_queue.remove_at(index)
+	score_queue.push_front(item)
+	print("[Director] Score queue promoted: %s to #1." % [
+		str(item.get("name", "?"))])
+	score_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func cancel_score_queued(index: int) -> void:
+	if index < 0 or index >= score_queue.size():
+		return
+	print("[Director] Unqueued scoring %s (%d left)" % [
+		str((score_queue[index] as Dictionary).get("name", "?")),
+		score_queue.size() - 1])
+	score_queue.remove_at(index)
+	score_queue_changed.emit()
+	_save_queues()
+
+
+func clear_score_queue() -> void:
+	if score_queue.is_empty():
+		return
+	score_queue.clear()
+	score_queue_changed.emit()
+	_save_queues()
+
+
+func pump_score_queue() -> bool:
+	# Starts the queue head when the score slot is free. A failed
+	# launch keeps the head (transient spawn trouble must not eat it).
+	return _pump_score_queue()
+
+
+func _pump_score_queue() -> bool:
+	if hold_spawns:
+		return false
+	if not score_job.is_empty() or score_queue.is_empty():
+		return false
+	var head: Dictionary = score_queue[0]
+	if not _launch_score(str(head.get("id", ""))):
+		print("[Director] Queued scoring deferred for %s." % [
+			str(head.get("name", "?"))])
+		return false
+	print("[Director] Auto-starting scoring %s (%d left waiting)" % [
+		str(head.get("name", "?")), score_queue.size() - 1])
+	score_queue.pop_front()
+	score_queue_changed.emit()
+	_save_queues()
+	return true
+
+
+func _launch_score(brain_id: String) -> bool:
+	# Eval-only probe after a school train (~2 min, weights untouched).
+	# One at a time; a probe failure only logs (the train already banked).
+	if not score_job.is_empty() or not python_ready:
+		return false
+	var result_file := job_dir.path_join("score_%s_result.json" % brain_id)
+	if FileAccess.file_exists(result_file):
+		DirAccess.remove_absolute(result_file)
+	var progress_path := job_dir.path_join("score_%s.json" % brain_id)
+	var f := FileAccess.open(progress_path, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify({"episode": 0, "total": 6, "pct": 0.0}))
+		f.close()
+	var pid := _spawn_worker(_cli_argv(["score", "--id", brain_id, "--episodes", "6",
+		"--seed", "7", "--progress", progress_path,
+		"--result-file", result_file]))
+	if pid <= 0:
+		print("[Director] Eval probe failed to spawn for %s." % brain_id)
+		return false
+	score_job = {"pid": pid, "result_file": result_file,
+		"progress_path": progress_path, "brain_id": brain_id}
+	_last_score_text = ""
+	_save_queues()
+	print("[Director] Eval probe started for %s." % brain_id)
+	return true
+
+
+func _poll_score() -> void:
+	var rf := str(score_job.get("result_file", ""))
+	var bid := str(score_job.get("brain_id", ""))
+	var pf := str(score_job.get("progress_path", ""))
+	if pf != "":
+		var pfr := FileAccess.open(pf, FileAccess.READ)
+		if pfr != null:
+			var ptext := pfr.get_as_text().strip_edges()
+			pfr.close()
+			# Skip the parse when the text is unchanged; emit only on
+			# (episode, total) change.
+			if ptext != _last_score_text:
+				_last_score_text = ptext
+				if ptext.begins_with("{") and ptext.ends_with("}"):
+					var pparsed = JSON.parse_string(ptext)
+					if pparsed is Dictionary:
+						var ep_s := int(pparsed.get("episode", 0))
+						var total_s := int(pparsed.get("total", 0))
+						if ep_s != _last_score_ep or total_s != _last_score_total:
+							_last_score_ep = ep_s
+							_last_score_total = total_s
+							score_progress.emit(ep_s, total_s)
+	var f := FileAccess.open(rf, FileAccess.READ)
+	if f != null:
+		var text := f.get_as_text().strip_edges()
+		f.close()
+		if text.begins_with("{") and text.ends_with("}"):
+			var parsed = JSON.parse_string(text)
+			if parsed is Dictionary:
+				_finish_score_job(parsed)
+				return
+			return  # Partial write; retry next frame.
+	var pid := int(score_job.get("pid", 0))
+	if pid > 0 and not OS.is_process_running(pid):
+		_fail_score_job()
+
+
+func _finish_score_job(parsed: Dictionary) -> void:
+	# Banks a completed eval probe (shared by the poller and boot
+	# adopt): stamp, vault refresh, queue pump.
+	var bid := str(score_job.get("brain_id", ""))
+	score_job = {}
+	_save_queues()
+	if bool(parsed.get("ok", false)):
+		var sc := float(parsed.get("eval_score", 0.0))
+		print("[Director] Eval score %.1f stamped for %s." % [sc, bid])
+		score_stamped.emit(bid, sc)
+	else:
+		print("[Director] Eval probe failed for %s: %s" % [
+			bid, str(parsed.get("error", "?"))])
+	vault_changed.emit()
+	pump_score_queue()
+
+
+func _fail_score_job() -> void:
+	# Banks a silently-died probe (shared by the poller and boot
+	# adopt): clear, pump, never hang the slot.
+	var bid := str(score_job.get("brain_id", ""))
+	print("[Director] Eval probe died silently for %s (see brains/jobs log)." % bid)
+	score_job = {}
+	_save_queues()
+	pump_score_queue()
 
 
 # ── Tournament setup ────────────────────────────────────────────────
@@ -345,7 +1107,7 @@ func best_of_options() -> Array:
 	return [1, 3, 5, 7, 9, 11]
 
 
-# ── Evolution mode: eternal tournament loop ──────────────────────
+# ── Continuous tournament mode: eternal loop ──────────────────────
 # Each generation archives the biggest loser and breeds 1 winner-clone
 # + 1 random, holding roster size constant. State rides in
 # tourney["evo"] (persisted by save_state), so quit/resume just works.
@@ -384,7 +1146,7 @@ func evo_vault_ids() -> Array:
 	# brackets, manual deletes); elimination must skip the missing
 	# instead of aborting the generation on a ghost.
 	var ids: Array = []
-	for b in list_brains():
+	for b in list_brains_cached():
 		ids.append(str((b as Dictionary).get("id", "")))
 	return ids
 
@@ -434,8 +1196,13 @@ func evo_bottom_two() -> Dictionary:
 
 
 func evo_archive(brain_id: String, reason: String) -> Dictionary:
-	# Blocking: local file move, milliseconds.
-	return _run_cli(["archive", "--id", brain_id, "--reason", reason])
+	# Blocking: local file move, milliseconds. Membership change:
+	# the roster cache must refresh (a same-minute draw off a stale
+	# cache once drafted an archived fighter into the next event).
+	var res := _run_cli(["archive", "--id", brain_id, "--reason", reason])
+	if res.get("ok", false):
+		vault_changed.emit()
+	return res
 
 
 func size_options() -> Array:
@@ -443,8 +1210,9 @@ func size_options() -> Array:
 
 
 func _strength(rec: Dictionary) -> Array:
+	# Primary sort key is ELO (descending); win rates stay as tiebreaks.
 	var r: Dictionary = rec.get("record", {})
-	return [int(r.get("matches_won", 0)) - int(r.get("matches_lost", 0)),
+	return [float(r.get("elo", 1200.0)),
 		_match_rate(r), _battle_rate(r), rec.get("name", "")]
 
 
@@ -458,8 +1226,8 @@ func _battle_rate(r: Dictionary) -> float:
 	return float(r.get("wins", 0)) / max(d, 1) if d > 0 else WIN_RATE_FALLBACK
 
 
-func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false, consolation: bool = false) -> Dictionary:
-	var all_brains: Array = list_brains() if brains_override.is_empty() else brains_override
+func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, round_time: float = 40.0, quick: bool = false, brains_override: Array = [], random_draw: bool = false, consolation: bool = false, fixed_order: bool = false) -> Dictionary:
+	var all_brains: Array = list_brains_cached() if brains_override.is_empty() else brains_override
 	var by_id := {}
 	for b in all_brains:
 		by_id[str(b.get("id", ""))] = b
@@ -474,12 +1242,62 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 	# No wiring gate: the server runs each fighter on its native wiring
 	# (base or experimental overlay), so any vault brains may share a
 	# bracket. Vault files keep their native arity end-to-end.
-	# Canonical single-elim seeding: place the strongest first into the
-	# standard power-of-two seed order, so the top seeds take the byes,
-	# the weakest meet earliest, and round 0 holds exactly size/2 slots
-	# (real matches, BYE cards for the resting seeds, VACANT cards for
-	# empty subtrees when the roster is under half full). Random draw
-	# shuffles the entrants instead (byes fall luck-of-the-draw).
+	var seeded := seed_first_round(players, size, random_draw, fixed_order)
+	players = seeded["players"]
+	var matches: Array = seeded["matches"]
+	var seeding := str(seeded["seeding"])
+	var tid := _next_tournament_id()
+	tourney = {
+		"id": tid, "status": "running", "size": size, "best_of": best_of,
+		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
+		"round_time": round_time, "quick": quick, "seeding": seeding,
+		"random_draw": random_draw,
+		"consolation": consolation and not quick,
+		"losers_start_round": -1, "last_place_id": "",
+		"created": Time.get_datetime_string_from_system(),
+		"players": players, "byes": [],
+		"rounds": [matches], "current_round": 0, "current_match": 0,
+		"champion_id": "",
+	}
+	sudden_death_armed = false
+	save_state()
+	return {"ok": true, "tournament_id": tid}
+
+
+func _next_tournament_id() -> String:
+	# Hex-second ids collide when two brackets start in the same second
+	# (quick battle + tournament, back-to-back evo gens): identical ids
+	# share a state file AND the server's battle dedup key, so the
+	# second event's battles get answered from the first's verdicts and
+	# are never banked. Suffix on collision; normal case keeps T+8hex.
+	var base := int(Time.get_unix_time_from_system())
+	var tid := "T%08X" % base
+	var n := 0
+	while FileAccess.file_exists(tournament_dir.path_join(tid + ".json")):
+		n += 1
+		tid = "T%08X-%d" % [base, n]
+	return tid
+
+
+func seed_first_round(player_dicts: Array, size: int, random_draw: bool, fixed_order: bool = false) -> Dictionary:
+	# Canonical single-elim seeding shared by build_bracket (vault brains)
+	# and preview_bracket (synthetic offspring welcome): place the
+	# strongest first into the standard power-of-two seed order, so the
+	# top seeds take the byes, the weakest meet earliest, and round 0
+	# holds exactly size/2 slots (real matches, BYE cards for resting
+	# seeds, VACANT cards for empty subtrees when under half full).
+	# Random draw shuffles instead (byes fall luck-of-the-draw).
+	# Fixed order (event finals) pairs consecutive entries untouched.
+	# Returns {players, matches, seeding}. Player dicts need id/name
+	# (record optional - missing ELO sorts as 1200).
+	var players: Array = player_dicts.duplicate()
+	if fixed_order:
+		var fmatches: Array = []
+		var i := 0
+		while i + 1 < players.size():
+			fmatches.append(_new_match(players[i], players[i + 1]))
+			i += 2
+		return {"players": players, "matches": fmatches, "seeding": "fixed"}
 	var seeding := "strength"
 	if random_draw:
 		seeding = "random"
@@ -515,22 +1333,20 @@ func build_bracket(player_ids: Array, size: int, best_of: int, lr_scale: float, 
 			m["winner_id"] = str(m.get("a_id", ""))
 		elif str(m.get("a_id", "")) == "" and str(m.get("b_id", "")) != "":
 			m["winner_id"] = str(m.get("b_id", ""))
-	var tid := "T%08X" % int(Time.get_unix_time_from_system())
-	tourney = {
-		"id": tid, "status": "running", "size": size, "best_of": best_of,
-		"wins_needed": best_of / 2 + 1, "lr_scale": lr_scale,
-		"round_time": round_time, "quick": quick, "seeding": seeding,
-		"random_draw": random_draw,
-		"consolation": consolation and not quick,
-		"losers_start_round": -1, "last_place_id": "",
-		"created": Time.get_datetime_string_from_system(),
-		"players": players, "byes": [],
-		"rounds": [matches], "current_round": 0, "current_match": 0,
-		"champion_id": "",
-	}
-	sudden_death_armed = false
-	save_state()
-	return {"ok": true, "tournament_id": tid}
+	return {"players": players, "matches": matches, "seeding": seeding}
+
+
+func preview_bracket(player_dicts: Array, size: int, random_draw: bool) -> Dictionary:
+	# Display-only next-generation preview (never saved, never played):
+	# round 0 seeded exactly like the real thing; the renderer pads the
+	# rest as TBD. Unbred offspring ride synthetic {id,name} cards that
+	# refresh to real names on adoption.
+	if player_dicts.size() < 2 or player_dicts.size() > size:
+		return {}
+	var seeded := seed_first_round(player_dicts, size, random_draw)
+	return {"players": seeded["players"], "rounds": [seeded["matches"]],
+		"size": size, "current_round": 0, "current_match": 0,
+		"status": "preview", "seeding": str(seeded["seeding"])}
 
 
 func _new_match(a, b) -> Dictionary:
@@ -542,7 +1358,49 @@ func _new_match(a, b) -> Dictionary:
 		"bye": (b == null and a != null), "vacant": (a == null and b == null),
 		"wins_a": 0, "wins_b": 0, "draws": 0,
 		"winner_id": "", "battles": 0,
+		"ko_a": 0, "ko_b": 0,
+		"banked": false, "bank_nonce": "",
 	}
+
+
+func _match_wins(pid: String) -> int:
+	# Decided pairings taken in this event file (drawn splits count
+	# for neither side): the sudden-death tiebreak currency.
+	var n := 0
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			if str((mm as Dictionary).get("winner_id", "")) == pid:
+				n += 1
+	return n
+
+
+func _battle_wins(pid: String) -> int:
+	# Total battle wins across every round (main + consolation): the
+	# deterministic tiebreak for skipped losers finals.
+	var n := 0
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			var d := mm as Dictionary
+			if str(d.get("a_id", "")) == pid:
+				n += int(d.get("wins_a", 0))
+			if str(d.get("b_id", "")) == pid:
+				n += int(d.get("wins_b", 0))
+	return n
+
+
+func _resolve_skipped_final(fin: Dictionary) -> void:
+	# Last-two archiving without fighting: fewer total battle wins is
+	# last place (ties go to b, so a_id takes last). Marks the card
+	# skipped for honest display; evo_bottom_two reads it like a played
+	# final (loser = last, winner = second-last).
+	var a := str(fin.get("a_id", ""))
+	var b := str(fin.get("b_id", ""))
+	var w := b
+	if _battle_wins(a) > _battle_wins(b):
+		w = a
+	fin["winner_id"] = w
+	fin["skipped"] = true
+	tourney["last_place_id"] = b if w == a else a
 
 
 func _match_loser(mm: Dictionary) -> String:
@@ -635,17 +1493,45 @@ func skip_unplayable() -> Dictionary:
 
 
 func brain_path(brain_id: String) -> String:
-	for b in list_brains():
-		if str(b.get("id", "")) == brain_id:
-			return brains_dir.path_join(str(b.get("filename", "")))
+	# Cached roster: get_load_params shells this TWICE per battle load
+	# (alpha + beta); an uncached shell here was ~1-2 s of loading each.
+	for b in list_brains_cached():
+		if str((b as Dictionary).get("id", "")) == brain_id:
+			return brains_dir.path_join(str((b as Dictionary).get("filename", "")))
 	return ""
+
+
+func vault_paths_for(player_ids: Array) -> Array:
+	# Vault file paths for a roster, one cached roster pass (warm
+	# pre-warming, preload diagnostics). Unknown ids skip silently.
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var out: Array = []
+	for pid in player_ids:
+		var fn := str((by_id.get(str(pid), {}) as Dictionary).get("filename", ""))
+		if fn != "":
+			out.append(brains_dir.path_join(fn))
+	return out
 
 
 func get_load_params() -> Dictionary:
 	var m := current_match()
+	# One roster pass for both fighters (cached; never two shells).
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var alpha_fn := ""
+	var beta_fn := ""
+	for pid in [str(m.get("a_id", "")), str(m.get("b_id", ""))]:
+		var rec: Dictionary = by_id.get(pid, {})
+		if pid == str(m.get("a_id", "")):
+			alpha_fn = str(rec.get("filename", ""))
+		else:
+			beta_fn = str(rec.get("filename", ""))
 	return {
-		"alpha_path": brain_path(str(m.get("a_id", ""))),
-		"beta_path": brain_path(str(m.get("b_id", ""))),
+		"alpha_path": brains_dir.path_join(alpha_fn) if alpha_fn != "" else "",
+		"beta_path": brains_dir.path_join(beta_fn) if beta_fn != "" else "",
 		"tournament_id": str(tourney.get("id", "")),
 		"match": "R%dM%d" % [int(tourney.get("current_round", 0)) + 1,
 			int(tourney.get("current_match", 0)) + 1],
@@ -657,16 +1543,91 @@ func get_load_params() -> Dictionary:
 	}
 
 
-func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}) -> Dictionary:
+func next_match_params() -> Dictionary:
+	# Peek the NEXT playable match without advancing: same-round
+	# next pairing (current_match+1 onward, byes/vacants walked past)
+	# is known the moment the round was built; a cross-round pairing
+	# depends on the current winner and returns {} until it resolves.
+	# Read-only (never mutates match state, never saves) - the arena
+	# preloads it into the server's prepare slot.
+	var r := int(tourney.get("current_round", 0))
+	var rounds: Array = tourney.get("rounds", [])
+	if r < 0 or r >= rounds.size():
+		return {}
+	var round_arr: Array = rounds[r]
+	var mi := int(tourney.get("current_match", 0)) + 1
+	while mi < round_arr.size():
+		var m: Dictionary = round_arr[mi]
+		if bool(m.get("vacant", false)) or bool(m.get("bye", false)):
+			mi += 1
+			continue
+		break
+	if mi >= round_arr.size():
+		return {}
+	var m: Dictionary = round_arr[mi]
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var alpha_fn := str((by_id.get(str(m.get("a_id", "")), {}) as Dictionary).get("filename", ""))
+	var beta_fn := str((by_id.get(str(m.get("b_id", "")), {}) as Dictionary).get("filename", ""))
+	if alpha_fn == "" or beta_fn == "":
+		return {}
+	return {
+		"alpha_path": brains_dir.path_join(alpha_fn),
+		"beta_path": brains_dir.path_join(beta_fn),
+		"tournament_id": str(tourney.get("id", "")),
+		"match": "R%dM%d" % [r + 1, mi + 1],
+		"a_name": str(m.get("a_name", "ALPHA")),
+		"b_name": str(m.get("b_name", "BETA")),
+	}
+
+
+func overtime_scale(draws: int) -> float:
+	# Overtime ladder: a pairing's next battle runs longer after each
+	# timeout-tie — 1.5x after the first DNF, 2x after the second.
+	# Pure (unit-tested); read at reset from the banked draw count,
+	# never persisted (a stored scale would leak into later matches).
+	if draws >= 2:
+		return 2.0
+	if draws >= 1:
+		return 1.5
+	return 1.0
+
+
+func replay_scale(m: Dictionary) -> float:
+	# Overtime applies to exactly ONE battle: the immediate replay
+	# after a DNF. A decisive battle ends the overtime even inside a
+	# best-of match (no carry-over to later battles); new matches
+	# start clean. The last banked battle decides: only a trailing
+	# draw replays overtime. Pure (unit-tested).
+	var draws := int(m.get("draws", 0))
+	if draws <= 0:
+		return 1.0
+	var fl: Array = m.get("flights", [])
+	if fl.is_empty():
+		return 1.0
+	if str((fl[fl.size() - 1] as Dictionary).get("winner", "")) != "draw":
+		return 1.0
+	return overtime_scale(draws)
+
+
+func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dictionary = {}, brain_stream: Dictionary = {}, kills_a: int = -1, kills_b: int = -1, drift_a: float = -1.0, drift_b: float = -1.0) -> Dictionary:
 	# winner: "alpha" | "beta" | "draw". Per-battle flight telemetry is
 	# banked on the match ("flights" list) so flight-style regressions
 	# have recorded evidence; the pool-rate stream rides along when the
 	# menu record toggle is on (gated arena-side; ~50 KB per battle).
-	# Returns sequencing action for arena.
+	# kills_a/b bank takedowns per side for group standings (negative =
+	# unreported, e.g. legacy callers). drift_a/b bank meters-past-the-
+	# arena-ring per DNF side (negative = unreported); the overtime
+	# health dock reads the freshest pair. Returns sequencing action.
 	var m := current_match()
 	if m.is_empty():
 		return {"action": "idle"}
 	m["battles"] = int(m.get("battles", 0)) + 1
+	if kills_a >= 0:
+		m["ko_a"] = int(m.get("ko_a", 0)) + kills_a
+	if kills_b >= 0:
+		m["ko_b"] = int(m.get("ko_b", 0)) + kills_b
 	if not flight_a.is_empty() or not flight_b.is_empty():
 		if not m.has("flights"):
 			m["flights"] = []
@@ -678,8 +1639,54 @@ func on_battle_result(winner: String, flight_a: Dictionary = {}, flight_b: Dicti
 		(m["flights"] as Array).append(entry)
 	if winner == "draw":
 		m["draws"] = int(m.get("draws", 0)) + 1
+		if drift_a >= 0.0:
+			m["drift_a"] = drift_a
+		if drift_b >= 0.0:
+			m["drift_b"] = drift_b
 		if int(m.get("draws", 0)) >= 3:
+			# Third draw resolves the match outright (no infinite
+			# rematches): higher start-of-match ELO advances, ties go
+			# alpha like fitness verdicts. Both ELOs were already
+			# docked when the draw was reported.
 			sudden_death_armed = true
+			var aid := str(m.get("a_id", ""))
+			var bid := str(m.get("b_id", ""))
+			# Prior match-wins decide (baseball merit, not rating): the
+			# side that already proved itself takes the pairing. Tied
+			# priors split the point in group play (drawn, 0.5 each);
+			# finals stay decisive via the legacy ELO fallback so a
+			# champion is always crowned.
+			var wa := _match_wins(aid)
+			var wb := _match_wins(bid)
+			if wa != wb:
+				var wslot := "alpha" if wa > wb else "beta"
+				m["winner_id"] = str(m.get("a_id" if wslot == "alpha" else "b_id", ""))
+				m["decided_by_draw"] = true
+				save_state()
+				return {"action": "match_over", "match_winner": wslot,
+					"score_a": int(m.get("wins_a", 0)),
+					"score_b": int(m.get("wins_b", 0)),
+					"resolved_by_draw": true}
+			if str(tourney.get("format", "bracket")) == "groups":
+				m["drawn"] = true
+				save_state()
+				return {"action": "match_over", "match_winner": "draw",
+					"score_a": int(m.get("wins_a", 0)),
+					"score_b": int(m.get("wins_b", 0)),
+					"resolved_by_draw": true}
+			var ea := _player_elo(aid)
+			var eb := _player_elo(bid)
+			var dslot := "alpha" if ea >= eb else "beta"
+			m["winner_id"] = str(m.get("a_id" if dslot == "alpha" else "b_id", ""))
+			# Display honesty: the card shows battle score (e.g. 1-3),
+			# so the tiebreak must be visible or the green winner
+			# looks wrong. The renderer tags these DRAW-BREAK.
+			m["decided_by_draw"] = true
+			save_state()
+			return {"action": "match_over", "match_winner": dslot,
+				"score_a": int(m.get("wins_a", 0)),
+				"score_b": int(m.get("wins_b", 0)),
+				"resolved_by_draw": true}
 		save_state()
 		return {"action": "replay", "sudden_death": sudden_death_armed,
 			"score_a": int(m.get("wins_a", 0)), "score_b": int(m.get("wins_b", 0))}
@@ -719,6 +1726,21 @@ func advance_after_match() -> Dictionary:
 		if int(tourney["current_match"]) < r.size():
 			save_state()
 			return {"action": "next_match"}
+	# Group format: the round-robin schedule is precomputed, so rounds
+	# just step forward (no winner-progression rebuild). Exhausting the
+	# schedule completes the group; standings decide advancers.
+	if str(tourney.get("format", "bracket")) == "groups":
+		tourney["current_round"] = int(tourney["current_round"]) + 1
+		tourney["current_match"] = 0
+		if int(tourney["current_round"]) >= (tourney["rounds"] as Array).size():
+			tourney["status"] = "complete"
+			save_state()
+			return {"action": "group_complete",
+				"group": str(tourney.get("group", "?")),
+				"event_id": str(tourney.get("event_id", "")),
+				"standings": group_standings()}
+		save_state()
+		return {"action": "next_match"}
 	# Round complete: build next from winners - or from losers inside
 	# the consolation bracket (loser advances, converging down to last
 	# place + second-last for the archives). Empty slots = vacant subtrees.
@@ -739,6 +1761,16 @@ func advance_after_match() -> Dictionary:
 			tourney["champion_id"] = winners[0]
 			if bool(tourney.get("consolation", false)):
 				if _build_losers_bracket():
+					var lr: Array = tourney["rounds"][int(tourney.get("losers_start_round", -1))]
+					if lr.size() == 1:
+						# Single-match consolation IS the final: both are
+						# last-two, archive them without fighting it.
+						_resolve_skipped_final(lr[0])
+						tourney["status"] = "complete"
+						save_state()
+						return {"action": "tournament_end",
+							"champion_id": str(tourney.get("champion_id", "")),
+							"last_place_id": str(tourney.get("last_place_id", ""))}
 					save_state()
 					return {"action": "next_match",
 						"consolation_started": true}
@@ -752,6 +1784,23 @@ func advance_after_match() -> Dictionary:
 			var w := str(fin.get("winner_id", ""))
 			tourney["last_place_id"] = str(fin.get(
 				"b_id" if w == str(fin.get("a_id", "")) else "a_id", ""))
+		tourney["status"] = "complete"
+		save_state()
+		return {"action": "tournament_end",
+			"champion_id": str(tourney.get("champion_id", "")),
+			"last_place_id": str(tourney.get("last_place_id", ""))}
+	# Loser-advance converging to a 2-fighter final: both are last-two,
+	# archive them without fighting it (needs two real advancers;
+	# ghosts fall through to the normal bye/vacant machinery).
+	if _loser_mode and winners.size() == 2 and str(winners[0]) != "" and str(winners[1]) != "":
+		var names2 := {}
+		for p in tourney.get("players", []):
+			names2[str(p.get("id", ""))] = str(p.get("name", "?"))
+		var fin2 := _new_match(
+			{"id": winners[0], "name": str(names2.get(winners[0], "?"))},
+			{"id": winners[1], "name": str(names2.get(winners[1], "?"))})
+		rounds.append([fin2])
+		_resolve_skipped_final(fin2)
 		tourney["status"] = "complete"
 		save_state()
 		return {"action": "tournament_end",
@@ -841,9 +1890,84 @@ func champion_name() -> String:
 	return "?"
 
 
+# Crossable wirings mirrored from experimental_wiring.FROZEN_GENOMES
+# (genome parents always qualify; these legacy mixes expand to rules).
+const CROSSABLE_MIXES := ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
+
+
+func is_genome_bearing(pid: String) -> bool:
+	# True when a roster brain can parent a crossover (genome or single
+	# frozen mix). Base/legacy/multi-mix brains would fail breeding and
+	# abort the generation, so the evo loop must never pick them.
+	for p in tourney.get("players", []):
+		if not (p is Dictionary):
+			continue
+		var pd := p as Dictionary
+		if str(pd.get("id", "")) != pid:
+			continue
+		var gp = pd.get("generator_params", {})
+		if not (gp is Dictionary):
+			return false
+		if (gp as Dictionary).get("genome", null) != null:
+			return true
+		var exp = (gp as Dictionary).get("experiment", null)
+		if exp is String and str(exp) in CROSSABLE_MIXES:
+			return true
+		if exp is Array and exp.size() == 1 \
+				and str(exp[0]) in CROSSABLE_MIXES:
+			return true
+		return false
+	return false
+
+
+func kin_base_name(champ_name: String) -> String:
+	# Pedigree base for clone specs: strip one leading G<N>- prefix,
+	# one trailing -kin[N]/-jr[N] suffix, and one trailing old wild
+	# " G<N>"/"_G<N>" tag. The worker appends -kin/-jr with the
+	# lineage counters at banking (counters are never parsed); the
+	# spec carries the base only. Unparseable names fall back to the
+	# full original.
+	var base := champ_name.strip_edges()
+	var gpos := base.find("-")
+	if gpos > 1 and base.substr(0, 1) == "G" \
+			and base.substr(1, gpos - 1).is_valid_int():
+		base = base.substr(gpos + 1)
+	for tag in ["-kin", "-jr"]:
+		var kpos := base.rfind(tag)
+		if kpos >= 0:
+			var tail := base.substr(kpos + 4)
+			if tail == "" or tail.is_valid_int():
+				base = base.substr(0, kpos)
+				break
+	for sep in [" G", "_G"]:
+		var gp := base.rfind(sep)
+		if gp >= 0 and base.substr(gp + 2).is_valid_int():
+			base = base.substr(0, gp)
+			break
+	if base == "":
+		base = champ_name.strip_edges()
+	return base
+
+
+func _player_elo(pid: String) -> float:
+	# Start-of-tournament ELO for bracket seeding tiebreaks and 3rd-draw
+	# resolution (players array is snapshotted at bracket build).
+	for p in tourney.get("players", []):
+		if str((p as Dictionary).get("id", "")) == pid:
+			return float(((p as Dictionary).get("record", {}) as Dictionary).get("elo", 1200.0))
+	return 1200.0
+
+
 func match_slot_name(slot: String) -> String:
 	var m := current_match()
 	return str(m.get("a_name" if slot == "alpha" else "b_name", slot.to_upper()))
+
+
+func _fmt_wins(v) -> String:
+	# Fractional match wins (0.5 splits) print trimmed ("2.5"), ints
+	# stay ints ("3").
+	var f := float(v)
+	return "%d" % int(f) if absf(f - float(int(f))) < 0.01 else "%.1f" % f
 
 
 func bracket_text() -> String:
@@ -871,15 +1995,17 @@ func bracket_text() -> String:
 				lines.append("  %s advances (bye)%s" % [str(mm.get("a_name", "?")), marker])
 			else:
 				var w := ""
-				if str(mm.get("winner_id", "")) != "":
+				if bool(mm.get("drawn", false)):
+					w = "  => DRAW SPLIT"
+				elif str(mm.get("winner_id", "")) != "":
 					if _la:
 						var ln := str(mm.get("b_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("a_name", "?"))
 						w = "  => %s (loser advances)" % ln
 					else:
 						var wn := str(mm.get("a_name", "?")) if str(mm.get("winner_id", "")) == str(mm.get("a_id", "")) else str(mm.get("b_name", "?"))
 						w = "  => %s" % wn
-				lines.append("  %s %d - %d %s%s%s" % [str(mm.get("a_name", "?")),
-					int(mm.get("wins_a", 0)), int(mm.get("wins_b", 0)),
+				lines.append("  %s %s - %s %s%s%s" % [str(mm.get("a_name", "?")),
+					_fmt_wins(mm.get("wins_a", 0)), _fmt_wins(mm.get("wins_b", 0)),
 					str(mm.get("b_name", "?")), w, marker])
 	if str(tourney.get("status", "")) == "complete":
 		lines.append("CHAMPION: %s" % champion_name())
@@ -917,3 +2043,864 @@ func load_state_file(path: String) -> bool:
 func quit_to_menu() -> void:
 	arena = null
 	get_tree().change_scene_to_file("res://scenes/MainMenu.tscn")
+
+
+# ── Group-stage events (evolution size-16) ──────────────────────────
+# One event = 4 round-robin group files (A-D) + 1 single-elim final,
+# chained by an event manifest (tournaments/E<id>.json). Bracket files
+# stay ordinary tournaments, so the battle loop, banking, review and
+# resume paths are untouched; only scheduling (fixed RR order, no
+# winner-progression rebuild) and advancement (standings) differ.
+
+
+func event_path(event_id: String) -> String:
+	return tournament_dir.path_join(str(event_id) + ".json")
+
+
+func event_load(event_id: String) -> Dictionary:
+	var f := FileAccess.open(event_path(event_id), FileAccess.READ)
+	if f == null:
+		return {}
+	var parsed = JSON.parse_string(f.get_as_text())
+	f.close()
+	return parsed if parsed is Dictionary else {}
+
+
+func event_load_cached(event_id: String) -> Dictionary:
+	# Mtime-gated manifest read for tick paths: serves memory when the
+	# file is unchanged (writers write through below). Falls back to a
+	# fresh parse on any change or miss.
+	if event_id != "" and event_cache.get("id", "") == event_id:
+		var mtime := FileAccess.get_modified_time(event_path(event_id))
+		if mtime > 0 and mtime == event_cache_mtime:
+			return event_cache
+	var ev := event_load(event_id)
+	if not ev.is_empty():
+		event_cache = ev
+		event_cache_mtime = FileAccess.get_modified_time(event_path(event_id))
+	return ev
+
+
+func event_save(ev: Dictionary) -> bool:
+	var f := FileAccess.open(event_path(str(ev.get("id", ""))), FileAccess.WRITE)
+	if f == null:
+		return false
+	f.store_string(JSON.stringify(ev, "\t"))
+	f.close()
+	event_cache = ev
+	event_cache_mtime = FileAccess.get_modified_time(event_path(str(ev.get("id", ""))))
+	return true
+
+
+func _snake_sort(player_dicts: Array) -> Array:
+	# ELO desc, deterministic (strength, then name): the snake draft
+	# input, so groups balance star power evenly.
+	var out: Array = player_dicts.duplicate()
+	out.sort_custom(func(a, b):
+		var sa := _strength(a)
+		var sb := _strength(b)
+		if sa[0] != sb[0]:
+			return sa[0] > sb[0]
+		if sa[1] != sb[1]:
+			return sa[1] > sb[1]
+		if sa[2] != sb[2]:
+			return sa[2] > sb[2]
+		return str(sa[3]) < str(sb[3]))
+	return out
+
+
+func event_begin(player_ids: Array, settings: Dictionary, generation: int, brains_override: Array = []) -> Dictionary:
+	# Snake-drafts exactly 16 brains into groups A-D (ranks
+	# 1,8,9,16 / 2,7,10,15 / 3,6,11,14 / 4,5,12,13) and writes the
+	# event manifest. Returns {ok, event_id, groups}.
+	var all_brains: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
+	var by_id := {}
+	for b in all_brains:
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	var players: Array = []
+	for pid in player_ids:
+		if by_id.has(str(pid)):
+			players.append(by_id[str(pid)])
+	if players.size() != 16:
+		return {"ok": false, "error": "group events need exactly 16 brains"}
+	players = _snake_sort(players)
+	var snake := [[0, 7, 8, 15], [1, 6, 9, 14], [2, 5, 10, 13], [3, 4, 11, 12]]
+	var letters := ["A", "B", "C", "D"]
+	var eid := "E" + _next_tournament_id().trim_prefix("T")
+	var en := 0
+	while FileAccess.file_exists(event_path(eid)):
+		en += 1
+		eid = "E" + _next_tournament_id().trim_prefix("T") + "-%d" % en
+	var groups := {}
+	for gi in range(4):
+		var gp: Array = []
+		for idx in snake[gi]:
+			gp.append(str(((players[idx]) as Dictionary).get("id", "")))
+		groups[letters[gi]] = {"players": gp, "bracket_id": "",
+			"standings": [], "done": false}
+	var ev := {"id": eid, "status": "running", "generation": generation,
+		"settings": settings, "groups": groups,
+		"group_order": letters, "final_id": "", "champion_id": "",
+		"pool": [], "phase": "groups_A",
+		"created": Time.get_datetime_string_from_system()}
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot write event file"}
+	return {"ok": true, "event_id": eid, "groups": groups}
+
+
+func build_group_bracket(group_dicts: Array, group_letter: String, event_id: String, best_of: int, lr_scale: float, round_time: float = 40.0) -> Dictionary:
+	# One 4-fighter round-robin file: canonical circle-method schedule
+	# (every pairing meets exactly once: 03/12, 02/31, 01/23).
+	if group_dicts.size() != 4:
+		return {"ok": false, "error": "groups need 4 brains"}
+	var sched := [[0, 3], [1, 2], [0, 2], [3, 1], [0, 1], [2, 3]]
+	var rounds: Array = []
+	for r in range(3):
+		var row: Array = []
+		for k in range(2):
+			var pair: Array = sched[r * 2 + k]
+			row.append(_new_match(group_dicts[pair[0]], group_dicts[pair[1]]))
+		rounds.append(row)
+	var tid := _next_tournament_id()
+	tourney = {"id": tid, "status": "running", "format": "groups",
+		"group": group_letter, "event_id": event_id, "phase": "groups_" + group_letter,
+		"size": 4, "best_of": best_of, "wins_needed": best_of / 2 + 1,
+		"lr_scale": lr_scale, "round_time": round_time, "quick": false,
+		"seeding": "snake", "random_draw": false, "consolation": false,
+		"losers_start_round": -1, "last_place_id": "",
+		"created": Time.get_datetime_string_from_system(),
+		"players": group_dicts, "byes": [],
+		"rounds": rounds, "current_round": 0, "current_match": 0,
+		"champion_id": ""}
+	sudden_death_armed = false
+	save_state()
+	return {"ok": true, "tournament_id": tid}
+
+
+func group_standings(t: Dictionary = {}) -> Array:
+	# [{id, name, wins, kos, matches, elo, dnf}] sorted wins desc, KO
+	# scored desc, snapshot ELO desc. Undecided matches don't count.
+	# dnf = timeout-tie battles fought (both sides of every drawn
+	# battle implicate); feeds the booster rule. Defaults to the
+	# loaded tourney; pass any bracket dict for overviews.
+	var src: Dictionary = t if not t.is_empty() else tourney
+	var table := {}
+	for p in src.get("players", []):
+		var pd := p as Dictionary
+		var pid := str(pd.get("id", ""))
+		if pid != "":
+			table[pid] = {"id": pid, "name": str(pd.get("name", "?")),
+				"wins": 0, "kos": 0, "matches": 0, "dnf": 0,
+				"elo": float((pd.get("record", {}) as Dictionary).get("elo", 1200.0))}
+	for rnd in (src.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			var m := mm as Dictionary
+			var wid := str(m.get("winner_id", ""))
+			var split := wid == "" and bool(m.get("drawn", false))
+			if wid == "" and not split:
+				continue
+			for slot in ["a", "b"]:
+				var sid := str(m.get(slot + "_id", ""))
+				if table.has(sid):
+					var row: Dictionary = table[sid]
+					row["matches"] = int(row.get("matches", 0)) + 1
+					row["kos"] = int(row.get("kos", 0)) + int(m.get("ko_" + slot, 0))
+					row["dnf"] = int(row.get("dnf", 0)) + int(m.get("draws", 0))
+					if split:
+						row["wins"] = float(row.get("wins", 0)) + 0.5
+			if table.has(wid):
+				var wrow: Dictionary = table[wid]
+				wrow["wins"] = float(wrow.get("wins", 0)) + 1.0
+	var out: Array = table.values()
+	out.sort_custom(func(x, y):
+		if float(x["wins"]) != float(y["wins"]):
+			return float(x["wins"]) > float(y["wins"])
+		if int(x["kos"]) != int(y["kos"]):
+			return int(x["kos"]) > int(y["kos"])
+		return float(x["elo"]) > float(y["elo"]))
+	return out
+
+
+func event_note_bracket(event_id: String, group_letter: String, bracket_id: String) -> void:
+	# Stamp the file id at BUILD time (completion records standings
+	# later): the overview can already match the live file mid-group.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return
+	var groups: Dictionary = ev.get("groups", {})
+	if groups.has(group_letter):
+		(groups[group_letter] as Dictionary)["bracket_id"] = bracket_id
+		event_save(ev)
+
+
+func event_booster_set() -> Array:
+	# Booster rule (pure over the loaded group bracket file — call with
+	# the completed group file loaded, same contract as
+	# event_record_group): a fly qualifies iff it played >=1 match
+	# (bye/vacant/undecided excluded by the canonical predicate) AND
+	# every played match has draws >= 1 — a timeout-tie in each outing,
+	# both sides implicated per drawn battle. Winners included: the
+	# rule is mechanical, extra school never hurts. Returns [ids].
+	var out: Array = []
+	var played := {}
+	var all_dnf := {}
+	for rnd in (tourney.get("rounds", []) as Array):
+		for mm in (rnd as Array):
+			var m := mm as Dictionary
+			var wid := str(m.get("winner_id", ""))
+			var split := wid == "" and bool(m.get("drawn", false))
+			if wid == "" and not split:
+				continue
+			var draws := int(m.get("draws", 0))
+			for slot in ["a", "b"]:
+				var sid := str(m.get(slot + "_id", ""))
+				if sid == "":
+					continue
+				played[sid] = true
+				if draws < 1:
+					all_dnf[sid] = false
+				elif not all_dnf.has(sid):
+					all_dnf[sid] = true
+	for pid in played.keys():
+		if bool(all_dnf.get(pid, false)):
+			out.append(str(pid))
+	return out
+
+
+func event_booster_queue(event_id: String) -> Dictionary:
+	# Post-event booster schooling: every marked brain gets +50 eps
+	# with the school curriculum (own stored wiring/rates — same
+	# whitelist as the top-up trainer). Skips ghosts (left the vault)
+	# and ids already queued/active (enqueue appends blindly). Called
+	# BEFORE elimination (the archived leave the vault). One pump at
+	# the end; hold_spawns keeps boots out of fights. Winners and
+	# eliminated alike: the rule is mechanical. Returns {ok, queued}.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var queued: Array = []
+	var by_id := {}
+	for b in list_brains_cached():
+		by_id[str((b as Dictionary).get("id", ""))] = b
+	for pid in (ev.get("booster", []) as Array):
+		var s := str(pid)
+		if not by_id.has(s):
+			continue
+		var busy := str(active_job.get("brain_id", "")) == s
+		if not busy:
+			for item in train_queue:
+				if str((item as Dictionary).get("id", "")) == s:
+					busy = true
+					break
+		if busy:
+			continue
+		var bd: Dictionary = by_id[s]
+		var gp: Dictionary = (bd as Dictionary).get("generator_params", {})
+		var params := {}
+		for k in ["variant", "seed", "learning_rate", "dist_gain",
+				"evasion", "align_bonus", "experiment", "genome",
+				"genome_id", "mapping", "yaw_bias"]:
+			if gp.has(k):
+				params[k] = gp[k]
+		params["curriculum"] = {}
+		params["booster"] = {"event": event_id}
+		enqueue_training(s, str(bd.get("name", "?")) + " [BOOSTER]",
+			50, params)
+		queued.append(s)
+	pump_train_queue()
+	return {"ok": true, "queued": queued}
+
+
+func event_record_group(event_id: String, group_letter: String) -> Dictionary:
+	# Call with the completed group file loaded: banks its standings
+	# into the manifest and stamps the bracket id. Also banks the
+	# booster set (per-group list + accumulated top-level list, deduped)
+	# for post-event +50 booster schooling.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var groups: Dictionary = ev.get("groups", {})
+	if not groups.has(group_letter):
+		return {"ok": false, "error": "no such group"}
+	var st := group_standings()
+	var boosters := event_booster_set()
+	var g: Dictionary = groups[group_letter]
+	g["standings"] = st
+	g["done"] = true
+	g["bracket_id"] = str(tourney.get("id", ""))
+	g["booster"] = boosters
+	var accum: Array = ev.get("booster", [])
+	for pid in boosters:
+		if not (pid in accum):
+			accum.append(pid)
+	ev["booster"] = accum
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "standings": st, "booster": boosters}
+
+
+func build_final_bracket(advancer_ids: Array, event_id: String, best_of: int, lr_scale: float, round_time: float = 40.0, brains_override: Array = []) -> Dictionary:
+	# 8 advancers in fixed QF order (A1vB2, C1vD2, B1vA2, D1vC2):
+	# consecutive pairing, no re-seeding. Standard single elim, no
+	# consolation (elimination runs on the ELO rule instead).
+	if advancer_ids.size() != 8:
+		return {"ok": false, "error": "finals need 8 advancers"}
+	var res := build_bracket(advancer_ids, 8, best_of, lr_scale,
+		round_time, false, brains_override, false, false, true)
+	if not bool(res.get("ok", false)):
+		return res
+	tourney["event_id"] = event_id
+	tourney["phase"] = "final"
+	save_state()
+	return res
+
+
+func event_advancers(event_id: String) -> Dictionary:
+	# Top 2 per group in QF order from recorded standings.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var order: Array = []
+	for g in ["A", "C", "B", "D"]:
+		var st: Array = ((ev.get("groups", {}) as Dictionary).get(g, {}) as Dictionary).get("standings", [])
+		if st.size() < 2:
+			return {"ok": false, "error": "group %s unfinished" % g}
+		order.append(str((st[0] as Dictionary).get("id", "")))
+		order.append(str((st[1] as Dictionary).get("id", "")))
+	# order is A1,A2,C1,C2,B1,B2,D1,D2 -> interleave to
+	# A1vB2, C1vD2, B1vA2, D1vC2.
+	var qf := [order[0], order[5], order[2], order[7],
+		order[4], order[1], order[6], order[3]]
+	return {"ok": true, "advancers": qf}
+
+
+func event_eliminate_candidates(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
+	# Worst-first elimination order: event participants with CAREER
+	# matches >= min_matches (vault record, not this event's files —
+	# a whole event only plays ~6) and live ELO below the cutoff,
+	# lowest ELO first. Green brains (< min_matches career) are never
+	# demoted no matter how low their ELO. Fewer than 2 qualifiers is
+	# a loud failure, never a silent widening: the loop must not eat
+	# the unproven. Pure (no archiving) so the rule is unit-testable;
+	# event_eliminate archives the bottom two.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var bids: Array = []
+	for g in (ev.get("group_order", []) as Array):
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+		if str(gd.get("bracket_id", "")) != "":
+			bids.append(str(gd.get("bracket_id", "")))
+	if str(ev.get("final_id", "")) != "":
+		bids.append(str(ev.get("final_id", "")))
+	var played := {}
+	for bid in bids:
+		var f := FileAccess.open(tournament_dir.path_join(bid + ".json"), FileAccess.READ)
+		if f == null:
+			continue
+		var t = JSON.parse_string(f.get_as_text())
+		f.close()
+		if not (t is Dictionary):
+			continue
+		for rnd in ((t as Dictionary).get("rounds", []) as Array):
+			for mm in (rnd as Array):
+				var m := mm as Dictionary
+				if str(m.get("winner_id", "")) == "" \
+						and not bool(m.get("drawn", false)):
+					continue
+				for slot in ["a", "b"]:
+					var sid := str(m.get(slot + "_id", ""))
+					if sid != "":
+						played[sid] = int(played.get(sid, 0)) + 1
+	var cards := _event_live_cards(live_override)
+	var experienced: Array = []
+	for pid in played.keys():
+		if not cards.has(pid):
+			continue
+		# Career gate (vault record matches): green brains stay out
+		# of the axe regardless of ELO.
+		if int((cards[pid] as Dictionary).get("matches", 0)) >= min_matches:
+			experienced.append(pid)
+	experienced.sort_custom(func(x, y): return float((cards[x] as Dictionary).get("elo", 0.0)) < float((cards[y] as Dictionary).get("elo", 0.0)))
+	if elo_cutoff > 0.0:
+		var cut: Array = []
+		for pid in experienced:
+			if float((cards[pid] as Dictionary).get("elo", 0.0)) < elo_cutoff:
+				cut.append(pid)
+		if cut.size() >= 2:
+			return {"ok": true, "candidates": cut}
+	return {"ok": true, "candidates": experienced}
+
+
+func event_eliminate(event_id: String, min_matches: int = 10, elo_cutoff: float = 0.0) -> Dictionary:
+	# Archives the bottom two candidates with the reason stamped.
+	var cands := event_eliminate_candidates(event_id, min_matches, elo_cutoff)
+	if not bool(cands.get("ok", false)):
+		return cands
+	var order: Array = cands.get("candidates", [])
+	if order.size() < 2:
+		return {"ok": false, "error": "fewer than 2 eligible brains"}
+	var live := {}
+	for b in list_brains_cached():
+		var bd := b as Dictionary
+		live[str(bd.get("id", ""))] = float((bd.get("record", {}) as Dictionary).get("elo", 1200.0))
+	var out: Array = [order[0], order[1]]
+	for pid in out:
+		var ar := evo_archive(pid, "event %s elimination (ELO %.0f)" % [event_id, float(live.get(pid, 1200.0))])
+		if not bool(ar.get("ok", false)):
+			return {"ok": false, "error": str(ar.get("error", "?"))}
+	return {"ok": true, "eliminated": out}
+
+
+func forfeit_fighter(brain_id: String, reason: String) -> Dictionary:
+	# Walkover for every undecided match holding a vanished fighter
+	# (vault file archived/deleted mid-event): the present opponent
+	# advances with bye semantics, stamped skipped for honest display.
+	# Decided matches stand (their data is already banked or audited).
+	# Unfought walkovers never enter a report cache, so no phantom ELO
+	# banks; standings count them like seeding byes. Returns
+	# {ok, forfeited: ["R1M1", ...]} (empty = nothing undecided left).
+	# Edge (consolation loser-advance): the loser slot may name the
+	# vanished fighter downstream - the load fast-path re-fires per
+	# occurrence, so each future match forfeits on demand instead of
+	# stalling.
+	var pid := str(brain_id)
+	if pid == "":
+		return {"ok": false, "error": "empty id"}
+	var done: Array = []
+	var rounds: Array = tourney.get("rounds", [])
+	for ri in range(rounds.size()):
+		var rms: Array = rounds[ri]
+		for mi in range(rms.size()):
+			var m := rms[mi] as Dictionary
+			if str(m.get("winner_id", "")) != "":
+				continue
+			var other := ""
+			if str(m.get("a_id", "")) == pid:
+				other = str(m.get("b_id", ""))
+			elif str(m.get("b_id", "")) == pid:
+				other = str(m.get("a_id", ""))
+			else:
+				continue
+			if other == "":
+				continue
+			m["winner_id"] = other
+			m["skipped"] = true
+			m["walkover"] = str(reason)
+			done.append("R%dM%d" % [ri + 1, mi + 1])
+	if not done.is_empty():
+		print("[Director] Walkover %s (%d matches): %s" % [pid, done.size(), reason])
+		save_state()
+	return {"ok": true, "forfeited": done}
+
+
+func live_participant_spots(brain_id: String) -> Array:
+	# Every live bracket holding this fighter: [tournament file ids]
+	# across the loaded tourney (when running) and all running event
+	# manifests. Pure readout for the delete guard (menu) and forensics.
+	var pid := str(brain_id)
+	var spots: Array = []
+	if pid == "":
+		return spots
+	if str(tourney.get("status", "")) == "running":
+		for p in (tourney.get("players", []) as Array):
+			if str((p as Dictionary).get("id", "")) == pid:
+				spots.append(str(tourney.get("id", "live")))
+				break
+	if not DirAccess.dir_exists_absolute(tournament_dir):
+		return spots
+	for f in DirAccess.get_files_at(tournament_dir):
+		if not (str(f).begins_with("E") and str(f).ends_with(".json")):
+			continue
+		var fh := FileAccess.open(tournament_dir.path_join(str(f)), FileAccess.READ)
+		if fh == null:
+			continue
+		var ev = JSON.parse_string(fh.get_as_text())
+		fh.close()
+		if not (ev is Dictionary):
+			continue
+		if str((ev as Dictionary).get("status", "")) != "running":
+			continue
+		for g in ((ev as Dictionary).get("group_order", []) as Array):
+			var gd: Dictionary = ((ev as Dictionary).get("groups", {}) as Dictionary).get(str(g), {})
+			for pl in (gd.get("players", []) as Array):
+				if str(pl) == pid and not (str((ev as Dictionary).get("id", "")) in spots):
+					spots.append(str((ev as Dictionary).get("id", "")))
+	return spots
+
+
+func _event_live_elo(live_override: Dictionary = {}) -> Dictionary:
+	# Plain {id: elo} view (override values may be floats or full
+	# cards - normalized here so trim/sort math never sees a dict).
+	var cards := _event_live_cards(live_override)
+	var out := {}
+	for pid in cards.keys():
+		out[pid] = float((cards[pid] as Dictionary).get("elo", 0.0))
+	return out
+
+
+func _event_live_card(bd: Dictionary) -> Dictionary:
+	# Full live card for pool/elimination math: rating, schooling and
+	# ring experience in one place.
+	var r: Dictionary = bd.get("record", {})
+	var t: Dictionary = bd.get("training", {})
+	return {"elo": float(r.get("elo", 1200.0)),
+		"train": int(t.get("episodes", 0)),
+		"matches": int(r.get("matches", 0))}
+
+
+func _event_live_cards(live_override: Dictionary = {}) -> Dictionary:
+	var cards := {}
+	if not live_override.is_empty():
+		for pid in live_override.keys():
+			var v = live_override[pid]
+			if v is Dictionary:
+				cards[str(pid)] = v
+			else:
+				cards[str(pid)] = {"elo": float(v), "train": 0, "matches": 0}
+		return cards
+	# Cached roster: this feeds the 5 s watcher tick mid-battle (pool
+	# maintain/drain); an uncached shell here froze the fight ~1-2 s
+	# every tick. Pool math tolerates 60 s staleness.
+	for b in list_brains_cached():
+		var bd := b as Dictionary
+		cards[str(bd.get("id", ""))] = _event_live_card(bd)
+	return cards
+
+
+func event_pool_add(event_id: String, ids: Array, live_override: Dictionary = {}) -> Dictionary:
+	# Bench bred offspring (cap 4, lowest live ELO trimmed first).
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var pool: Array = ev.get("pool", [])
+	for pid in ids:
+		var s := str(pid)
+		if s != "" and not (s in pool):
+			pool.append(s)
+	while pool.size() > 4:
+		var live := _event_live_elo(live_override)
+		pool.sort_custom(func(x, y): return float(live.get(x, 0.0)) < float(live.get(y, 0.0)))
+		pool.remove_at(0)
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "pool": pool}
+
+
+func event_pool_qualified(event_id: String, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}) -> Dictionary:
+	# Bench brains ready for the ring: schooled to min_train episodes
+	# with live ELO at/above the floor (floor <= 0 disables). Pure
+	# readout for handoff/maintain checks; the draw consumes.
+	# Cached manifest (mtime-gated): this feeds the 5 s tick mid-battle.
+	var ev := event_load_cached(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var cards := _event_live_cards(live_override)
+	var qualified: Array = []
+	for pid in (ev.get("pool", []) as Array):
+		var s := str(pid)
+		if not cards.has(s):
+			continue
+		var card: Dictionary = cards[s]
+		if int(card.get("train", 0)) >= min_train \
+				and float(card.get("elo", 0.0)) >= elo_floor:
+			qualified.append(s)
+	return {"ok": true, "qualified": qualified}
+
+
+static func schooled_ids(roster: Array, cards: Dictionary, min_train: int = 50, elo_floor: float = 0.0, exclude := {}) -> Array:
+	# Schooled-gate filter shared by the top-up draw and the fresh-roster
+	# draw: ids with train >= min_train and ELO >= floor, minus the
+	# exclude set. Pure (no files), so the menu can draw before any
+	# event file exists.
+	var out: Array = []
+	for b in roster:
+		var pid := str((b as Dictionary).get("id", ""))
+		if pid == "" or exclude.has(pid) or not cards.has(pid):
+			continue
+		var card: Dictionary = cards[pid]
+		if int(card.get("train", 0)) >= min_train \
+				and float(card.get("elo", 0.0)) >= elo_floor:
+			out.append(pid)
+	return out
+
+
+static func filler_ids(roster: Array, cards: Dictionary, elo_floor: float = 0.0, exclude := {}, skip: Array = [], n: int = 1) -> Array:
+	# Backfill picks for draw-first handoffs: vault brains the strict
+	# schooled draw skipped, ordered greenest-first (fewest career
+	# matches, then most school episodes) so debutants field while the
+	# school loop tops them up in parallel mid-event. The ELO floor
+	# and the exclusion set still apply (demotion line and current
+	# fighters stay out); only the school-episode bar relaxes. skip
+	# carries already-drawn ids so one handoff never fields the same
+	# brain twice. Pure (no files).
+	var skipset := {}
+	for pid in skip:
+		skipset[str(pid)] = true
+	var cands: Array = []
+	for b in roster:
+		var pid := str((b as Dictionary).get("id", ""))
+		if pid == "" or exclude.has(pid) or skipset.has(pid) \
+				or not cards.has(pid):
+			continue
+		if float((cards[pid] as Dictionary).get("elo", 0.0)) >= elo_floor:
+			cands.append(pid)
+	cands.sort_custom(func(a, b):
+		var ca: Dictionary = cards[str(a)]
+		var cb: Dictionary = cards[str(b)]
+		var ma := int(ca.get("matches", 0))
+		var mb := int(cb.get("matches", 0))
+		if ma != mb:
+			return ma < mb
+		return int(ca.get("train", 0)) > int(cb.get("train", 0)))
+	return cands.slice(0, mini(n, cands.size()))
+
+
+static func draw_green_picks(qualified: Array, cards: Dictionary, n: int) -> Array:	# Green-weighted random draw: one weighted pass per slot with weight
+	# 1/(1+matches), so debutants surface first while veterans stay
+	# possible. Pure apart from the RNG; short bags just draw short
+	# (callers gate on the count).
+	var drawn: Array = []
+	var bag: Array = qualified.duplicate()
+	for _i in range(n):
+		if bag.is_empty():
+			break
+		var total := 0.0
+		for pid in bag:
+			total += 1.0 / (1.0 + float((cards.get(str(pid), {}) as Dictionary).get("matches", 0)))
+		var roll := randf() * total
+		var pick := str(bag[bag.size() - 1])
+		for pid in bag:
+			roll -= 1.0 / (1.0 + float((cards.get(str(pid), {}) as Dictionary).get("matches", 0)))
+			if roll <= 0.0:
+				pick = str(pid)
+				break
+		drawn.append(pick)
+		bag.erase(pick)
+	return drawn
+
+
+func event_draw_candidates(event_id: String, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = [], include_participants: bool = false) -> Dictionary:
+	# Promotion pool: the ENTIRE vault, not the bench — every schooled
+	# brain (train >= min_train, ELO >= floor) outside the current
+	# event's players. Archived brains are absent from the vault, so
+	# they can never draw. Current-event players are excluded (they
+	# advance or eliminate on their own path; survivors re-enter via
+	# the roster, never the draw) unless include_participants rides
+	# along for a full fresh-roster draw. Pure readout; the draw
+	# consumes.
+	var ev := event_load_cached(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var participants := {}
+	if not include_participants:
+		for g in (ev.get("group_order", []) as Array):
+			var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				participants[str(pid)] = true
+	var roster: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
+	var cards := _event_live_cards(live_override)
+	var qualified := schooled_ids(roster, cards, min_train, elo_floor, participants)
+	return {"ok": true, "qualified": qualified}
+
+
+func event_draw_roster(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+	# Full fresh roster for redraw mode: same schooled gate and green
+	# weighting as the top-up draw, but NOBODY is excluded (last
+	# iteration's fighters may re-qualify — that is the point of a new
+	# random draw). Drawn ids still leave the bench pool when present
+	# there: ring fighters must not also sit on the bench.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var q := event_draw_candidates(event_id, min_train, elo_floor,
+		live_override, brains_override, true)
+	if not bool(q.get("ok", false)):
+		return q
+	var qualified: Array = q.get("qualified", [])
+	if qualified.size() < n:
+		return {"ok": false, "error": "roster short (%d/%d schooled)" % [qualified.size(), n]}
+	var cards := _event_live_cards(live_override)
+	var drawn := draw_green_picks(qualified, cards, n)
+	var pool: Array = ev.get("pool", [])
+	for pid in drawn:
+		pool.erase(str(pid))
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}
+
+
+func event_draw_pool(event_id: String, n: int, min_train: int = 50, elo_floor: float = 0.0, live_override: Dictionary = {}, brains_override: Array = [], include_participants: bool = false) -> Dictionary:
+	# Random draw weighted toward the least-experienced qualifiers
+	# (weight 1/(1+matches)): every schooled vault brain cycles into
+	# the ring over time instead of the top-ELO pair hogging every
+	# event. Drawn ids leave the bench pool when present there.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var q := event_draw_candidates(event_id, min_train, elo_floor,
+		live_override, brains_override, include_participants)
+	if not bool(q.get("ok", false)):
+		return q
+	var qualified: Array = q.get("qualified", [])
+	if qualified.size() < n:
+		return {"ok": false, "error": "pool short (%d/%d qualified)" % [qualified.size(), n]}
+	var cards := _event_live_cards(live_override)
+	var drawn := draw_green_picks(qualified, cards, n)
+	var pool: Array = ev.get("pool", [])
+	for pid in drawn:
+		pool.erase(str(pid))
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "drawn": drawn, "pool": ev["pool"]}
+
+
+func event_draw_backfill(event_id: String, n: int, elo_floor: float = 0.0, skip: Array = [], include_participants: bool = false, live_override: Dictionary = {}, brains_override: Array = []) -> Dictionary:
+	# Draw-first backfill: greenest-first vault bodies the strict
+	# schooled draw skipped, so a handoff fields NOW instead of
+	# waiting on breeding/schooling. Same ELO floor and participant
+	# exclusion as the strict draws; skip carries their drawn ids so
+	# one handoff never fields the same brain twice. Drawn ids leave
+	# the bench pool like strict picks. Fails only when even bodies
+	# run short (true empty vault).
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var participants := {}
+	if not include_participants:
+		for g in (ev.get("group_order", []) as Array):
+			var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(str(g), {})
+			for pid in (gd.get("players", []) as Array):
+				participants[str(pid)] = true
+	var roster: Array = brains_override if not brains_override.is_empty() else list_brains_cached()
+	var cards := _event_live_cards(live_override)
+	var drawn := filler_ids(roster, cards, elo_floor, participants, skip, n)
+	if drawn.size() < n:
+		return {"ok": false, "error": "backfill short (%d/%d bodies)" % [drawn.size(), n]}
+	var pool: Array = ev.get("pool", [])
+	for pid in drawn:
+		pool.erase(str(pid))
+	ev["pool"] = pool
+	if not event_save(ev):
+		return {"ok": false, "error": "cannot save event"}
+	return {"ok": true, "drawn": drawn, "pool": pool}
+
+
+func event_overview_data(event_id: String) -> Dictionary:
+	# 2x2 overview assembly: per group {letter, players, rounds,
+	# standings, is_current, is_done, bracket_id}. Sibling files load
+	# read-only; the loaded tourney (when it belongs to this event)
+	# supplies the live table. Display-only, never written back.
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return {}
+	var live_id := str(tourney.get("id", ""))
+	var live_event := str(tourney.get("event_id", ""))
+	var out: Array = []
+	for g in (ev.get("group_order", []) as Array):
+		var letter := str(g)
+		var gd: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+		var bid := str(gd.get("bracket_id", ""))
+		var is_current := bid != "" and bid == live_id and live_event == event_id
+		var cell := {"letter": letter, "players": [], "rounds": [],
+			"standings": [], "is_current": is_current,
+			"is_done": bool(gd.get("done", false)), "bracket_id": bid,
+			"cur_round": -1, "cur_match": -1}
+		if is_current:
+			cell["players"] = tourney.get("players", [])
+			cell["rounds"] = tourney.get("rounds", [])
+			cell["standings"] = group_standings()
+			cell["cur_round"] = int(tourney.get("current_round", 0))
+			cell["cur_match"] = int(tourney.get("current_match", 0))
+		elif bid != "":
+			var f := FileAccess.open(tournament_dir.path_join(bid + ".json"), FileAccess.READ)
+			if f != null:
+				var t = JSON.parse_string(f.get_as_text())
+				f.close()
+				if t is Dictionary:
+					cell["players"] = (t as Dictionary).get("players", [])
+					cell["rounds"] = (t as Dictionary).get("rounds", [])
+					cell["standings"] = group_standings(t)
+		if (cell["players"] as Array).is_empty():
+			# Upcoming group (no file yet): resolve manifest ids to
+			# cards for the preview table.
+			var by_id := {}
+			for b in list_brains_cached():
+				by_id[str((b as Dictionary).get("id", ""))] = b
+			var cards: Array = []
+			var gd2: Dictionary = (ev.get("groups", {}) as Dictionary).get(letter, {})
+			for pid in (gd2.get("players", []) as Array):
+				if by_id.has(str(pid)):
+					cards.append(by_id[str(pid)])
+			cell["players"] = cards
+		if (cell["standings"] as Array).is_empty():
+			cell["standings"] = group_standings({"players": cell["players"], "rounds": []})
+		out.append(cell)
+	return {"groups": out,
+		"current": str(tourney.get("group", "")) if live_event == event_id and str(tourney.get("format", "")) == "groups" else ""}
+
+
+func event_topup_pick(event_id: String, target: int = 50, live_override: Dictionary = {}) -> Dictionary:
+	# Least-trained bench brain below target: {ok, id, name, episodes,
+	# deficit}. Pure over live cards (override for tests); empty when
+	# the whole bench already graduated. Cached manifest (mtime-gated):
+	# this feeds the 30 s top-up tick.
+	var ev := event_load_cached(event_id)
+	if ev.is_empty():
+		return {"ok": false, "error": "no such event"}
+	var cards := _event_live_cards(live_override)
+	var worst := ""
+	var worst_eps := target
+	for pid in (ev.get("pool", []) as Array):
+		var s := str(pid)
+		if not cards.has(s):
+			continue
+		var eps := int((cards[s] as Dictionary).get("train", 0))
+		if eps < worst_eps:
+			worst_eps = eps
+			worst = s
+	if worst == "":
+		return {"ok": false, "error": "bench graduated"}
+	return {"ok": true, "id": worst, "episodes": worst_eps,
+		"deficit": target - worst_eps}
+
+
+func event_next_group(event_id: String, after_letter: String = "") -> String:
+	# First unfinished group after the given letter ("" = from the top):
+	# the gallery preview target. "" when every group is done (final).
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return ""
+	var groups: Dictionary = ev.get("groups", {})
+	var order: Array = ev.get("group_order", [])
+	var past := after_letter == ""
+	for g in order:
+		var letter := str(g)
+		if not past:
+			if letter == after_letter:
+				past = true
+			continue
+		if not bool((groups.get(letter, {}) as Dictionary).get("done", false)):
+			return letter
+	return ""
+
+
+func event_set_phase(event_id: String, phase: String) -> void:
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return
+	ev["phase"] = phase
+	event_save(ev)
+
+
+func event_finish(event_id: String, champion_id: String) -> void:
+	var ev := event_load(event_id)
+	if ev.is_empty():
+		return
+	ev["status"] = "complete"
+	ev["phase"] = "done"
+	ev["champion_id"] = champion_id
+	event_save(ev)

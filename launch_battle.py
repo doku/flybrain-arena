@@ -26,11 +26,28 @@ def port_in_use(port):
         s.close()
 
 
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def rotate_log_if_needed(log_path, max_size=MAX_LOG_SIZE):
+    """Rotates log file to .old if it exceeds max_size."""
+    if os.path.isfile(log_path):
+        try:
+            if os.path.getsize(log_path) > max_size:
+                old_path = log_path + ".old"
+                if os.path.isfile(old_path):
+                    os.remove(old_path)
+                os.replace(log_path, old_path)
+        except OSError:
+            pass
+
+
 def pump_server_log(proc, log_path):
     """Drains the server's stdout to a log file. The pipe is NEVER read by
     the parent otherwise, so without this the server blocks forever once
     the OS pipe buffer fills (~4 KB) - typically wedged mid-print during
     a tournament_load, i.e. stuck at LOADING with live animations."""
+    rotate_log_if_needed(log_path)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"\n===== server launch {datetime.now().isoformat(timespec='seconds')} =====\n")
         f.flush()
@@ -94,7 +111,17 @@ def main():
             env=env
         )
     finally:
-        print("\n[*] Shutting down Connectome Server...")
+        # Exit-code honesty: a nonzero Godot return means the game
+        # crashed (or was killed) rather than quit cleanly - say so,
+        # so the next mid-event vanishing window is diagnosable here
+        # instead of reading as a server shutdown.
+        code = godot_proc.returncode if "godot_proc" in dir() else "?"
+        if code == 0:
+            print("\n[*] Godot exited clean (code 0).")
+        else:
+            print(f"\n[*] Godot is gone with exit code {code} - "
+                  "CRASH/KILL suspected, not a clean quit.")
+        print("[*] Shutting down Connectome Server...")
         server_proc.terminate()
         try:
             server_proc.wait(timeout=3)

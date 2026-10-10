@@ -1,0 +1,156 @@
+extends SceneTree
+## Headless menu-page tests: the menu opens on three tabbed pages (fly
+## brains / training / tournament) with exactly one visible, tabs
+## switch visibility without rebuilding, and every former column
+## widget still exists exactly once. _build_layout is pure widgets
+## (no vault I/O), so a tree-less instance suffices - _ready never runs.
+## Run: godot --headless --path arena -s tests/test_menu_pages.gd
+## Exit code = failure count (0 = all green).
+
+var failures := 0
+var menu = null
+
+
+func _check(cond: bool, label: String) -> void:
+	if cond:
+		print("PASS: ", label)
+	else:
+		failures += 1
+		printerr("FAIL: ", label)
+
+
+func _initialize() -> void:
+	var scr = load("res://scripts/MainMenu.gd")
+	if scr == null or not scr.can_instantiate():
+		printerr("FAIL: menu script loads")
+		failures += 1
+		quit(failures)
+		return
+	menu = scr.new()
+	menu._build_layout()
+
+
+func _is_on_page(node: Control, page_idx: int) -> bool:
+	var p: Control = menu._menu_pages[page_idx]
+	return p.is_ancestor_of(node)
+
+
+func _process(_delta: float) -> bool:
+	_check(menu._menu_pages.size() == 3, "three pages")
+	_check(menu._page_buttons.size() == 3, "three tab buttons")
+	_check((menu._menu_pages[0] as Control).visible
+		and not (menu._menu_pages[1] as Control).visible
+		and not (menu._menu_pages[2] as Control).visible,
+		"first page visible at boot")
+	# Every former column landed on its page exactly once.
+	_check(_is_on_page(menu.brain_list, 0), "vault list on brains page")
+	_check(_is_on_page(menu.archive_list_view, 0), "archive on brains page")
+	_check(_is_on_page(menu.detail_label, 0), "detail on brains page")
+	_check(_is_on_page(menu.queue_list, 1), "train queue on training page")
+	_check(_is_on_page(menu.score_list, 1), "score queue on training page")
+	_check(_is_on_page(menu.gen_name, 1), "generate form on training page")
+	_check(_is_on_page(menu.player_list, 2), "participants on tournament page")
+	_check(_is_on_page(menu.resume_button, 2), "resume on tournament page")
+	_check(_is_on_page(menu.quick_button, 2), "quick battle on tournament page")
+	_check(_is_on_page(menu.bracket_view, 2), "bracket on tournament page")
+	# Two columns per page (vertical fit rework): page = HBox holding
+	# two VBox columns.
+	for i in 3:
+		var pg: Control = menu._menu_pages[i]
+		_check(pg is HBoxContainer and pg.get_child_count() == 2,
+			"page %d holds two columns" % i)
+	# Vertical-fit regression: every page's minimum height must fit
+	# the window's page budget. Budget = 720 window - 24 margins -
+	# 201 persistent rows - 56 separations (7 gaps x 8, hidden pages
+	# take no separation) = 439. Headless probes once measured
+	# 505/691/913 and the pages overflowed off-screen.
+	for i in 3:
+		var h: float = (menu._menu_pages[i] as Control).get_combined_minimum_size().y
+		_check(h <= 439.0, "page %d fits vertically (%.0fpx)" % [i, h])
+	# Tab switch flips visibility, keeps widgets.
+	menu._show_menu_page(2)
+	_check((menu._menu_pages[2] as Control).visible
+		and not (menu._menu_pages[0] as Control).visible,
+		"tournament tab shows")
+	_check(_is_on_page(menu.brain_list, 0), "vault list survives switch")
+	menu._show_menu_page(1)
+	_check((menu._menu_pages[1] as Control).visible
+		and not (menu._menu_pages[2] as Control).visible,
+		"training tab shows")
+	# Persistent footer: settings + launch bar outside the pages.
+	_check(menu.bv_enable != null and menu.perf_pip != null
+		and menu.sound_voice != null, "settings rows persist")
+	# Voice picker is gone (fixed clip pack needs no UI): the SOUND
+	# row keeps announcer/sfx toggles, palette, preview - and with no
+	# long voice names left to stretch it, stays narrow by construction.
+	_check(not ("sound_voice_pick" in menu), "no voice picker")
+	_check(menu.sound_palette_pick != null, "palette picker persists")
+	var srow: Control = menu.sound_palette_pick.get_parent()
+	_check(srow.get_combined_minimum_size().x <= 900.0,
+		"SOUND row stays bounded without voice names")
+	_check(menu.evo_pool_threshold != null, "pool threshold spin exists")
+	_check(_is_on_page(menu.queue_up_btn, 1), "queue UP on training page")
+	_check(_is_on_page(menu.queue_down_btn, 1), "queue DOWN on training page")
+	_check(_is_on_page(menu.queue_top_btn, 1), "queue TOP on training page")
+	_check(_is_on_page(menu.queue_episodes, 1), "queue episodes spin on training page")
+	_check(_is_on_page(menu.queue_setep_btn, 1), "queue SET EP on training page")
+	_check(_is_on_page(menu.score_up_btn, 1), "score UP on training page")
+	_check(_is_on_page(menu.score_down_btn, 1), "score DOWN on training page")
+	_check(_is_on_page(menu.tourney_redraw, 2), "fresh-roster toggle on tournament page")
+	_check(not menu.tourney_redraw.button_pressed, "fresh-roster defaults OFF")
+	_check(int(menu.evo_pool_threshold.min_value) == 0
+		and int(menu.evo_pool_threshold.max_value) == 200
+		and int(menu.evo_pool_threshold.value) == 25,
+		"pool threshold 0-200, default 25")
+	test_train_picker()
+	if failures == 0:
+		print("ALL MENU-PAGE TESTS PASSED")
+	else:
+		printerr("MENU-PAGE TESTS: %d FAILURES" % failures)
+	quit(failures)
+	return true
+
+
+func _fake_brains() -> Array:
+	return [{"id": "a1", "name": "Alpha",
+			"record": {"matches": 3, "matches_won": 2, "matches_lost": 1,
+				"tournaments_won": 0, "elo": 1300.0},
+			"training": {"recent_avg": 4.0},
+			"generator_params": {}},
+		{"id": "b2", "name": "Beta",
+			"record": {"matches": 1, "matches_won": 0, "matches_lost": 1,
+				"tournaments_won": 0, "elo": 1200.0},
+			"training": {"recent_avg": 0.0},
+			"generator_params": {}}]
+
+
+func test_train_picker() -> void:
+	# Training page roster: same brains, same order as the vault list
+	# (shared index space, one handler); picking in either list shows
+	# in both; refills follow the brain id, never the row.
+	menu.brains = _fake_brains()
+	menu.selected_brain = {}
+	menu._fill_brain_lists()
+	_check(menu.train_brain_list.item_count == 2, "picker fills with vault")
+	_check(menu.brain_list.item_count == 2, "vault list fills")
+	_check(str(menu.selected_brain.get("id", "")) == "a1",
+		"first brain auto-selected")
+	_check(Array(menu.train_brain_list.get_selected_items()) == [0]
+		and Array(menu.brain_list.get_selected_items()) == [0],
+		"both lists show the pick")
+	menu._on_brain_selected(1)
+	_check(str(menu.selected_brain.get("id", "")) == "b2",
+		"picker index selects the brain")
+	_check(Array(menu.train_brain_list.get_selected_items()) == [1]
+		and Array(menu.brain_list.get_selected_items()) == [1],
+		"vault list mirrors the picker")
+	# Refill with the pick moved: visual follows the id, not the row.
+	menu.brains = [_fake_brains()[1], _fake_brains()[0]]
+	menu._fill_brain_lists()
+	_check(str(menu.selected_brain.get("id", "")) == "b2",
+		"selection survives refill")
+	_check(Array(menu.train_brain_list.get_selected_items()) == [0]
+		and Array(menu.brain_list.get_selected_items()) == [0],
+		"visuals follow the id")
+	var h: float = (menu._menu_pages[1] as Control).get_combined_minimum_size().y
+	_check(h <= 439.0, "training page still fits (%.0fpx)" % h)

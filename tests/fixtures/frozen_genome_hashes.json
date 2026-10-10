@@ -1,0 +1,29 @@
+{
+  "lplc2_contra_dn": {
+    "sha256": "b3d1ae6d4e3e99931be06e812459d8b5273c43ed786a7ea26d19924a428fd668",
+    "n_edges": 2960,
+    "dtypes": [
+      "int32",
+      "int32",
+      "float32"
+    ]
+  },
+  "retina_wide": {
+    "sha256": "f804644e5e33d3489297481c5167ddb3b21da8895e57d5531ea62b82a0ae494a",
+    "n_edges": 4980,
+    "dtypes": [
+      "int32",
+      "int32",
+      "float32"
+    ]
+  },
+  "spear_lunge": {
+    "sha256": "564d88067d84bb7da29daa8c0fe291ccbcfb50b90285210598d9ffccb987a168",
+    "n_edges": 2490,
+    "dtypes": [
+      "int32",
+      "int32",
+      "float32"
+    ]
+  }
+}

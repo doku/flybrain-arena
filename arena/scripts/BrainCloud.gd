@@ -98,6 +98,7 @@ func set_nets(edges: Array) -> void:
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.vertex_color_use_as_albedo = true
 	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
 	im.surface_begin(Mesh.PRIMITIVE_LINES, mat)
 	for e in edges:
 		var edge: Array = e

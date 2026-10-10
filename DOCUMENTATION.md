@@ -134,7 +134,12 @@ fallbacks to the excitatory default).
 
 - **Pheromone:** bilateral concentrations × head-shadow antenna factors;
   strength follows nose direction (directional smelling: full nose-on, faint
-  trace behind).
+  trace behind). The gradient floor never dies (lost flies must re-acquire);
+  ORN drive habituates above the floor knee (gain → 0.3 sustained, ~20 s
+  recovery, fresh nose per episode/battle). Yaw reflex reads lateral
+  CONTRAST (R−L)/(R+L), so faint traces steer as decisively as strong ones.
+  Scent dynamics keys (`scent_lost`/`scent_cast`/`scent_surge`) drive search
+  steering (lost 3+ s + blind → cast sweeps) and closing surge (+0.25 thrust).
 - **LC10 tracking:** gated on target-visible; side by azimuth sign (dead-ahead
   splits both sides); intensity falls off toward the periphery.
 - **LC4:** rival-loom scalar drives both sides (non-spatial); legacy brains use
@@ -152,7 +157,9 @@ fallbacks to the excitatory default).
   DNp09 kick + MN votes (muscles_up) + LC11/loom urgency (retina).
 - **Yaw:** normalized DN population vector (intrinsic +9 R-bias subtracted)
   + DNp20 + MN laterality (muscles_up) + LC11 fixation (retina), blended
-  30/70 with the olfactory/visual reflex (reflex leads the sign).
+  30/70 with the olfactory/visual reflex (reflex leads the sign; reflex
+  yaw is lateral-contrast normalized, and blends toward cast sweeps when
+  scent is lost 3+ s with nothing visible).
 - **Pitch:** reflex-driven (elevation tracking + altitude hold).
 - **Roll:** VS/HS balance, gyro_flow only.
 - **Bursts:** ram (DNpe017 ≥ 2), emergency evade (giant fiber gated on visible
@@ -179,11 +186,15 @@ retina.
   only — evade/parry paths untouched, rear-aspect kills preserved.
 - **flow_trans**: +translational optic flow (T4/T5 direction cells).
   Arena and trainer derive ventral flow (groundspeed ÷ altitude, cruise
-  reads ~0.35), lateral slip (signed), expansion/climb on descent/ascent
-  — trainer lateral is always 0 (no sideslip axis; drift learns live).
-  Decoder: cruise-control thrust trim toward target flow, small drift yaw
-  trim, landing flare (thrust cut on expansion). Dopamine: cruise
-  steadiness bonus + direction-pool credit, scheme-gated.
+  reads ~0.35), lateral slip (signed; trainer synthesizes crosswind gust
+  windows since its kinematic fly has no sideslip axis), expansion/climb
+  on descent/ascent. Windup guards: saccade gate (spin quiets T4 drive),
+  per-direction habituation (floor 0.3), drift trim disengages when
+  lateral pegs (saturated direction is untrustworthy). Decoder:
+  cruise-control thrust trim toward target flow, small drift yaw trim,
+  landing flare (thrust cut on expansion). Dopamine: cruise steadiness
+  bonus + direction-pool credit, scheme-gated; T4/T5 efferents sit in the
+  pinned sens pool so runaway potentiation gets pinned like the rest.
 - **yaw_bias**: per-brain DN lateralization correction (default 9.0,
   measured range 6–12, ceiling 25 for hot mixes). Menu spinbox +
   randomize draw; stamped in generator params, retrain-graduatable.
@@ -225,6 +236,32 @@ form). Vault files keep native arity end-to-end; mixed brackets supported
   higher wins, winner logged); equal-priority clashes reject loudly.
   Sharing a downstream pool (e.g. both tree-contra and retina-wide driving
   DNs) is allowed with a saturation warning, not an error.
+
+## 7b. Wiring genomes (replaces hand overlays for new brains)
+
+A genome is a list of projection **rules**
+`{source, source_side, target, target_side, sign, weight, fanout,
+topography, stream, stream_seed}` compiled to the same edge arrays the
+overlays return — the three legacy wirings above are frozen genomes
+(byte-identical output, gated by `frozen_genome_hashes.json`). New neuron
+groups become explorable by existing in the pool registry (34 pools:
+sensory/motor/modulatory/central roles), not by writing overlay code.
+- **Generation** (`generate_genome`): sensory sources → motor/central
+  targets, 80% excitatory, deterministic per seed; each rule its own draw
+  stream. Wild (`breed_random`) brains are born from fresh genomes.
+- **Mapping derivation** (`derive_mapping`): schemes go live from genome
+  efferents (retina←LC, flow_trans←T4/T5, gyro_flow←JO/VS/HS,
+  muscles_up←MN, mbon←KC/MBON) — no more silent wiring/mapping pairs.
+- **Structural mutation** (`mutate_genome`, clones only, ≤1 change/gen by
+  default): weight/fanout jitter, target rewire, rule add/drop, sign flip;
+  `remap_weights` carries surviving trained weights over and inits new
+  edges from the parent scale. Genome-less parents clone unchanged.
+- **Checkpoints:** `__gen_<id>` namespace (`genome_id` = sha1 of canonical
+  rules); records carry the envelope in `generator_params.genome`.
+- **Fitness:** genome novelty bonus in `EvolutionManager` (+8 per pool
+  touched by ≤3 past winners, capped at 80 — kill-dominance preserved;
+  counts persist in `evo_pool_counts.json`). Pool-level win rates mineable
+  via `mine_wiring_fitness.py` over finished brackets.
 
 ## 8. Dopamine learning (`dopamine_learning.py`)
 
@@ -286,9 +323,9 @@ gate, 1.2 s cooldown, 0.35 s extension window, kick scale, contact reach):
 aimed committed lunges earn shaping reward, blind/wild lunges cost, and
 contact ends the episode as a strike kill; dopamine credits the
 lobula-feature→mouth efferents on paid-off lunges. Translational flow
-channels are computed kinematically (ventral/expansion exact; lateral is
-always 0 — no sideslip axis, drift-cancel learns live) with a cruise
-steadiness reward for flow_trans runs. Known shaping simplifications:
+channels are computed kinematically (ventral/expansion exact; lateral
+from crosswind gust windows so drift-cancel trains before arena day)
+with a cruise steadiness reward for flow_trans runs. Known shaping simplifications:
 kinematic (no momentum), scripted target, 6 s episodes vs 40 s rounds,
 no roll axis (JO-roll learns live).
 
@@ -362,7 +399,36 @@ no roll axis (JO-roll learns live).
   auto-escalates UDP detail for spike ids. Pool-to-pool network lines
   connect real centroid positions and light with presynaptic drive,
   gated per fighter like the flow diagram — the active networks glow
-  inside the flashing cloud.
+   inside the flashing cloud.
+
+### Battle rules: timeouts, DNF, overtime, wander dock
+
+  A battle that times out is decided by **remaining health**: most
+  health wins, no matter what dented the loser (strikes, wing tears,
+  tree rams, ground scrapes — bad flying is bad outcome). Near-equal
+  health (within half a point) is a **DNF (did not finish)** — no
+  winner, no dopamine, both records bank a draw, and the pairing
+  replays through the overtime ladder below. The arena decides;
+  the server only records the outcome and trains (legacy undecided
+  timeouts still fall back to its fitness verdict).
+  The first replay runs at **1.5x** the designated
+  time, the second at **2x** — each exactly once, for the immediate
+  replay only: a decisive battle ends the overtime even mid-match
+  (no carry-over into later battles), and new matches start clean.
+  A third DNF ends the pairing by the standard resolution (prior
+  match-wins, group split, ELO fallback).
+  The white outer arena ring sits 30 m from center
+  (`glade_ground.gdshader`); at every DNF the arena measures each
+  fly's meters past that ring (**drift**). Why: a fly that finishes a
+  battle deep in the forest fringe was most likely confused or evading
+  rather than fighting, and a plain replay would likely tie again.
+  So the overtime battle docks starting health by drift —
+  `min(drift x 4 HP/m, 50 HP)` per fly, zero drift docks zero — which
+  converts wandering into a concrete disadvantage: unequal health
+  produces unequal damage, and the timeout/KO verdict almost never
+  ties a second time. Drift past 5 m also banks a career **wander**
+  mark (`record.wander`, shown in stats/gallery); the overtime callout
+  previews each side's dock, and the timer reads `(OVERTIME x1.5)`.
 
 ## 11. Tournament protocol (UDP)
 
@@ -414,10 +480,11 @@ separates wiring effects from learned effects), learning verification
 conditioning), pool diagnostics (`brain_engine/diagnose_pools.py`:
 weight ratios, spike census).
 
-## 14. Evolution mode (eternal tournament loop)
+## 14. Continuous tournament mode (eternal loop)
 
-`START EVOLUTION` runs tournaments back-to-back forever (until EVO STOP
-or quit): each generation archives the single biggest loser (earliest
+`START CONTINUOUS` runs tournaments back-to-back forever (until
+STOP CONTINUOUS or quit): each generation archives the single biggest
+loser (earliest
 exit + fewest battle wins, random tie-break) to `brains/archive/` —
 invisible to the roster, listed in the menu hall of shame with per-brain
 Restore — then breeds 1 winner-clone (weight copy + noise, **fresh

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import numpy as np
 from scipy import sparse
@@ -92,24 +94,11 @@ def lplc2_contra_dn(pops, fanout=16, weight=260.0):
     Edges are excitatory (+weight). fanout is how many contralateral DNs each
     LPLC2 cell innervates; weight is tuned by phase-0 probe vs the DN readout
     sensitivity (dnR-dnL ~ 9 bias, tanh /15).
+
+    Frozen genome: compiles FROZEN_GENOMES["lplc2_contra_dn"] (byte-identical
+    to the historical implementation).
     """
-    lp_l = np.asarray(pops["visual_lplc2"]["left"], dtype=np.int64)
-    lp_r = np.asarray(pops["visual_lplc2"]["right"], dtype=np.int64)
-    dn_r = np.asarray(pops["descending_all"]["right"], dtype=np.int64)
-    dn_l = np.asarray(pops["descending_all"]["left"], dtype=np.int64)
-    rng = np.random.default_rng(0)  # deterministic wiring across runs
-    pre, post, w = [], [], []
-    for src, tgt in ((lp_l, dn_r), (lp_r, dn_l)):
-        for s in src:
-            picks = rng.choice(tgt, size=min(fanout, len(tgt)), replace=False)
-            pre.append(np.full(len(picks), s))
-            post.append(picks)
-            w.append(np.full(len(picks), float(weight)))
-    if not pre:
-        return None
-    return (np.concatenate(pre).astype(np.int32),
-            np.concatenate(post).astype(np.int32),
-            np.concatenate(w).astype(np.float32))
+    return _frozen("lplc2_contra_dn", pops, fanout, weight)
 
 
 @_register("retina_wide")
@@ -125,27 +114,11 @@ def retina_wide(pops, fanout=6, weight=200.0):
     pursuit toward (contrast the contra tree-avoidance wiring), and the
     overlay is small enough that the standard DN readout and dopamine
     keep working on top.
+
+    Frozen genome: compiles FROZEN_GENOMES["retina_wide"] (byte-identical
+    to the historical implementation).
     """
-    pre, post, w = [], [], []
-    rng = np.random.default_rng(7)  # deterministic wiring across runs
-    dn_l = np.asarray(pops["descending_all"]["left"], dtype=np.int64)
-    dn_r = np.asarray(pops["descending_all"]["right"], dtype=np.int64)
-    for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
-        pool = pops.get(key, {})
-        for src, tgt in ((np.asarray(pool.get("left", []), dtype=np.int64), dn_l),
-                         (np.asarray(pool.get("right", []), dtype=np.int64), dn_r)):
-            if len(src) == 0 or len(tgt) == 0:
-                continue
-            for s in src:
-                picks = rng.choice(tgt, size=min(fanout, len(tgt)), replace=False)
-                pre.append(np.full(len(picks), s))
-                post.append(picks)
-                w.append(np.full(len(picks), float(weight)))
-    if not pre:
-        return None
-    return (np.concatenate(pre).astype(np.int32),
-            np.concatenate(post).astype(np.int32),
-            np.concatenate(w).astype(np.float32))
+    return _frozen("retina_wide", pops, fanout, weight)
 
 
 @_register("spear_lunge")
@@ -158,29 +131,11 @@ def spear_lunge(pops, fanout=3, weight=200.0):
     LC15/17/18 loom) onto all six MNxm cells, giving the decoder a
     genuine mouth-motor signal to fire the spear thrust from. Aimed in
     the decoder (visible + frontal gate), so rear tracking never lunges.
+
+    Frozen genome: compiles FROZEN_GENOMES["spear_lunge"] (byte-identical
+    to the historical implementation).
     """
-    pre, post, w = [], [], []
-    rng = np.random.default_rng(21)  # deterministic wiring across runs
-    mx = np.asarray(pops.get("motor_mouth", {}).get("all", []), dtype=np.int64)
-    if len(mx) == 0:
-        return None
-    drivers = []
-    for key in ("visual_lc11", "visual_lc15", "visual_lc17", "visual_lc18"):
-        pool = pops.get(key, {})
-        drivers += list(pool.get("left", [])) + list(pool.get("right", []))
-    drivers = np.asarray(drivers, dtype=np.int64)
-    if len(drivers) == 0:
-        return None
-    for s in drivers:
-        picks = rng.choice(mx, size=min(fanout, len(mx)), replace=False)
-        pre.append(np.full(len(picks), s))
-        post.append(picks)
-        w.append(np.full(len(picks), float(weight)))
-    if not pre:
-        return None
-    return (np.concatenate(pre).astype(np.int32),
-            np.concatenate(post).astype(np.int32),
-            np.concatenate(w).astype(np.float32))
+    return _frozen("spear_lunge", pops, fanout, weight)
 
 
 def apply_overlay(csr, pre, post, w):
@@ -277,3 +232,960 @@ def experiment_suffix(experiment):
     if mix is None:
         return ""
     return "__exp_" + "__".join(mix)
+
+
+# ── Genome layer: parameterized projection rules ─────────────────────
+# A wiring genome is a small list of projection RULES instead of a toggle
+# over hand-written overlays. Each rule names source/target pools (+side),
+# polarity, weight, fanout, topography, and the rng stream it draws from.
+# The compiler below materializes rules to the same (pre, post, w) edge
+# arrays the legacy overlay functions return, so combine_overlays,
+# apply_overlay, arity handling, and the vault all work unchanged. The
+# three legacy wirings are frozen genomes (byte-identical output, proven
+# by tests/fixtures/frozen_genome_hashes.json); new neuron groups become
+# explorable by adding rows to the pool registry, not overlay code.
+
+ROLE_BY_PREFIX = (
+    ("visual_", "sensory"),
+    ("pheromone_", "sensory"),
+    ("gyro_", "sensory"),
+    ("flow_", "sensory"),
+    ("motor_", "motor"),
+    ("descending_", "motor"),
+    ("dopamine_", "modulatory"),
+    ("mbon_", "central"),
+    ("mushroom_body_", "central"),
+)
+
+GENOME_SIDES = ("left", "right", "all")
+GENOME_TOPOGRAPHIES = ("random",)
+MAX_RULE_WEIGHT = 2000.0
+MAX_RULE_FANOUT = 64
+
+# Generator marriages: which target roles a sensory source may innervate.
+# motor = readout drive, central = association readout. modulatory pools
+# are never wiring targets (dopamine arrives via plasticity, not edges).
+GENOME_TARGET_ROLES = ("motor", "central")
+
+
+def pool_role(name):
+    """Role of a connectome pool for wiring constraints (prefix table)."""
+    for prefix, role in ROLE_BY_PREFIX:
+        if str(name).startswith(prefix):
+            return role
+    return "central"
+
+
+def build_pool_registry(pops):
+    """{pool: {role, sides: {side: size}}} for pools with any members."""
+    reg = {}
+    for key, pool in pops.items():
+        if not isinstance(pool, dict):
+            continue
+        sides = {}
+        for side in ("left", "right", "all"):
+            try:
+                n = len(pool.get(side, []))
+            except TypeError:
+                n = 0
+            if n:
+                sides[side] = n
+        if sides:
+            reg[str(key)] = {"role": pool_role(key), "sides": sides}
+    return reg
+
+
+_RULE_KEYS = ("source", "source_side", "target", "target_side", "sign",
+              "weight", "fanout", "topography", "stream", "stream_seed")
+
+
+def _as_int(value, field, rule, lo, hi):
+    """Coerce integral values to int (Godot's JSON parser turns every
+    number into a float, so menu-round-tripped genomes arrive with
+    16.0-style values; like seeds, these must survive the trip).
+    Rejects bools, non-integral floats, and out-of-range values."""
+    if isinstance(value, bool):
+        raise ValueError(f"rule {field} must be an int: {rule}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"rule {field} must be an int: {rule}")
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError(f"rule {field} must be an int: {rule}")
+    if not lo <= value <= hi:
+        raise ValueError(f"rule {field} must be in [{lo}, {hi}]: {rule}")
+    return value
+
+
+def validate_rule(rule):
+    """Canonicalize one projection rule (raises ValueError on anything
+    malformed). Returns a normalized copy; never mutates the input."""
+    if not isinstance(rule, dict):
+        raise ValueError(f"rule must be a dict, got {type(rule).__name__}")
+    missing = [k for k in _RULE_KEYS if k not in rule]
+    if missing:
+        raise ValueError(f"rule missing keys {missing}: {rule}")
+    src, tgt = str(rule["source"]), str(rule["target"])
+    if not src or not tgt:
+        raise ValueError(f"rule needs non-empty source/target: {rule}")
+    ss, ts = str(rule["source_side"]), str(rule["target_side"])
+    if ss not in GENOME_SIDES or ts not in GENOME_SIDES:
+        raise ValueError(f"rule sides must be in {GENOME_SIDES}: {rule}")
+    try:
+        sign = float(rule["sign"])
+    except (TypeError, ValueError):
+        raise ValueError(f"rule sign must be numeric (+1/-1): {rule}")
+    if sign not in (1.0, -1.0):
+        raise ValueError(f"rule sign must be +1 or -1: {rule}")
+    try:
+        weight = float(rule["weight"])
+    except (TypeError, ValueError):
+        raise ValueError(f"rule weight must be numeric: {rule}")
+    if not 0.0 < weight <= MAX_RULE_WEIGHT:
+        raise ValueError(
+            f"rule weight must be in (0, {MAX_RULE_WEIGHT}]: {rule}")
+    fanout = _as_int(rule["fanout"], "fanout", rule, 1, MAX_RULE_FANOUT)
+    topo = str(rule["topography"])
+    if topo not in GENOME_TOPOGRAPHIES:
+        raise ValueError(
+            f"rule topography must be in {GENOME_TOPOGRAPHIES}: {rule}")
+    stream = str(rule["stream"])
+    if not stream:
+        raise ValueError(f"rule stream must be a non-empty name: {rule}")
+    seed = _as_int(rule["stream_seed"], "stream_seed", rule, 0, 2 ** 32 - 1)
+    return {"source": src, "source_side": ss, "target": tgt,
+            "target_side": ts, "sign": sign, "weight": weight,
+            "fanout": fanout, "topography": topo, "stream": stream,
+            "stream_seed": seed}
+
+
+def validate_genome(genome, pops=None):
+    """Canonicalize a genome envelope {"name": str|None, "rules": [...]};
+    duplicate (source, side, target, side) pairs are rejected (the
+    compiler keeps first-wins, so dupes are almost always a mistake).
+    With pops given, unknown pool names are also rejected (typo guard);
+    without pops only rule shapes are checked, so stale caches with
+    missing pools still compile (the compiler skips them like the
+    legacy retina overlay always did)."""
+    if not isinstance(genome, dict) or not isinstance(
+            genome.get("rules"), list) or not genome["rules"]:
+        raise ValueError("genome needs a non-empty 'rules' list")
+    name = genome.get("name", None)
+    if name is not None and not isinstance(name, str):
+        raise ValueError("genome name must be a string or None")
+    rules = [validate_rule(r) for r in genome["rules"]]
+    seen = set()
+    for r in rules:
+        pair = (r["source"], r["source_side"], r["target"], r["target_side"])
+        if pair in seen:
+            raise ValueError(f"duplicate rule pair {pair} in genome")
+        seen.add(pair)
+    if pops is not None:
+        registry = build_pool_registry(pops)
+        for r in rules:
+            for pool_key in ("source", "target"):
+                if r[pool_key] not in registry:
+                    raise ValueError(
+                        f"unknown {pool_key} pool '{r[pool_key]}' "
+                        f"(registry has {sorted(registry)})")
+    return {"name": name, "rules": rules}
+
+
+def compile_rules(rules, pops):
+    """Materialize validated rule dicts to (pre, post, w) edge arrays.
+
+    Rules sharing a (stream, stream_seed) draw from one rng in rule
+    order (this is how the frozen legacy genomes reproduce their exact
+    historical edge sets). Exact-duplicate edges keep the first
+    occurrence. Returns None when nothing innervates (same contract as
+    the legacy overlay functions). Missing/empty pools are skipped.
+    """
+    streams = {}
+    order = []
+    for r in rules:
+        key = (r["stream"], r["stream_seed"])
+        if key not in streams:
+            streams[key] = []
+            order.append(key)
+        streams[key].append(r)
+    pre, post, w = [], [], []
+    seen = set()
+    for key in order:
+        rng = np.random.default_rng(key[1])
+        for r in streams[key]:
+            src = np.asarray(pops.get(r["source"], {}).get(
+                r["source_side"], []), dtype=np.int64)
+            tgt = np.asarray(pops.get(r["target"], {}).get(
+                r["target_side"], []), dtype=np.int64)
+            if len(src) == 0 or len(tgt) == 0:
+                continue
+            for s in src:
+                picks = rng.choice(
+                    tgt, size=min(r["fanout"], len(tgt)), replace=False)
+                for q in picks.tolist():
+                    edge = (int(s), int(q))
+                    if edge in seen:
+                        continue
+                    seen.add(edge)
+                    pre.append(edge[0])
+                    post.append(edge[1])
+                    w.append(float(r["sign"]) * float(r["weight"]))
+    if not pre:
+        return None
+    return (np.array(pre, dtype=np.int32),
+            np.array(post, dtype=np.int32),
+            np.array(w, dtype=np.float32))
+
+
+def compile_genome(genome, pops):
+    """Validate + compile a genome envelope to edge arrays (None if empty)."""
+    return compile_rules(validate_genome(genome)["rules"], pops)
+
+
+def genome_id(genome):
+    """Stable id for a genome: sha1 of canonical rules, 10 hex chars.
+    Renames don't change it (name excluded); rule ORDER does (streams
+    draw in rule order, so reordered rules are a different genome)."""
+    rules = validate_genome(genome)["rules"]
+    canon = json.dumps(rules, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:10]
+
+
+def genome_label(genome):
+    """Filename-safe arity-namespace label for genome checkpoints."""
+    return "g" + genome_id(genome)
+
+
+def genome_from_seed(seed, n_rules=3):
+    """Deterministic genome envelope from a menu-friendly seed (loads
+    the cached pool registry; no CSR needed). The same seed always
+    builds the same envelope, so generate/train/breed entry points
+    reproduce it independently without passing rules around."""
+    import numpy as _np
+    from connectome_loader import load_or_extract_populations
+    pops = load_or_extract_populations()
+    return generate_genome(_np.random.default_rng(int(seed)), pops,
+                           max(1, int(n_rules)))
+
+
+def attach_genome(params, genome):
+    """Stamps a genome envelope + its stable id onto a params dict
+    (vault whitelist carries both into the record)."""
+    params["genome"] = genome
+    params["genome_id"] = genome_label(genome)
+    return params
+
+
+def generate_genome(rng, pops, n_rules=3, name=None):
+    """Sample a random wiring genome. rng is np.random.Generator (use
+    np.random.default_rng(seed) for reproducibility); sources are
+    sensory-role pools, targets motor/central; signs mostly excitatory;
+    each rule gets its own draw stream. Raises on tiny registries that
+    can't supply n_rules distinct pairs."""
+    if n_rules < 1:
+        raise ValueError("generate_genome needs n_rules >= 1")
+    registry = build_pool_registry(pops)
+    sources = sorted(p for p, m in registry.items() if m["role"] == "sensory")
+    targets = sorted(p for p, m in registry.items()
+                     if m["role"] in GENOME_TARGET_ROLES)
+    if not sources or not targets:
+        raise ValueError(
+            "genome generation needs sensory sources and motor/central targets")
+    rules = []
+    seen_pairs = set()
+    tries = 0
+    while len(rules) < n_rules and tries < 50 * n_rules:
+        tries += 1
+        cand = _random_rule(rng, registry, len(rules))
+        pair = (cand["source"], cand["source_side"], cand["target"],
+                cand["target_side"])
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        rules.append(cand)
+    if len(rules) < n_rules:
+        raise ValueError(
+            f"registry too small for {n_rules} distinct rule pairs")
+    return validate_genome({"name": name, "rules": rules}, pops)
+
+
+# Frozen legacy genomes: the three historical overlays re-expressed as
+# rules. Stream seeds reproduce each overlay's original rng stream, so
+# compiled output is byte-identical to the pre-genome functions (gated
+# by tests/fixtures/frozen_genome_hashes.json). Rule order mirrors the
+# original loops exactly - do not reorder.
+FROZEN_GENOMES = {
+    "lplc2_contra_dn": {"name": "lplc2_contra_dn", "rules": [
+        {"source": "visual_lplc2", "source_side": "left",
+         "target": "descending_all", "target_side": "right",
+         "sign": 1.0, "weight": 260.0, "fanout": 16,
+         "topography": "random", "stream": "lplc2_contra_dn",
+         "stream_seed": 0},
+        {"source": "visual_lplc2", "source_side": "right",
+         "target": "descending_all", "target_side": "left",
+         "sign": 1.0, "weight": 260.0, "fanout": 16,
+         "topography": "random", "stream": "lplc2_contra_dn",
+         "stream_seed": 0},
+    ]},
+    "retina_wide": {"name": "retina_wide", "rules": [
+        {"source": pool, "source_side": side,
+         "target": "descending_all", "target_side": side,
+         "sign": 1.0, "weight": 200.0, "fanout": 6,
+         "topography": "random", "stream": "retina_wide",
+         "stream_seed": 7}
+        for pool in ("visual_lc11", "visual_lc15", "visual_lc17",
+                     "visual_lc18")
+        for side in ("left", "right")
+    ]},
+    "spear_lunge": {"name": "spear_lunge", "rules": [
+        {"source": pool, "source_side": side,
+         "target": "motor_mouth", "target_side": "all",
+         "sign": 1.0, "weight": 200.0, "fanout": 3,
+         "topography": "random", "stream": "spear_lunge",
+         "stream_seed": 21}
+        for pool in ("visual_lc11", "visual_lc15", "visual_lc17",
+                     "visual_lc18")
+        for side in ("left", "right")
+    ]},
+}
+
+
+def mutate_genome(rng, genome, pops, max_changes=1):
+    """Structural mutation: up to max_changes rule edits drawn from
+    {jitter weight, jitter fanout, rewire target, add rule, drop rule,
+    flip sign}. Role-compatible (rewires/adds target motor/central
+    pools only; pairs stay unique; single-rule genomes never drop to
+    zero). Deterministic in rng. Returns a NEW validated envelope
+    (input untouched); same-arity edits (weight/sign) keep every edge,
+    structural ones change the edge set (see remap_weights)."""
+    if max_changes < 1:
+        raise ValueError("mutate_genome needs max_changes >= 1")
+    canon = validate_genome(genome, pops)
+    registry = build_pool_registry(pops)
+    targets = sorted(p for p, m in registry.items()
+                     if m["role"] in GENOME_TARGET_ROLES)
+    if not targets:
+        raise ValueError("mutate_genome needs motor/central targets")
+    rules = [dict(r) for r in canon["rules"]]
+    n_changes = 0
+    guard = 0
+    while n_changes < max_changes and guard < 20:
+        guard += 1
+        op = str(rng.choice(
+            ["jitter_weight", "jitter_fanout", "rewire_target",
+             "add_rule", "drop_rule", "flip_sign"],
+            p=[0.40, 0.15, 0.15, 0.10, 0.10, 0.10]))
+        if op == "drop_rule" and len(rules) <= 1:
+            continue
+        idx = int(rng.integers(0, len(rules)))
+        r = rules[idx]
+        if op == "jitter_weight":
+            r["weight"] = round(float(r["weight"]) * float(
+                rng.uniform(0.7, 1.4)), 1)
+        elif op == "jitter_fanout":
+            delta = int(rng.integers(-2, 3))
+            if delta == 0:
+                continue
+            r["fanout"] = int(np.clip(
+                int(r["fanout"]) + delta, 1, MAX_RULE_FANOUT))
+        elif op == "rewire_target":
+            pair = None
+            current = (str(r["target"]), str(r["target_side"]))
+            for _ in range(10):
+                cand = (str(rng.choice(targets)),
+                        str(rng.choice(["left", "right"])))
+                taken = {(x["target"], x["target_side"]) for j, x in
+                         enumerate(rules) if j != idx}
+                if cand not in taken and cand != current:
+                    pair = cand
+                    break
+            if pair is None:
+                continue
+            r["target"], r["target_side"] = pair
+        elif op == "add_rule":
+            seen = {(x["source"], x["source_side"], x["target"],
+                     x["target_side"]) for x in rules}
+            newr = None
+            for _ in range(20):
+                cand = _random_rule(rng, registry, len(rules))
+                pair = (cand["source"], cand["source_side"],
+                        cand["target"], cand["target_side"])
+                if pair not in seen:
+                    newr = cand
+                    break
+            if newr is None:
+                continue
+            rules.append(newr)
+        elif op == "drop_rule":
+            del rules[idx]
+        elif op == "flip_sign":
+            r["sign"] = -1.0 * float(r["sign"])
+        # Streams stay attached to their rule (draws stay reproducible);
+        # added rules get fresh streams from _random_rule.
+        n_changes += 1
+    return validate_genome({"name": canon["name"], "rules": rules}, pops)
+
+
+def _random_rule(rng, registry, stream_idx):
+    """One grammar-constrained rule (shared by generate/mutate)."""
+    sources = sorted(p for p, m in registry.items() if m["role"] == "sensory")
+    targets = sorted(p for p, m in registry.items()
+                     if m["role"] in GENOME_TARGET_ROLES)
+    src = str(rng.choice(sources))
+    tgt = str(rng.choice(targets))
+    return {
+        "source": src, "source_side": str(rng.choice(["left", "right"])),
+        "target": tgt, "target_side": str(rng.choice(["left", "right"])),
+        "sign": 1.0 if float(rng.random()) < 0.8 else -1.0,
+        "weight": round(float(rng.uniform(50.0, 400.0)), 1),
+        "fanout": int(rng.integers(2, 17)),
+        "topography": "random",
+        "stream": "g%d" % int(stream_idx),
+        "stream_seed": int(rng.integers(0, 2 ** 31)),
+    }
+
+
+def remap_weights(old_edges, new_edges, old_w, rng, fallback_scale=None):
+    """Arity surgery for structural mutation: weights for surviving
+    (pre, post) edges carry over verbatim; new edges initialize
+    N(0, sigma) with sigma = surviving-weight std (or fallback_scale,
+    defaulting to the legacy overlay scale 200.0). Returns a float32
+    array aligned to new_edges order. Deterministic in rng.
+
+    Row-wise sweep (no whole-matrix dict): old and new sides are
+    grouped by presynaptic row, so full 25M-edge breed remaps run in
+    bounded memory instead of a multi-GB key table. Survivor lookup,
+    fresh-draw count/order, and the arity guard match the legacy
+    semantics exactly."""
+    if len(old_w) != len(old_edges[0]):
+        raise ValueError(
+            f"remap parent weights {len(old_w)} != parent arity "
+            f"{len(old_edges[0])}; never mix arities")
+    old_pre = np.asarray(old_edges[0])
+    old_post = np.asarray(old_edges[1])
+    new_pre = np.asarray(new_edges[0])
+    new_post = np.asarray(new_edges[1])
+    old_w = np.asarray(old_w, dtype=np.float32)
+    n_new = len(new_pre)
+    out = np.empty(n_new, dtype=np.float32)
+    if n_new == 0 or len(old_pre) == 0:
+        if n_new == 0:
+            return np.ascontiguousarray(out)
+        sigma0 = float(fallback_scale if fallback_scale is not None else 200.0)
+        out[:] = np.float32(rng.normal(0.0, sigma0, n_new))
+        return np.ascontiguousarray(out)
+    o_ord = np.argsort(old_pre, kind="stable")
+    n_ord = np.argsort(new_pre, kind="stable")
+    op, oq, ow = old_pre[o_ord], old_post[o_ord], old_w[o_ord]
+    np_s, nq = new_pre[n_ord], new_post[n_ord]
+    # Row boundaries on the already-sorted sides (no second sort).
+    o_bound = np.flatnonzero(np.diff(op) != 0) + 1
+    o_bound = np.concatenate(([0], o_bound, [len(op)]))
+    n_bound = np.flatnonzero(np.diff(np_s) != 0) + 1
+    n_bound = np.concatenate(([0], n_bound, [len(np_s)]))
+    o_rows = op[o_bound[:-1]]
+    n_rows = np_s[n_bound[:-1]]
+    # Survivor mask in NEW-edge order; sigma from running sums (exact
+    # std with O(1) memory at 25M scale).
+    is_new = np.zeros(n_new, dtype=bool)
+    kept_n = 0
+    kept_sum = 0.0
+    kept_sumsq = 0.0
+    oi = 0
+    for ni in range(len(n_rows)):
+        r = int(n_rows[ni])
+        while oi < len(o_rows) and int(o_rows[oi]) < r:
+            oi += 1
+        old_map = {}
+        if oi < len(o_rows) and int(o_rows[oi]) == r:
+            a, b = int(o_bound[oi]), int(o_bound[oi + 1])
+            for q, v in zip(oq[a:b].tolist(), ow[a:b].tolist()):
+                old_map[int(q)] = float(v)
+        c, d = int(n_bound[ni]), int(n_bound[ni + 1])
+        for j in range(c, d):
+            key = int(nq[j])
+            orig = int(n_ord[j])
+            if key in old_map:
+                v = old_map[key]
+                out[orig] = np.float32(v)
+                kept_n += 1
+                kept_sum += v
+                kept_sumsq += v * v
+            else:
+                is_new[orig] = True
+    if kept_n > 0:
+        mean = kept_sum / kept_n
+        sigma = float(max(kept_sumsq / kept_n - mean * mean, 0.0) ** 0.5)
+    else:
+        sigma = float(
+            fallback_scale if fallback_scale is not None else 200.0)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = 200.0
+    fresh = rng.normal(0.0, sigma, int(is_new.sum()))
+    out[is_new] = np.float32(fresh)
+    return np.ascontiguousarray(out)
+
+
+def _merged_edge_lists(csr, overlay):
+    """Full (pre, post) edge lists for base CSR + an overlay (or None):
+    the exact structure training builds via apply_overlay, as key
+    arrays for arity surgery. Overlaps merge (no duplicate keys)."""
+    if overlay is None:
+        indptr = np.ascontiguousarray(csr.indptr, dtype=np.int32)
+        indices = np.ascontiguousarray(csr.indices, dtype=np.int32)
+    else:
+        pre, post, w = overlay
+        indptr, indices, _data = apply_overlay(csr, pre, post, w)
+    counts = np.diff(indptr).astype(np.int64)
+    pre_full = np.repeat(
+        np.arange(len(indptr) - 1, dtype=np.int32), counts)
+    return pre_full, np.ascontiguousarray(indices, dtype=np.int32)
+
+
+def remap_for_genome(old_experiment, old_genome, new_genome, old_w,
+                     rng, pops, csr):
+    """Breed-time arity surgery: parent weights (any old wiring: base,
+    legacy mix, or genome) remapped onto a mutated child genome.
+    Both sides expand to FULL arity (base CSR + overlay) first: base
+    edges are identical parent to child, so trained base weights carry
+    over verbatim and only overlay deltas re-initialize. Surviving
+    edges keep trained weights; new edges init N(0, parent std).
+    Returns float32 weights aligned to the child arity. Raises on
+    uncompilable genomes like the normal build path, and loudly on a
+    short/long parent weight vector (never mix arities)."""
+    if old_genome is not None:
+        old_over = compile_genome(old_genome, pops)
+    else:
+        mix = normalize_experiment(old_experiment)
+        old_over = combine_overlays(mix, pops) if mix is not None else None
+    new_over = compile_genome(new_genome, pops)
+    if new_over is None:
+        raise ValueError("remap needs a compilable child genome")
+    old_full = _merged_edge_lists(csr, old_over)
+    new_full = _merged_edge_lists(csr, new_over)
+    if len(old_w) != len(old_full[0]):
+        raise ValueError(
+            f"remap parent weights {len(old_w)} != parent arity "
+            f"{len(old_full[0])}; never mix arities")
+    return remap_weights(old_full, new_full, old_w, rng)
+
+
+def _frozen(name, pops, fanout=None, weight=None):
+    """Compile a frozen genome, optionally overriding fanout/weight."""
+    rules = []
+    for r in FROZEN_GENOMES[name]["rules"]:
+        rr = dict(r)
+        if fanout is not None:
+            rr["fanout"] = fanout
+        if weight is not None:
+            rr["weight"] = weight
+        rules.append(rr)
+    return compile_rules(rules, pops)
+
+
+# Schemes whose sensory pools a genome drives (mapping derivation).
+SCHEME_SOURCES = {
+    "retina": ("visual_lc11", "visual_lc15", "visual_lc17",
+               "visual_lc18"),
+    "flow_trans": ("visual_t4a", "visual_t4b", "visual_t4c",
+                   "visual_t4d", "visual_t5a", "visual_t5b",
+                   "visual_t5c", "visual_t5d"),
+    "gyro_flow": ("gyro_jo",),
+    "mbon": ("mushroom_body_kc",),
+}
+# Schemes whose readout pools a genome drives.
+SCHEME_TARGETS = {
+    "muscles_up": ("motor_flight_thrust", "motor_steer"),
+    "gyro_flow": ("flow_vs", "flow_hs"),
+    "mbon": ("mbon_app", "mbon_av"),
+}
+
+
+def derive_mapping(genome):
+    """Derive a neuro-mapping stack from a genome's efferents: a scheme
+    is live when the genome drives its sensory pools (sources) or its
+    readout pools (targets). Returns a sorted tuple shaped like
+    normalize_mapping output (() = base). Mouth-target rules (spear)
+    derive nothing - the spear readout is always active. Presence-based
+    only; strength-weighted derivation is future work (see the
+    attribution miner)."""
+    rules = validate_genome(genome)["rules"]
+    srcs = {r["source"] for r in rules}
+    tgts = {r["target"] for r in rules}
+    out = set()
+    for scheme, pools in SCHEME_SOURCES.items():
+        if srcs & set(pools):
+            out.add(scheme)
+    for scheme, pools in SCHEME_TARGETS.items():
+        if tgts & set(pools):
+            out.add(scheme)
+    return tuple(sorted(out))
+
+
+def build_genome_arrays(genome, csr, pops):
+    """(indptr, indices, data) for a genome envelope (None envelope =
+    base CSR arrays, mirroring experiment_arrays)."""
+    if genome is None:
+        return (np.ascontiguousarray(csr.indptr, dtype=np.int32),
+                np.ascontiguousarray(csr.indices, dtype=np.int32),
+                np.ascontiguousarray(csr.data, dtype=np.float32))
+    edges = compile_genome(genome, pops)
+    if edges is None:
+        return (np.ascontiguousarray(csr.indptr, dtype=np.int32),
+                np.ascontiguousarray(csr.indices, dtype=np.int32),
+                np.ascontiguousarray(csr.data, dtype=np.float32))
+    pre, post, w = edges
+    print(f"[ExpWiring] genome {genome_label(genome)}: injecting "
+          f"{len(pre):,} edges (compiled genome)")
+    return apply_overlay(csr, pre, post, w)
+
+
+def genome_suffix(genome):
+    """Filename suffix for genome checkpoints (empty when None)."""
+    if genome is None:
+        return ""
+    return "__gen_" + genome_label(genome)
+
+
+# ── Reference fly + modular exploration ──────────────────────────
+# The reference is the canonical wiring: one rule group per fly
+# mechanic, each attached to its neuron bundle (frozen-genome style:
+# explicit rules, fixed streams). Wilds explore AROUND it - grafts add
+# onto one bundle, shuffles deal subsystem hands, novelty seeks empty
+# pool cells, crossover recombines parents - so every novel feature
+# stays attributable to the bundle (or cross) that introduced it.
+
+def _ref_rule(source, sside, target, tside, weight, fanout, seed,
+              sign=1.0):
+    return {"source": source, "source_side": sside,
+            "target": target, "target_side": tside,
+            "sign": float(sign), "weight": float(weight),
+            "fanout": int(fanout),
+            "topography": "random", "stream": "reference",
+            "stream_seed": int(seed)}
+
+
+REFERENCE_SUBSYSTEMS = {
+    # Small-target pursuit drive: full documented LC set, ipsilateral
+    # like frozen retina_wide (measured pursuit-toward tuning).
+    "pursuit": [
+        _ref_rule(pool, side, "descending_all", side, 150.0, 6, seed)
+        for seed, (pool, side) in enumerate(
+            [(p, s) for p in ("visual_lc11", "visual_lc15",
+                              "visual_lc17", "visual_lc18")
+             for s in ("left", "right")], start=101)
+    ],
+    # Loom evasion: measured LPLC2-contra path (base wiring is 99.9%
+    # ipsilateral and steers INTO trees) plus rival-loom LC4-contra.
+    "loom": [
+        _ref_rule("visual_lplc2", "left", "descending_all", "right",
+                  260.0, 16, 109),
+        _ref_rule("visual_lplc2", "right", "descending_all", "left",
+                  260.0, 16, 110),
+        _ref_rule("visual_lc4", "left", "descending_all", "right",
+                  150.0, 10, 111),
+        _ref_rule("visual_lc4", "right", "descending_all", "left",
+                  150.0, 10, 112),
+    ],
+    # Optic-flow cruise: T4a excites DN drive and MN cruise thrust;
+    # T4d INHIBITS DN (descent brake - expansion must cut drive for
+    # the landing flare, never feed it).
+    "flow": [
+        _ref_rule("visual_t4a", "left", "descending_all", "left",
+                  150.0, 6, 113),
+        _ref_rule("visual_t4a", "right", "descending_all", "right",
+                  150.0, 6, 114),
+        _ref_rule("visual_t4a", "left", "motor_flight_thrust", "left",
+                  150.0, 6, 115),
+        _ref_rule("visual_t4a", "right", "motor_flight_thrust", "right",
+                  150.0, 6, 116),
+        _ref_rule("visual_t4d", "left", "descending_all", "left",
+                  150.0, 6, 133, sign=-1.0),
+        _ref_rule("visual_t4d", "right", "descending_all", "right",
+                  150.0, 6, 134, sign=-1.0),
+    ],
+    # Gyro stabilization readout, plus the equilibrium arc onto the
+    # haltere roll-motor pool (without it the stabilization path has
+    # no learned bank actuator).
+    "gyro": [
+        _ref_rule("gyro_jo", "left", "motor_steer", "left",
+                  150.0, 6, 117),
+        _ref_rule("gyro_jo", "right", "motor_steer", "right",
+                  150.0, 6, 118),
+        _ref_rule("gyro_jo", "left", "motor_roll_mnhl", "left",
+                  150.0, 6, 135),
+        _ref_rule("gyro_jo", "right", "motor_roll_mnhl", "right",
+                  150.0, 6, 136),
+    ],
+    # Ram-readout priming: the documented charge fires at >=2
+    # DNpe017 spikes, so frontal input lowers its threshold. (Frontal
+    # approach drive itself lives in pursuit: LC15->DN same-side.)
+    "ram": [
+        _ref_rule("visual_lc15", "left", "motor_ram_dnpe017", "left",
+                  150.0, 6, 121),
+        _ref_rule("visual_lc15", "right", "motor_ram_dnpe017", "right",
+                  150.0, 6, 122),
+    ],
+    # Spear lunge readout: full frozen set (measured ~0->6 MNxm
+    # spikes, clean strike signal).
+    "spear": [
+        _ref_rule(pool, side, "motor_mouth", "all", 200.0, 3, seed)
+        for seed, (pool, side) in enumerate(
+            [(p, s) for p in ("visual_lc11", "visual_lc15",
+                              "visual_lc17", "visual_lc18")
+             for s in ("left", "right")], start=123)
+    ],
+    # Valence memory: odor-approach and loom-avoid associations.
+    # (mushroom_body_kc is a sideless list in pops, outside the rule
+    # registry - it feeds mbon via plasticity, never wiring edges.)
+    "memory": [
+        _ref_rule("pheromone_va1v", "left", "mbon_app", "left",
+                  150.0, 6, 131),
+        _ref_rule("visual_lc4", "right", "mbon_av", "right",
+                  150.0, 6, 132),
+    ],
+}
+
+REFERENCE_ORDER = ("pursuit", "loom", "flow", "gyro", "ram", "spear",
+                   "memory")
+
+
+def reference_genome():
+    """Canonical reference envelope (fixed rule order, fixed streams)."""
+    rules = []
+    for sub in REFERENCE_ORDER:
+        rules.extend(dict(r) for r in REFERENCE_SUBSYSTEMS[sub])
+    return validate_genome({"name": "reference", "rules": rules})
+
+
+def reference_distance(genome):
+    """1 - Jaccard overlap of (source, target) pairs vs the reference
+    (0.0 = same bundles wired, 1.0 = disjoint)."""
+    ref = {(r["source"], r["target"])
+           for r in reference_genome()["rules"]}
+    mine = {(r["source"], r["target"])
+            for r in validate_genome(genome)["rules"]}
+    if not ref and not mine:
+        return 0.0
+    return 1.0 - len(ref & mine) / len(ref | mine)
+
+
+EXPLORE_MODES = ("legacy", "graft", "shuffle", "novelty", "crossover")
+
+
+def rule_budget(generation):
+    """Extra-rule budget ramping with generation: 1 at gen 1-2, +1 per
+    2 gens, capped at 4 (young lineages explore small genomes)."""
+    return min(4, 1 + (max(1, int(generation)) - 1) // 2)
+
+
+def _registry_targets(registry):
+    return sorted(p for p, m in registry.items()
+                  if m["role"] in GENOME_TARGET_ROLES)
+
+
+def _available_sides(registry, pool):
+    sides = list((registry.get(pool, {}) or {}).get("sides", {}).keys())
+    for prefer in ("left", "right", "all"):
+        if prefer in sides:
+            return prefer
+    return sides[0] if sides else "left"
+
+
+def _forced_target_rule(rng, registry, target, tside, stream_idx, seen):
+    """_random_rule with a fixed target bundle (graft/novelty adds)."""
+    sources = sorted(p for p, m in registry.items()
+                     if m["role"] == "sensory")
+    for _ in range(20):
+        cand = {
+            "source": str(rng.choice(sources)),
+            "source_side": str(rng.choice(["left", "right"])),
+            "target": target, "target_side": tside,
+            "sign": 1.0 if float(rng.random()) < 0.8 else -1.0,
+            "weight": round(float(rng.uniform(50.0, 400.0)), 1),
+            "fanout": int(rng.integers(2, 17)),
+            "topography": "random",
+            "stream": "graft%d" % int(stream_idx),
+            "stream_seed": int(rng.integers(0, 2 ** 31)),
+        }
+        pair = (cand["source"], cand["source_side"], cand["target"],
+                cand["target_side"])
+        if pair not in seen:
+            return cand
+    raise ValueError("registry too small for distinct graft pairs")
+
+
+def graft_genome(rng, pops, budget=1):
+    """Reference genome plus `budget` extra rules sampled onto ONE
+    randomly chosen motor/central target bundle. Returns (envelope,
+    provenance); every novel edge is attributable to added_bundle."""
+    registry = build_pool_registry(pops)
+    targets = _registry_targets(registry)
+    if not targets:
+        raise ValueError("graft needs motor/central targets")
+    target = str(rng.choice(targets))
+    tside = _available_sides(registry, target)
+    ref = reference_genome()["rules"]
+    seen = {(r["source"], r["source_side"], r["target"],
+             r["target_side"]) for r in ref}
+    rules = [dict(r) for r in ref]
+    added = []
+    for k in range(max(0, int(budget))):
+        cand = _forced_target_rule(rng, registry, target, tside, k, seen)
+        seen.add((cand["source"], cand["source_side"], cand["target"],
+                  cand["target_side"]))
+        rules.append(cand)
+        added.append(len(rules) - 1)
+    env = validate_genome({"name": None, "rules": rules}, pops)
+    return env, {"mode": "graft", "added_bundle": [target, tside],
+                 "added_rules": added,
+                 "reference_id": genome_label(reference_genome())}
+
+
+def shuffle_genome(rng, pops, budget=1):
+    """Deal a random hand of reference subsystems (at least 2, at most
+    all), kept verbatim, plus `budget` random-fill rules. Returns
+    (envelope, provenance)."""
+    subs = list(REFERENCE_ORDER)
+    n_keep = int(rng.integers(2, len(subs) + 1))
+    kept = sorted(rng.choice(subs, size=n_keep, replace=False).tolist())
+    rules = []
+    for sub in REFERENCE_ORDER:
+        if sub in kept:
+            rules.extend(dict(r) for r in REFERENCE_SUBSYSTEMS[sub])
+    seen = {(r["source"], r["source_side"], r["target"],
+             r["target_side"]) for r in rules}
+    registry = build_pool_registry(pops)
+    filled = []
+    for k in range(max(0, int(budget))):
+        cand = None
+        for _ in range(20):
+            c = _random_rule(rng, registry, 100 + k)
+            pair = (c["source"], c["source_side"], c["target"],
+                    c["target_side"])
+            if pair not in seen:
+                cand = c
+                seen.add(pair)
+                break
+        if cand is None:
+            raise ValueError("registry too small for shuffle fill")
+        rules.append(cand)
+        filled.append(len(rules) - 1)
+    env = validate_genome({"name": None, "rules": rules}, pops)
+    return env, {"mode": "shuffle", "kept_subsystems": kept,
+                 "filled_rules": filled,
+                 "reference_id": genome_label(reference_genome())}
+
+
+def load_pool_counts():
+    """Winner pool counts for novelty guidance (same file the novelty
+    bonus reads). Breed workers inherit Godot's CWD (arena/), so the
+    module-adjacent checkpoints dir comes first and the CWD-relative
+    one second; {} when absent so novelty degrades to uniform."""
+    cands = [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "checkpoints", "evo_pool_counts.json"),
+             os.path.join("checkpoints", "evo_pool_counts.json")]
+    for path in cands:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def novelty_genome(rng, pops, budget=1, pool_counts=None,
+                   prefer_weak=True):
+    """Graft onto the emptiest motor/central target bundle (lowest
+    winner count, ties broken randomly among the 3 emptiest), with
+    sustained-losing bundles (<50% over 5+ fights) preferred first.
+    Returns (envelope, provenance)."""
+    registry = build_pool_registry(pops)
+    targets = _registry_targets(registry)
+    if not targets:
+        raise ValueError("novelty needs motor/central targets")
+    counts = dict(pool_counts) if pool_counts is not None \
+        else load_pool_counts()
+    weak = set()
+    if prefer_weak:
+        try:
+            from mine_wiring_fitness import weak_bundles
+            weak = {p for p, _w, _n in weak_bundles()}
+        except Exception:
+            weak = set()
+    ranked = sorted(targets,
+                    key=lambda p: (0 if p in weak else 1,
+                                   counts.get(p, 0), p))
+    cands = ranked[:min(3, len(ranked))]
+    target = str(cands[int(rng.integers(0, len(cands)))])
+    tside = _available_sides(registry, target)
+    ref = reference_genome()["rules"]
+    seen = {(r["source"], r["source_side"], r["target"],
+             r["target_side"]) for r in ref}
+    rules = [dict(r) for r in ref]
+    added = []
+    for k in range(max(0, int(budget))):
+        cand = _forced_target_rule(rng, registry, target, tside, k, seen)
+        seen.add((cand["source"], cand["source_side"], cand["target"],
+                  cand["target_side"]))
+        rules.append(cand)
+        added.append(len(rules) - 1)
+    env = validate_genome({"name": None, "rules": rules}, pops)
+    return env, {"mode": "novelty", "added_bundle": [target, tside],
+                 "added_rules": added,
+                 "bundle_count": int(counts.get(target, 0)),
+                 "weak_target": target in weak,
+                 "reference_id": genome_label(reference_genome())}
+
+
+def crossover_genomes(rng, genome_a, genome_b, pops):
+    """Rule-level uniform crossover: each slot inherited from a random
+    parent (first-wins on pair collisions), then one structural
+    mutate_genome step. Returns (envelope, provenance with per-slot
+    parent tags + parent genome ids)."""
+    ra = validate_genome(genome_a)["rules"]
+    rb = validate_genome(genome_b)["rules"]
+    rules = []
+    prov = []
+    for i in range(max(len(ra), len(rb))):
+        picks = []
+        if i < len(ra):
+            picks.append(("a", ra[i]))
+        if i < len(rb):
+            picks.append(("b", rb[i]))
+        tag, rule = picks[int(rng.integers(0, len(picks)))]
+        rules.append(dict(rule))
+        prov.append(tag)
+    seen = set()
+    deduped = []
+    dprov = []
+    for r, t in zip(rules, prov):
+        pair = (r["source"], r["source_side"], r["target"],
+                r["target_side"])
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(r)
+        dprov.append(t)
+    child = mutate_genome(rng, {"name": None, "rules": deduped}, pops, 1)
+    return child, {"mode": "crossover",
+                   "parent_ids": [genome_label(genome_a),
+                                  genome_label(genome_b)],
+                   "slot_parents": dprov, "post_mutated": True}
+
+
+def generate_exploratory_genome(rng, pops, mode="graft", budget=1,
+                                pool_counts=None):
+    """Seed-based exploration dispatcher (graft/shuffle/novelty).
+    Legacy and crossover go through their own breeders. Returns
+    (envelope, provenance)."""
+    if mode == "graft":
+        return graft_genome(rng, pops, budget)
+    if mode == "shuffle":
+        return shuffle_genome(rng, pops, budget)
+    if mode == "novelty":
+        return novelty_genome(rng, pops, budget, pool_counts)
+    raise ValueError(f"unknown explore mode '{mode}' "
+                     f"(graft|shuffle|novelty)")

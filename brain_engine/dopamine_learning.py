@@ -1,5 +1,30 @@
 import numpy as np
 
+# Ground-scrape aversive per step at full ground signal (moderate:
+# clear discouragement, capped by the [-2, 2] DA window; kill pulses
+# (+1.0 dominance) still dominate any scrape).
+GROUND_DA = 0.5
+from sensory_motor import FLOW_CRUISE
+
+_BASE_MEANS_MEMO = {}
+
+
+def _base_means_cached(populations, bindptr, bindices, bweights):
+    """Memoized _compute_base_means: a wiring constant (5 floats) that
+    every DopamineReinforcement construction recomputed from scratch —
+    ~100 MB of repeat/mask temps per stage, per server boot. Keyed by
+    object identity with strong refs (keeps the base wiring alive, so
+    ids stay stable and hits stay correct); capped at 2 wirings."""
+    key = (id(populations), id(bindptr), id(bweights))
+    hit = _BASE_MEANS_MEMO.get(key)
+    if hit is not None:
+        return hit[4]
+    means = _compute_base_means_impl(populations, bindptr, bindices, bweights)
+    _BASE_MEANS_MEMO[key] = (populations, bindptr, bindices, bweights, means)
+    while len(_BASE_MEANS_MEMO) > 2:
+        _BASE_MEANS_MEMO.pop(next(iter(_BASE_MEANS_MEMO)))
+    return means
+
 
 class DopamineReinforcement:
     """
@@ -23,7 +48,7 @@ class DopamineReinforcement:
         # pinning (unit tests, diagnose scripts).
         self._base_means = None
         if base is not None:
-            self._base_means = self._compute_base_means(populations, *base)
+            self._base_means = _base_means_cached(populations, *base)
 
         # Sensory pools as lists for fast iteration (gain modulation acts on
         # ALL efferents from these pools, not just monosynaptic sensory->DN
@@ -57,6 +82,11 @@ class DopamineReinforcement:
         # Antennal-gyro pools (JO, gyro_flow scheme). Stale-cache safe.
         jo = populations.get("gyro_jo", {})
         self.jo_left = list(jo.get("left", []))
+        # Haltere roll-motor pools (learned banks, muscles_up scheme).
+        # Stale-cache safe: empty lists scale nothing.
+        mnhl = populations.get("motor_roll_mnhl", {})
+        self.mnhl_left = list(mnhl.get("left", []))
+        self.mnhl_right = list(mnhl.get("right", []))
         self.jo_right = list(jo.get("right", []))
         # Translational-flow pools (T4/T5, flow_trans scheme). Direction
         # groups combine T4+T5 of one tuning (a progressive, b
@@ -131,6 +161,8 @@ class DopamineReinforcement:
                             ("lplc2", self.lplc2_left), ("lplc2", self.lplc2_right),
                             ("lc11", self.lc11_left), ("lc11", self.lc11_right),
                             ("jo", self.jo_left), ("jo", self.jo_right),
+                            ("mnhl", self.mnhl_left),
+                            ("mnhl", self.mnhl_right),
                             ("t4a", self.t4["a"]), ("t4b", self.t4["b"]),
                             ("t4c", self.t4["c"]), ("t4d", self.t4["d"])):
             self._pool_of[id(_lst)] = _name
@@ -179,74 +211,8 @@ class DopamineReinforcement:
     def _compute_base_means(self, populations, bindptr, bindices, bweights):
         """Mean |w| per plastic pool on the reference connectome. One factor
         per pool (never per row/side) so every learned ratio survives."""
-        bindptr = np.asarray(bindptr)
-        bindices = np.asarray(bindices)
-        bweights = np.asarray(bweights, dtype=np.float32)
-        sens_ids = (list(populations["pheromone_da1"]["left"])
-                    + list(populations["pheromone_da1"]["right"])
-                    + list(populations["pheromone_va1v"]["left"])
-                    + list(populations["pheromone_va1v"]["right"])
-                    + list(populations["visual_lc10"]["left"])
-                    + list(populations["visual_lc10"]["right"])
-                    + list(populations["visual_lc4"]["left"])
-                    + list(populations["visual_lc4"]["right"])
-                    + list(populations["visual_lplc2"]["left"])
-                    + list(populations["visual_lplc2"]["right"])
-                    + list(populations.get("visual_lc11", {}).get("left", []))
-                    + list(populations.get("visual_lc11", {}).get("right", []))
-                    + list(populations.get("visual_lc15", {}).get("left", []))
-                    + list(populations.get("visual_lc15", {}).get("right", []))
-                    + list(populations.get("visual_lc17", {}).get("left", []))
-                    + list(populations.get("visual_lc17", {}).get("right", []))
-                    + list(populations.get("visual_lc18", {}).get("left", []))
-                    + list(populations.get("visual_lc18", {}).get("right", [])))
-        jo_ids = list(populations.get("gyro_jo", {}).get("left", [])) \
-            + list(populations.get("gyro_jo", {}).get("right", []))
-        n = len(bindptr) - 1
-        dn_ids = np.concatenate([
-            np.asarray(populations.get("descending_all", {}).get("left", []), dtype=np.int32),
-            np.asarray(populations.get("descending_all", {}).get("right", []), dtype=np.int32)])
-        kc_ids = np.asarray(populations.get("mushroom_body_kc", []), dtype=np.int32)
-        mbon_ids = np.concatenate([
-            np.asarray(populations.get("mbon_app", {}).get("all", []), dtype=np.int32),
-            np.asarray(populations.get("mbon_av", {}).get("all", []), dtype=np.int32)])
-        pos_sens = self._row_positions(bindptr, sens_ids)
-        pos_jo = self._row_positions(bindptr, jo_ids)
-        pos_dn = np.where(np.isin(bindices, dn_ids))[0].astype(np.int32) if len(dn_ids) else np.empty(0, dtype=np.int32)
-        brows = np.repeat(np.arange(n, dtype=np.int32), np.diff(bindptr).astype(np.int64))
-        is_kc = np.zeros(n, dtype=bool)
-        if len(kc_ids):
-            is_kc[kc_ids[kc_ids < n]] = True
-        is_mbon = np.zeros(n, dtype=bool)
-        if len(mbon_ids):
-            is_mbon[mbon_ids[mbon_ids < n]] = True
-        pos_kcm = np.where(is_kc[brows] & is_mbon[bindices])[0].astype(np.int32)
-        del brows
-        # Bulk = everything outside the pinned pools. Tracked separately
-        # because the global mean masks composition: hot pools plus
-        # crushed bulk cancel out (measured: 22x pools with 0.04x bulk
-        # reads as a healthy global). Bulk collapse is always drift -
-        # nothing in the engine learns by suppressing all non-pool
-        # synapses - so bulk gets bands but no suppression floor.
-        covered = np.zeros(len(bweights), dtype=bool)
-        for pos in (pos_sens, pos_jo):
-            if len(pos):
-                covered[pos] = True
-        dn_cov = np.isin(bindices, dn_ids) if len(dn_ids) else np.zeros(len(bweights), dtype=bool)
-        covered |= dn_cov
-        if len(pos_kcm):
-            covered[pos_kcm] = True
-        pos_bulk = np.where(~covered)[0].astype(np.int32)
-        del covered
-        means = {}
-        for name, pos in (("sens", pos_sens), ("jo", pos_jo), ("dn_in", pos_dn),
-                          ("kcmbon", pos_kcm), ("bulk", pos_bulk)):
-            if len(pos) == 0:
-                means[name] = 0.0
-            else:
-                means[name] = float(np.abs(bweights[pos]).mean())
-        means["global"] = float(np.abs(bweights).mean())
-        return means
+        return _compute_base_means_impl(populations, bindptr, bindices, bweights)
+
 
     def _ensure_pin_positions(self, brain):
         """Flat positions for the pinned pools on this brain's wiring.
@@ -258,7 +224,8 @@ class DopamineReinforcement:
                 + self.va1v_right + self.lc10_left + self.lc10_right \
                 + self.lc4_left + self.lc4_right + self.lplc2_left \
                 + self.lplc2_right + self.lc11_left + self.lc11_right \
-                + self._retina_feat
+                + self._retina_feat + self.t4["a"] + self.t4["b"] \
+                + self.t4["c"] + self.t4["d"]
             jo_ids = self.jo_left + self.jo_right
             cached = (len(brain.weights),
                       self._row_positions(indptr, sens_ids),
@@ -372,7 +339,8 @@ class DopamineReinforcement:
                 self._base_means.get("kcmbon", 0.0))
 
     def compute_reward(self, current_dist, prev_dist, azimuth_deg, dt=0.05, tail_chase=0.0,
-                       ventral=0.0, schemes=()):
+                       ventral=0.0, schemes=(), scent_now=0.0, scent_prev=0.0,
+                       ground=0.0):
         """
         Computes the net dopamine neuromodulatory signal:
           - Closing distance (prev_dist > current_dist) -> PAM reward (positive DA)
@@ -382,6 +350,11 @@ class DopamineReinforcement:
           - Steady cruise (flow_trans brains only): ventral flow near the
             cruise target earns a small bonus, so speed regulation itself
             is worth something, not just closing.
+          - Scent gradient ascent (optional scent_now/scent_prev totals):
+            rising total concentration pays up to +0.5, falling costs the
+            same - smelling the approach is worth something even when the
+            eyes haven't found the rival yet. Defaults 0.0 keep legacy
+            callers (and the server battle loop) exactly unchanged.
         The tail bonus is deliberately small (+0.4 max): positioning is shaping
         for the kill, never worth more than the kill itself.
         """
@@ -390,6 +363,10 @@ class DopamineReinforcement:
 
         # 1. Distance shaping reward: rewards positive closing velocity
         r_dist = np.clip(closing_speed * self.dist_gain, -2.0, 2.0)
+
+        # 1b. Scent gradient ascent: rising total odor concentration.
+        scent_rate = (float(scent_now) - float(scent_prev)) / max(dt, 1e-6)
+        r_scent = 0.5 * float(np.clip(scent_rate * 2.0, -1.0, 1.0))
 
         # 2. Heading alignment reward: bonus if facing toward opponent
         abs_azimuth = abs(azimuth_deg)
@@ -402,14 +379,21 @@ class DopamineReinforcement:
             r_align = bad
 
         # 3. Cruise steadiness (flow_trans only): ventral flow near target.
-        from sensory_motor import FLOW_CRUISE
         r_flow = 0.0
-        if "flow_trans" in tuple(schemes or ()):
+        if "flow_trans" in (schemes or ()):
             v = float(np.clip(ventral, 0.0, 1.0))
             r_flow = 0.2 * (1.0 - min(abs(v - FLOW_CRUISE) / FLOW_CRUISE, 1.0))
 
-        # Net dopamine concentration (PAM > 0 vs PPL1 < 0)
-        da_signal = np.clip(r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0)) + r_flow, -2.0, 2.0)
+        # Net dopamine concentration (PAM > 0 vs PPL1 < 0). ground is
+        # the per-step ground-scrape signal in [0, 1] (train loop only;
+        # default 0.0 keeps every legacy caller bit-identical): bumping
+        # the floor or nose-diving into it pays aversive, so ground-
+        # clipping behavior is discouraged where it learns.
+        da_signal = np.clip(
+            r_dist + r_align + 0.4 * float(np.clip(tail_chase, 0.0, 1.0))
+            + r_flow + r_scent
+            - GROUND_DA * float(np.clip(ground, 0.0, 1.0)),
+            -2.0, 2.0)
         return float(da_signal)
 
     def apply_plasticity(self, brain, sensory_dict, motor_dict, da_signal, schemes=(),
@@ -441,6 +425,7 @@ class DopamineReinforcement:
         azimuth = sensory_dict.get("visual_target_azimuth", 0.0)
 
         yaw = motor_dict.get("yaw_torque", 0.0)
+        roll = motor_dict.get("roll_torque", 0.0)
 
         left_active = (c_left > c_right + 0.03) or (azimuth < -15.0)
         right_active = (c_right > c_left + 0.03) or (azimuth > 15.0)
@@ -465,6 +450,25 @@ class DopamineReinforcement:
                 mag = self.lr * max(abs(da_signal), 0.3)
                 self._scale_incoming(brain, "left", 1.0 - mag * 0.5)
                 self._scale_incoming(brain, "right", 1.0 + mag * 0.5)
+
+        # Haltere roll-motor credit (learned banks): coordinated turns
+        # bank into the yaw. Correct-side roll with a correct turn
+        # potentiates that side's MNhl drive; fighting roll depresses
+        # it. Empty pools (unwired/stale-cache brains) scale nothing.
+        if left_active and not right_active:
+            if yaw < -0.05 and roll < -0.05:
+                self._scale_outgoing(brain, self.mnhl_left,
+                                     1.0 + self.lr * da_signal)
+            elif yaw < -0.05 and roll > 0.05:
+                dep = 1.0 - self.lr * abs(da_signal) * 0.5
+                self._scale_outgoing(brain, self.mnhl_left, dep)
+        elif right_active and not left_active:
+            if yaw > 0.05 and roll > 0.05:
+                self._scale_outgoing(brain, self.mnhl_right,
+                                     1.0 + self.lr * da_signal)
+            elif yaw > 0.05 and roll < -0.05:
+                dep = 1.0 - self.lr * abs(da_signal) * 0.5
+                self._scale_outgoing(brain, self.mnhl_right, dep)
 
         # Lateralized case: stimulus clearly on one side
         if left_active and not right_active:
@@ -676,6 +680,18 @@ class DopamineReinforcement:
                 brain.weights[start:end] = np.clip(
                     brain.weights[start:end] * factor, -3000.0, 3000.0)
 
+    def scent_acuity(self, brain):
+        """Olfactory acuity lineage metric: mean |w| over DA1+VA1v
+        outgoing synapses (both sides). Rises when pursuit training
+        potentiates the nose, falls when wrong-way turns depress it.
+        Read-only measurement for breeding records and selection design;
+        fitness integration needs arena->server stats plumbing (follow-up).
+        Returns 0.0 when the brain has no ORN efferents yet."""
+        return float(np.mean([
+            self._pool_cur(brain, self.da1_left + self.da1_right),
+            self._pool_cur(brain, self.va1v_left + self.va1v_right),
+        ]))
+
     @staticmethod
     def _pool_cur(brain, pre_list):
         """Mean |w| over outgoing synapses of the listed presynaptic cells."""
@@ -794,3 +810,92 @@ class DopamineReinforcement:
     def _modulate_pathway(self, brain, pre_set, post_set, factor):
         """Legacy direct-edge API kept for compat; now scales outgoing."""
         self._scale_outgoing(brain, list(pre_set), factor)
+
+def _compute_base_means_impl(populations, bindptr, bindices, bweights):
+    """Mean |w| per plastic pool on the reference connectome (module-level
+    so _base_means_cached can memoize it across constructions)."""
+    bindptr = np.asarray(bindptr)
+    bindices = np.asarray(bindices)
+    bweights = np.asarray(bweights, dtype=np.float32)
+    sens_ids = (list(populations["pheromone_da1"]["left"])
+                + list(populations["pheromone_da1"]["right"])
+                + list(populations["pheromone_va1v"]["left"])
+                + list(populations["pheromone_va1v"]["right"])
+                + list(populations["visual_lc10"]["left"])
+                + list(populations["visual_lc10"]["right"])
+                + list(populations["visual_lc4"]["left"])
+                + list(populations["visual_lc4"]["right"])
+                + list(populations["visual_lplc2"]["left"])
+                + list(populations["visual_lplc2"]["right"])
+                + list(populations.get("visual_lc11", {}).get("left", []))
+                + list(populations.get("visual_lc11", {}).get("right", []))
+                + list(populations.get("visual_lc15", {}).get("left", []))
+                + list(populations.get("visual_lc15", {}).get("right", []))
+                + list(populations.get("visual_lc17", {}).get("left", []))
+                + list(populations.get("visual_lc17", {}).get("right", []))
+                + list(populations.get("visual_lc18", {}).get("left", []))
+                + list(populations.get("visual_lc18", {}).get("right", []))
+                + list(populations.get("visual_t4a", {}).get("left", []))
+                + list(populations.get("visual_t4a", {}).get("right", []))
+                + list(populations.get("visual_t4b", {}).get("left", []))
+                + list(populations.get("visual_t4b", {}).get("right", []))
+                + list(populations.get("visual_t4c", {}).get("left", []))
+                + list(populations.get("visual_t4c", {}).get("right", []))
+                + list(populations.get("visual_t4d", {}).get("left", []))
+                + list(populations.get("visual_t4d", {}).get("right", []))
+                + list(populations.get("visual_t5a", {}).get("left", []))
+                + list(populations.get("visual_t5a", {}).get("right", []))
+                + list(populations.get("visual_t5b", {}).get("left", []))
+                + list(populations.get("visual_t5b", {}).get("right", []))
+                + list(populations.get("visual_t5c", {}).get("left", []))
+                + list(populations.get("visual_t5c", {}).get("right", []))
+                + list(populations.get("visual_t5d", {}).get("left", []))
+                + list(populations.get("visual_t5d", {}).get("right", [])))
+    jo_ids = list(populations.get("gyro_jo", {}).get("left", [])) \
+        + list(populations.get("gyro_jo", {}).get("right", []))
+    n = len(bindptr) - 1
+    dn_ids = np.concatenate([
+        np.asarray(populations.get("descending_all", {}).get("left", []), dtype=np.int32),
+        np.asarray(populations.get("descending_all", {}).get("right", []), dtype=np.int32)])
+    kc_ids = np.asarray(populations.get("mushroom_body_kc", []), dtype=np.int32)
+    mbon_ids = np.concatenate([
+        np.asarray(populations.get("mbon_app", {}).get("all", []), dtype=np.int32),
+        np.asarray(populations.get("mbon_av", {}).get("all", []), dtype=np.int32)])
+    pos_sens = DopamineReinforcement._row_positions(bindptr, sens_ids)
+    pos_jo = DopamineReinforcement._row_positions(bindptr, jo_ids)
+    pos_dn = np.where(np.isin(bindices, dn_ids))[0].astype(np.int32) if len(dn_ids) else np.empty(0, dtype=np.int32)
+    brows = np.repeat(np.arange(n, dtype=np.int32), np.diff(bindptr).astype(np.int64))
+    is_kc = np.zeros(n, dtype=bool)
+    if len(kc_ids):
+        is_kc[kc_ids[kc_ids < n]] = True
+    is_mbon = np.zeros(n, dtype=bool)
+    if len(mbon_ids):
+        is_mbon[mbon_ids[mbon_ids < n]] = True
+    pos_kcm = np.where(is_kc[brows] & is_mbon[bindices])[0].astype(np.int32)
+    del brows
+    # Bulk = everything outside the pinned pools. Tracked separately
+    # because the global mean masks composition: hot pools plus
+    # crushed bulk cancel out (measured: 22x pools with 0.04x bulk
+    # reads as a healthy global). Bulk collapse is always drift -
+    # nothing in the engine learns by suppressing all non-pool
+    # synapses - so bulk gets bands but no suppression floor.
+    covered = np.zeros(len(bweights), dtype=bool)
+    for pos in (pos_sens, pos_jo):
+        if len(pos):
+            covered[pos] = True
+    dn_cov = np.isin(bindices, dn_ids) if len(dn_ids) else np.zeros(len(bweights), dtype=bool)
+    covered |= dn_cov
+    if len(pos_kcm):
+        covered[pos_kcm] = True
+    pos_bulk = np.where(~covered)[0].astype(np.int32)
+    del covered
+    means = {}
+    for name, pos in (("sens", pos_sens), ("jo", pos_jo), ("dn_in", pos_dn),
+                      ("kcmbon", pos_kcm), ("bulk", pos_bulk)):
+        if len(pos) == 0:
+            means[name] = 0.0
+        else:
+            means[name] = float(np.abs(bweights[pos]).mean())
+    means["global"] = float(np.abs(bweights).mean())
+    return means
+

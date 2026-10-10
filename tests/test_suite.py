@@ -21,6 +21,31 @@ from experimental_wiring import EXPERIMENTS, apply_overlay, experiment_arrays
 import brain_package as vault_pkg
 
 
+def _free_udp_port():
+    # Probe an ephemeral port for an isolated test server (the live
+    # server owns 9999; headless suites must never touch it).
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _isolated_server_env(tmp_root, port):
+    # Private vault + tournaments + port for a spawned test server, so
+    # protocol suites run fully isolated (previously they banked into
+    # the LIVE vault/server on 9999 mid-tournament).
+    vault_dir = os.path.join(tmp_root, "brains")
+    os.makedirs(vault_dir, exist_ok=True)
+    tour_dir = os.path.join(tmp_root, "tournaments")
+    os.makedirs(tour_dir, exist_ok=True)
+    env = dict(os.environ)
+    env["FLY_VAULT_DIR"] = vault_dir
+    env["FLY_TOURNAMENTS_DIR"] = tour_dir
+    env["BRAIN_PORT"] = str(port)
+    return env, vault_dir, tour_dir
+
+
 class TestConnectomeData(unittest.TestCase):
     """Verifies that connectome files and mapped populations are intact and valid."""
     @classmethod
@@ -127,6 +152,584 @@ class TestSensoryMotor(unittest.TestCase):
         for s in spikes_right:
             self.assertIn(s, da1_right_set)
 
+    def test_reflex_yaw_contrast(self):
+        # Lateral contrast (R-L)/(R+L): bearing reads the same faint or
+        # strong; equal inputs (incl. double-zero) stay exactly silent.
+        ry = MotorDecoder.reflex_yaw
+        self.assertEqual(ry({"pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}), 0.0)
+        self.assertEqual(ry({"pheromone_conc_left": 0.0, "pheromone_conc_right": 0.0}), 0.0)
+        faint = ry({"pheromone_conc_left": 0.2, "pheromone_conc_right": 0.05})
+        glued = ry({"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.85})
+        self.assertLess(faint, 0.0)
+        self.assertLess(glued, 0.0)
+        # Faint-but-lateral steers harder than strong-but-balanced.
+        self.assertLess(faint, glued)
+        self.assertGreater(
+            ry({"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.2}), 0.0)
+
+    def test_lost_search_and_surge(self):
+        # Lost 3+ s with nothing visible: yaw blends toward the cast
+        # sweep instead of coasting; eyes or fresh scent disables it.
+        dec = MotorDecoder(self.pops)
+        lost = {"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.05,
+                "visual_target_visible": False, "scent_lost": 10.0,
+                "scent_cast": 1.0, "scent_surge": 0.0}
+        self.assertGreater(dec.decode([], sensory_hint=lost)["yaw_torque"], 0.0)
+        lost["scent_cast"] = -1.0
+        self.assertLess(dec.decode([], sensory_hint=lost)["yaw_torque"], 0.0)
+        found = dict(lost, scent_lost=0.0, scent_cast=1.0)
+        self.assertAlmostEqual(
+            dec.decode([], sensory_hint=found)["yaw_torque"],
+            dec.reflex_yaw(found), places=6)
+        seen = dict(lost, visual_target_visible=True)
+        self.assertAlmostEqual(
+            dec.decode([], sensory_hint=seen)["yaw_torque"],
+            dec.reflex_yaw(seen), places=6)
+        # Surge: rising scent spends extra thrust (capped at 1.0).
+        calm = {"pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5,
+                "visual_target_visible": True, "scent_surge": 0.0}
+        rising = dict(calm, scent_surge=1.0)
+        t0 = dec.decode([], sensory_hint=calm)["thrust"]
+        t1 = dec.decode([], sensory_hint=rising)["thrust"]
+        self.assertGreater(t1, t0)
+        self.assertLessEqual(t1, 1.0)
+
+    def test_ground_scrape_reward(self):
+        # Moderate aversive: reward drops monotonically with the
+        # ground signal; legacy callers (ground absent) are unchanged.
+        import dopamine_learning as dl
+        rl = dl.DopamineReinforcement(self.pops)
+        base = dict(current_dist=10.0, prev_dist=11.0,
+                    azimuth_deg=0.0, dt=1.0)
+        clean = rl.compute_reward(**base)
+        self.assertAlmostEqual(clean, rl.compute_reward(**base, ground=0.0))
+        half = rl.compute_reward(**base, ground=0.5)
+        full = rl.compute_reward(**base, ground=1.0)
+        self.assertLess(half, clean)
+        self.assertLess(full, half)
+
+    def test_ground_scrape_detection(self):
+        # Floor band flags the signal; clear air does not.
+        from train_homing import KinematicFly
+        f = KinematicFly(y=0.7)
+        f.step(0.0, 0.0)
+        self.assertEqual(f.ground_now, 1.0)
+        self.assertGreater(f.scrape_time, 0.0)
+        f2 = KinematicFly(y=7.0)
+        f2.step(0.0, 0.0)
+        self.assertEqual(f2.ground_now, 0.0)
+
+    def test_fitness_ground_demerit(self):
+        # A scraper ranks below an equal clean flier; kills still
+        # dominate any scrape.
+        from evolution_engine import EvolutionManager
+        m = EvolutionManager.__new__(EvolutionManager)
+        clean = m.calc_fitness({"kills": 0, "scrape_time_s": 0.0})
+        scraper = m.calc_fitness({"kills": 0, "scrape_time_s": 6.0})
+        self.assertLess(scraper, clean)
+        killer = m.calc_fitness({"kills": 1, "scrape_time_s": 10.0})
+        self.assertGreater(killer, scraper)
+        self.assertAlmostEqual(
+            scraper, -min(6.0, 10.0) * 8.0)
+
+    def test_control_channel_audit(self):
+        # Every decoded output is registered in CONTROL_CHANNELS with
+        # at least one driving neuron pool: reflex-only control can
+        # never slip in silently again.
+        from sensory_motor import CONTROL_CHANNELS
+        out = self.decoder.decode([], sensory_hint={
+            "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5,
+            "visual_target_visible": True, "visual_target_azimuth": 0.0,
+            "visual_target_elevation": 0.0, "altitude": 7.0,
+            "visual_looming_rate": 0.0, "visual_tree_looming": 0.0,
+            "visual_flow_ventral": 0.3, "visual_flow_lateral": 0.0,
+            "visual_flow_expansion": 0.0, "scent_lost": 0.0})
+        self.assertTrue(len(out) > 0)
+        for key in out:
+            self.assertIn(key, CONTROL_CHANNELS)
+            self.assertGreater(
+                len(CONTROL_CHANNELS[key]["pools"]), 0, key)
+
+    def test_blend_defaults_match_legacy(self):
+        # Untouched blends reproduce the legacy operating point exactly.
+        from sensory_motor import BLEND_DEFAULTS
+        hint = {"pheromone_conc_left": 0.2, "pheromone_conc_right": 0.7,
+                "visual_target_visible": True, "visual_target_azimuth": 10.0,
+                "visual_target_elevation": 5.0, "altitude": 7.0,
+                "visual_looming_rate": 0.8, "visual_tree_looming": 0.0,
+                "scent_lost": 0.0}
+        a = MotorDecoder(self.pops).decode([], sensory_hint=dict(hint))
+        b = MotorDecoder(self.pops,
+                         blends=dict(BLEND_DEFAULTS)).decode(
+                             [], sensory_hint=dict(hint))
+        self.assertEqual(a, b)
+
+    def test_yaw_blend_migrates_vote(self):
+        # yaw_blend=1 flies the brain vote alone (hint reflex gone);
+        # default blends keep the legacy reflex-led turn. Spikes keep
+        # the decode on the main path (empty spikes take the
+        # blend-exempt dead-brain failsafe).
+        hint = {"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.8,
+                "visual_target_visible": False, "scent_lost": 0.0}
+        dn = list(self.pops["descending_all"]["all"])[:24]
+        default = MotorDecoder(self.pops).decode(dn, sensory_hint=dict(hint))
+        neural = MotorDecoder(self.pops,
+                              blends={"yaw_blend": 1.0}).decode(
+                                  dn, sensory_hint=dict(hint))
+        lone = MotorDecoder(self.pops).decode(dn, sensory_hint=None)
+        self.assertGreater(default["yaw_torque"], 0.0)
+        self.assertAlmostEqual(neural["yaw_torque"], lone["yaw_torque"],
+                               places=6)
+
+    def test_evade_backup_toggle(self):
+        # Looming rival, silent giant fiber: backup on (legacy) evades,
+        # evade_backup=0 trusts the GF alone and holds. Spikes keep the
+        # decode on the main path (empty spikes take the blend-exempt
+        # dead-brain failsafe).
+        hint = {"visual_target_visible": True, "visual_target_azimuth": 0.0,
+                "visual_rival_looming": 0.9, "visual_tree_looming": 0.0,
+                "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}
+        # Thrust-only spikes: no GF/mouth/ram drive, so evade can only
+        # come from the reflex backup under test.
+        dn = list(self.pops["motor_thrust_dnp09"]["all"])
+        on = MotorDecoder(self.pops).decode(dn, sensory_hint=dict(hint))
+        off = MotorDecoder(self.pops,
+                           blends={"evade_backup": 0.0}).decode(
+                               dn, sensory_hint=dict(hint))
+        self.assertTrue(on["emergency_evade"])
+        self.assertFalse(off["emergency_evade"])
+
+    def test_pitch_neural_vote(self):
+        # Legacy reflex holds the nose level here (elevation 0, alt 7);
+        # pitch_blend=0 with a T4c climb volley pitches up on neurons.
+        hint = {"visual_target_elevation": 0.0, "altitude": 7.0,
+                "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}
+        pops = self.pops
+        climb = list(pops["visual_t4c"]["all"]) + list(pops["visual_t5c"]["all"])
+        self.assertGreater(len(climb), 0)
+        base = MotorDecoder(self.pops).decode(
+            climb, sensory_hint=dict(hint))["pitch_torque"]
+        self.assertAlmostEqual(base, 0.0, places=6)
+        neural = MotorDecoder(self.pops,
+                              blends={"pitch_blend": 0.0}).decode(
+                                  climb, sensory_hint=dict(hint))["pitch_torque"]
+        self.assertGreater(neural, 0.0)
+
+    def test_flow_cruise_reads_spikes(self):
+        # Same ventral hint: silent T4a falls back to the hint trim
+        # (legacy), a full T4a volley reads fast and trims thrust down.
+        hint = {"visual_flow_ventral": 0.0, "visual_flow_lateral": 0.0,
+                "visual_flow_expansion": 0.0,
+                "pheromone_conc_left": 0.5, "pheromone_conc_right": 0.5}
+        pops = self.pops
+        fast = list(pops["visual_t4a"]["all"]) + list(pops["visual_t5a"]["all"])
+        self.assertGreater(len(fast), 0)
+        dec = MotorDecoder(self.pops, mapping="flow_trans")
+        fallback = dec.decode([], sensory_hint=dict(hint))["thrust"]
+        neural = dec.decode(fast, sensory_hint=dict(hint))["thrust"]
+        self.assertLess(neural, fallback)
+
+    def test_lost_search_orn_vote(self):
+        # Lost with a right cast: silent antennae follow the sweep
+        # (legacy); whispering left ORNs pull the vote back left.
+        hint = {"pheromone_conc_left": 0.05, "pheromone_conc_right": 0.05,
+                "visual_target_visible": False, "scent_lost": 10.0,
+                "scent_cast": 1.0, "scent_surge": 0.0}
+        pops = self.pops
+        left_orn = list(pops["pheromone_da1"]["left"]) \
+            + list(pops["pheromone_va1v"]["left"])
+        self.assertGreater(len(left_orn), 0)
+        dec = MotorDecoder(self.pops)
+        sweep = dec.decode([], sensory_hint=dict(hint))["yaw_torque"]
+        whisper = dec.decode(left_orn,
+                             sensory_hint=dict(hint))["yaw_torque"]
+        self.assertGreater(sweep, 0.0)
+        self.assertLess(whisper, sweep)
+
+    def test_scent_reward_and_acuity(self):
+        # Rising total conc pays, falling costs; acuity reads ORN
+        # efferent strength and rises with correct-turn potentiation.
+        rl = DopamineReinforcement(self.pops)
+        up = rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.6, scent_prev=0.4)
+        flat = rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.4, scent_prev=0.4)
+        down = rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.4, scent_prev=0.6)
+        self.assertGreater(up, flat)
+        self.assertLess(down, flat)
+        # Legacy callers (no scent kwargs) unchanged.
+        self.assertEqual(
+            rl.compute_reward(20.0, 20.0, 0.0),
+            rl.compute_reward(20.0, 20.0, 0.0, scent_now=0.0, scent_prev=0.0))
+        # Minimal fake brain: 3 outgoing 0.5-weight edges per ORN.
+        # Targets sit past every pool id so motor/KC masks (matched on
+        # postsynaptic targets) stay empty and only ORN efferents move.
+        import types
+        orn = set(self.pops["pheromone_da1"]["left"]
+                  + self.pops["pheromone_da1"]["right"]
+                  + self.pops["pheromone_va1v"]["left"]
+                  + self.pops["pheromone_va1v"]["right"])
+        top = max(orn) + 2
+        indptr = np.zeros(top + 1, dtype=np.int64)
+        tot = 0
+        for i in range(top):
+            indptr[i] = tot
+            if i in orn:
+                tot += 3
+        indptr[top] = tot
+        brain = types.SimpleNamespace(
+            indptr=indptr,
+            indices=(900000 + np.arange(tot)).astype(np.int32),
+            weights=np.full(tot, 0.5, dtype=np.float32))
+        a0 = rl.scent_acuity(brain)
+        self.assertAlmostEqual(a0, 0.5, places=5)
+        sens = {"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.1,
+                "visual_target_azimuth": -40.0}
+        motor = {"yaw_torque": -0.5, "thrust": 0.3, "pitch_torque": 0.0}
+        rl.apply_plasticity(brain, sens, motor, 1.0)
+        self.assertGreater(rl.scent_acuity(brain), a0)
+
+    def test_flow_saccade_gate(self):
+        # Spin quiets T4 drive (saccade suppression); still air reads full.
+        from sensory_motor import SensoryEncoder
+        still = SensoryEncoder(self.pops, mapping="flow_trans")
+        n_still = len(still.encode({"visual_flow_ventral": 1.0}))
+        spin = SensoryEncoder(self.pops, mapping="flow_trans")
+        n_spin = len(spin.encode({"visual_flow_ventral": 1.0,
+                                  "angular_yaw_rate": 1.0,
+                                  "angular_roll_rate": 0.0}))
+        self.assertGreater(n_still, 0)
+        self.assertLess(n_spin, n_still * 0.5)
+        # Absent angular keys behave exactly as before (gain 1.0).
+        plain = SensoryEncoder(self.pops, mapping="flow_trans")
+        n_plain = len(plain.encode({"visual_flow_ventral": 1.0}))
+        self.assertEqual(n_plain, n_still)
+
+    def test_flow_habituation(self):
+        # Sustained saturating flow adapts that group down (floor 0.3);
+        # clean air recovers; reset restores.
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        sat = {"visual_flow_ventral": 1.0}
+        enc.encode(sat)
+        for _ in range(200):
+            enc.encode(sat)
+        self.assertLess(enc.flow_hab["a"], 1.0)
+        self.assertGreaterEqual(enc.flow_hab["a"], 0.3)
+        # Untouched groups stay fresh.
+        self.assertEqual(enc.flow_hab["b"], 1.0)
+        g_low = enc.flow_hab["a"]
+        for _ in range(400):
+            enc.encode({})
+        self.assertGreater(enc.flow_hab["a"], g_low)
+        enc.reset_odor()
+        self.assertEqual(enc.flow_hab,
+                         {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0})
+
+    def test_drift_trim_disengages_saturated(self):
+        # Pegged lateral (|l|=1) skips the drift trim; mid lateral applies.
+        from sensory_motor import MotorDecoder
+        dec = MotorDecoder(self.pops, mapping="flow_trans")
+        spikes = [1, 2, 3]
+        y_sat = dec.decode(spikes, sensory_hint={
+            "visual_flow_ventral": 0.35, "visual_flow_lateral": 1.0})["yaw_torque"]
+        y_mid = dec.decode(spikes, sensory_hint={
+            "visual_flow_ventral": 0.35, "visual_flow_lateral": 0.5})["yaw_torque"]
+        self.assertLess(y_sat, y_mid)
+
+    def test_t4_pinned(self):
+        # T4/T5 efferent rows belong to the pinned sens pool.
+        import types
+        import numpy as np
+        from dopamine_learning import DopamineReinforcement
+        rl = DopamineReinforcement(self.pops)
+        need = []
+        for k in ("pheromone_da1", "visual_lc10", "visual_t4a",
+                  "visual_t5d"):
+            need += list(self.pops[k]["left"][:4])
+        top = max(need) + 2
+        indptr = np.arange(top + 1, dtype=np.int64)
+        indptr = np.append(indptr, top + 1)
+        fake = types.SimpleNamespace(
+            indptr=indptr,
+            indices=np.zeros(top + 1, dtype=np.int32),
+            weights=np.ones(top + 1, dtype=np.float32))
+        pos_sens, _jo = rl._ensure_pin_positions(fake)
+        pos_set = set(int(x) for x in np.asarray(pos_sens).tolist())
+        t4pre = int(self.pops["visual_t4a"]["left"][0])
+        self.assertIn(t4pre, pos_set)
+
+    def test_trainer_gusts(self):
+        # Gust windows produce bounded nonzero lateral slip; mechanics
+        # are deterministic when preset (no global draws involved).
+        import numpy as np
+        from train_homing import KinematicFly, compute_agent_senses
+        fly = KinematicFly()
+        tgt = KinematicFly(x=10.0, z=2.0)
+        fly.gust_steps = 100
+        fly.gust_val = 0.5
+        for _ in range(10):
+            senses, _d = compute_agent_senses(fly, tgt, prev_dist=15.0)
+            self.assertAlmostEqual(senses["visual_flow_lateral"], 0.5)
+        self.assertEqual(fly.gust_steps, 90)
+        # Fresh flies start calm; gusts appear over long runs, bounded.
+        np.random.seed(7)
+        peak = 0.0
+        f2 = KinematicFly()
+        for _ in range(3000):
+            s, _d = compute_agent_senses(f2, tgt, prev_dist=15.0)
+            peak = max(peak, abs(float(s["visual_flow_lateral"])))
+        self.assertLessEqual(peak, 0.61)
+        self.assertGreater(peak, 0.0)
+
+    def test_school_score(self):
+        # Scenario-weighted: takedown 10, camp 8, reach 6, crash 0,
+        # partial = closed fraction * 4 (capped); overrides honored.
+        from train_homing import _school_score
+        base = {"initial_dist": 20.0}
+        self.assertEqual(_school_score(dict(base, takedown=True), {}),
+                         10.0)
+        self.assertEqual(_school_score(dict(base, camp=True), {}), 8.0)
+        self.assertEqual(_school_score(dict(base, success=True), {}), 6.0)
+        self.assertEqual(_school_score(dict(base, crashed=True), {}), 0.0)
+        # Takedown beats camp beats reach (priority order).
+        self.assertEqual(
+            _school_score(dict(base, takedown=True, success=True), {}), 10.0)
+        # Partial: half-closed = 2.0, overshoot capped at 4.0.
+        self.assertAlmostEqual(
+            _school_score(dict(base, closed=10.0), {}), 2.0)
+        self.assertAlmostEqual(
+            _school_score(dict(base, closed=99.0), {}), 4.0)
+        # Curriculum override.
+        self.assertEqual(
+            _school_score(dict(base, success=True),
+                          {"score_weights": {"reach": 100.0}}), 100.0)
+
+    def test_school_skill_scores(self):
+        # Skill composition: dodge passes, stalk lock, gate threading.
+        # Takedown stays on top; crashes stay absolute zero.
+        from train_homing import _school_score
+        base = {"initial_dist": 20.0}
+        clean = dict(base, dodge=True, success=True, dodge_failed=False,
+                     min_dist=5.0)
+        self.assertEqual(_school_score(clean, {}), 8.0)
+        touched = dict(base, dodge=True, success=True, dodge_failed=True,
+                       min_dist=0.5)
+        self.assertEqual(_school_score(touched, {}), 6.0)
+        far = dict(base, dodge=True, success=True, dodge_failed=False,
+                   min_dist=12.0)
+        self.assertEqual(_school_score(far, {}), 6.0)
+        failed = dict(base, dodge=True, success=False)
+        self.assertEqual(_school_score(failed, {}), 0.0)
+        self.assertAlmostEqual(
+            _school_score(dict(base, gaze_lock_frac=0.5), {}), 2.0)
+        self.assertAlmostEqual(
+            _school_score(dict(base, gaze_lock_frac=1.0,
+                               gate_paid=True), {}),
+            6.0)
+        self.assertEqual(
+            _school_score(dict(base, success=True, gate_paid=True), {}),
+            8.0)
+        self.assertEqual(
+            _school_score(dict(base, takedown=True, gate_paid=True), {}),
+            10.0)
+        self.assertEqual(
+            _school_score(dict(base, crashed=True, gate_paid=True), {}),
+            0.0)
+        self.assertEqual(
+            _school_score(dict(clean, gate_paid=True),
+                          {"score_weights": {"dodge": 5.0, "gate": 1.0}}),
+            6.0)
+
+    def test_scenario_pinning(self):
+        # Curriculum pins restrict the scheduler draw; unknown pins are
+        # ignored and deterministic seeds stay deterministic.
+        import random
+        from train_homing import pick_school_scenario
+        for _ in range(30):
+            b, e = pick_school_scenario(
+                random.Random(3), 0.1, {"pin_behaviors": ["duel"]})
+            self.assertEqual(b, "duel")
+        for _ in range(30):
+            b, e = pick_school_scenario(
+                random.Random(3), 0.9,
+                {"pin_behaviors": ["DUEL"],
+                 "pin_envs": ["forest", "bogus"]})
+            self.assertEqual(b, "duel")
+            self.assertEqual(e, "forest")
+        # Unknown-only pins fall back to the full table.
+        seen = set()
+        for i in range(40):
+            b, _e = pick_school_scenario(
+                random.Random(i), 0.1, {"pin_behaviors": ["bogus"]})
+            seen.add(b)
+        self.assertGreater(len(seen), 1)
+
+    def test_scenario_mults(self):
+        # Default tables are 1.0 (legacy scoring); curriculum overrides
+        # scale the non-takedown base; takedowns keep fixed supremacy.
+        from train_homing import _school_score, _scenario_mult
+        base = {"initial_dist": 20.0, "success": True,
+                "scenario": "DUEL+OPEN"}
+        # Fitted defaults (duel 1.00 x open 1.04) scale the reach base.
+        self.assertAlmostEqual(_school_score(dict(base), {}), 6.24)
+        self.assertEqual(_scenario_mult({"scenario": "BOGUS+X"}, {}), 1.0)
+        self.assertEqual(_scenario_mult({}, {}), 1.0)
+        cur = {"scenario_mult": {"behaviors": {"duel": 2.0},
+                                 "envs": {"open": 0.5}}}
+        self.assertEqual(_scenario_mult({"scenario": "DUEL+OPEN"}, cur), 1.0)
+        self.assertEqual(_school_score(dict(base), cur), 6.0)
+        cur2 = {"scenario_mult": {"behaviors": {"duel": 0.5}}}
+        self.assertAlmostEqual(_school_score(dict(base), cur2), 3.12)
+        # Takedown supremacy untouched by mults.
+        self.assertEqual(
+            _school_score(dict(base, takedown=True), cur2), 10.0)
+
+    def test_scenario_marginals_and_stamp(self):
+        # by_scenario combos split into behavior+env marginal avgs;
+        # stamps accumulate across probes (enrich, never overwrite).
+        from train_homing import scenario_marginals
+        import train_job
+        import brain_package as vault
+        by = {"DUEL+OPEN": {"episodes": 4, "successes": 2, "takedowns": 0,
+                            "score": 16.0},
+              "DUEL+FOREST": {"episodes": 2, "successes": 0, "takedowns": 0,
+                              "score": 2.0}}
+        m = scenario_marginals(by)
+        self.assertAlmostEqual(m["DUEL"], 3.0)
+        self.assertAlmostEqual(m["OPEN"], 4.0)
+        self.assertAlmostEqual(m["FOREST"], 1.0)
+        self.assertEqual(scenario_marginals({}), {})
+        r = vault.new_record("ScenTest")
+        train_job.stamp_scenario_scores(r, by)
+        train_job.stamp_scenario_scores(r, by)
+        table = r["training"]["scenario_scores"]
+        self.assertEqual(table["DUEL"]["episodes"], 12)
+        self.assertAlmostEqual(table["DUEL"]["score"], 36.0)
+
+    def test_merge_summaries_cells(self):
+        # Multi-stage merges sum per-scenario cells (both stages
+        # schooled, so both count) instead of keeping the last.
+        import train_job
+        merged = train_job.merge_summaries([
+            {"episodes": 2, "successes": 1, "score": 8.0,
+             "by_scenario": {"DUEL+OPEN": {"episodes": 2, "successes": 1,
+                                           "takedowns": 0, "score": 8.0}}},
+            {"episodes": 3, "successes": 1, "score": 6.0,
+             "by_scenario": {"DUEL+OPEN": {"episodes": 1, "successes": 0,
+                                           "takedowns": 0, "score": 2.0},
+                             "CAMP+OPEN": {"episodes": 2, "successes": 1,
+                                            "takedowns": 0, "score": 4.0}}}])
+        self.assertEqual(merged["episodes"], 5)
+        self.assertAlmostEqual(merged["score"], 14.0)
+        cell = merged["by_scenario"]["DUEL+OPEN"]
+        self.assertEqual(cell["episodes"], 3)
+        self.assertAlmostEqual(cell["score"], 10.0)
+
+    def test_score_correlations_report(self):
+        # Records-only audit: per-family r vs ELO plus suggested mults.
+        import vault_cli
+        recs = []
+        for i in range(6):
+            elo = 1200.0 + i * 50.0
+            recs.append({"id": "b%d" % i, "name": "B%d" % i,
+                         "record": {"elo": elo, "battles": 10},
+                         "training": {"episodes": 50, "score": 100.0,
+                                      "avg_score": 2.0, "recent_avg": 2.0,
+                                      "scenario_scores": {
+                                          "DUEL": {"score": 4.0 * (i + 1),
+                                                   "episodes": 10},
+                                          "CAMP": {"score": 30.0,
+                                                   "episodes": 10}}}})
+        rows, overall, n = vault_cli.score_correlation_rows(recs, 5, 4)
+        self.assertEqual(n, 6)
+        rows = {r["family"]: r for r in rows}
+        # DUEL rises with ELO -> r ~ +1, mult > 1; CAMP flat -> r ~ 0.
+        self.assertGreater(rows["DUEL"]["pearson_vs_elo"], 0.9)
+        self.assertGreater(rows["DUEL"]["suggested_mult"], 1.0)
+        self.assertAlmostEqual(rows["CAMP"]["pearson_vs_elo"], 0.0, places=6)
+        self.assertEqual(rows["CAMP"]["suggested_mult"], 1.0)
+        self.assertEqual(rows["DUEL"]["n"], 6)
+
+    def test_score_stamping(self):
+        # Score banks on the record, accumulates across sessions, avg
+        # spans cumulative episodes; new records default 0. Production
+        # ordering: log_training_session (episodes) runs BEFORE the stamp.
+        import train_job
+        import brain_package as vault
+        r = vault.new_record("ScoreTest")
+        self.assertEqual(float(r["training"].get("score", 0.0)), 0.0)
+        vault.log_training_session(r, 25, {}, "s1")
+        train_job.stamp_train_score(r, {"score": 50.0, "episodes": 25})
+        self.assertAlmostEqual(float(r["training"]["score"]), 50.0)
+        self.assertAlmostEqual(float(r["training"]["avg_score"]), 2.0)
+        # Second session accumulates; avg recomputed over cumulative.
+        vault.log_training_session(r, 25, {}, "s2")
+        train_job.stamp_train_score(r, {"score": 150.0, "episodes": 25})
+        self.assertAlmostEqual(float(r["training"]["score"]), 200.0)
+        self.assertAlmostEqual(float(r["training"]["avg_score"]),
+                               200.0 / 50.0)
+        # Missing/None summary tolerated.
+        train_job.stamp_train_score(r, None)
+        self.assertAlmostEqual(float(r["training"]["score"]), 200.0)
+        # merge_summaries carries scores.
+        merged = train_job.merge_summaries([
+            {"episodes": 25, "successes": 10, "score": 50.0},
+            {"episodes": 25, "successes": 8, "score": 150.0}])
+        self.assertAlmostEqual(merged["score"], 200.0)
+        self.assertAlmostEqual(merged["avg_score"], 4.0)
+
+    def test_stamp_recent_form(self):
+        # Recent form = exact mean over the last RECENT_EPISODES banked
+        # episodes. Filling each banked episode with its session mean
+        # keeps the window sum exact at session granularity.
+        import train_job
+        import brain_package as vault
+        r = vault.new_record("RecentTest")
+        vault.log_training_session(r, 25, {}, "s1")
+        train_job.stamp_train_score(r, {"score": 50.0, "episodes": 25})
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 2.0)
+        vault.log_training_session(r, 25, {}, "s2")
+        train_job.stamp_train_score(r, {"score": 150.0, "episodes": 25})
+        # Window (20) holds only the second session: all 6.0.
+        self.assertEqual(len(r["training"]["recent"]), 20)
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 6.0)
+        # A short hot session blends with the tail of the last one:
+        # 10x6.0 + 10x10.0 over the 20-ep window = 8.0.
+        vault.log_training_session(r, 10, {}, "s3")
+        train_job.stamp_train_score(r, {"score": 100.0, "episodes": 10})
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 8.0)
+        # Degenerate stamp leaves the ring alone.
+        train_job.stamp_train_score(r, {"score": 5.0, "episodes": 0})
+        self.assertAlmostEqual(float(r["training"]["recent_avg"]), 8.0)
+        self.assertEqual(len(r["training"]["recent"]), 20)
+
+    def test_odor_habituation(self):
+        # Sustained strong odor adapts the drive down (bounded by the
+        # floor); clean air recovers slowly; the floor zone never adapts.
+        enc = SensoryEncoder(self.pops)
+        strong = {"pheromone_conc_left": 0.9, "pheromone_conc_right": 0.9}
+        np.random.seed(7)
+        n1 = len(enc.encode(strong))
+        self.assertGreater(n1, 0)
+        for _ in range(200):
+            enc.encode(strong)
+        self.assertLess(enc.odor_gain, 1.0)
+        self.assertGreaterEqual(enc.odor_gain, 0.3)
+        np.random.seed(7)
+        n2 = len(enc.encode(strong))
+        self.assertLess(n2, n1 * 0.7)
+        # Floor zone never habituates (re-acquisition trace survives).
+        enc2 = SensoryEncoder(self.pops)
+        for _ in range(50):
+            enc2.encode({"pheromone_conc_left": 0.1, "pheromone_conc_right": 0.1})
+        self.assertEqual(enc2.odor_gain, 1.0)
+        # Slow recovery in clean air, then fresh-nose reset.
+        g_low = enc.odor_gain
+        for _ in range(400):
+            enc.encode({})
+        self.assertGreater(enc.odor_gain, g_low)
+        enc.reset_odor()
+        self.assertEqual(enc.odor_gain, 1.0)
+
     def test_sensory_encoder_visual_tracking(self):
         spikes_vis_left = self.encoder.encode({
             "visual_target_visible": True,
@@ -211,6 +814,25 @@ class TestSensoryMotor(unittest.TestCase):
         gf_neurons = self.pops["motor_giant_fiber"]["all"]
         ctrl = self.decoder.decode(gf_neurons)
         self.assertTrue(ctrl["emergency_evade"])
+
+    def test_roll_readout_mnhl(self):
+        # Haltere-motor laterality drives roll under muscles_up only:
+        # right-bank positive, silent pool reads wings-level, and base
+        # + legacy brains never roll from MNhl spikes.
+        from sensory_motor import MotorDecoder
+        dec = MotorDecoder(self.pops, mapping=["muscles_up"])
+        mnhl_r = self.pops["motor_roll_mnhl"]["right"]
+        mnhl_l = self.pops["motor_roll_mnhl"]["left"]
+        self.assertGreater(
+            dec.decode([mnhl_r[0]] * 20)["roll_torque"], 0.3)
+        self.assertLess(
+            dec.decode([mnhl_l[0]] * 20)["roll_torque"], -0.3)
+        self.assertEqual(dec.decode([], None)["roll_torque"], 0.0)
+        self.assertEqual(
+            self.decoder.decode([mnhl_r[0]] * 20)["roll_torque"], 0.0)
+        leg = MotorDecoder(self.pops, mapping=["muscles_up"], legacy=True)
+        self.assertEqual(
+            leg.decode([mnhl_r[0]] * 20)["roll_torque"], 0.0)
 
     def test_gf_evade_gated_on_visible_frontal_rival(self):
         # Phantom case: GF spikes from an unseen (or side) rival must NOT
@@ -623,7 +1245,8 @@ class TestMbonMapping(unittest.TestCase):
             self.pops, base=(csr.indptr, csr.indices, csr.data.copy()))
         # Artificially inflate left-sensory rows 40x with a lateral bias.
         # Covers the full sens pool definition (DA1+VA1v+LC10+LC4+LPLC2+
-        # LC11/15/17/18 left) so the inflated mean still reads runaway.
+        # LC11/15/17/18+T4a-d/T5a-d left) so the inflated mean still
+        # reads runaway.
         left_ids = (self.pops["pheromone_da1"]["left"]
                     + self.pops["pheromone_va1v"]["left"]
                     + self.pops["visual_lc10"]["left"]
@@ -632,7 +1255,15 @@ class TestMbonMapping(unittest.TestCase):
                     + self.pops["visual_lc11"]["left"]
                     + self.pops["visual_lc15"]["left"]
                     + self.pops["visual_lc17"]["left"]
-                    + self.pops["visual_lc18"]["left"])
+                    + self.pops["visual_lc18"]["left"]
+                    + self.pops["visual_t4a"]["left"]
+                    + self.pops["visual_t4b"]["left"]
+                    + self.pops["visual_t4c"]["left"]
+                    + self.pops["visual_t4d"]["left"]
+                    + self.pops["visual_t5a"]["left"]
+                    + self.pops["visual_t5b"]["left"]
+                    + self.pops["visual_t5c"]["left"]
+                    + self.pops["visual_t5d"]["left"])
         for pre in left_ids:
             s, e = int(brain.indptr[pre]), int(brain.indptr[pre + 1])
             if e > s:
@@ -895,23 +1526,40 @@ class TestEvolutionEngine(unittest.TestCase):
 
 class TestUDPServerIntegration(unittest.TestCase):
     """Verifies end-to-end UDP network protocol with the Brain Server."""
+    # Isolated instance (own port/vault/tournaments): this suite used
+    # to hit the LIVE server on 9999 mid-tournament.
+    srv_port = 9999
     @classmethod
     def setUpClass(cls):
+        import tempfile
+        cls.tmp = tempfile.mkdtemp(prefix="udp_proto_")
+        cls.srv_port = _free_udp_port()
+        _env, _vdir, _tdir = _isolated_server_env(cls.tmp, cls.srv_port)
+        # stdout to a FILE, never PIPE: an undrained pipe fills (64 KB)
+        # and BLOCKS the single-threaded server loop mid-print - the
+        # wedge that only hit combined runs. The file also doubles as
+        # the isolated run's diagnostic log.
+        cls._srv_log = open(os.path.join(cls.tmp, "server_test.log"), "w")
         cls.server_proc = subprocess.Popen(
             [sys.executable, "-u", "brain_server.py"],
             cwd=BRAIN_ENGINE_DIR,
-            stdout=subprocess.PIPE,
+            env=_env,
+            stdout=cls._srv_log,
             stderr=subprocess.STDOUT
         )
         time.sleep(5.0) # Allow server to bind and load graph (boot is heavy)
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
         cls.server_proc.terminate()
         try:
             cls.server_proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             cls.server_proc.kill()
+        finally:
+            cls._srv_log.close()
+            shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_udp_step_and_round_over(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -920,7 +1568,7 @@ class TestUDPServerIntegration(unittest.TestCase):
         if hasattr(socket, "SIO_UDP_CONNRESET"):
             sock.ioctl(socket.SIO_UDP_CONNRESET, False)
 
-        server_addr = ("127.0.0.1", 9999)
+        server_addr = ("127.0.0.1", self.srv_port)
 
         # Ensure server is listening
         step_packet = {
@@ -943,9 +1591,14 @@ class TestUDPServerIntegration(unittest.TestCase):
 
         # Wide retry window: the server loads a 25M-synapse graph at boot and
         # can be slow when the suite runs other CPU-heavy tests concurrently.
+        # Deadline-based (not attempt-counted): while the port is unbound,
+        # every sendto raises instant ConnectionResetError (ICMP), so a
+        # 30-attempt loop burns out in ~15 s - under heavy machine load the
+        # server can take 30 s+ to bind. Patience is TIME, not tries.
         sock.settimeout(4.0)
         res = None
-        for attempt in range(30):
+        deadline = time.time() + 150.0
+        while time.time() < deadline:
             try:
                 sock.sendto(json.dumps(step_packet).encode("utf-8"), server_addr)
                 data, _ = sock.recvfrom(65535)
@@ -960,6 +1613,24 @@ class TestUDPServerIntegration(unittest.TestCase):
         self.assertIn("beta", res)
         self.assertIn("thrust", res["alpha"])
         self.assertIn("yaw_torque", res["alpha"])
+        # Step sequencing: untagged sends echo 0 (untracked); a tagged
+        # send echoes its seq so the arena can drop widowed replies.
+        self.assertEqual(res.get("stats", {}).get("step_echo", None), 0,
+                         "untagged step echoes 0")
+        step_packet["step_seq"] = 41
+        res2 = None
+        for _attempt in range(6):
+            try:
+                sock.sendto(json.dumps(step_packet).encode("utf-8"), server_addr)
+                data, _ = sock.recvfrom(65535)
+                res2 = json.loads(data.decode("utf-8"))
+                break
+            except (socket.timeout, ConnectionResetError):
+                time.sleep(0.5)
+        self.assertIsNotNone(res2, "Server failed to echo the tagged step")
+        self.assertEqual(res2.get("status"), "ok")
+        self.assertEqual(res2.get("stats", {}).get("step_echo"), 41,
+                         "tagged step echoes its seq")
 
         # 2. Test round_over on a FRESH socket: the step socket may still hold
         # stale step responses in its buffer, so reuse would mis-order packets.
@@ -975,7 +1646,8 @@ class TestUDPServerIntegration(unittest.TestCase):
             "stats_beta": { "kills": 0, "damage_dealt": 0.0, "damage_taken": 80.0, "tracking_time_s": 4.0 }
         }
         round_res = None
-        for attempt in range(30):
+        round_deadline = time.time() + 150.0
+        while time.time() < round_deadline:
             try:
                 sock_round.sendto(json.dumps(round_packet).encode("utf-8"), server_addr)
                 data, _ = sock_round.recvfrom(65535)
@@ -1021,6 +1693,90 @@ class TestBrainVault(unittest.TestCase):
         self.assertTrue(np.allclose(w, w2))
         self.assertEqual(rec2["generator_params"]["seed"], 11)
 
+    def test_scan_vault_cleans_stale_tmp(self):
+        # Crashed-save leftovers die in scan_vault: a fresh zero-size
+        # package tmp (died at create) and aged nonzero tmps (both
+        # package-suffix and index-prefix shapes). A fresh nonzero tmp
+        # (in-flight save shape) survives the scan untouched.
+        live = os.path.join(self.tmp, "tmpLIVE12.tmp")
+        with open(live, "wb") as f:
+            f.write(b"z" * 16)
+        empty = os.path.join(self.tmp, "tmpEMPTY34.tmp")
+        open(empty, "wb").close()
+        aged = os.path.join(self.tmp, "tmpAGED567.tmp")
+        with open(aged, "wb") as f:
+            f.write(b"y" * 16)
+        idx = os.path.join(self.tmp, ".tmp-zz.json")
+        with open(idx, "w") as f:
+            f.write("{}")
+        ancient = time.time() - 700.0
+        os.utime(aged, (ancient, ancient))
+        os.utime(idx, (ancient, ancient))
+        vault_pkg.scan_vault(silent=True)
+        self.assertTrue(os.path.exists(live))
+        self.assertFalse(os.path.exists(empty))
+        self.assertFalse(os.path.exists(aged))
+        self.assertFalse(os.path.exists(idx))
+
+    def test_normalize_names_apply(self):
+        # Dry run changes nothing; apply renames G/kin-stack names,
+        # backfills lineage base/kin/jr, and resolves collisions by
+        # creation order (first keeps the bare name). Runs in the
+        # temp vault (class fixture), never the live one.
+        from types import SimpleNamespace
+        import vault_cli
+        made = []
+        for name, stamp in [("G5-Kestrel-kin2", "2026-01-01T00:00:01"),
+                            ("Kestrel_G2", "2026-01-01T00:00:02"),
+                            ("X-kin-kin1", "2026-01-01T00:00:03"),
+                            ("Viper", "2026-01-01T00:00:04"),
+                            ("Kestrel_G9", "2026-01-01T00:00:05")]:
+            rec = vault_pkg.new_record(name, {})
+            rec["created_utc"] = stamp
+            vault_pkg.save_brain(
+                rec, np.arange(8, dtype=np.float32))
+            made.append(rec["id"])
+        import json as _json
+        import shutil as _shutil
+        import tempfile as _tf
+        tmp = _tf.mkdtemp(prefix="normnames_")
+        rf = os.path.join(tmp, "dry.json")
+        self.assertEqual(
+            vault_cli.cmd_normalize_names(
+                SimpleNamespace(apply=False, result_file=rf)), 0)
+        with open(rf) as f:
+            dry = _json.load(f)
+        self.assertTrue(dry["ok"])
+        self.assertTrue(dry["dry_run"])
+        again, _w = vault_pkg.load_brain(made[0])
+        self.assertEqual(again["name"], "G5-Kestrel-kin2")
+        rf2 = os.path.join(tmp, "apply.json")
+        self.assertEqual(
+            vault_cli.cmd_normalize_names(
+                SimpleNamespace(apply=True, result_file=rf2)), 0)
+        with open(rf2) as f:
+            got = _json.load(f)
+        self.assertTrue(got["ok"])
+        self.assertFalse(got["dry_run"])
+        _shutil.rmtree(tmp, ignore_errors=True)
+        names = {}
+        for bid in made:
+            r, _w = vault_pkg.load_brain(bid)
+            names[bid] = r["name"]
+            lin = r.get("lineage", {})
+            self.assertIn("base", lin)
+            self.assertIn("kin", lin)
+            self.assertIn("jr", lin)
+            self.assertEqual(lin["jr"], 0)
+        self.assertEqual(names[made[0]], "Kestrel-kin2")
+        self.assertEqual(names[made[1]], "Kestrel")
+        self.assertEqual(names[made[2]], "X-kin1")
+        self.assertEqual(names[made[3]], "Viper")
+        self.assertEqual(names[made[4]], "Kestrel Mk2")
+        r0, _w0 = vault_pkg.load_brain(made[0])
+        self.assertEqual(r0["lineage"]["base"], "Kestrel")
+        self.assertEqual(r0["lineage"]["kin"], 2)
+
     def test_scan_and_records(self):
         rec = vault_pkg.new_record("Hawk", {})
         vault_pkg.save_brain(rec, np.zeros(64, dtype=np.float32))
@@ -1049,6 +1805,50 @@ class TestBrainVault(unittest.TestCase):
         self.assertFalse(any(r["filename"] == "junk_deadbeef.flybrain" for r in recs))
         self.assertTrue(os.path.isfile(bad + ".corrupt"))
 
+    def test_incremental_index_no_scan(self):
+        import json
+        from unittest import mock
+        rec = vault_pkg.new_record("Idx", {"seed": 3})
+        vault_pkg.save_brain(rec, np.zeros(32, dtype=np.float32))
+        with open(vault_pkg.VAULT_INDEX) as f:
+            before = json.load(f)["brains"]
+        self.assertTrue(any(b["id"] == rec["id"] for b in before))
+        # A re-save must upsert without scanning: a scan here fails loudly.
+        rec["record"]["wins"] = 7
+        with mock.patch.object(vault_pkg, "scan_vault",
+                               side_effect=AssertionError("scanned")):
+            vault_pkg.save_brain(rec, np.zeros(32, dtype=np.float32))
+        with open(vault_pkg.VAULT_INDEX) as f:
+            after = json.load(f)["brains"]
+        hit = [b for b in after if b["id"] == rec["id"]]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["record"]["wins"], 7)
+
+    def test_index_fallback_and_remove(self):
+        import json
+        from unittest import mock
+        rec = vault_pkg.new_record("Gone", {})
+        vault_pkg.save_brain(rec, np.zeros(16, dtype=np.float32))
+        fname = os.path.basename(vault_pkg.package_path(rec))
+        vault_pkg.remove_index_entry(fname)
+        with open(vault_pkg.VAULT_INDEX) as f:
+            brains = json.load(f)["brains"]
+        self.assertFalse(any(b["id"] == rec["id"] for b in brains))
+        # Removing an absent entry writes nothing (mtime stable).
+        mtime = os.path.getmtime(vault_pkg.VAULT_INDEX)
+        vault_pkg.remove_index_entry(fname)
+        self.assertEqual(mtime, os.path.getmtime(vault_pkg.VAULT_INDEX))
+        # A corrupt index falls back to a full scan on save.
+        with open(vault_pkg.VAULT_INDEX, "w") as f:
+            f.write("garbage{{{")
+        with mock.patch.object(vault_pkg, "scan_vault",
+                               wraps=vault_pkg.scan_vault) as spied:
+            vault_pkg.save_brain(rec, np.zeros(16, dtype=np.float32))
+            self.assertTrue(spied.called)
+        with open(vault_pkg.VAULT_INDEX) as f:
+            brains = json.load(f)["brains"]
+        self.assertTrue(any(b["id"] == rec["id"] for b in brains))
+
     def test_import_legacy_npz(self):
         tmp_npz = os.path.join(self.tmp, "legacy.npz")
         np.savez_compressed(tmp_npz, weights=np.ones(128, dtype=np.float32))
@@ -1056,6 +1856,40 @@ class TestBrainVault(unittest.TestCase):
         _rec2, w2 = vault_pkg.load_brain(rec["id"])
         self.assertTrue(np.allclose(w2, 1.0))
         self.assertTrue(str(rec["lineage"]["source"]).startswith("imported:"))
+
+    def test_concurrent_index_writes(self):
+        # Regression: parallel breed workers once shared one fixed
+        # vault_index.json.tmp and Windows refused the rename
+        # (WinError 5/32), failing a fully-trained breed. Hammer the
+        # index from 8 threads: no errors, valid JSON, no tmp litter,
+        # and the legacy fixed tmp name never reappears.
+        import json
+        import threading
+        rec = vault_pkg.new_record("Race", {})
+        vault_pkg.save_brain(rec, np.zeros(8, dtype=np.float32))
+        with open(vault_pkg.VAULT_INDEX) as f:
+            brains = json.load(f)["brains"]
+        errors = []
+        gate = threading.Barrier(8)
+        def worker():
+            try:
+                gate.wait(timeout=10)
+                for _ in range(5):
+                    vault_pkg._write_index(brains)
+            except Exception as e:  # noqa: BLE001 - collected, asserted below
+                errors.append(e)
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(errors, [])
+        with open(vault_pkg.VAULT_INDEX) as f:
+            json.load(f)
+        litter = [f for f in os.listdir(vault_pkg.VAULT_DIR)
+                  if f.endswith(".tmp")]
+        self.assertEqual(litter, [])
 
     def test_progress_file_contract(self):
         # Progress/result files must always be complete JSON objects (the
@@ -1099,12 +1933,27 @@ class TestBrainVault(unittest.TestCase):
 
 class TestTournamentProtocol(unittest.TestCase):
     """Live server: tournament_load -> battles (KO + draw) -> match/end records."""
+    # Fully isolated instance (own port/vault/tournaments): this suite
+    # used to hit the LIVE server on 9999 and the live vault
+    # mid-tournament.
+    srv_port = 9999
     @classmethod
     def setUpClass(cls):
+        import tempfile
+        cls.tmp = tempfile.mkdtemp(prefix="tourney_proto_")
+        cls._real_vault = vault_pkg.VAULT_DIR
+        cls._real_index = vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = os.path.join(cls.tmp, "brains")
+        vault_pkg.VAULT_INDEX = os.path.join(vault_pkg.VAULT_DIR, "vault_index.json")
+        cls.srv_port = _free_udp_port()
+        _env, _vdir, _tdir = _isolated_server_env(cls.tmp, cls.srv_port)
+        # stdout to a FILE (undrained PIPE blocks the server loop).
+        cls._srv_log = open(os.path.join(cls.tmp, "server_test.log"), "w")
         cls.server_proc = subprocess.Popen(
             [sys.executable, "-u", "brain_server.py"],
             cwd=BRAIN_ENGINE_DIR,
-            stdout=subprocess.PIPE,
+            env=_env,
+            stdout=cls._srv_log,
             stderr=subprocess.STDOUT
         )
         time.sleep(5.0)
@@ -1134,6 +1983,7 @@ class TestTournamentProtocol(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
         for bid in (getattr(cls, "id_a", ""), getattr(cls, "id_b", ""),
                     getattr(cls, "id_c", ""), getattr(cls, "id_x", "")):
             try:
@@ -1142,27 +1992,40 @@ class TestTournamentProtocol(unittest.TestCase):
             except OSError:
                 pass
         vault_pkg.refresh_index()
+        vault_pkg.VAULT_DIR = cls._real_vault
+        vault_pkg.VAULT_INDEX = cls._real_index
         cls.server_proc.terminate()
         try:
             cls.server_proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             cls.server_proc.kill()
+        finally:
+            cls._srv_log.close()
+            shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def _rpc(self, msg, timeout=120.0):
+    def _rpc(self, msg, timeout=300.0):
         # Tournament round_overs trigger dopamine + vault saves (~10s), so
         # send ONCE and wait patiently: resending would queue duplicate
-        # battles on the single-threaded server.
+        # battles on the single-threaded server. Vault saves on this box
+        # have measured 60-136 s (slow-disk days), so the default waits
+        # 300 s - the arena's own battle budget is 240 s for the same
+        # reason. battle_progress
+        # heartbeats ride the same socket while a bank runs: keep-alive
+        # only, never the answer - skip them and keep waiting.
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(5.0)
         if hasattr(socket, "SIO_UDP_CONNRESET"):
             sock.ioctl(socket.SIO_UDP_CONNRESET, False)
         deadline = time.time() + timeout
         try:
-            sock.sendto(json.dumps(msg).encode("utf-8"), ("127.0.0.1", 9999))
+            sock.sendto(json.dumps(msg).encode("utf-8"), ("127.0.0.1", self.srv_port))
             while time.time() < deadline:
                 try:
                     data, _ = sock.recvfrom(65535)
-                    return json.loads(data.decode("utf-8"))
+                    reply = json.loads(data.decode("utf-8"))
+                    if reply.get("status") == "battle_progress":
+                        continue
+                    return reply
                 except (socket.timeout, ConnectionResetError):
                     pass
         finally:
@@ -1196,6 +2059,22 @@ class TestTournamentProtocol(unittest.TestCase):
         # Leaving tournament mode after a mixed bout restores clean boots.
         f = self._rpc({"type": "free_mode"})
         self.assertEqual(f.get("status"), "free_ready")
+
+    def test_step_seq_monotonic(self):
+        # Lockstep proof for the HUD (n/srv): every step reply carries
+        # the session-cumulative steps integrated, strictly increasing
+        # across consecutive steps.
+        f = self._rpc({"type": "free_mode"})
+        self.assertEqual(f.get("status"), "free_ready")
+        s1 = self._rpc({"type": "step", "alpha": {}, "beta": {}})
+        self.assertEqual(s1.get("status"), "ok")
+        s2 = self._rpc({"type": "step", "alpha": {}, "beta": {}})
+        self.assertEqual(s2.get("status"), "ok")
+        q1 = (s1.get("stats") or {}).get("step_seq")
+        q2 = (s2.get("stats") or {}).get("step_seq")
+        self.assertIsInstance(q1, int)
+        self.assertIsInstance(q2, int)
+        self.assertLess(q1, q2)
 
     def test_tournament_flow(self):
         res = self._rpc({"type": "tournament_load", "alpha_path": self.path_a,
@@ -1234,6 +2113,43 @@ class TestTournamentProtocol(unittest.TestCase):
         self.assertEqual(ra["record"]["tournaments_won"], 1)
         self.assertEqual(rb["record"]["losses"], 1)
         self.assertGreaterEqual(len(ra["training"]["sessions"]), 1)
+
+    def test_crown_by_id_not_slot(self):
+        # Regression: at close time the slots hold consolation fighters,
+        # not the champion. The title must land on champion_id; the slot
+        # holders must not gain titles. Duplicate crowns must not stack.
+        ckpt = os.path.join(PROJECT_ROOT, "checkpoints",
+                            "trained_homing_A.npz")
+        champ = vault_pkg.import_legacy_npz(ckpt, "ProtoChamp")
+        champ_id = champ["id"]
+        try:
+            res = self._rpc({"type": "tournament_load",
+                             "alpha_path": self.path_a,
+                             "beta_path": self.path_b,
+                             "tournament_id": "UTCROWN",
+                             "match": "R9M9", "lr_scale": 0.5})
+            self.assertEqual(res.get("status"), "brains_loaded")
+            e = self._rpc({"type": "tournament_end", "champion": "alpha",
+                           "champion_id": champ_id})
+            self.assertEqual(e.get("status"), "tournament_closed")
+            rc, _w = vault_pkg.load_brain(champ_id)
+            self.assertEqual(rc["record"]["tournaments_won"], 1)
+            ra, _w2 = vault_pkg.load_brain(self.id_a)
+            self.assertEqual(ra["record"]["tournaments_won"], 0)
+            e2 = self._rpc({"type": "tournament_end", "champion": "alpha",
+                            "champion_id": champ_id})
+            self.assertEqual(e2.get("status"), "tournament_closed")
+            rc2, _w3 = vault_pkg.load_brain(champ_id)
+            self.assertEqual(rc2["record"]["tournaments_won"], 1)
+            f = self._rpc({"type": "free_mode"})
+            self.assertEqual(f.get("status"), "free_ready")
+        finally:
+            try:
+                os.remove(vault_pkg.package_path(
+                    vault_pkg.load_brain(champ_id)[0]))
+            except OSError:
+                pass
+            vault_pkg.refresh_index()
 
 
 class TestLegacyCompat(unittest.TestCase):
@@ -1330,6 +2246,71 @@ class TestLegacyCompat(unittest.TestCase):
             return b
         pos = DopamineReinforcement._row_positions(indptr, sens)
         return rl, _make, pos, sens
+
+    def test_mnhl_roll_credit_assignment(self):
+        # Coordinated banks earn credit: left stimulus + left yaw +
+        # left roll potentiates left MNhl efferents; fighting roll
+        # depresses them; the quiet side is untouched either way.
+        from dopamine_learning import DopamineReinforcement
+        rng = np.random.default_rng(21)
+        n, deg = 200, 6
+        indptr = np.arange(n + 1, dtype=np.int32) * deg
+        indices = rng.integers(0, n, size=n * deg).astype(np.int32)
+        base_w = rng.normal(4.0, 0.5, size=n * deg).astype(np.float32)
+        fake_pops = {
+            "pheromone_da1": {"left": list(range(0, 10)),
+                              "right": list(range(10, 20))},
+            "pheromone_va1v": {"left": [], "right": []},
+            "visual_lc10": {"left": [], "right": []},
+            "visual_lc4": {"left": [], "right": []},
+            "visual_lplc2": {"left": [], "right": []},
+            "visual_lc11": {"left": [], "right": []},
+            "gyro_jo": {"left": [], "right": []},
+            "dopamine_pam": {"all": []}, "dopamine_ppl1": {"all": []},
+            "motor_turn_dnp20": {"left": [100], "right": [101]},
+            "motor_thrust_dnp09": {"all": [102]},
+            "motor_ram_dnpe017": {"all": [103]},
+            "motor_giant_fiber": {"all": [104]},
+            "motor_roll_mnhl": {"left": [110], "right": [111]},
+            "descending_all": {"left": [100], "right": [101],
+                               "all": [100, 101, 102]},
+            "mushroom_body_kc": [], "mbon_app": {"all": []},
+            "mbon_av": {"all": []},
+        }
+        rl = DopamineReinforcement(fake_pops)
+
+        class _Brain:
+            pass
+
+        def _make():
+            b = _Brain()
+            b.indptr = indptr
+            b.indices = indices
+            b.weights = base_w.copy()
+            return b
+
+        pos_l = DopamineReinforcement._row_positions(indptr, [110])
+        pos_r = DopamineReinforcement._row_positions(indptr, [111])
+        left_stim = {"pheromone_conc_left": 0.8,
+                     "pheromone_conc_right": 0.2,
+                     "visual_target_azimuth": -30.0}
+        b = _make()
+        rl.begin_episode(b)
+        rl.apply_plasticity(b, left_stim,
+                            {"yaw_torque": -0.5, "roll_torque": -0.5},
+                            1.0, gain_cap=0.3)
+        self.assertGreater(float(np.abs(b.weights[pos_l]).mean()),
+                           float(np.abs(base_w[pos_l]).mean()))
+        np.testing.assert_array_equal(b.weights[pos_r], base_w[pos_r])
+        # Fighting roll (bank right while turning left) depresses it.
+        b2 = _make()
+        rl.begin_episode(b2)
+        rl.apply_plasticity(b2, left_stim,
+                            {"yaw_torque": -0.5, "roll_torque": 0.5},
+                            1.0, gain_cap=0.3)
+        self.assertLess(float(np.abs(b2.weights[pos_l]).mean()),
+                        float(np.abs(base_w[pos_l]).mean()))
+        np.testing.assert_array_equal(b2.weights[pos_r], base_w[pos_r])
 
     def test_spear_branch_credit_assignment(self):
         # Aimed lunges with positive DA potentiate the lobula-feature
@@ -1895,14 +2876,1116 @@ class TestWiringMixes(unittest.TestCase):
             ew.WIRING_PRIORITY.update(saved_prio)
 
 
+class TestWiringGenome(unittest.TestCase):
+    """Genome layer: frozen legacy byte-identity, deterministic random
+    generation under role constraints, validation rejects, stable ids.
+    Pops-only (no CSR) so it runs without the connectome cache."""
+    @classmethod
+    def setUpClass(cls):
+        cls.pops = load_or_extract_populations()
+
+    def test_frozen_byte_identity(self):
+        # Frozen genomes must reproduce the historical overlays exactly
+        # (pre-refactor hashes in tests/fixtures/frozen_genome_hashes.json).
+        import hashlib
+        import json
+        import os
+        import experimental_wiring as ew
+        fix_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "fixtures", "frozen_genome_hashes.json")
+        with open(fix_path) as f:
+            fix = json.load(f)
+        for name in ("lplc2_contra_dn", "retina_wide", "spear_lunge"):
+            with self.subTest(wiring=name):
+                pre, post, w = ew.EXPERIMENTS[name](self.pops)
+                self.assertEqual(len(pre), fix[name]["n_edges"])
+                h = hashlib.sha256()
+                h.update(pre.tobytes())
+                h.update(post.tobytes())
+                h.update(w.tobytes())
+                self.assertEqual(h.hexdigest(), fix[name]["sha256"])
+                # Frozen rules compile to the same bytes directly.
+                cpre, cpost, cw = ew.compile_genome(
+                    ew.FROZEN_GENOMES[name], self.pops)
+                np.testing.assert_array_equal(pre, cpre)
+                np.testing.assert_array_equal(post, cpost)
+                np.testing.assert_array_equal(w, cw)
+
+    def test_generate_deterministic(self):
+        import numpy as np
+        import experimental_wiring as ew
+        a = ew.generate_genome(np.random.default_rng(11), self.pops, 4)
+        b = ew.generate_genome(np.random.default_rng(11), self.pops, 4)
+        self.assertEqual(a, b)
+        c = ew.generate_genome(np.random.default_rng(12), self.pops, 4)
+        self.assertNotEqual(a, c)
+        self.assertEqual(len(a["rules"]), 4)
+
+    def test_generate_roles(self):
+        import numpy as np
+        import experimental_wiring as ew
+        reg = ew.build_pool_registry(self.pops)
+        for seed in range(200):
+            g = ew.generate_genome(
+                np.random.default_rng(seed), self.pops, 3)
+            self.assertEqual(len(g["rules"]), 3)
+            for r in g["rules"]:
+                self.assertEqual(reg[r["source"]]["role"], "sensory")
+                self.assertIn(reg[r["target"]]["role"], ("motor", "central"))
+                self.assertIn(r["source_side"], ("left", "right"))
+                self.assertIn(r["target_side"], ("left", "right"))
+                self.assertIn(r["sign"], (1.0, -1.0))
+                self.assertTrue(0.0 < r["weight"] <= 2000.0)
+                self.assertTrue(1 <= r["fanout"] <= 64)
+
+    def test_validator_rejects(self):
+        import experimental_wiring as ew
+        good = dict(ew.FROZEN_GENOMES["lplc2_contra_dn"]["rules"][0])
+        ew.validate_rule(good)  # frozen rules are valid
+        bad_variants = []
+        for k in ("source", "sign", "stream_seed"):
+            v = dict(good)
+            del v[k]
+            bad_variants.append(v)
+        for kw in ({"source_side": "up"}, {"target_side": "down"},
+                   {"sign": 0.0}, {"sign": 2.0},
+                   {"weight": 0.0}, {"weight": -5.0}, {"weight": 99999.0},
+                   {"fanout": 0}, {"fanout": -2}, {"fanout": True},
+                   {"fanout": 999}, {"topography": "retinotopic"},
+                   {"stream": ""}, {"stream_seed": -1}):
+            vv = dict(good)
+            vv.update(kw)
+            bad_variants.append(vv)
+        for bad in bad_variants:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ew.validate_rule(bad)
+        with self.assertRaises(ValueError):
+            ew.validate_genome({"name": "x", "rules": []})
+        with self.assertRaises(ValueError):
+            ew.validate_genome({"name": "x",
+                                "rules": [good, dict(good)]})
+        # Unknown pools pass shape validation but fail with pops given.
+        v = dict(good, source="no_such_pool_xyz")
+        ew.validate_rule(v)
+        with self.assertRaises(ValueError):
+            ew.validate_genome({"name": "x", "rules": [v]}, self.pops)
+        ew.validate_genome({"name": "x", "rules": [good]}, self.pops)
+        with self.assertRaises(ValueError):
+            ew.generate_genome(np.random.default_rng(3), self.pops, 0)
+
+    def test_derive_mapping(self):
+        import experimental_wiring as ew
+        # Frozen genomes derive their historical pairings (retina_wide
+        # wiring <-> retina mapping; spear's LC sources read retina too,
+        # matching historical usage - the mouth readout is always on).
+        self.assertEqual(
+            ew.derive_mapping(ew.FROZEN_GENOMES["retina_wide"]),
+            ("retina",))
+        self.assertEqual(
+            ew.derive_mapping(ew.FROZEN_GENOMES["spear_lunge"]),
+            ("retina",))
+        t4rule = {"source": "visual_t4a", "source_side": "left",
+                  "target": "descending_all", "target_side": "left",
+                  "sign": 1.0, "weight": 100.0, "fanout": 4,
+                  "topography": "random", "stream": "t", "stream_seed": 1}
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [t4rule]}),
+            ("flow_trans",))
+        mnrule = dict(t4rule, source="visual_lc11", target="motor_steer",
+                      target_side="right", stream="u")
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [t4rule, mnrule]}),
+            ("flow_trans", "muscles_up", "retina"))
+        # Scent pools have no scheme: DA1 wiring derives base ().
+        da1 = dict(t4rule, source="pheromone_da1", stream="v")
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [da1]}), ())
+        # Generated genomes always derive a valid (possibly base) stack.
+        import numpy as np
+        from sensory_motor import normalize_mapping
+        for seed in range(30):
+            g = ew.generate_genome(
+                np.random.default_rng(seed), self.pops, 3)
+            normalize_mapping(list(ew.derive_mapping(g)))
+
+    def test_mutate_genome(self):
+        import numpy as np
+        import experimental_wiring as ew
+        base = ew.generate_genome(np.random.default_rng(31), self.pops, 3)
+        a = ew.mutate_genome(np.random.default_rng(7), base, self.pops, 1)
+        b = ew.mutate_genome(np.random.default_rng(7), base, self.pops, 1)
+        self.assertEqual(a, b)
+        self.assertGreaterEqual(len(a["rules"]), 1)
+        # Input untouched by mutation.
+        self.assertEqual(len(base["rules"]), 3)
+        # max_changes bounds the edit count (rule-list diff).
+        for seed in range(20):
+            m = ew.mutate_genome(
+                np.random.default_rng(seed), base, self.pops, 1)
+            diff = sum(1 for r in m["rules"]
+                       if r not in base["rules"]) + sum(
+                           1 for r in base["rules"] if r not in m["rules"])
+            self.assertLessEqual(diff, 3)
+        with self.assertRaises(ValueError):
+            ew.mutate_genome(np.random.default_rng(0), base, self.pops, 0)
+
+    def test_remap_weights(self):
+        import numpy as np
+        import experimental_wiring as ew
+        base = ew.generate_genome(np.random.default_rng(41), self.pops, 2)
+        be = ew.compile_genome(base, self.pops)
+        n = len(be[0])
+        old_w = np.arange(n, dtype=np.float32)
+        # Identity remap preserves every weight.
+        same = ew.remap_weights(be, be, old_w,
+                                np.random.default_rng(1))
+        np.testing.assert_array_equal(same, old_w)
+        # Mutated child: survivors keep weights, fresh init is finite
+        # and nonzero-scaled, aligned to the child arity.
+        child = ew.mutate_genome(
+            np.random.default_rng(9), base, self.pops, 2)
+        ce = ew.compile_genome(child, self.pops)
+        new_w = ew.remap_weights(be, ce, old_w,
+                                 np.random.default_rng(2))
+        self.assertEqual(len(new_w), len(ce[0]))
+        self.assertTrue(bool(np.all(np.isfinite(new_w))))
+        old_map = {(int(s), int(q)): float(v) for s, q, v in
+                   zip(be[0].tolist(), be[1].tolist(), be[2].tolist())}
+        for i, (s, q) in enumerate(zip(ce[0].tolist(), ce[1].tolist())):
+            if (int(s), int(q)) in old_map:
+                self.assertAlmostEqual(float(new_w[i]),
+                                       old_map[(int(s), int(q))])
+        # Full-arity entry point (the breed path): base CSR + overlays
+        # on both sides. A sparse stand-in base keeps it fast without
+        # the connectome cache.
+        from scipy import sparse as _sp
+        n = 166701
+        br = np.array([10, 10, 50000, 90000], dtype=np.int32)
+        bc = np.array([20, 30, 60000, 100000], dtype=np.int32)
+        fake_csr = _sp.csr_matrix(
+            (np.ones(4, dtype=np.float32), (br, bc)), shape=(n, n))
+        old_pre, old_post = ew._merged_edge_lists(
+            fake_csr, ew.compile_genome(base, self.pops))
+        old_w2 = np.arange(len(old_pre), dtype=np.float32)
+        rw = ew.remap_for_genome(None, base, child, old_w2,
+                                 np.random.default_rng(3), self.pops,
+                                 fake_csr)
+        new_pre, new_post = ew._merged_edge_lists(
+            fake_csr, ew.compile_genome(child, self.pops))
+        self.assertEqual(len(rw), len(new_pre))
+        old_map = {(int(s), int(q)): float(v) for s, q, v in
+                   zip(old_pre.tolist(), old_post.tolist(), old_w2.tolist())}
+        new_pairs = list(zip(new_pre.tolist(), new_post.tolist()))
+        for i, (s, q) in enumerate(new_pairs):
+            if (int(s), int(q)) in old_map:
+                self.assertAlmostEqual(float(rw[i]),
+                                       old_map[(int(s), int(q))])
+        # A base-only key (in neither overlay) keeps its trained weight:
+        # the Stag_G2 case (25.58M base carried, 3.8k overlay remapped).
+        be_keys = set((int(s), int(q)) for s, q in
+                      zip(*ew.compile_genome(base, self.pops)[:2]))
+        ce_keys = set((int(s), int(q)) for s, q in
+                      zip(*ew.compile_genome(child, self.pops)[:2]))
+        base_only = [(int(s), int(q)) for s, q in zip(br.tolist(), bc.tolist())
+                     if (int(s), int(q)) not in be_keys
+                     and (int(s), int(q)) not in ce_keys]
+        self.assertTrue(base_only)
+        old_pairs = list(zip(old_pre.tolist(), old_post.tolist()))
+        oi = old_pairs.index(base_only[0])
+        ni = new_pairs.index(base_only[0])
+        self.assertAlmostEqual(float(rw[ni]), float(old_w2[oi]))
+        # Arity mismatch is loud, never silent.
+        with self.assertRaises(ValueError):
+            ew.remap_for_genome(None, base, child, old_w2[:-1],
+                                np.random.default_rng(3), self.pops,
+                                fake_csr)
+
+    def test_genome_from_seed_and_attach(self):
+        import experimental_wiring as ew
+        a = ew.genome_from_seed(77, 3)
+        b = ew.genome_from_seed(77, 3)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a["rules"]), 3)
+        ew.validate_genome(a, self.pops)
+        params = {}
+        ew.attach_genome(params, a)
+        self.assertEqual(params["genome"], a)
+        self.assertEqual(params["genome_id"], ew.genome_label(a))
+
+    def test_derive_mapping_cli(self):
+        import io
+        import json
+        import types
+        from contextlib import redirect_stdout
+        import vault_cli
+        ns = types.SimpleNamespace(genome="", genome_seed=42,
+                                   genome_rules=3, result_file="")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = vault_cli.cmd_derive_mapping(ns)
+        self.assertEqual(code, 0)
+        payload = json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertTrue(payload.get("ok", False))
+        self.assertEqual(payload["genome_id"], "0e5f52b8c9")
+        self.assertEqual(payload["mapping"], ["muscles_up"])
+        self.assertEqual(payload["n_rules"], 3)
+
+    def test_validator_coerces_godot_floats(self):
+        # Godot's JSON parser turns every number into a float, so menu
+        # round-tripped genomes arrive with 16.0-style values (this killed
+        # real training jobs). Integral floats coerce; the genome id is
+        # identical to the int original; non-integral stays rejected.
+        import experimental_wiring as ew
+        good = dict(ew.FROZEN_GENOMES["lplc2_contra_dn"]["rules"][0])
+        floaty = dict(good, fanout=float(good["fanout"]),
+                      stream_seed=float(good["stream_seed"]),
+                      weight=float(good["weight"]))
+        v = ew.validate_rule(floaty)
+        self.assertIs(type(v["fanout"]), int)
+        self.assertIs(type(v["stream_seed"]), int)
+        self.assertEqual(v["fanout"], good["fanout"])
+        self.assertEqual(v["stream_seed"], good["stream_seed"])
+        g_int = {"name": None, "rules": [good]}
+        g_float = {"name": None, "rules": [floaty]}
+        self.assertEqual(ew.genome_id(g_float), ew.genome_id(g_int))
+        for bad in (dict(good, fanout=16.5),
+                    dict(good, stream_seed=1.5),
+                    dict(good, fanout=True)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ew.validate_rule(bad)
+
+    def test_genome_id_stable(self):
+        import numpy as np
+        import experimental_wiring as ew
+        a = ew.generate_genome(np.random.default_rng(21), self.pops, 3)
+        b = ew.generate_genome(np.random.default_rng(21), self.pops, 3)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertEqual(ew.genome_label(a), "g" + ew.genome_id(a))
+        renamed = dict(a, name="whatever")
+        self.assertEqual(ew.genome_id(renamed), ew.genome_id(a))
+        c = ew.generate_genome(np.random.default_rng(22), self.pops, 3)
+        self.assertNotEqual(ew.genome_id(a), ew.genome_id(c))
+        self.assertRegex(ew.genome_label(a), r"^g[0-9a-f]{10}$")
+
+    def test_reference_pin(self):
+        import json
+        import os
+        import numpy as np
+        import experimental_wiring as ew
+        g = ew.reference_genome()
+        self.assertEqual(ew.genome_id(g), "f66baac62c")
+        self.assertEqual(ew.genome_label(g), "gf66baac62c")
+        self.assertEqual(len(g["rules"]), 34)
+        art_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "brain_engine", "reference_genome.json")
+        with open(art_path) as f:
+            art = json.load(f)
+        self.assertEqual(ew.genome_id(art), ew.genome_id(g))
+        # Every subsystem compiles real edges (attached, not decorative).
+        for sub in ew.REFERENCE_ORDER:
+            with self.subTest(subsystem=sub):
+                e = ew.compile_rules(ew.REFERENCE_SUBSYSTEMS[sub],
+                                     self.pops)
+                self.assertIsNotNone(e)
+                self.assertGreater(len(e[0]), 0)
+        self.assertEqual(ew.reference_distance(g), 0.0)
+        rnd = ew.generate_genome(np.random.default_rng(7), self.pops, 3)
+        self.assertGreater(ew.reference_distance(rnd), 0.5)
+
+    def test_roll_pool_registered(self):
+        import experimental_wiring as ew
+        self.assertEqual(ew.pool_role("motor_roll_mnhl"), "motor")
+        reg = ew.build_pool_registry(self.pops)
+        self.assertIn("motor_roll_mnhl", reg)
+        self.assertEqual(reg["motor_roll_mnhl"]["role"], "motor")
+        # sides maps side -> cell count (bilateral, graft-targetable).
+        self.assertGreater(
+            reg["motor_roll_mnhl"]["sides"].get("left", 0), 0)
+        self.assertGreater(
+            reg["motor_roll_mnhl"]["sides"].get("right", 0), 0)
+
+    def test_rule_budget(self):
+        import experimental_wiring as ew
+        self.assertEqual(
+            [ew.rule_budget(g) for g in (1, 2, 3, 4, 5, 7, 100)],
+            [1, 1, 2, 2, 3, 4, 4])
+
+    def test_graft(self):
+        import numpy as np
+        import experimental_wiring as ew
+        ref_id = ew.genome_label(ew.reference_genome())
+        a, pa = ew.graft_genome(np.random.default_rng(31), self.pops, 2)
+        b, _pb = ew.graft_genome(np.random.default_rng(31), self.pops, 2)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertEqual(pa["mode"], "graft")
+        self.assertEqual(pa["reference_id"], ref_id)
+        self.assertEqual(len(pa["added_rules"]), 2)
+        # All novel edges land on ONE motor/central bundle.
+        tgt = tuple(pa["added_bundle"])
+        rules = ew.validate_genome(a)["rules"]
+        added = [rules[i] for i in pa["added_rules"]]
+        self.assertTrue(all((r["target"], r["target_side"]) == tgt
+                            for r in added))
+        self.assertIn(ew.pool_role(tgt[0]), ("motor", "central"))
+        untouched = [r for i, r in enumerate(rules)
+                     if i not in pa["added_rules"]]
+        self.assertEqual(
+            [(r["source"], r["target"]) for r in untouched],
+            [(r["source"], r["target"])
+             for r in ew.reference_genome()["rules"]])
+
+    def test_shuffle(self):
+        import numpy as np
+        import experimental_wiring as ew
+        a, pa = ew.shuffle_genome(np.random.default_rng(77), self.pops, 2)
+        b, _pb = ew.shuffle_genome(np.random.default_rng(77), self.pops, 2)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertGreaterEqual(len(pa["kept_subsystems"]), 2)
+        self.assertTrue(set(pa["kept_subsystems"]) <= set(ew.REFERENCE_ORDER))
+        self.assertEqual(len(pa["filled_rules"]), 2)
+        ref_pairs = {(r["source"], r["source_side"], r["target"],
+                      r["target_side"])
+                     for sub in pa["kept_subsystems"]
+                     for r in ew.REFERENCE_SUBSYSTEMS[sub]}
+        rules = ew.validate_genome(a)["rules"]
+        for i, r in enumerate(rules):
+            pair = (r["source"], r["source_side"], r["target"],
+                    r["target_side"])
+            if i in pa["filled_rules"]:
+                self.assertNotIn(pair, ref_pairs)
+            else:
+                self.assertIn(pair, ref_pairs)
+
+    def test_novelty(self):
+        import numpy as np
+        import experimental_wiring as ew
+        targets = sorted(
+            p for p, m in ew.build_pool_registry(self.pops).items()
+            if m["role"] in ew.GENOME_TARGET_ROLES)
+        counts = {t: i for i, t in enumerate(targets)}
+        # Isolated from the live vault: weak preference off.
+        a, pa = ew.novelty_genome(np.random.default_rng(5), self.pops, 1,
+                                  counts, prefer_weak=False)
+        # Choice lands among the emptiest bundles however the rng falls.
+        self.assertLessEqual(counts[pa["added_bundle"][0]], 2)
+        self.assertEqual(pa["bundle_count"],
+                         counts[pa["added_bundle"][0]])
+        self.assertEqual(len(pa["added_rules"]), 1)
+        self.assertFalse(pa["weak_target"])
+
+    def test_novelty_prefers_weak(self):
+        import numpy as np
+        from unittest import mock
+        import experimental_wiring as ew
+        weak3 = [("motor_mouth", 1, 8), ("motor_steer", 0, 6),
+                 ("mbon_app", 2, 9)]
+        counts = {p: 50 for p, _w, _n in weak3}
+        with mock.patch("mine_wiring_fitness.weak_bundles",
+                        return_value=list(weak3)):
+            a, pa = ew.novelty_genome(np.random.default_rng(5), self.pops,
+                                      1, counts)
+        # All three weak pools outrank every 50-count bundle, and the
+        # rng picks among exactly those three - deterministic either way.
+        self.assertIn(pa["added_bundle"][0], [p for p, _w, _n in weak3])
+        self.assertTrue(pa["weak_target"])
+
+    def test_crossover(self):
+        import numpy as np
+        import experimental_wiring as ew
+        ga = ew.reference_genome()
+        gb = ew.generate_genome(np.random.default_rng(9), self.pops, 2)
+        a, pa = ew.crossover_genomes(np.random.default_rng(13), ga, gb,
+                                     self.pops)
+        b, _pb = ew.crossover_genomes(np.random.default_rng(13), ga, gb,
+                                      self.pops)
+        self.assertEqual(ew.genome_id(a), ew.genome_id(b))
+        self.assertEqual(pa["mode"], "crossover")
+        self.assertEqual(pa["parent_ids"],
+                         [ew.genome_label(ga), ew.genome_label(gb)])
+        self.assertTrue(set(pa["slot_parents"]) <= {"a", "b"})
+        self.assertIn("a", pa["slot_parents"])
+        self.assertIn("b", pa["slot_parents"])
+        # One post-mutation step: at most one novel pair beyond the union.
+        union = {(r["source"], r["source_side"], r["target"],
+                  r["target_side"])
+                 for g in (ga, gb) for r in ew.validate_genome(g)["rules"]}
+        novel = [(r["source"], r["source_side"], r["target"],
+                  r["target_side"])
+                 for r in ew.validate_genome(a)["rules"]
+                 if (r["source"], r["source_side"], r["target"],
+                     r["target_side"]) not in union]
+        self.assertLessEqual(len(novel), 1)
+
+    def test_exploratory_dispatcher(self):
+        import numpy as np
+        import experimental_wiring as ew
+        for mode in ("graft", "shuffle", "novelty"):
+            with self.subTest(mode=mode):
+                a, pa = ew.generate_exploratory_genome(
+                    np.random.default_rng(3), self.pops, mode, 1)
+                self.assertEqual(pa["mode"], mode)
+                self.assertIsNotNone(ew.compile_genome(a, self.pops))
+        with self.assertRaises(ValueError):
+            ew.generate_exploratory_genome(
+                np.random.default_rng(3), self.pops, "crossover", 1)
+
+
+class TestWiringAttribution(unittest.TestCase):
+    """Attribution miner on synthetic brackets: outcome extraction,
+    vault-meta join, exactly-one-side scoring (no files, no CSR)."""
+    def _rec(self, bid, genome=None, experiment=None, mapping=None):
+        gp = {"experiment": experiment, "genome": genome,
+              "mapping": mapping}
+        return {"id": bid, "generator_params": gp}
+
+    def _tourney(self, matches):
+        # matches: [(a, b, winner)] -> rounds-shaped dict.
+        return {"rounds": [[{"a_id": a, "b_id": b, "winner_id": w}
+                            for a, b, w in matches]]}
+
+    def test_outcomes_skip_junk(self):
+        import mine_wiring_fitness as mw
+        t = {"rounds": [[
+            {"a_id": "a", "b_id": "b", "winner_id": "a"},
+            {"a_id": "c", "b_id": "", "winner_id": "c", "bye": True},
+            {"a_id": "", "b_id": "", "winner_id": "", "vacant": True},
+            {"a_id": "d", "b_id": "e", "winner_id": ""},
+        ]]}
+        self.assertEqual(mw.match_outcomes(t), [("a", "b")])
+
+    def test_pool_lift(self):
+        import mine_wiring_fitness as mw
+        import experimental_wiring as ew
+        retina = ew.FROZEN_GENOMES["retina_wide"]
+        base_rec = self._rec("base1")
+        ret_rec = self._rec("ret1", genome=dict(retina))
+        metas = {"base1": mw.brain_meta(base_rec),
+                 "ret1": mw.brain_meta(ret_rec)}
+        self.assertIn("visual_lc11", metas["ret1"]["pools"])
+        self.assertEqual(metas["base1"]["pools"], set())
+        # Retina brain beats base 3-1: pool lift must be positive.
+        outcomes = [("ret1", "base1")] * 3 + [("base1", "ret1")]
+        stats = mw.tally(outcomes, metas)
+        self.assertEqual(stats["matches"], 4)
+        w, n = stats["pools"]["visual_lc11"]
+        self.assertEqual((w, n), (3, 4))
+        # Mirror matches (both touch) never score.
+        stats2 = mw.tally([("ret1", "ret1")], metas)
+        self.assertEqual(stats2["matches"], 1)
+        self.assertNotIn("visual_lc11", stats2["pools"])
+        # Unknown brains are skipped, not crashed on.
+        stats3 = mw.tally([("ghost", "base1")], metas)
+        self.assertEqual(stats3["matches"], 0)
+
+    def test_weak_from_stats(self):
+        import mine_wiring_fitness as mw
+        stats = {"pools": {"strong": (9, 10), "weak": (1, 8),
+                           "tiny": (0, 2), "even": (5, 10)},
+                 "mappings": {}, "rules_winners": 0.0,
+                 "rules_losers": 0.0, "matches": 30}
+        weak = mw.weak_from_stats(stats)
+        self.assertEqual([(p, w, n) for p, w, n in weak],
+                         [("weak", 1, 8)])
+        # Custom floor/ceiling.
+        weak2 = mw.weak_from_stats(stats, min_n=2, max_rate=0.5)
+        self.assertEqual([p for p, _w, _n in weak2], ["tiny", "weak"])
+        self.assertEqual(mw.weak_from_stats(
+            {"pools": {}, "mappings": {}, "rules_winners": 0.0,
+             "rules_losers": 0.0, "matches": 0}), [])
+
+    def test_mapping_and_rules(self):
+        import mine_wiring_fitness as mw
+        m1 = self._rec("m1", mapping=["retina"])
+        m2 = self._rec("m2", mapping=None)
+        metas = {"m1": mw.brain_meta(m1), "m2": mw.brain_meta(m2)}
+        self.assertEqual(metas["m1"]["mapping"], ("retina",))
+        self.assertEqual(metas["m2"]["mapping"], ())
+        stats = mw.tally([("m1", "m2"), ("m1", "m2"), ("m2", "m1")], metas)
+        w, n = stats["mappings"][("retina",)]
+        self.assertEqual((w, n), (2, 3))
+        self.assertAlmostEqual(stats["rules_winners"], 0.0)
+        rep = mw.report(stats, min_n=1)
+        self.assertIn("retina", rep)
+        self.assertIn("scored matches: 3", rep)
+
+
+class TestGenomeNovelty(unittest.TestCase):
+    """Frequency-dependent genome fitness: pool extraction, bonus math
+    and caps, persistence, kill-dominance. CSR-free (tmp checkpoint dir)."""
+    def _mgr(self):
+        import tempfile
+        from evolution_engine import EvolutionManager
+        return EvolutionManager(
+            checkpoints_dir=tempfile.mkdtemp(prefix="evo_nov_"))
+
+    def _rec(self, genome=None, experiment=None):
+        return {"id": "x", "generator_params": {"genome": genome,
+                                                "experiment": experiment}}
+
+    def test_wiring_pools(self):
+        import experimental_wiring as ew
+        from evolution_engine import EvolutionManager
+        mgr = self._mgr()
+        g = {"name": None, "rules": [dict(
+            ew.FROZEN_GENOMES["retina_wide"]["rules"][0])]}
+        pools = mgr.wiring_pools(self._rec(genome=g))
+        self.assertIn("visual_lc11", pools)
+        self.assertIn("descending_all", pools)
+        mix_pools = mgr.wiring_pools(self._rec(experiment="retina_wide"))
+        self.assertTrue(pools < mix_pools)
+        self.assertIn("visual_lc15", mix_pools)
+        self.assertEqual(mgr.wiring_pools(self._rec()), set())
+        self.assertEqual(mgr.wiring_pools({"genome": g}), pools)
+
+    def test_novelty_bonus_and_cap(self):
+        from evolution_engine import EvolutionManager
+        mgr = self._mgr()
+        self.assertEqual(mgr.genome_novelty_bonus(set()), 0.0)
+        fresh = mgr.genome_novelty_bonus({"a", "b", "c"})
+        self.assertEqual(fresh, 3 * mgr.NOVELTY_PER_POOL)
+        many = mgr.genome_novelty_bonus({f"p{i}" for i in range(50)})
+        self.assertEqual(many, mgr.NOVELTY_CAP)
+        mgr.pool_counts = {"a": 99}
+        self.assertEqual(mgr.genome_novelty_bonus({"a", "b"}),
+                         mgr.NOVELTY_PER_POOL)
+
+    def test_evaluate_match_novelty(self):
+        from evolution_engine import EvolutionManager
+        mgr = self._mgr()
+        stats = {"kills": 0, "damage_dealt": 10.0, "damage_taken": 10.0,
+                 "tracking_time_s": 5.0, "tail_time_s": 0.0,
+                 "nectar_consumed": 0.0}
+        w0, fa0, fb0 = mgr.evaluate_match(dict(stats), dict(stats))
+        # No records: legacy behavior, no novelty keys beyond zero.
+        self.assertEqual(fa0, fb0)
+        import experimental_wiring as ew
+        g = {"name": None, "rules": [dict(
+            ew.FROZEN_GENOMES["retina_wide"]["rules"][0])]}
+        ra = self._rec(genome=g)
+        rb = self._rec()
+        w1, fa1, fb1 = mgr.evaluate_match(dict(stats), dict(stats), ra, rb)
+        self.assertEqual(w1, "alpha")
+        self.assertGreater(fa1, fa0)
+        self.assertEqual(fb1, fb0)
+        self.assertEqual(mgr.history[-1]["novelty_beta"], 0.0)
+        self.assertGreater(mgr.history[-1]["novelty_alpha"], 0.0)
+        # Winner pools counted; a reloaded manager sees them (persistence).
+        mgr2 = EvolutionManager(checkpoints_dir=mgr.checkpoints_dir)
+        self.assertGreater(
+            mgr2.pool_counts.get("visual_lc11", 0), 0)
+        # Kill dominance survives novelty: a kill beats max novelty.
+        killer = dict(stats, kills=1)
+        w2, fk, _fb = mgr.evaluate_match(dict(killer), dict(stats), rb, ra)
+        self.assertEqual(w2, "alpha")
+
+    def test_evaluate_match_legacy_identical(self):
+        from evolution_engine import EvolutionManager
+        m1 = self._mgr()
+        m2 = self._mgr()
+        stats = {"kills": 0, "damage_dealt": 20.0, "damage_taken": 5.0,
+                 "tracking_time_s": 8.0, "tail_time_s": 2.0,
+                 "nectar_consumed": 0.0}
+        r1 = m1.evaluate_match(dict(stats), dict(stats))
+        r2 = m2.evaluate_match(dict(stats), dict(stats), None, None)
+        self.assertEqual(r1, r2)
+
+
+class TestStagedTraining(unittest.TestCase):
+    """Two-step training: sequencer, summary merge, staging helper,
+    stage-2 params (all with mocked run_training - no CSR needed)."""
+    def _rec(self):
+        return {"id": "staged", "training": {"episodes": 0, "sessions": []},
+                "generator_params": {"seed": 1}}
+
+    def test_train_staged_sequences(self):
+        import train_job
+        calls = []
+
+        def fake_run_training(**kw):
+            calls.append(kw)
+            w = kw["init_weights"]
+            cb = kw.get("progress_cb")
+            for ep in range(1, kw["num_episodes"] + 1):
+                if cb is not None:
+                    cb(ep, kw["num_episodes"])
+            return ("p", w + 1.0, {"episodes": kw["num_episodes"],
+                                   "successes": kw["num_episodes"]})
+        real = train_job.run_training
+        train_job.run_training = fake_run_training
+        try:
+            import numpy as np
+            prog = []
+            rec, w, summaries = train_job.train_staged(
+                self._rec(), np.zeros(3, dtype=np.float32),
+                [(2, {"seed": 1}, "pre-train"),
+                 (3, {"seed": 1}, "school")],
+                progress_cb=lambda ep, total: prog.append((ep, total)),
+                save=False)
+            self.assertEqual(len(summaries), 2)
+            self.assertEqual(rec["training"]["episodes"], 5)
+            self.assertEqual(
+                [s["notes"] for s in rec["training"]["sessions"]],
+                ["pre-train", "school"])
+            # Weights handed stage 1 -> stage 2 (+1 each).
+            np.testing.assert_array_equal(
+                w, np.full(3, 2.0, dtype=np.float32))
+            # Progress rescaled to the combined total, monotonic.
+            self.assertEqual(prog[-1], (5, 5))
+            for (ep, total) in prog:
+                self.assertEqual(total, 5)
+            self.assertEqual(
+                [ep for ep, _t in prog], sorted(ep for ep, _t in prog))
+            merged = train_job.merge_summaries(summaries)
+            self.assertEqual(merged["episodes"], 5)
+            self.assertEqual(merged["successes"], 5)
+            self.assertEqual(len(merged["stages"]), 2)
+        finally:
+            train_job.run_training = real
+
+    def test_train_staged_stage2_failure_keeps_stage1(self):
+        import train_job
+        calls = []
+
+        def fake_run_training(**kw):
+            calls.append(kw)
+            if len(calls) > 1:
+                raise RuntimeError("school blew up")
+            return ("p", kw["init_weights"],
+                    {"episodes": kw["num_episodes"]})
+        real = train_job.run_training
+        train_job.run_training = fake_run_training
+        try:
+            import numpy as np
+            rec = self._rec()
+            with self.assertRaises(RuntimeError):
+                train_job.train_staged(
+                    rec, np.zeros(2, dtype=np.float32),
+                    [(1, {}, "pre-train"), (1, {}, "school")], save=False)
+            self.assertEqual(len(rec["training"]["sessions"]), 1)
+            self.assertEqual(rec["training"]["episodes"], 1)
+        finally:
+            train_job.run_training = real
+
+    def test_staged_or_single(self):
+        import train_job
+        import evo_breeder
+        seen = []
+
+        def fake_train_brain(record, weights, episodes, params=None,
+                             progress_cb=None, notes="", save=True):
+            seen.append((episodes, dict(params or {}), notes))
+            return record, weights, {"episodes": episodes}
+        real = train_job.train_brain
+        train_job.train_brain = fake_train_brain
+        try:
+            import numpy as np
+            rec = self._rec()
+            # Single stage: one call, params untouched; small counts
+            # floor to the 50-episode breeding minimum.
+            evo_breeder._staged_or_single(
+                rec, np.zeros(1), 2, {"seed": 1, "a": 1}, "n1",
+                None, None, "n2", None)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], 50)
+            # Staged: stage-2 inherits unset keys, keeps its own; the
+            # deficit lands on stage 1, the school stage never shrinks.
+            seen.clear()
+            evo_breeder._staged_or_single(
+                rec, np.zeros(1), 2, {"seed": 1, "a": 1}, "n1",
+                3, {"b": 2}, "n2", None)
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(seen[0][0], 47)
+            self.assertEqual(seen[1][0], 3)
+            self.assertEqual(seen[1][1]["b"], 2)
+            self.assertEqual(seen[1][1]["a"], 1)
+            self.assertEqual(seen[1][1]["seed"], 1)
+            # Larger counts pass through untouched.
+            seen.clear()
+            evo_breeder._staged_or_single(
+                rec, np.zeros(1), 60, {"seed": 1, "a": 1}, "n1",
+                None, None, "n2", None)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], 60)
+        finally:
+            train_job.train_brain = real
+
+    def test_parse_params2(self):
+        import types
+        import vault_cli
+        self.assertIsNone(vault_cli._parse_params2(types.SimpleNamespace()))
+        ns = types.SimpleNamespace(params2='{"curriculum": "school"}',
+                                   params2_file="")
+        self.assertEqual(vault_cli._parse_params2(ns),
+                         {"curriculum": "school"})
+        bad = types.SimpleNamespace(params2='{oops', params2_file="")
+        self.assertIn("__error", vault_cli._parse_params2(bad))
+
+
+class TestFlightSchool(unittest.TestCase):
+    """Advanced Flight School: anchored camps, planned paths, scheduler,
+    difficulty curves (KinematicFly-level, no CSR needed)."""
+    def test_anchored_target_never_moves(self):
+        from train_homing import KinematicFly
+        t = KinematicFly(x=5.0, y=7.0, z=-3.0, heading_rad=0.7, anchored=True)
+        p0 = t.pos.copy()
+        for _ in range(20):
+            t.step(thrust=1.0, yaw_torque=0.9, pitch_cmd=0.5, dt=0.05)
+        np.testing.assert_array_equal(t.pos, p0)
+        self.assertEqual(t.last_speed, 0.0)
+        f = KinematicFly(x=5.0, y=7.0, z=-3.0, heading_rad=0.7)
+        f.step(thrust=1.0, yaw_torque=0.0, dt=0.05)
+        self.assertGreater(float(np.linalg.norm(f.pos - p0)), 0.0)
+
+    def test_roll_axis(self):
+        # Roll integrates from command (right-bank positive, turning
+        # right with it), auto-levels to wings-level, and stays exactly
+        # zero without commands (legacy flight identical).
+        from train_homing import KinematicFly, apply_arena_controls
+        f = KinematicFly(x=0.0, y=7.0, z=0.0, heading_rad=0.0)
+        h0 = f.heading
+        f.step(thrust=0.2, yaw_torque=0.0, dt=0.05)
+        self.assertEqual(f.roll, 0.0)
+        self.assertEqual(f.heading, h0)
+        self.assertEqual(f.roll_rate_applied, 0.0)
+        f.step(thrust=0.2, yaw_torque=0.0, dt=0.05, roll_cmd=1.0)
+        self.assertGreater(f.roll, 0.0)
+        self.assertLessEqual(f.roll, 0.9)
+        self.assertLess(f.heading, h0)
+        self.assertGreater(f.roll_rate_applied, 0.0)
+        for _ in range(400):
+            f.step(thrust=0.2, yaw_torque=0.0, dt=0.05)
+        self.assertAlmostEqual(f.roll, 0.0, places=2)
+        f2 = KinematicFly(x=0.0, y=7.0, z=0.0, heading_rad=0.0)
+        apply_arena_controls(
+            f2, {"thrust": 0.2, "yaw_torque": 0.0, "roll_torque": 0.6,
+                 "spear_thrust": 0.0}, {}, 10.0)
+        self.assertGreater(f2.roll, 0.0)
+
+    def test_dodge_episode(self):
+        # Dodge-only curriculum: head-on threat spawned ahead along the
+        # nose, homing at the agent; slalom envs carry two gate points.
+        import numpy as np
+        from train_homing import _school_episode
+        rngs = {k: np.random.default_rng(11)
+                for k in ("spawn", "path", "forest", "target")}
+        curriculum = {"stages": [{"until": 1.01,
+                                  "behaviors": {"dodge": 1.0},
+                                  "envs": {"open": 1.0}}]}
+        target, fly, _upset, env, _extra, ctx = _school_episode(
+            rngs, 0.5, curriculum, 0.0, 0.0, 30.0, 0.0)
+        self.assertEqual(ctx["behavior"], "dodge")
+        self.assertEqual(ctx["gates"], [])
+        self.assertEqual(ctx["min_dist"], float("inf"))
+        to_t = target.pos - fly.pos
+        fwd = np.array([np.cos(fly.heading), 0.0, np.sin(fly.heading)])
+        ahead = float(np.dot(to_t[[0, 2]], fwd[[0, 2]]))
+        self.assertGreater(ahead, 0.0)
+        # Threat nose points back at the agent (collision course).
+        back = fly.pos - target.pos
+        tdir = np.array([np.cos(target.heading), 0.0,
+                         np.sin(target.heading)])
+        self.assertGreater(float(np.dot(back[[0, 2]], tdir[[0, 2]])), 0.0)
+
+    def test_stalk_gaze_pay(self):
+        # Spear-geometry shaped, stalk-only: max dead-ahead close,
+        # tapering to the 35-degree gate; everything else pays zero.
+        from train_homing import stalk_gaze_pay
+        pay, locked = stalk_gaze_pay("stalk", True, 0.0, 2.0)
+        self.assertAlmostEqual(pay, 0.4)
+        self.assertTrue(locked)
+        pay, _locked = stalk_gaze_pay("stalk", True, 17.5, 2.0)
+        self.assertAlmostEqual(pay, 0.2)
+        pay, locked = stalk_gaze_pay("stalk", True, 0.0, 9.0)
+        self.assertEqual(pay, 0.0)
+        self.assertTrue(locked)
+        self.assertEqual(stalk_gaze_pay("stalk", True, 35.1, 2.0),
+                         (0.0, False))
+        self.assertEqual(stalk_gaze_pay("stalk", False, 0.0, 2.0),
+                         (0.0, False))
+        # Other lessons never pay for staring (no fixation farming).
+        for behavior in ("camp", "mover", "duel", "dodge"):
+            self.assertEqual(stalk_gaze_pay(behavior, True, 0.0, 2.0),
+                             (0.0, False))
+
+    def test_stalk_episode(self):
+        # Stalk-only curriculum: lateral-sweeper archetypes (never
+        # flee), deterministic layouts, gaze keys present.
+        import numpy as np
+        from train_homing import _school_episode, STALK_ARCHETYPES
+        curriculum = {"stages": [{"until": 1.01,
+                                  "behaviors": {"stalk": 1.0},
+                                  "envs": {"open": 1.0}}]}
+
+        def _build(seed):
+            rngs = {k: np.random.default_rng(seed)
+                    for k in ("spawn", "path", "forest", "target")}
+            return _school_episode(rngs, 0.5, curriculum,
+                                   0.0, 0.0, 30.0, 0.0)
+
+        t1, _f1, _u1, _e1, _x1, ctx1 = _build(21)
+        t2, _f2, _u2, _e2, _x2, ctx2 = _build(21)
+        self.assertEqual(ctx1["behavior"], "stalk")
+        self.assertIn(ctx1["archetype"], STALK_ARCHETYPES)
+        self.assertNotEqual(ctx1["archetype"], "flee")
+        self.assertIsNotNone(ctx1["path"])
+        # Deterministic: same seed rebuilds the same lesson.
+        self.assertEqual(ctx1["archetype"], ctx2["archetype"])
+        np.testing.assert_array_equal(t1.pos, t2.pos)
+        self.assertEqual(ctx1.get("gaze_locks", 0), 0)
+
+    def test_slalom_gates(self):
+        import numpy as np
+        from train_homing import _school_episode
+        rngs = {k: np.random.default_rng(11)
+                for k in ("spawn", "path", "forest", "target")}
+        curriculum = {"stages": [{"until": 1.01,
+                                  "behaviors": {"dodge": 1.0},
+                                  "envs": {"slalom": 1.0}}]}
+        _t, _f, _u, env, extra, ctx = _school_episode(
+            rngs, 0.5, curriculum, 0.0, 0.0, 30.0, 0.0)
+        self.assertEqual(env, "slalom")
+        self.assertEqual(len(extra), 3)
+        self.assertEqual(len(ctx["gates"]), 2)
+        self.assertFalse(ctx["gate_paid"])
+
+    def test_plan_path_properties(self):
+        import numpy as np
+        from train_homing import plan_path, MOVER_ARCHETYPES
+        self.assertEqual(set(MOVER_ARCHETYPES),
+                         {"patrol", "weave", "flee", "orbit",
+                          "zigzag", "doubleback",
+                          "circle_slow", "circle_fast"})
+        for arch in MOVER_ARCHETYPES:
+            p = plan_path(np.random.default_rng(4), 4, archetype=arch)
+            self.assertEqual(p["archetype"], arch)
+            self.assertEqual(len(p["points"]), 4)
+            for pt, sp in zip(p["points"], p["speeds"]):
+                self.assertTrue(-40.0 <= pt[0] <= 40.0)
+                self.assertTrue(4.0 <= pt[1] <= 14.0)
+                self.assertTrue(-40.0 <= pt[2] <= 40.0)
+                self.assertTrue(0.7 <= sp <= 1.0)
+        a = plan_path(np.random.default_rng(4), 3)
+        b = plan_path(np.random.default_rng(4), 3)
+        self.assertEqual(a, b)
+        c = plan_path(np.random.default_rng(5), 3)
+        self.assertNotEqual(a["points"], c["points"])
+        # New lessons: geometry signatures.
+        z = plan_path(np.random.default_rng(4), 6, archetype="zigzag")
+        pzs = [pt[2] for pt in z["points"]]
+        diffs = [b - a for a, b in zip(pzs, pzs[1:])]
+        signs = set(1 if d > 0 else -1 for d in diffs if abs(d) > 1e-9)
+        self.assertGreater(len(signs), 1,
+                           "zigzag oscillates laterally")
+        d = plan_path(np.random.default_rng(4), 4, archetype="doubleback")
+        pxs = [pt[0] for pt in d["points"]]
+        self.assertAlmostEqual(pxs[0], pxs[2])
+        self.assertAlmostEqual(pxs[1], pxs[3])
+        self.assertNotAlmostEqual(pxs[0], pxs[1])
+        for c in ("circle_slow", "circle_fast"):
+            cp = plan_path(np.random.default_rng(4), 6, archetype=c)
+            first, last = cp["points"][0], cp["points"][-1]
+            self.assertAlmostEqual(first[0], last[0], places=4)
+            self.assertAlmostEqual(first[2], last[2], places=4)
+            self.assertTrue(all(s == cp["speeds"][0] for s in cp["speeds"]),
+                            "circle legs run at a steady pace")
+
+    def test_step_path_target_advances(self):
+        import numpy as np
+        from train_homing import KinematicFly, plan_path, step_path_target
+        t = KinematicFly(x=-14.0, z=0.0, heading_rad=0.0)
+        path = plan_path(np.random.default_rng(9), 3)
+        state = {"wp": 0}
+        seen = {0}
+        for _ in range(400):
+            step_path_target(t, path, state, 6.0, dt=0.05)
+            seen.add(int(state["wp"]))
+            if len(seen) > 1:
+                break
+        self.assertGreater(len(seen), 1)
+
+    def test_scheduler_coverage_and_determinism(self):
+        import numpy as np
+        from train_homing import (pick_school_scenario, _school_diff,
+                                  SCHOOL_BEHAVIORS, SCHOOL_ENVS)
+        a = pick_school_scenario(np.random.default_rng(2), 0.1, {})
+        b = pick_school_scenario(np.random.default_rng(2), 0.1, {})
+        self.assertEqual(a, b)
+        self.assertIn(a[0], SCHOOL_BEHAVIORS)
+        self.assertIn(a[1], SCHOOL_ENVS)
+        kinds = set()
+        for seed in range(60):
+            kinds.add(pick_school_scenario(
+                np.random.default_rng(seed), 0.5, {})[0])
+        self.assertEqual(kinds, set(SCHOOL_BEHAVIORS))
+        self.assertAlmostEqual(_school_diff(0.0, {}, "camp_dist"), 20.0)
+        self.assertAlmostEqual(_school_diff(1.0, {}, "camp_dist"), 35.0)
+        self.assertAlmostEqual(
+            _school_diff(0.5, {"difficulty": {"camp_dist": [0.0, 10.0]}},
+                         "camp_dist"), 5.0)
+
+    def test_mover_archetype_staging(self):
+        import numpy as np
+        from train_homing import _mover_archetype, MOVER_ARCHETYPES
+        a = _mover_archetype(np.random.default_rng(2), 0.1, {})
+        b = _mover_archetype(np.random.default_rng(2), 0.1, {})
+        self.assertEqual(a, b)
+        self.assertIn(a, MOVER_ARCHETYPES)
+        # Early training never draws the advanced lessons.
+        early = set()
+        for seed in range(60):
+            early.add(_mover_archetype(
+                np.random.default_rng(seed), 0.0, {}))
+        self.assertNotIn("doubleback", early)
+        self.assertNotIn("circle_fast", early)
+        # Late training covers the full lesson set.
+        late = set()
+        for seed in range(200):
+            late.add(_mover_archetype(
+                np.random.default_rng(seed), 1.0, {}))
+        self.assertEqual(late, set(MOVER_ARCHETYPES))
+        # Curriculum override respected.
+        ov = {"mover_archetypes": [{"until": 1.01,
+                                    "archetypes": {"zigzag": 1.0}}]}
+        self.assertEqual(
+            _mover_archetype(np.random.default_rng(0), 0.0, ov), "zigzag")
+
+    def test_anchored_target_senses(self):
+        from train_homing import KinematicFly, compute_agent_senses
+        fly = KinematicFly(x=-14.0, z=0.0, heading_rad=0.0)
+        camp = KinematicFly(x=12.0, z=2.0, heading_rad=1.0, anchored=True)
+        senses, dist = compute_agent_senses(fly, camp, prev_dist=20.0)
+        self.assertGreater(dist, 20.0)
+        self.assertIn("scent_lost", senses)
+        self.assertIn("scent_cast", senses)
+        self.assertIn("scent_surge", senses)
+        self.assertGreater(senses["pheromone_conc_left"]
+                           + senses["pheromone_conc_right"], 0.0)
+
+    def test_scent_log_falloff_regimes(self):
+        # Log falloff with a floor (mirrors FlyPhysics SCENT_FLOOR 0.06,
+        # SCENT_LOG_K 0.5, SCENT_RANGE_M 80): steep near field, fat tail.
+        # Nose-on totals must match the documented curve within epsilon;
+        # facing away at the edge reads lost.
+        from train_homing import KinematicFly, compute_agent_senses
+        import math
+        def total_at(dist, away=False):
+            fly = KinematicFly(x=0.0, z=0.0,
+                               heading_rad=math.pi if away else 0.0)
+            camp = KinematicFly(x=dist, z=0.0, heading_rad=0.0)
+            senses, _ = compute_agent_senses(fly, camp)
+            return (senses["pheromone_conc_left"]
+                    + senses["pheromone_conc_right"])
+        ds = [2.0, 5.0, 10.0, 28.0, 55.0]
+        totals = [total_at(d) for d in ds]
+        for i in range(len(totals) - 1):
+            self.assertGreater(totals[i], totals[i + 1],
+                               "scent falls with distance")
+        # Pin the curve itself: c_base nose-on, antenna factor for a
+        # dead-ahead rival (0.7 lateral = 35 deg alignment each side).
+        align = 1.0 / math.sqrt(1.0 + 0.7 ** 2)
+        factor = 0.45 + 0.55 * ((align + 0.3) / 1.3)
+        for d, t in zip(ds, totals):
+            c_base = (0.06 + 0.94
+                      * (1.0 - math.log(1.0 + 0.5 * d) / math.log(41.0)))
+            self.assertAlmostEqual(t, 2.0 * c_base * factor, places=3,
+                                   msg="curve parity at %gm" % d)
+        self.assertGreater(totals[-1], 0.12, "edge nose-on stays found")
+        self.assertLess(total_at(55.0, away=True), 0.12,
+                        "edge facing-away goes quiet")
+        near = (totals[0] - totals[2]) / 8.0
+        far = (totals[3] - totals[4]) / 27.0
+        self.assertGreater(near, 4.0 * far, "close reads sharper")
+
+
+class TestT4Recurrence(unittest.TestCase):
+    """T4/T5 cannot self-sustain: saturated drive evokes exactly the
+    forced set (each cell fires once, no refire), and silence follows
+    stimulus removal immediately - on fresh AND 20x-potentiated
+    efferents. Guards the no-seizure verdict: if T4 counts ever reach
+    thousands per tick again, one of these fails first."""
+    POOLS = ["visual_t4a", "visual_t4b", "visual_t4c", "visual_t4d",
+             "visual_t5a", "visual_t5b", "visual_t5c", "visual_t5d"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.csr = load_or_build_csr()
+        cls.pops = load_or_extract_populations()
+        cls.t4ids = set()
+        for k in cls.POOLS:
+            cls.t4ids.update(cls.pops[k]["all"])
+
+    def _brain(self, potentiate=1.0):
+        from lif_brain import FlyBrain
+        w = np.ascontiguousarray(
+            np.asarray(self.csr.data, dtype=np.float32).copy())
+        if potentiate != 1.0:
+            indptr = np.asarray(self.csr.indptr)
+            for pre in self.t4ids:
+                s, e = int(indptr[pre]), int(indptr[pre + 1])
+                if e > s:
+                    w[s:e] *= potentiate
+        return FlyBrain(self.csr.indptr, self.csr.indices, w)
+
+    def _hot_stim(self):
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        return enc.encode({"visual_flow_ventral": 1.0,
+                           "visual_flow_lateral": 1.0,
+                           "visual_flow_expansion": 1.0,
+                           "visual_flow_climb": 1.0})
+
+    def _t4hits(self, spikes):
+        from collections import Counter
+        c = Counter(int(s) for s in spikes)
+        hits = sum(v for k, v in c.items() if k in self.t4ids)
+        uniq = sum(1 for k in c if k in self.t4ids)
+        return hits, uniq
+
+    def test_no_refire_fresh(self):
+        brain = self._brain()
+        last = None
+        for _ in range(5):
+            last = brain.integrate_50ms(self._hot_stim())
+        hits, uniq = self._t4hits(last)
+        # Forced set only (<= 480 stimulus ids), each exactly once.
+        self.assertLessEqual(uniq, 480)
+        self.assertEqual(hits, uniq)
+
+    def test_no_persistence(self):
+        brain = self._brain()
+        for _ in range(5):
+            brain.integrate_50ms(self._hot_stim())
+        from sensory_motor import SensoryEncoder
+        enc = SensoryEncoder(self.pops, mapping="flow_trans")
+        for _ in range(3):
+            s = brain.integrate_50ms(enc.encode({}))
+            hits, _u = self._t4hits(s)
+            self.assertEqual(hits, 0)
+            self.assertEqual(len(s), 0)
+
+    def test_no_refire_potentiated(self):
+        brain = self._brain(potentiate=20.0)
+        last = None
+        for _ in range(5):
+            last = brain.integrate_50ms(self._hot_stim())
+        hits, uniq = self._t4hits(last)
+        self.assertEqual(hits, uniq)
+        s = brain.integrate_50ms(
+            SensoryEncoder(self.pops, mapping="flow_trans").encode({}))
+        self.assertEqual(len(s), 0)
+
+
 class TestMappingMatrix(unittest.TestCase):
     """Certifies every wiring x mapping regime: each combination must
     integrate, decode a complete finite control set, and stay isolated
     (legacy ignores split keys, mapped schemes compose). Includes the
     mirror-direction readouts the old suite only tested one-sided."""
     CTRL_KEYS = {"thrust", "yaw_torque", "pitch_torque", "roll_torque",
-                 "approach_bias", "ram_burst", "emergency_evade",
-                 "spear_thrust"}
+                 "approach_bias", "ram_burst", "ram_drive",
+                 "emergency_evade", "spear_thrust"}
 
     @classmethod
     def setUpClass(cls):
@@ -1972,6 +4055,22 @@ class TestMappingMatrix(unittest.TestCase):
                 self.assertTrue(dec.legacy)
                 spikes = brain.integrate_50ms(enc.encode(stim))
                 self._finite_ctrl(dec.decode(spikes, sensory_hint=stim))
+
+    def test_degenerate_weights_refused(self):
+        # Zero-activity gate: an all-zero or non-finite weight vector of
+        # the right arity passes every prior check - _bind_brain must
+        # refuse it loudly instead of loading a reflex-zombie brain.
+        import brain_server as bs
+        from experimental_wiring import experiment_arrays
+        _indptr, indices, _wbasis = experiment_arrays(None, self.csr, self.pops)
+        rec = {"name": "Zed", "generator_params": {}}
+        with self.assertRaises(ValueError):
+            bs._bind_brain(rec, np.zeros(len(indices), dtype=np.float32),
+                           self.csr, self.pops, {})
+        nan_w = np.asarray(_wbasis, dtype=np.float32).copy()
+        nan_w[0] = np.nan
+        with self.assertRaises(ValueError):
+            bs._bind_brain(rec, nan_w, self.csr, self.pops, {})
 
     def test_mix_integrate_and_decode(self):
         # Representative additive mix across regimes: union wiring must
@@ -2068,6 +4167,63 @@ class TestMappingMatrix(unittest.TestCase):
         self.assertFalse(dec.decode(gf_pool[:1])["ram_burst"])
         self.assertTrue(dec.decode(gf_pool[:2])["ram_burst"])
 
+    def test_drive_curve_shape(self):
+        # Log saturation: hover at zero, ~4 m/s at low-moderate drive,
+        # asymptote exactly 12, diminishing returns throughout.
+        from sensory_motor import drive_speed, DRIVE_VMAX
+        self.assertEqual(drive_speed(0.0), 0.0)
+        self.assertEqual(drive_speed(1.0), DRIVE_VMAX)
+        self.assertAlmostEqual(drive_speed(0.15), 4.0, delta=0.5)
+        pts = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
+        vals = [drive_speed(a) for a in pts]
+        for v, prev in zip(vals[1:], vals):
+            self.assertGreater(v, prev)
+        gains = [(vals[i + 1] - vals[i]) / (pts[i + 1] - pts[i])
+                 for i in range(len(pts) - 1)]
+        for g, last_gain in zip(gains[1:], gains):
+            self.assertLess(g, last_gain)
+        # Out-of-range inputs clamp, never NaN.
+        self.assertEqual(drive_speed(-3.0), 0.0)
+        self.assertEqual(drive_speed(99.0), DRIVE_VMAX)
+
+    def test_ram_drive_scaling(self):
+        # Charge scales with DNpe017 volley size; the boolean gate
+        # (stats/compat) is unchanged.
+        dec = MotorDecoder(self.pops)
+        pool = list(self.pops["motor_ram_dnpe017"]["all"])
+        c0 = dec.decode([])
+        self.assertEqual(c0["ram_drive"], 0.0)
+        self.assertFalse(c0["ram_burst"])
+        c2 = dec.decode(pool[:2])
+        self.assertTrue(c2["ram_burst"])
+        self.assertGreater(c2["ram_drive"], 0.0)
+        self.assertLess(c2["ram_drive"], 1.0)
+        full = dec.decode(pool * 3)
+        self.assertEqual(full["ram_drive"], 1.0)
+
+    def test_activation_hover_and_ram(self):
+        # No drive hovers in place; full drive cruises 12; ram adds
+        # headroom up to the hard cap, never beyond.
+        from train_homing import KinematicFly
+        from sensory_motor import SPEED_CAP
+        hover = KinematicFly()
+        p0 = hover.pos.copy()
+        hover.step(0.0, 0.0)
+        self.assertEqual(hover.last_speed, 0.0)
+        self.assertTrue((hover.pos == p0).all())
+        cruise = KinematicFly()
+        cruise.step(1.0, 0.0)
+        self.assertAlmostEqual(cruise.last_speed, 12.0)
+        ram = KinematicFly()
+        ram.step(1.0, 0.0, ram_drive=1.0)
+        self.assertAlmostEqual(ram.last_speed, 18.0)
+        self.assertLessEqual(ram.last_speed, SPEED_CAP)
+        # Partial ram scales between cruise and full charge.
+        half = KinematicFly()
+        half.step(1.0, 0.0, ram_drive=0.5)
+        self.assertGreater(half.last_speed, cruise.last_speed)
+        self.assertLess(half.last_speed, ram.last_speed)
+
     def test_mixed_regime_battle_pair(self):
         # exp-vs-exp and legacy-vs-mapped pairs integrate side by side
         # with native arity and full control sets (extends the base/exp
@@ -2106,6 +4262,7 @@ class TestTrainerArenaContract(unittest.TestCase):
 
     # Mirror of FlyPhysics.gd get_sensory_data (update together).
     ARENA_KEYS = {"pheromone_conc_left", "pheromone_conc_right",
+                  "scent_lost", "scent_cast", "scent_surge",
                   "visual_target_azimuth", "visual_target_elevation",
                   "visual_target_visible", "visual_rival_looming",
                   "visual_tree_left_looming", "visual_tree_ahead_looming",
@@ -2144,8 +4301,8 @@ class TestTrainerArenaContract(unittest.TestCase):
         # arena control application (no silently dropped channels).
         from train_homing import KinematicFly, apply_arena_controls
         for key in ("thrust", "yaw_torque", "pitch_torque", "roll_torque",
-                    "approach_bias", "ram_burst", "emergency_evade",
-                    "spear_thrust"):
+                    "approach_bias", "ram_burst", "ram_drive",
+                    "emergency_evade", "spear_thrust"):
             self.assertIn(key, TestMappingMatrix.CTRL_KEYS)
         ctrl = {"thrust": 0.5, "yaw_torque": 0.2, "pitch_torque": 0.1,
                 "roll_torque": 0.0, "approach_bias": 0.1,
@@ -2365,6 +4522,179 @@ class TestRetinaVision(unittest.TestCase):
             return_brain=True)
         self.assertEqual(summary["episodes"], 3)
         self.assertGreater(summary["avg_closed"], 5.0)
+
+    def test_eval_only_scores_without_touching_weights(self):
+        # Pre-training score probe: 2 school episodes, plasticity and
+        # pinning disabled; returned weights must equal the reference
+        # build bit-for-bit, and the summary must carry a score.
+        from train_homing import (run_training, experiment_arrays,
+                                  load_or_build_csr)
+        from connectome_loader import load_or_extract_populations
+        csr = load_or_build_csr()
+        pops = load_or_extract_populations()
+        _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+        start = np.ascontiguousarray(np.asarray(wbasis, dtype=np.float32))
+        _save, w_out, summary = run_training(
+            num_episodes=2, variant="custom", seed=11,
+            target_evasion=0.2, experiment="retina_wide", mapping="retina",
+            init_weights=start.copy(), curriculum={},
+            return_brain=True, eval_only=True)
+        self.assertIsNone(_save)
+        np.testing.assert_array_equal(w_out, start)
+        self.assertEqual(summary["episodes"], 2)
+        self.assertIn("score", summary)
+        self.assertIn("avg_score", summary)
+
+    def test_score_command_stamps_eval(self):
+        # vault_cli score: eval probe stamps training.eval_score and
+        # leaves the vault weights bit-identical.
+        import shutil
+        import tempfile
+        import brain_package as vault_pkg
+        from train_homing import experiment_arrays, load_or_build_csr
+        from vault_cli import cmd_score
+        tmp = tempfile.mkdtemp(prefix="score_cmd_")
+        old_vault, old_index = vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = tmp
+        vault_pkg.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            csr = load_or_build_csr()
+            pops = load_or_extract_populations()
+            _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+            rec = vault_pkg.new_record(
+                "Scorey", {"experiment": "retina_wide",
+                           "mapping": "retina"})
+            w0 = np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy())
+            vault_pkg.save_brain(rec, w0)
+
+            class _A:
+                pass
+            a = _A()
+            a.id = rec["id"]
+            a.episodes = 2
+            a.seed = 11
+            a.result_file = ""
+            base_score = float(rec.get("training", {}).get("score", 0.0))
+            base_eps = int(rec.get("training", {}).get("episodes", 0))
+            self.assertEqual(cmd_score(a), 0)
+            rec2, w2 = vault_pkg.load_brain(rec["id"])
+            # Single odometer: probe points bank into score, episodes
+            # bumped, no second tag, weights bit-identical.
+            self.assertNotIn("eval_score", rec2.get("training", {}))
+            self.assertGreater(rec2["training"]["score"], base_score)
+            self.assertEqual(rec2["training"]["episodes"], base_eps + 2)
+            self.assertAlmostEqual(
+                rec2["training"]["avg_score"],
+                rec2["training"]["score"] / rec2["training"]["episodes"])
+            np.testing.assert_array_equal(w2, w0)
+        finally:
+            vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_score_stamp_leaves_zip_untouched(self):
+        # Unchanged probe (no concurrent train): counters bank via the
+        # sidecar while the ~100 MB zip stays byte-identical.
+        import shutil
+        import tempfile
+        import brain_package as vault_pkg
+        from train_homing import experiment_arrays, load_or_build_csr
+        from vault_cli import cmd_score
+        tmp = tempfile.mkdtemp(prefix="score_sidecar_")
+        old_vault, old_index = vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = tmp
+        vault_pkg.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            csr = load_or_build_csr()
+            pops = load_or_extract_populations()
+            _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+            rec = vault_pkg.new_record(
+                "Sidecar", {"experiment": "retina_wide",
+                            "mapping": "retina"})
+            w0 = np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy())
+            vault_pkg.save_brain(rec, w0)
+
+            class _A:
+                pass
+            a = _A()
+            a.id = rec["id"]
+            a.episodes = 2
+            a.seed = 11
+            a.result_file = ""
+            path = vault_pkg.package_path(rec)
+            with open(path, "rb") as f:
+                before = f.read()
+            self.assertEqual(cmd_score(a), 0)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before)
+            rec2, w2 = vault_pkg.load_brain(rec["id"])
+            self.assertEqual(rec2["training"]["episodes"], 2)
+            self.assertGreater(rec2["training"]["score"], 0.0)
+            np.testing.assert_array_equal(w2, w0)
+        finally:
+            vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_score_merges_concurrent_train(self):
+        # A train landing mid-probe must survive the probe's save:
+        # counters merge onto the fresh record, newer weights kept.
+        import shutil
+        import tempfile
+        from unittest import mock
+        import brain_package as vault_pkg
+        from train_homing import experiment_arrays, load_or_build_csr
+        from vault_cli import cmd_score
+        tmp = tempfile.mkdtemp(prefix="score_merge_")
+        old_vault, old_index = vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX
+        vault_pkg.VAULT_DIR = tmp
+        vault_pkg.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            csr = load_or_build_csr()
+            pops = load_or_extract_populations()
+            _ip, _ix, wbasis = experiment_arrays("retina_wide", csr, pops)
+            rec = vault_pkg.new_record(
+                "Mergey", {"experiment": "retina_wide",
+                           "mapping": "retina"})
+            w0 = np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy())
+            vault_pkg.save_brain(rec, w0)
+            # A concurrent train saves different weights + counters.
+            w1 = np.ascontiguousarray(w0 + 1.0)
+            rec_train, _ = vault_pkg.load_brain(rec["id"])
+            rec_train["training"]["score"] = 50.0
+            rec_train["training"]["episodes"] = 25
+            vault_pkg.save_brain(rec_train, w1)
+
+            class _A:
+                pass
+            a = _A()
+            a.id = rec["id"]
+            a.episodes = 2
+            a.seed = 11
+            a.result_file = ""
+            loads = {"n": 0}
+            real_load = vault_pkg.load_brain
+
+            def _flaky_load(bid):
+                # First load (probe start) sees pre-train weights;
+                # merge reload sees the train's newer save.
+                loads["n"] += 1
+                if loads["n"] == 1:
+                    return rec, w0.copy()
+                return real_load(bid)
+
+            with mock.patch.object(vault_pkg, "load_brain",
+                                   side_effect=_flaky_load):
+                self.assertEqual(cmd_score(a), 0)
+            rec2, w2 = vault_pkg.load_brain(rec["id"])
+            # Train's weights kept, both counters merged.
+            np.testing.assert_array_equal(w2, w1)
+            self.assertEqual(rec2["training"]["episodes"], 25 + 2)
+            self.assertGreater(rec2["training"]["score"], 50.0)
+        finally:
+            vault_pkg.VAULT_DIR, vault_pkg.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_sector_wood_drives_lplc2(self):
         enc = SensoryEncoder(self.pops, mapping="retina")
@@ -2742,31 +5072,31 @@ class TestEvoLoop(unittest.TestCase):
     def test_wild_name_deterministic(self):
         import random
         import evo_breeder as evo
-        a = evo.wild_name(random.Random(42), 3)
-        b = evo.wild_name(random.Random(42), 3)
+        a = evo.wild_name(random.Random(42))
+        b = evo.wild_name(random.Random(42))
         self.assertEqual(a, b)
-        self.assertTrue(a.endswith(" G3"))
-        parts = a.split(" ")
-        self.assertEqual(len(parts), 3)
-        self.assertIn(parts[0], evo.WILD_ADJECTIVES)
-        self.assertIn(parts[1], evo.WILD_CALLSIGNS)
-        self.assertEqual(parts[2], "G3")
-        names = {evo.wild_name(random.Random(s), 3) for s in range(60)}
-        self.assertGreater(len(names), 50)
+        # Bare memorable stem, no generation tag, single word
+        # (never "Adjective_Callsign", never "Stem GN").
+        self.assertIn(a, evo.WILD_STEMS)
+        self.assertNotIn(" ", a)
+        self.assertNotIn("_", a)
+        self.assertFalse(any(ch.isdigit() for ch in a))
+        names = {evo.wild_name(random.Random(s)) for s in range(40)}
+        self.assertGreater(len(names), 30)
 
     def test_unique_wild_name_collision(self):
         import random
         import evo_breeder as evo
-        base = evo.wild_name(random.Random(7), 2)
+        base = evo.wild_name(random.Random(7))
         # No collision: plain deterministic name.
         self.assertEqual(
-            evo.unique_wild_name(random.Random(7), 2, set()), base)
+            evo.unique_wild_name(random.Random(7), set()), base)
         # Collision: deterministic Mk suffix, repeatable.
-        u1 = evo.unique_wild_name(random.Random(7), 2, {base})
+        u1 = evo.unique_wild_name(random.Random(7), {base})
         self.assertTrue(u1.startswith(base + " Mk"))
         self.assertEqual(
-            u1, evo.unique_wild_name(random.Random(7), 2, {base}))
-        u2 = evo.unique_wild_name(random.Random(7), 2, {base, u1})
+            u1, evo.unique_wild_name(random.Random(7), {base}))
+        u2 = evo.unique_wild_name(random.Random(7), {base, u1})
         self.assertNotEqual(u2, u1)
         self.assertTrue(u2.startswith(base + " Mk"))
 
@@ -2862,6 +5192,11 @@ class TestEvoLoop(unittest.TestCase):
             self.assertEqual(back["id"], rec["id"])
             self.assertTrue(os.path.isfile(
                 os.path.join(tmp, rec["filename"])))
+            # Restored brains leave the archive entirely: no row, not
+            # even a "(missing)" ghost.
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec["id"]], [])
             with self.assertRaises(FileNotFoundError):
                 vault.restore_brain("nope-not-here")
         finally:
@@ -2870,25 +5205,834 @@ class TestEvoLoop(unittest.TestCase):
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_delete_orphan_duplicates(self):
+        # One brain archived twice leaves two "(missing)" rows after the
+        # files vanish; deleting by id must clear both, never fail as
+        # "ambiguous". Unknown ids still fail loud.
+        import shutil
+        import tempfile
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_orphan_test_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("Ghost", {})
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32),
+                             backup=False)
+            vault.archive_brain(rec["id"], reason="first loss")
+            # Restored pre-prune and re-archived: duplicate log rows.
+            shutil.move(
+                os.path.join(tmp, "archive", rec["filename"]),
+                os.path.join(tmp, rec["filename"]))
+            vault.archive_brain(rec["id"], reason="second loss")
+            rows = [e for e in vault.list_archive()
+                    if e["id"] == rec["id"]]
+            self.assertEqual(len(rows), 2)
+            for fn in {row["filename"] for row in rows}:
+                os.remove(os.path.join(tmp, "archive", fn))
+            info = vault.delete_archived(rec["id"])
+            self.assertEqual(info["id"], rec["id"])
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec["id"]], [])
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived(rec["id"])
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived("never-existed")
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_archive_delete_frees_space(self):
+        import tempfile
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_del_test_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("DelMe", {})
+            rng = np.random.default_rng(7)
+            vault.save_brain(
+                rec, rng.random(500_000, dtype=np.float32),
+                backup=False)
+            vault.archive_brain(rec["id"], reason="space test")
+            listed = [e for e in vault.list_archive()
+                      if e["id"] == rec["id"]]
+            self.assertEqual(len(listed), 1)
+            self.assertTrue(listed[0]["present"])
+            self.assertGreater(listed[0]["size_mb"], 0.0)
+            info = vault.delete_archived(rec["id"])
+            self.assertEqual(info["id"], rec["id"])
+            self.assertGreater(info["freed_bytes"], 0)
+            self.assertFalse(os.path.isfile(
+                os.path.join(tmp, "archive", rec["filename"])))
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec["id"]], [])
+            # Deleting twice / unknown id fails loud, never silent.
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived(rec["id"])
+            with self.assertRaises(FileNotFoundError):
+                vault.delete_archived("nope-not-here")
+            # Orphan log entry (file manually removed) still prunes.
+            rec2 = vault.new_record("Orphan", {})
+            vault.save_brain(
+                rec2, np.zeros(32, dtype=np.float32), backup=False)
+            vault.archive_brain(rec2["id"], reason="orphan test")
+            os.remove(os.path.join(tmp, "archive", rec2["filename"]))
+            info2 = vault.delete_archived(rec2["id"])
+            self.assertEqual(info2["freed_bytes"], 0)
+            self.assertEqual(
+                [e["id"] for e in vault.list_archive()
+                 if e["id"] == rec2["id"]], [])
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_breed_random_params_valid(self):
-        # Random param construction without training: valid wiring,
-        # mapping, yaw_bias ranges (mirrors breed_random's draws).
+        # Random param construction without training: valid genome,
+        # derived mapping, yaw_bias ranges (mirrors breed_random's draws).
         import random as _random
-        from experimental_wiring import normalize_experiment
+        import numpy as _np
+        from experimental_wiring import (validate_genome, derive_mapping,
+                                         genome_label, generate_genome)
         from sensory_motor import (normalize_mapping, normalize_yaw_bias,
                                    draw_yaw_bias, YAW_BIAS_LO, YAW_BIAS_HI)
-        exps = ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
-        maps = ["muscles_up", "gyro_flow", "mbon", "retina", "flow_trans"]
+        from connectome_loader import load_or_extract_populations
+        pops = load_or_extract_populations()
         for seed in range(20):
             rr = _random.Random(seed)
-            mix = sorted(x for x in exps if rr.random() < 0.4)
-            stack = sorted(x for x in maps if rr.random() < 0.5)
-            normalize_experiment(mix or None)
+            grng = _np.random.default_rng(seed)
+            genome = generate_genome(grng, pops, 1 + int(grng.integers(0, 4)))
+            validate_genome(genome, pops)
+            stack = list(derive_mapping(genome))
             normalize_mapping(stack or None)
+            genome_label(genome)
             v = draw_yaw_bias(rr)
             normalize_yaw_bias(v)
             self.assertGreaterEqual(v, YAW_BIAS_LO)
             self.assertLessEqual(v, YAW_BIAS_HI)
+
+
+_ELO_MISSING = object()
+
+
+class TestElo(unittest.TestCase):
+    """ELO ratings: zero-sum math, defaults, backfill, inheritance.
+    No training runs here (CSR-free); server call sites are covered by
+    mocked handler tests below."""
+    def _rec(self, elo=_ELO_MISSING, wins=0, losses=0):
+        r = {"battles": wins + losses, "wins": wins, "losses": losses,
+             "draws": 0, "matches": 0, "matches_won": 0,
+             "matches_lost": 0, "tournaments_won": 0}
+        if elo is not _ELO_MISSING:
+            r["elo"] = elo
+        return {"id": "t", "record": r}
+
+    def test_elo_zero_sum(self):
+        import brain_package as vault
+        a, b = self._rec(1200.0), self._rec(1200.0)
+        na, nb = vault.apply_elo(a, b, "win", vault.ELO_K_BATTLE)
+        self.assertAlmostEqual(na, 1205.0)
+        self.assertAlmostEqual(nb, 1195.0)
+        self.assertAlmostEqual(na + nb, 2400.0)
+
+    def test_elo_upset_swings_more(self):
+        import brain_package as vault
+        a, b = self._rec(1200.0), self._rec(1600.0)
+        na, _nb = vault.apply_elo(a, b, "win", 10.0)
+        underdog_gain = na - 1200.0
+        c, d = self._rec(1200.0), self._rec(1600.0)
+        _nc, nd = vault.apply_elo(c, d, "loss", 10.0)
+        favorite_gain = nd - 1600.0
+        self.assertGreater(underdog_gain, 5.0)
+        self.assertGreater(underdog_gain, favorite_gain)
+
+    def test_elo_draw_equal_no_change(self):
+        import brain_package as vault
+        a, b = self._rec(1200.0), self._rec(1200.0)
+        na, nb = vault.apply_elo(a, b, "draw", 10.0)
+        self.assertEqual(na, 1200.0)
+        self.assertEqual(nb, 1200.0)
+
+    def test_elo_bad_outcome_raises(self):
+        import brain_package as vault
+        with self.assertRaises(ValueError):
+            vault.apply_elo(self._rec(), self._rec(), "banana", 10.0)
+
+    def test_elo_missing_key_defaults(self):
+        import brain_package as vault
+        a, b = self._rec(), self._rec()
+        na, nb = vault.apply_elo(a, b, "win", 10.0)
+        self.assertAlmostEqual(na, 1205.0)
+        self.assertAlmostEqual(nb, 1195.0)
+        self.assertIn("elo", a["record"])
+
+    def test_draw3_penalty(self):
+        import brain_package as vault
+        a, b = self._rec(1300.0), self._rec(1100.0)
+        na, nb = vault.apply_draw3_penalty(a, b)
+        self.assertAlmostEqual(na, 1300.0 - vault.ELO_DRAW3_PENALTY)
+        self.assertAlmostEqual(nb, 1100.0 - vault.ELO_DRAW3_PENALTY)
+
+    def test_new_record_default(self):
+        import brain_package as vault
+        rec = vault.new_record("Rookie")
+        self.assertEqual(rec["record"]["elo"], vault.ELO_DEFAULT)
+
+    def test_backfill(self):
+        import tempfile
+        import shutil
+        import brain_package as vault
+        tmp = tempfile.mkdtemp(prefix="vault_elo_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        try:
+            rec = vault.new_record("Vet")
+            del rec["record"]["elo"]
+            rec["record"]["wins"] = 6
+            rec["record"]["losses"] = 2
+            vault.save_brain(rec, np.zeros(64, dtype=np.float32))
+            rec2 = vault.new_record("Fresh")
+            vault.save_brain(rec2, np.zeros(64, dtype=np.float32))
+            self.assertEqual(vault.backfill_elo(), 1)
+            got, _w = vault.load_brain(rec["id"])
+            self.assertAlmostEqual(got["record"]["elo"], 1200.0 + 25.0 * 4)
+            self.assertEqual(vault.backfill_elo(), 0)
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_inherit_elo(self):
+        import evo_breeder as evo
+        self.assertAlmostEqual(evo.inherit_elo(1500.0), 1410.0)
+        self.assertAlmostEqual(evo.inherit_elo(1200.0), 1200.0)
+        # Below-mean parents breed upward toward the mean.
+        self.assertAlmostEqual(evo.inherit_elo(800.0), 920.0)
+
+    def test_breed_clone_stamps_inherited_elo(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3},
+                  "record": {"battles": 4, "wins": 4, "losses": 0,
+                             "draws": 0, "matches": 1, "matches_won": 1,
+                             "matches_lost": 0, "tournaments_won": 0,
+                             "elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x"}}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5, episodes=1,
+                                          mutate_structure=False)
+        self.assertAlmostEqual(rec["record"]["elo"], 1410.0)
+
+    def test_mutate_kin_traits(self):
+        import evo_breeder as evo
+        base = {"learning_rate": 0.008, "dist_gain": 0.15,
+                "evasion": 0.2, "yaw_bias": 9.0,
+                "align_bonus": [0.5, 0.2, -0.3]}
+        # One random trait moves, in range, everything else identical.
+        p1 = dict(base)
+        m1 = evo.mutate_kin_traits(p1, seed=11, n=1)
+        self.assertEqual(len(m1), 1)
+        key = next(iter(m1))
+        self.assertEqual(m1[key][0], base[key])
+        self.assertNotEqual(m1[key][1], base[key])
+        if key == "learning_rate":
+            self.assertTrue(0.003 <= p1[key] <= 0.010)
+        elif key == "dist_gain":
+            self.assertTrue(0.05 <= p1[key] <= 0.30)
+        elif key == "evasion":
+            self.assertTrue(0.0 <= p1[key] <= 0.6)
+        elif key == "yaw_bias":
+            self.assertTrue(6.0 <= p1[key] <= 12.0)
+        for k in base:
+            if k != key:
+                self.assertEqual(p1[k], base[k])
+        # Deterministic per seed; zero disables; None bias never mutates.
+        p2 = dict(base)
+        self.assertEqual(evo.mutate_kin_traits(p2, seed=11, n=1), m1)
+        p3 = dict(base)
+        self.assertEqual(evo.mutate_kin_traits(p3, seed=11, n=0), {})
+        self.assertEqual(p3, base)
+        p4 = dict(base, yaw_bias=None)
+        for _ in range(20):
+            q = dict(p4)
+            mutated = evo.mutate_kin_traits(q, seed=_, n=4)
+            self.assertNotIn("yaw_bias", mutated)
+            self.assertIsNone(q["yaw_bias"])
+
+    def test_breed_clone_trait_mutation(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3, "learning_rate": 0.008,
+                                       "dist_gain": 0.15, "evasion": 0.2,
+                                       "yaw_bias": 9.0},
+                  "record": {"battles": 4, "wins": 4, "losses": 0,
+                             "draws": 0, "matches": 1, "matches_won": 1,
+                             "matches_lost": 0, "tournaments_won": 0,
+                             "elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x"}}
+        seen = {}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            seen.update(params)
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5, episodes=1,
+                                          mutate_structure=False,
+                                          mutate_traits=2)
+        changed = [k for k in ("learning_rate", "dist_gain", "evasion",
+                               "yaw_bias")
+                   if seen.get(k) != parent["generator_params"][k]]
+        self.assertEqual(len(changed), 2)
+        stamped = rec["lineage"]["trait_mutations"]
+        for k in changed:
+            self.assertIn(k, stamped)
+        # Reflex blends inherit ± a delta alongside (stamped too).
+        for k in evo.BLEND_KEYS:
+            self.assertIn(k, seen)
+            if k in stamped:
+                old, new = stamped[k]
+                self.assertLessEqual(abs(new - old),
+                                     evo.BLEND_DELTAS[k] + 1e-9)
+                self.assertTrue(0.0 <= new <= 1.0)
+        # Disabled: hyperparameters copy over exactly (seed always fresh).
+        seen.clear()
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            evo.breed_clone("p1", "Kid2", seed=6, episodes=1,
+                            mutate_structure=False, mutate_traits=0)
+        for k in ("learning_rate", "dist_gain", "evasion", "yaw_bias"):
+            self.assertEqual(seen.get(k), parent["generator_params"][k])
+
+    def test_clone_names_kin_jr(self):
+        # Pedigree suffix encodes the outcome: same gene re-seeded ->
+        # kin, taken structural mutation -> junior. Counters live in
+        # lineage; names never stack and are never parsed (except the
+        # one-time pre-migration fallback).
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        parent = {"id": "p1", "name": "Kestrel",
+                  "generator_params": {"seed": 3},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "base": "Kestrel", "kin": 2, "jr": 0}}
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            # Genome-less: no structural change possible -> kin.
+            rec, _w, _s = evo.breed_clone("p1", "", seed=5, episodes=1,
+                                          mutate_structure=False,
+                                          mutate_traits=0)
+            self.assertEqual(rec["name"], "Kestrel-kin3")
+            self.assertEqual(rec["lineage"]["kin"], 3)
+            self.assertEqual(rec["lineage"]["jr"], 0)
+            self.assertEqual(rec["lineage"]["base"], "Kestrel")
+            # Explicit names pass through verbatim, counters carried.
+            rec2, _w2, _s2 = evo.breed_clone("p1", "Kid", seed=5,
+                                             episodes=1,
+                                             mutate_structure=False,
+                                             mutate_traits=0)
+            self.assertEqual(rec2["name"], "Kid")
+            self.assertEqual(rec2["lineage"]["kin"], 2)
+            # Unmutated child of a junior takes the kin line (history
+            # stays in lineage, never stacks in the string).
+            parent_jr = dict(parent)
+            parent_jr["name"] = "Kestrel-jr1"
+            parent_jr["lineage"] = {"parent_ids": [], "source": "x",
+                                    "base": "Kestrel", "kin": 0, "jr": 1}
+            with mock.patch("brain_package.load_brain",
+                            return_value=(parent_jr, np.zeros(
+                                8, dtype=np.float32))):
+                rec3, _w3, _s3 = evo.breed_clone(
+                    "p1", "", seed=5, episodes=1, mutate_structure=False,
+                    mutate_traits=0)
+            self.assertEqual(rec3["name"], "Kestrel-kin1")
+            self.assertEqual(rec3["lineage"]["jr"], 1)
+
+    def test_normalize_display_name(self):
+        import evo_breeder as evo
+        # One-time parse: G tags stripped, kin stacks collapse to the
+        # highest N, wilds to bare stems, jr always 0.
+        self.assertEqual(evo.normalize_display_name("G5-Kestrel-kin2"),
+                         ("Kestrel", 2))
+        self.assertEqual(evo.normalize_display_name("Kestrel_G2"),
+                         ("Kestrel", 0))
+        self.assertEqual(evo.normalize_display_name("X-kin-kin1"),
+                         ("X", 1))
+        self.assertEqual(evo.normalize_display_name("G3-G2-flow2-kin-kin1"),
+                         ("flow2", 1))
+        self.assertEqual(evo.normalize_display_name("Viper"),
+                         ("Viper", 0))
+        self.assertEqual(evo.normalize_display_name("Kestrel-kin"),
+                         ("Kestrel", 1))
+
+    def test_clone_names_jr_on_mutation(self):
+        # A taken structural mutation earns the junior suffix off the
+        # same base (reference genome parent, max_changes >= 1).
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        from train_job import fresh_weights
+        from experimental_wiring import reference_genome
+        genome = reference_genome()
+        w0 = np.ascontiguousarray(np.asarray(
+            fresh_weights(None, genome), dtype=np.float32).copy())
+        parent = {"id": "p1", "name": "Kestrel",
+                  "generator_params": {"seed": 3, "genome": genome},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "base": "Kestrel", "kin": 2, "jr": 0}}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, w0)), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            rec, _w, _s = evo.breed_clone("p1", "", seed=5, episodes=1,
+                                          max_changes=1, mutate_traits=0)
+            self.assertEqual(rec["name"], "Kestrel-jr1")
+            self.assertEqual(rec["lineage"]["jr"], 1)
+            self.assertEqual(rec["lineage"]["kin"], 2)
+            # max_changes = 0 skips the mutation: kin line instead.
+            rec2, _w2, _s2 = evo.breed_clone(
+                "p1", "", seed=6, episodes=1, max_changes=0,
+                mutate_traits=0)
+            self.assertEqual(rec2["name"], "Kestrel-kin3")
+
+    def test_breed_random_rejects_bad_mode(self):
+        import evo_breeder as evo
+        # Validation fires before any vault scan or training.
+        with self.assertRaises(ValueError):
+            evo.breed_random("X", seed=1, episodes=1, mode="bogus")
+        with self.assertRaises(ValueError):
+            evo.breed_random("X", seed=1, episodes=1, mode="crossover")
+
+    def test_breed_episode_floor(self):
+        # Breeding trains at least MIN_BREED_EPISODES (more allowed):
+        # explicit small counts and small inherited recipes both floor
+        # to 50, with the lineage stamp staying honest.
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3},
+                  "record": {"battles": 4, "wins": 4, "losses": 0,
+                             "draws": 0, "matches": 1, "matches_won": 1,
+                             "matches_lost": 0, "tournaments_won": 0,
+                             "elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "training": {"episodes_total": 12,
+                                           "stage_split": 0.5,
+                                           "noise": 0.05,
+                                           "max_changes": 1}}}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            # Mirrors log_training_session: stages accumulate.
+            child["training"]["episodes"] = \
+                int(child["training"].get("episodes", 0)) + episodes
+            return child, start_weights, {"episodes": episodes}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch("train_job.train_brain",
+                           side_effect=fake_train_brain):
+            # Explicit small count floors.
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5,
+                                          episodes=1,
+                                          mutate_structure=False,
+                                          mutate_traits=0)
+            self.assertGreaterEqual(
+                rec["training"]["episodes"], vault_pkg.MIN_BREED_EPISODES)
+            self.assertGreaterEqual(
+                rec["lineage"]["training"]["episodes_total"],
+                vault_pkg.MIN_BREED_EPISODES)
+            # Small inherited recipe floors too (episodes=None).
+            rec2, _w2, _s2 = evo.breed_clone(
+                "p1", "Kid2", seed=6, mutate_structure=False,
+                mutate_traits=0)
+            self.assertGreaterEqual(
+                rec2["training"]["episodes"], vault_pkg.MIN_BREED_EPISODES)
+
+    def test_staged_floor_backstop(self):
+        # _staged_or_single floors direct callers (reference path):
+        # the deficit lands on stage 1, an explicit school never shrinks.
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        seen = {}
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            seen.setdefault("calls", []).append(episodes)
+            return child, start_weights, {"episodes": episodes}
+
+        child = vault_pkg.new_record("Floor", {})
+        with mock.patch("train_job.train_brain",
+                        side_effect=fake_train_brain), \
+                mock.patch.object(vault_pkg, "save_brain",
+                                  return_value="mock-path"):
+            evo._staged_or_single(child, np.zeros(4, dtype=np.float32),
+                                  5, {}, "pre", None, None, "school", None)
+            self.assertEqual(seen["calls"], [50])
+            # Explicit school stage preserved, deficit on stage 1.
+            seen.clear()
+            evo._staged_or_single(child, np.zeros(4, dtype=np.float32),
+                                  5, {}, "pre", 10, {}, "school", None)
+        self.assertEqual(seen["calls"], [40, 10])
+
+    def test_training_recipe_inherit(self):
+        import evo_breeder as evo
+        base = {"episodes_total": 50, "stage_split": 0.5, "noise": 0.05,
+                "max_changes": 1}
+        # Child stays within one delta per knob, stamps [old, new].
+        recipe, mut = evo.inherit_recipe(base, seed=600521426)
+        self.assertLessEqual(abs(recipe["episodes_total"] - 50), 10)
+        self.assertLessEqual(abs(recipe["stage_split"] - 0.5), 0.1 + 1e-9)
+        self.assertLessEqual(abs(recipe["noise"] - 0.05), 0.02 + 1e-9)
+        self.assertLessEqual(abs(recipe["max_changes"] - 1), 1)
+        for k, (old, new) in mut.items():
+            self.assertEqual(old, base[k])
+            self.assertEqual(new, recipe[k])
+        # Deterministic per seed; clamps hold at the walls.
+        self.assertEqual(evo.inherit_recipe(base, seed=600521426)[0], recipe)
+        low, _m = evo.inherit_recipe({"episodes_total": 20, "stage_split": 0.25,
+                                       "noise": 0.0, "max_changes": 0},
+                                      seed=7)
+        self.assertGreaterEqual(low["episodes_total"], 20)
+        self.assertGreaterEqual(low["stage_split"], 0.25)
+        self.assertGreaterEqual(low["noise"], 0.0)
+        self.assertGreaterEqual(low["max_changes"], 0)
+        high, _m = evo.inherit_recipe({"episodes_total": 80, "stage_split": 0.75,
+                                        "noise": 0.15, "max_changes": 3},
+                                       seed=7)
+        self.assertLessEqual(high["episodes_total"], 80)
+        self.assertLessEqual(high["stage_split"], 0.75)
+        self.assertLessEqual(high["noise"], 0.15)
+        self.assertLessEqual(high["max_changes"], 3)
+        # Missing recipe = recipe-less parent: vary around the defaults.
+        orphan, _m = evo.inherit_recipe({}, seed=600521426)
+        self.assertLessEqual(abs(orphan["episodes_total"] - 50), 10)
+        # Fresh wild draws land in range.
+        for s in range(10):
+            f = evo.fresh_recipe(s)
+            self.assertTrue(20 <= f["episodes_total"] <= 80)
+            self.assertTrue(0.25 <= f["stage_split"] <= 0.75)
+            self.assertTrue(0.0 <= f["noise"] <= 0.15)
+            self.assertTrue(0 <= f["max_changes"] <= 3)
+
+    def test_blends_inherit_fresh(self):
+        import evo_breeder as evo
+        from sensory_motor import BLEND_DEFAULTS
+        gp = dict(BLEND_DEFAULTS)
+        # Child stays within one delta per knob, stamps [old, new].
+        bl, mut = evo.inherit_blends(gp, seed=99)
+        for k in evo.BLEND_KEYS:
+            self.assertLessEqual(abs(bl[k] - gp[k]),
+                                 evo.BLEND_DELTAS[k] + 1e-9)
+            self.assertTrue(0.0 <= bl[k] <= 1.0)
+        for k, (old, new) in mut.items():
+            self.assertEqual(old, gp[k])
+            self.assertEqual(new, bl[k])
+        self.assertEqual(evo.inherit_blends(gp, seed=99)[0], bl)
+        # Missing parent (legacy brains) = defaults ± delta.
+        bl2, _m = evo.inherit_blends({}, seed=99)
+        for k in evo.BLEND_KEYS:
+            self.assertLessEqual(abs(bl2[k] - BLEND_DEFAULTS[k]),
+                                 evo.BLEND_DELTAS[k] + 1e-9)
+        # Fresh wild draws stay in the flyable regime.
+        f = evo.fresh_blends(7)
+        self.assertTrue(0.0 <= f["yaw_blend"] <= 0.6)
+        self.assertIn(f["evade_backup"], (0.0, 1.0))
+        self.assertTrue(0.0 <= f["flow_authority"] <= 1.0)
+        self.assertTrue(0.2 <= f["search_blend"] <= 0.8)
+        self.assertTrue(0.5 <= f["pitch_blend"] <= 1.0)
+        self.assertEqual(evo.fresh_blends(7), f)
+
+    def test_breed_clone_zero_structural_changes(self):
+        # Regression (live gen-5 abort): an inherited max_changes = 0
+        # is a legal recipe meaning "structurally identical clone" -
+        # it must skip mutate_genome (which requires >= 1), not crash.
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        from experimental_wiring import reference_genome
+        genome = reference_genome()
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3, "genome": genome,
+                                       "mapping": ["m1"],
+                                       "learning_rate": 0.008,
+                                       "dist_gain": 0.15, "evasion": 0.2,
+                                       "yaw_bias": 9.0},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "training": {"episodes_total": 45,
+                                           "stage_split": 0.5,
+                                           "noise": 0.05,
+                                           "max_changes": 0}}}
+        seen = {}
+
+        def fake_staged(child, start_weights, ep1, params, _n1, ep2,
+                        _p2, _n2, progress_cb):
+            seen.update(params)
+            return child, start_weights, {}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch.object(evo, "_staged_or_single",
+                                  side_effect=fake_staged):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5,
+                                          mutate_structure=True,
+                                          mutate_traits=0)
+        self.assertEqual(rec["generator_params"]["genome"], genome)
+        self.assertEqual(rec["generator_params"]["mapping"], ["m1"])
+        self.assertEqual(rec["lineage"]["training"]["max_changes"], 0)
+
+    def test_resolve_recipe_stages(self):
+        import evo_breeder as evo
+        base = {"episodes_total": 50, "stage_split": 0.5, "noise": 0.05,
+                "max_changes": 1}
+        # Derived: stages sum to the inherited total.
+        recipe, _m, ep1, ep2, _nz, _mc = evo._resolve_recipe(
+            base, 600521426, None, None, None, None)
+        self.assertEqual(ep1 + ep2, recipe["episodes_total"])
+        self.assertGreater(ep1, 0)
+        self.assertGreater(ep2, 0)
+        # Explicit episodes without episodes2 keeps single-stage.
+        _r, _m, ep1, ep2, _nz, _mc = evo._resolve_recipe(
+            base, 600521426, 60, None, None, None)
+        self.assertEqual(ep1, 60)
+        self.assertIsNone(ep2)
+        # ...but never below the 50-episode breeding floor.
+        _r2, _m2, ep1f, ep2f, _nz2, _mc2 = evo._resolve_recipe(
+            base, 600521426, 1, None, None, None)
+        self.assertEqual(ep1f, 50)
+        self.assertIsNone(ep2f)
+        self.assertEqual(_r2["episodes_total"], 50)
+
+    def test_breed_clone_inherits_recipe(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        parent = {"id": "p1", "name": "Champ",
+                  "generator_params": {"seed": 3, "learning_rate": 0.008,
+                                       "dist_gain": 0.15, "evasion": 0.2,
+                                       "yaw_bias": 9.0},
+                  "record": {"elo": 1500.0},
+                  "training": {"episodes": 0, "sessions": []},
+                  "lineage": {"parent_ids": [], "source": "x",
+                              "training": {"episodes_total": 50,
+                                           "stage_split": 0.5,
+                                           "noise": 0.05,
+                                           "max_changes": 1}}}
+        seen = {}
+
+        def fake_staged(child, start_weights, ep1, params, _n1, ep2,
+                        _p2, _n2, progress_cb):
+            seen["ep1"] = ep1
+            seen["ep2"] = ep2
+            return child, start_weights, {}
+
+        with mock.patch("brain_package.load_brain",
+                        return_value=(parent, np.zeros(8,
+                                                      dtype=np.float32))), \
+                mock.patch.object(evo, "_staged_or_single",
+                                  side_effect=fake_staged):
+            rec, _w, _s = evo.breed_clone("p1", "Kid", seed=5,
+                                          mutate_structure=False,
+                                          mutate_traits=0)
+        tr = rec["lineage"]["training"]
+        self.assertEqual(seen["ep1"] + seen["ep2"], tr["episodes_total"])
+        self.assertEqual(tr["inherited_from"], "p1")
+        for k in ("episodes_total", "stage_split", "noise", "max_changes"):
+            self.assertIn(k, tr)
+        for k, (old, new) in rec["lineage"]["training_mutations"].items():
+            self.assertEqual(new, tr[k])
+
+    def test_crossover_parent_genome(self):
+        import evo_breeder as evo
+        from experimental_wiring import (reference_genome, FROZEN_GENOMES)
+        g = evo._crossover_parent_genome(
+            {"genome": reference_genome()})
+        self.assertEqual(len(g["rules"]),
+                         len(reference_genome()["rules"]))
+        g2 = evo._crossover_parent_genome({"experiment": "retina_wide"})
+        self.assertEqual(len(g2["rules"]),
+                         len(FROZEN_GENOMES["retina_wide"]["rules"]))
+        for bad in ({"experiment": None}, {},
+                    {"experiment": ["retina_wide", "spear_lunge"]}):
+            with self.subTest(params=bad):
+                with self.assertRaises(ValueError):
+                    evo._crossover_parent_genome(bad)
+
+    def test_breed_reference(self):
+        import numpy as np
+        from unittest import mock
+        import evo_breeder as evo
+        from experimental_wiring import (reference_genome, genome_label,
+                                         derive_mapping)
+        gid = genome_label(reference_genome())
+
+        def fake_train_brain(child, start_weights, episodes, params,
+                             progress_cb=None, notes="", save=True):
+            return child, start_weights, {"episodes": episodes}
+
+        saved = {}
+        with mock.patch("train_job.train_brain",
+                        side_effect=fake_train_brain), \
+                mock.patch.object(vault_pkg, "save_brain",
+                                  side_effect=lambda r, w: saved.update(
+                                      rec=r, weights=w) or "mock-path"), \
+                mock.patch.object(vault_pkg, "read_vault",
+                                  return_value=[]), \
+                mock.patch.object(vault_pkg, "scan_vault",
+                                  return_value=[]):
+            rec, w, _s = evo.breed_reference(
+                "Reference", seed=7, episodes=4)
+        gp = rec["generator_params"]
+        self.assertEqual(gp["genome_id"], gid)
+        self.assertEqual(len(gp["genome"]["rules"]),
+                         len(reference_genome()["rules"]))
+        self.assertTrue(len(list(derive_mapping(gp["genome"]))) > 0)
+        self.assertEqual(
+            (gp["learning_rate"], gp["dist_gain"], gp["evasion"],
+             gp["yaw_bias"]),
+            (0.008, 0.15, 0.2, 9.0))
+        self.assertEqual(rec["lineage"]["source"], "reference")
+        self.assertEqual(rec["lineage"]["explore_mode"], "reference")
+        self.assertEqual(saved["rec"]["id"], rec["id"])
+        np.testing.assert_array_equal(
+            np.asarray(saved["weights"], dtype=np.float32),
+            np.asarray(w, dtype=np.float32))
+        # Single canonical stock: a vault already holding the
+        # reference genome refuses a second.
+        ghost = {"id": "ghost", "name": "Reference",
+                 "generator_params": {"genome_id": gid}}
+        with mock.patch.object(vault_pkg, "read_vault",
+                               return_value=[ghost]), \
+                mock.patch.object(vault_pkg, "scan_vault",
+                                  return_value=[ghost]):
+            with self.assertRaises(ValueError):
+                evo.breed_reference("Reference", seed=7, episodes=1)
+
+    def test_cmd_generate_reference_stock(self):
+        # Menu two-phase path: raw envelope in params gets its id
+        # stamped, mapping derived, lineage set, duplicate refused.
+        import json
+        import shutil
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        import vault_cli
+        from experimental_wiring import (reference_genome, genome_label,
+                                         derive_mapping)
+        gid = genome_label(reference_genome())
+        params = {"variant": "custom", "seed": 7,
+                  "learning_rate": 0.008, "dist_gain": 0.15,
+                  "align_bonus": [0.5, 0.2, -0.3], "evasion": 0.2,
+                  "experiment": None, "mapping": None, "yaw_bias": 9.0,
+                  "explore_mode": "reference",
+                  "genome": reference_genome(), "reference_stock": True}
+        tmp = tempfile.mkdtemp(prefix="refgen_")
+        try:
+            rf = os.path.join(tmp, "result.json")
+            a = SimpleNamespace(name="Reference",
+                                params=json.dumps(params), params_file="",
+                                result_file=rf, log_file="")
+            seen = {}
+
+            def fake_train_brain(record, weights, episodes, params=None,
+                                 progress_cb=None, notes="", save=True):
+                seen["episodes"] = episodes
+                record["training"]["episodes"] = episodes
+                return record, weights, {"episodes": episodes}
+
+            with mock.patch.object(
+                    vault_pkg, "save_brain",
+                    return_value=os.path.join(tmp, "x.flybrain")), \
+                    mock.patch("train_job.train_brain",
+                               side_effect=fake_train_brain), \
+                    mock.patch.object(vault_pkg, "read_vault",
+                                      return_value=[]), \
+                    mock.patch.object(vault_pkg, "scan_vault",
+                                      return_value=[]):
+                self.assertEqual(vault_cli.cmd_generate(a), 0)
+            # Generate schools the fresh weights: 50+ eps, never less.
+            self.assertGreaterEqual(seen.get("episodes", 0), 50)
+            with open(rf) as f:
+                res = json.load(f)
+            self.assertTrue(res["ok"])
+            rec = res["brain"]
+            gp = rec["generator_params"]
+            self.assertEqual(gp["genome_id"], gid)
+            self.assertEqual(list(gp["mapping"]),
+                             list(derive_mapping(gp["genome"])))
+            self.assertEqual(rec["lineage"]["source"], "reference")
+            ghost = {"id": "g", "name": "Reference",
+                     "generator_params": {"genome_id": gid}}
+            a2 = SimpleNamespace(name="Reference",
+                                 params=json.dumps(params), params_file="",
+                                 result_file="", log_file="")
+            with mock.patch.object(vault_pkg, "read_vault",
+                                   return_value=[ghost]), \
+                    mock.patch.object(vault_pkg, "scan_vault",
+                                      return_value=[ghost]):
+                self.assertEqual(vault_cli.cmd_generate(a2), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestGodotArenaHeadless(unittest.TestCase):
@@ -2924,6 +6068,35 @@ class TestGodotArenaHeadless(unittest.TestCase):
                 out = self._run_headless(scene)
                 self.assertNotIn("SCRIPT ERROR", out, f"Godot raised script error:\n{out}")
                 self.assertNotIn("Parse Error", out, f"Godot raised parse error:\n{out}")
+
+    def test_arena_shaders_parse(self):
+        # Beauty pass gate (parse level): every beauty shader exists and
+        # the arena boot reports no shader-related errors. Headless uses
+        # the dummy rasterizer, so this catches syntax/parse faults; the
+        # windowed run per phase is the compile gate.
+        for name in ("glade_ground", "stylized_sky", "chitin", "wing",
+                     "underbrush", "health_ring", "vignette"):
+            path = os.path.join(PROJECT_ROOT, "arena", "scripts",
+                                name + ".gdshader")
+            self.assertTrue(os.path.isfile(path),
+                            f"missing beauty shader: {path}")
+        out = self._run_headless("res://scenes/ArenaGlade.tscn")
+        for line in out.splitlines():
+            low = line.lower()
+            if "error" in low and "shad" in low:
+                self.fail(f"Godot reported shader error:\n{line}\n--- full output ---\n{out}")
+
+
+_ROUND_FIX = {}
+
+
+def _round_csr_pops():
+    # Real connectome + populations, loaded once per session: round
+    # replay binds brains by arity, so synthetic small weights fail.
+    if "csr" not in _ROUND_FIX:
+        _ROUND_FIX["csr"] = load_or_build_csr()
+        _ROUND_FIX["pops"] = load_or_extract_populations()
+    return _ROUND_FIX["csr"], _ROUND_FIX["pops"]
 
 
 class TestBattleTransaction(unittest.TestCase):
@@ -3082,6 +6255,151 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(stored["key"], key)
         self.assertEqual(stored["result"], resp)
 
+    def test_draw_journal_skips_weights(self):
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "draw")
+        vault_pkg.record_battle_result(rb, "draw")
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "D1", "draw": True}
+        resp = {"status": "tournament_battle", "battle_winner": "draw",
+                "fitness_alpha": 1.0, "fitness_beta": 1.0,
+                "battle_id": "D1"}
+        self.srv._write_pending_battle(
+            key, resp,
+            [{"side": "alpha", "record": ra, "weights_unchanged": True},
+             {"side": "beta", "record": rb, "weights_unchanged": True}],
+            {})
+        # Records-only journal: KBs, never the 200 MB weight payload.
+        self.assertLess(
+            os.path.getsize(self.srv._pending_battle_path()), 65536)
+        self.srv._recover_pending_battle((sta, stb))
+        la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        lb, wb2 = vault_pkg.load_brain(rec_b["id"])
+        np.testing.assert_array_equal(wa2, wa)
+        np.testing.assert_array_equal(wb2, wb)
+        self.assertEqual((la["record"]["draws"], la["record"]["battles"]),
+                         (1, 1))
+        self.assertEqual((lb["record"]["draws"], lb["record"]["battles"]),
+                         (1, 1))
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"], key)
+        self.assertEqual(stored["result"], resp)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+
+    def test_package_artifact_cleanup(self):
+        # Sidecars + .bak follow their package everywhere: delete
+        # drops them, archive moves them alongside, restore brings
+        # them back, archived-delete clears all three. No orphans.
+        import tempfile
+        import brain_package as vault
+        from types import SimpleNamespace
+        import vault_cli
+        tmp = tempfile.mkdtemp(prefix="vault_sweep_")
+        old_vault, old_index = vault.VAULT_DIR, vault.VAULT_INDEX
+        old_arch, old_log = vault.ARCHIVE_DIR, vault.ARCHIVE_LOG
+        vault.VAULT_DIR = tmp
+        vault.VAULT_INDEX = os.path.join(tmp, "vault_index.json")
+        vault.ARCHIVE_DIR = os.path.join(tmp, "archive")
+        vault.ARCHIVE_LOG = os.path.join(tmp, "archive", "log.json")
+        try:
+            rec = vault.new_record("Sweep", {})
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain_record_only(rec)
+            path = vault.package_path(rec)
+            self.assertTrue(os.path.isfile(path + ".bak"))
+            self.assertTrue(os.path.isfile(path + ".record.json"))
+            vault.archive_brain(rec["id"], reason="sweep test")
+            self.assertFalse(os.path.exists(path + ".record.json"))
+            arch = os.path.join(tmp, "archive", os.path.basename(path))
+            self.assertTrue(os.path.isfile(arch + ".record.json"))
+            self.assertTrue(os.path.isfile(arch + ".bak"))
+            vault.restore_brain(rec["id"])
+            self.assertTrue(os.path.isfile(path + ".record.json"))
+            self.assertTrue(os.path.isfile(path + ".bak"))
+            self.assertEqual(
+                vault_cli.cmd_delete(SimpleNamespace(id=rec["id"])), 0)
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".record.json"))
+            self.assertFalse(os.path.exists(path + ".bak"))
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain(rec, np.zeros(16, dtype=np.float32))
+            vault.save_brain_record_only(rec)
+            vault.archive_brain(rec["id"], reason="sweep test 2")
+            freed = vault.delete_archived(rec["id"])
+            self.assertGreater(freed["freed_bytes"], 0)
+            self.assertFalse(os.path.exists(arch))
+            self.assertFalse(os.path.exists(arch + ".record.json"))
+            self.assertFalse(os.path.exists(arch + ".bak"))
+        finally:
+            vault.VAULT_DIR, vault.VAULT_INDEX = old_vault, old_index
+            vault.ARCHIVE_DIR, vault.ARCHIVE_LOG = old_arch, old_log
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_session_cap_rolls_up(self):
+        # Past 50 sessions, oldest fold episode counts into the
+        # sessions_archive rollup; odometers stay exact.
+        rec = vault_pkg.new_record("Cap", {})
+        for i in range(55):
+            vault_pkg.log_training_session(rec, 2, {}, "s%d" % i)
+        tr = rec["training"]
+        self.assertEqual(len(tr["sessions"]), 50)
+        self.assertEqual(tr["episodes"], 110)
+        arch = tr["sessions_archive"]
+        self.assertEqual(arch["sessions"], 5)
+        self.assertEqual(arch["episodes"], 10)
+        self.assertEqual(tr["sessions"][0]["notes"], "s5")
+        self.assertEqual(tr["sessions"][-1]["notes"], "s54")
+
+    def test_save_brain_record_only(self):
+        import zipfile
+        rec = vault_pkg.new_record("RecOnly", {})
+        w = np.arange(24, dtype=np.float32)
+        vault_pkg.save_brain(rec, w)
+        path = vault_pkg.package_path(rec)
+        size_before = os.path.getsize(path)
+        mtime_before = os.path.getmtime(path)
+        rec["record"]["wins"] = 3
+        vault_pkg.save_brain_record_only(rec)
+        # Sidecar path: the zip is untouched, live counters served.
+        self.assertEqual(os.path.getsize(path), size_before)
+        self.assertEqual(os.path.getmtime(path), mtime_before)
+        rec2, w2 = vault_pkg.load_brain(rec["id"])
+        self.assertEqual(rec2["record"]["wins"], 3)
+        np.testing.assert_array_equal(w2, w)
+        # A full save clears the sidecar: embedded metadata wins.
+        rec["record"]["wins"] = 5
+        vault_pkg.save_brain(rec, w)
+        self.assertFalse(os.path.exists(path + ".record.json"))
+        rec3, _ = vault_pkg.load_brain(rec["id"])
+        self.assertEqual(rec3["record"]["wins"], 5)
+        # A missing package must fail loud, never bank half a battle.
+        ghost = vault_pkg.new_record("Ghost", {})
+        with self.assertRaises(ValueError):
+            vault_pkg.save_brain_record_only(ghost)
+
+    def test_save_brain_clears_sidecar(self):
+        # A full save supersedes any record sidecar: after save_brain
+        # the sidecar is gone and the zip's record wins — so a stale
+        # sidecar can never shadow newer embedded metadata, whatever
+        # the mtime granularity.
+        rec = vault_pkg.new_record("Bucket", {})
+        w = np.arange(16, dtype=np.float32)
+        vault_pkg.save_brain(rec, w)
+        rec["record"]["wins"] = 3
+        vault_pkg.save_brain_record_only(rec)
+        path = vault_pkg.package_path(rec)
+        self.assertTrue(os.path.exists(path + ".record.json"))
+        rec["record"]["wins"] = 7
+        vault_pkg.save_brain(rec, w)
+        self.assertFalse(os.path.exists(path + ".record.json"))
+        rec2, _w2 = vault_pkg.load_brain(rec["id"])
+        self.assertEqual(rec2["record"]["wins"], 7)
+
     def test_unkeyed_journal_preserves_previous_verdict(self):
         import copy
         seed_key = {"tournament_id": "T", "match": "M",
@@ -3108,6 +6426,799 @@ class TestBattleTransaction(unittest.TestCase):
         stored = self.srv._read_last_verdict()
         self.assertEqual(stored["key"], seed_key)
         self.assertEqual(stored["result"], seed_resp)
+
+    def test_handle_match_report_batches_match(self):
+        # Batched match reporting: one message banks N battles in order
+        # (dopamine replay via the fake RL, ELO chain, records/ko/wander/
+        # sessions) plus the match bank (matches + K_MATCH) - one
+        # journal, one save pair, one reply echoing every battle.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def __init__(self):
+                self.calls = []
+            def begin_episode(self, brain):
+                self.calls.append(("begin",))
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                self.calls.append(("plastic", sig))
+            def pin_gains(self, brain, legacy=False):
+                self.calls.append(("pin", legacy))
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+        msg = {"match_winner": "alpha", "tournament_id": "T",
+               "match": "M", "match_id": "M1", "partial": False,
+               "battles": [
+                   {"battle_id": "M-B1", "draw": False, "draw_penalty": False,
+                    "end_reason": "ko",
+                    "verdict": {"winner_slot": "alpha",
+                                "blow_source": "thorax", "blow_amount": 80.0,
+                                "loser_slot": "beta"},
+                    "stats_a": {"kills": 1}, "stats_b": {"kills": 0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl},
+                   {"battle_id": "M-B2", "draw": True, "draw_penalty": False,
+                    "end_reason": "tie",
+                    "verdict": {"winner_slot": ""},
+                    "stats_a": {"kills": 0, "center_drift": 0.0},
+                    "stats_b": {"kills": 0, "center_drift": 0.0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl}]}
+        rl = _FakeRL()
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, sta, stb,
+            {"tournament_id": "T", "match": "M"}, 0.5, True,
+            _FakeEvo(), rl, 1.0, sta["brain"], stb["brain"],
+            lambda: "tourney T match M")
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "tournament_match_battled")
+        self.assertEqual(body["match_winner"], "alpha")
+        self.assertEqual(len(body["battles"]), 2)
+        self.assertEqual(body["battles"][0]["battle_winner"], "alpha")
+        self.assertEqual(body["battles"][1]["battle_winner"], "draw")
+        # Dopamine replayed for the non-draw battle only (draws skip
+        # plasticity wholesale).
+        self.assertEqual(rl.calls.count(("begin",)), 2)
+        self.assertIn(("plastic", 1.0), rl.calls)
+        self.assertIn(("pin", False), rl.calls)
+        la, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _ = vault_pkg.load_brain(stb["rec"]["id"])
+        ra, rb = la["record"], lb["record"]
+        self.assertEqual((ra["battles"], ra["wins"], ra["draws"]), (2, 1, 1))
+        self.assertEqual((rb["battles"], rb["losses"], rb["draws"]), (2, 1, 1))
+        self.assertEqual(ra["ko"], 1)
+        self.assertEqual((ra["matches"], ra["matches_won"]), (1, 1))
+        self.assertEqual((rb["matches"], rb["matches_lost"]), (1, 1))
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["match"], "M")
+        self.assertEqual(stored["result"]["match_winner"], "alpha")
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+        # Exact resend (same nonce): resend, no re-bank.
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, sta, stb,
+            {"tournament_id": "T", "match": "M"}, 0.5, True,
+            _FakeEvo(), _FakeRL(), 1.0, sta["brain"], stb["brain"],
+            lambda: "tourney T match M")
+        la2, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual(la2["record"]["battles"], 2)
+        self.assertEqual(la2["record"]["matches"], 1)
+
+    def test_handle_match_report_partial_skips_match_bank(self):
+        # Quit-flush: partial reports bank battles only, the match
+        # result stays undecided (no match counters).
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("beta", 5.0, 4.0)
+
+        msg = {"match_winner": "pending", "tournament_id": "T",
+               "match": "MP", "match_id": "MP1", "partial": True,
+               "battles": [
+                   {"battle_id": "MP-B1", "draw": False,
+                    "draw_penalty": False, "end_reason": "time",
+                    "verdict": {"winner_slot": "beta", "dmg_a": 80.0,
+                                "dmg_b": 90.0},
+                    "stats_a": {"kills": 0}, "stats_b": {"kills": 0},
+                    "sens_a": {}, "sens_b": {},
+                    "ctrl_a": {}, "ctrl_b": {}}]}
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, sta, stb,
+            {"tournament_id": "T", "match": "MP"}, 0.5, True,
+            _FakeEvo(), _FakeRL(), 1.0, sta["brain"], stb["brain"],
+            lambda: "tourney T match MP")
+        la, _ = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual((la["record"]["battles"], la["record"]["losses"]), (1, 1))
+        self.assertEqual(la["record"]["matches"], 0)
+
+    def _round_fighters(self, names, wbasis):
+        # Real-arity experiment-wired brains in the temp vault (the
+        # round replay binds by arity - synthetic 32-elem weights would
+        # fail). Ids de-collided like _two_fighters.
+        import time
+        recs = []
+        for name in names:
+            rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                              "mapping": None})
+            while any(r["id"] == rec["id"] for r in recs):
+                time.sleep(0.002)
+                rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                                  "mapping": None})
+            vault_pkg.save_brain(rec, np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy()))
+            recs.append(rec)
+        return recs
+
+
+    def _round_fighters(self, names, wbasis):
+        import time
+        recs = []
+        for name in names:
+            rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                              "mapping": None})
+            while any(r["id"] == rec["id"] for r in recs):
+                time.sleep(0.002)
+                rec = vault_pkg.new_record(name, {"experiment": "lplc2_contra_dn",
+                                                  "mapping": None})
+            vault_pkg.save_brain(rec, np.ascontiguousarray(
+                np.asarray(wbasis, dtype=np.float32).copy()))
+            recs.append(rec)
+        return recs
+
+
+    def test_handle_round_report_batches_round(self):
+        # Round-batch: two matches bank in one message (replay in
+        # order, one journal, one save set); per-battle + per-match
+        # echoes; verdict keyed by round nonce; journal gone after.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        _rec_a, _rec_b, _rec_c, _rec_d = self._round_fighters(
+            ["RndA", "RndB", "RndC", "RndD"], wbasis)
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def __init__(self):
+                self.calls = []
+            def begin_episode(self, brain):
+                self.calls.append(("begin",))
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                self.calls.append(("plastic", sig))
+            def pin_gains(self, brain, legacy=False):
+                self.calls.append(("pin", legacy))
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+
+        def _battle(bid, draw, winner):
+            return {"battle_id": bid, "draw": draw, "draw_penalty": False,
+                    "end_reason": "" if draw else "ko",
+                    "verdict": {"winner_slot": "" if draw else winner,
+                                "blow_source": "thorax", "blow_amount": 80.0,
+                                "loser_slot": "beta"},
+                    "stats_a": {"kills": 0 if draw else 1},
+                    "stats_b": {"kills": 0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl}
+
+        def _match(mid, winner, ra, rb):
+            return {"match_id": mid, "match_winner": winner,
+                    "alpha_id": ra["id"], "beta_id": rb["id"],
+                    "alpha_path": vault_pkg.package_path(ra),
+                    "beta_path": vault_pkg.package_path(rb),
+                    "battles": [_battle(mid + "-B1", False, winner)]}
+
+        msg = {"round_nonce": "RND-1", "tournament_id": "T", "match": "R1M1",
+               "matches": [_match("M1", "alpha", _rec_a, _rec_b),
+                           _match("M2", "beta", _rec_c, _rec_d)]}
+        rl = _FakeRL()
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": "T", "match": "R1M1"},
+            0.5, True, _FakeEvo(), rl, 1.0, lambda: "tourney T match M1",
+            csr, pops, {})
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "round_banked")
+        self.assertEqual(len(body["matches"]), 2)
+        self.assertEqual(body["matches"][0]["match_winner"], "alpha")
+        self.assertEqual(
+            body["matches"][0]["battles"][0]["battle_winner"], "alpha")
+        self.assertEqual(body["matches"][1]["match_winner"], "beta")
+        # Dopamine replayed per non-draw battle (begin per brain).
+        self.assertEqual(rl.calls.count(("begin",)), 4)
+        self.assertIn(("plastic", 1.0), rl.calls)
+        self.assertIn(("pin", False), rl.calls)
+        la, _ = vault_pkg.load_brain(_rec_a["id"])
+        lb, _ = vault_pkg.load_brain(_rec_b["id"])
+        lc, _ = vault_pkg.load_brain(_rec_c["id"])
+        self.assertEqual(
+            (la["record"]["battles"], la["record"]["wins"]), (1, 1))
+        self.assertEqual(
+            (lb["record"]["battles"], lb["record"]["losses"]), (1, 1))
+        self.assertEqual(
+            (lc["record"]["battles"], lc["record"]["losses"]), (1, 1))
+        self.assertEqual((la["record"]["matches"], la["record"]["matches_won"]), (1, 1))
+        self.assertNotEqual(la["record"]["elo"], lb["record"]["elo"])
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["battle_id"], "RND-1")
+        self.assertEqual(len(stored["result"]["matches"]), 2)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+        # Exact resend (same nonce): resend, no re-bank.
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": "T", "match": "R1M1"},
+            0.5, True, _FakeEvo(), rl, 1.0, lambda: "tourney T match M1",
+            csr, pops, {})
+        # The resend re-acks from the stored verdict (the client retry
+        # ladder depends on this reply to clear its owed latch).
+        again = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(again["status"], "round_banked")
+        self.assertEqual(again["battle_id"], "RND-1")
+        la2, _ = vault_pkg.load_brain(_rec_a["id"])
+        self.assertEqual(la2["record"]["battles"], 1)
+        self.assertEqual(la2["record"]["matches"], 1)
+
+    def test_handle_warm_wirings(self):
+        # Bind-only pre-warm: novel wirings bind into the shared caches
+        # (objects discarded), a second pass skips everything (key
+        # agreement with the binds), the reply counts the split. The
+        # third fighter shares the wiring but not the mapping: struct
+        # hit, codec miss, still a warm.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        ra, rb = self._round_fighters(["WrmA", "WrmB"], wbasis)
+        rc = vault_pkg.new_record("WrmC", {"experiment": "lplc2_contra_dn",
+                                           "mapping": "gyro_flow"})
+        vault_pkg.save_brain(rc, np.ascontiguousarray(
+            np.asarray(wbasis, dtype=np.float32).copy()))
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        sc = {}
+        cc = {}
+        paths = [vault_pkg.package_path(ra), vault_pkg.package_path(rb),
+                 vault_pkg.package_path(rc)]
+        w1 = self.srv._handle_warm_wirings(_FakeSock(), ("127.0.0.1", 1),
+                                           {"paths": paths}, csr, pops, sc, cc)
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "wirings_warm")
+        self.assertEqual(w1, (2, 1))
+        ka, _ = self.srv._wiring_cache_keys(ra)
+        self.assertIn(ka, sc)
+        w2 = self.srv._handle_warm_wirings(_FakeSock(), ("127.0.0.1", 1),
+                                           {"paths": paths}, csr, pops, sc, cc)
+        self.assertEqual(w2, (0, 3))
+        # Unknown paths skip silently (they refuse at load time anyway).
+        w3 = self.srv._handle_warm_wirings(_FakeSock(), ("127.0.0.1", 1),
+                                           {"paths": ["nope.flybrain"]},
+                                           csr, pops, {}, {})
+        self.assertEqual(w3, (0, 0))
+
+    def _clean_match_verdicts(self):
+        # Per-match verdict sidecars live in the tournaments dir (same
+        # isolation story as the single-slot verdict in tearDown).
+        try:
+            d = self.srv.TOURNAMENTS_DIR
+            for f in os.listdir(d):
+                if f.startswith("match_verdict_") and f.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(d, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def test_match_reports_equal_round_report(self):
+        # Parity: two single-match banks equal one two-match round bank
+        # (records, ELO, wins, KOs) - the incremental path banks the
+        # same learning in smaller datagrams. Plus match resend dedup
+        # (including after a later match banked: sidecar, not just the
+        # single-slot verdict).
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        fa = self._round_fighters(["PA1", "PB1", "PC1", "PD1"], wbasis)
+        fb = self._round_fighters(["PA2", "PB2", "PC2", "PD2"], wbasis)
+        self.addCleanup(self._clean_match_verdicts)
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+
+        def _battle(bid):
+            return {"battle_id": bid, "draw": False, "draw_penalty": False,
+                    "end_reason": "ko",
+                    "verdict": {"winner_slot": "alpha",
+                                "blow_source": "thorax", "blow_amount": 80.0,
+                                "loser_slot": "beta"},
+                    "stats_a": {"kills": 1}, "stats_b": {"kills": 0},
+                    "sens_a": sens, "sens_b": sens,
+                    "ctrl_a": ctrl, "ctrl_b": ctrl}
+
+        def _mpath(ra, rb, mid, mlabel):
+            return {"match_id": mid, "tournament_id": "TP",
+                    "match": mlabel, "match_winner": "alpha",
+                    "alpha_path": vault_pkg.package_path(ra),
+                    "beta_path": vault_pkg.package_path(rb),
+                    "battles": [_battle(mid + "-B1")]}
+
+        def _snap(recs):
+            out = []
+            for r in recs:
+                rec, _w = vault_pkg.load_brain(r["id"])
+                d = rec["record"]
+                out.append((d.get("battles"), d.get("wins"),
+                            d.get("matches"), d.get("matches_won"),
+                            d.get("elo"), d.get("ko")))
+            return out
+
+        tag = {"tournament_id": "TP", "match": "R1"}
+        # Path A: two single-match banks.
+        for i in (0, 2):
+            self.srv._handle_match_report(
+                _FakeSock(), ("127.0.0.1", 1),
+                _mpath(fa[i], fa[i + 1], "MA%d" % (i // 2 + 1),
+                       "R1M%d" % (i // 2 + 1)),
+                tag, 0.5, True, _FakeEvo(), _FakeRL(), 1.0,
+                lambda: "parity", csr, pops, {})
+        ma1 = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(ma1["status"], "tournament_match_battled")
+        # Same-nonce resend re-acks without re-banking.
+        before = _snap(fa)
+        self.srv._handle_match_report(
+            _FakeSock(), ("127.0.0.1", 1),
+            _mpath(fa[0], fa[1], "MA1", "R1M1"),
+            tag, 0.5, True, _FakeEvo(), _FakeRL(), 1.0,
+            lambda: "parity", csr, pops, {})
+        again = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(again["status"], "tournament_match_battled")
+        self.assertEqual(again["battle_id"], "MA1")
+        self.assertEqual(_snap(fa), before)
+        # Path B: one two-match round bank over fresh fighters.
+        rmsg = {"round_nonce": "RND-P", "tournament_id": "TP",
+                "match": "R1M2",
+                "matches": [
+                    {"match_id": "MB1", "match_winner": "alpha",
+                     "alpha_path": vault_pkg.package_path(fb[0]),
+                     "beta_path": vault_pkg.package_path(fb[1]),
+                     "battles": [_battle("MB1-B1")]},
+                    {"match_id": "MB2", "match_winner": "alpha",
+                     "alpha_path": vault_pkg.package_path(fb[2]),
+                     "beta_path": vault_pkg.package_path(fb[3]),
+                     "battles": [_battle("MB2-B1")]}]}
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), rmsg, {"rec": None},
+            {"rec": None}, {"tournament_id": "TP", "match": "R1M2"},
+            0.5, True, _FakeEvo(), _FakeRL(), 1.0, lambda: "parity",
+            csr, pops, {})
+        self.assertEqual(_snap(fa), _snap(fb))
+
+    def _group_reset(self):
+        self.srv._group_pinned.clear()
+        self.srv._group_pinned.update({"tournament_id": "", "brains": {}})
+        for f in (self.srv._pending_group_path(),):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    def _group_isolate(self):
+        # Hermetic tournaments dir per test: group journals/verdicts
+        # must never touch the live dir (a running server recovers
+        # foreign journals on every message - a TOCTOU race that flaked
+        # these tests). Runs even on failure via addCleanup.
+        import tempfile
+        import shutil
+        self._real_tourn = self.srv.TOURNAMENTS_DIR
+        self._group_tmp = tempfile.mkdtemp(prefix="group_txn_")
+        self.srv.TOURNAMENTS_DIR = self._group_tmp
+        self._group_reset()
+        self.addCleanup(self._group_unisolate)
+
+    def _group_unisolate(self):
+        import shutil
+        self._group_reset()
+        self.srv.TOURNAMENTS_DIR = self._real_tourn
+        shutil.rmtree(self._group_tmp, ignore_errors=True)
+
+    def _group_fakes(self):
+        class _FakeSock:
+            def __init__(self):
+                self.sent = {}
+            def sendto(self, data, addr):
+                self.sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("alpha", 5.0, 4.0)
+        return _FakeSock(), _FakeRL(), _FakeEvo()
+
+    def _group_battle(self, bid, winner):
+        sens = {"pheromone_conc_left": 0.5, "yaw_torque": 0.1}
+        ctrl = {"yaw_torque": 0.1, "thrust": 0.2}
+        return {"battle_id": bid, "draw": False, "draw_penalty": False,
+                "end_reason": "ko",
+                "verdict": {"winner_slot": winner, "blow_source": "thorax",
+                            "blow_amount": 80.0, "loser_slot": "beta"},
+                "stats_a": {"kills": 1}, "stats_b": {"kills": 0},
+                "sens_a": sens, "sens_b": sens,
+                "ctrl_a": ctrl, "ctrl_b": ctrl}
+
+    def _group_match(self, mid, winner, ra, rb, nb=1):
+        return {"match_id": mid, "match_winner": winner,
+                "alpha_id": ra["id"], "beta_id": rb["id"],
+                "alpha_path": vault_pkg.package_path(ra),
+                "beta_path": vault_pkg.package_path(rb),
+                "battles": [self._group_battle(
+                    "%s-B%d" % (mid, i + 1), winner)
+                    for i in range(nb)]}
+
+    def _group_round(self, srv, sock, rl, evo, csr, pops, nonce, tid,
+                     match, matches):
+        msg = {"round_nonce": nonce, "tournament_id": tid, "match": match,
+               "matches": matches, "group": True}
+        srv._handle_round_report(
+            sock, ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": tid, "match": match},
+            0.5, True, evo, rl, 1.0, lambda: "tourney T match",
+            csr, pops, {}, None)
+        return json.loads(sock.sent["data"].decode("utf-8"))
+
+    def test_handle_group_round_pins_without_saving(self):
+        # Group rounds pin brains in RAM and journal records-only: the
+        # ack flows, vault weight files stay untouched, records bank.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpA", "GrpB", "GrpC", "GrpD"], wbasis)
+        before = {}
+        for r in (ra, rb, rc, rd):
+            p = vault_pkg.package_path(r)
+            with open(p, "rb") as f:
+                before[r["id"]] = (os.path.getmtime(p), f.read())
+        sock, rl, evo = self._group_fakes()
+        body = self._group_round(
+            self.srv, sock, rl, evo, csr, pops, "RND-G1", "TG", "R1M1",
+            [self._group_match("M1", "alpha", ra, rb),
+             self._group_match("M2", "beta", rc, rd)])
+        self.assertEqual(body["status"], "round_banked")
+        self.assertEqual(len(body["matches"]), 2)
+        # No weight save: package bytes + mtimes identical.
+        for r in (ra, rb, rc, rd):
+            p = vault_pkg.package_path(r)
+            with open(p, "rb") as f:
+                self.assertEqual(
+                    (os.path.getmtime(p), f.read()), before[r["id"]])
+        # Records banked via the cheap record flush.
+        la, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(
+            (la["record"]["battles"], la["record"]["wins"]), (1, 1))
+        # Session pinned all four; inputs journal holds the round.
+        self.assertEqual(self.srv._group_pinned["tournament_id"], "TG")
+        self.assertEqual(len(self.srv._group_pinned["brains"]), 4)
+        doc = self.srv._group_inputs_read()
+        self.assertEqual(doc["tournament_id"], "TG")
+        self.assertEqual(len(doc["rounds"]), 1)
+        self.assertEqual(len(doc["pregroup"]), 4)
+        # Verdict slot holds this round (retry contract intact).
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["battle_id"], "RND-G1")
+        self._group_reset()
+
+    def test_handle_group_round_resend_dedup(self):
+        # Same round twice: second is a stored resend (records never
+        # double-bank); a second round accumulates onto pinned state.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpE", "GrpF", "GrpG", "GrpH"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        mk = lambda: [self._group_match("M1", "alpha", ra, rb),
+                      self._group_match("M2", "beta", rc, rd)]
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G2", "TG", "R2M1", mk())
+        la, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la["record"]["battles"], 2)
+        self.assertEqual(len(self.srv._group_inputs_read()["rounds"]), 2)
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        la2, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la2["record"]["battles"], 2)
+        self._group_reset()
+
+    def test_handle_group_report_seals_once(self):
+        # Group seal: one save set (weights land), journal removed,
+        # session cleared, verdict keyed by group nonce; resend replays
+        # nothing.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpI", "GrpJ", "GrpK", "GrpL"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        mk = lambda: [self._group_match("M1", "alpha", ra, rb),
+                      self._group_match("M2", "beta", rc, rd)]
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+
+        class _Sock2:
+            def __init__(self):
+                self.sent = {}
+            def sendto(self, data, addr):
+                self.sent["data"] = data
+        sock2 = _Sock2()
+        self.srv._handle_group_report(
+            sock2, ("127.0.0.1", 1),
+            {"group_nonce": "GRP-1", "tournament_id": "TG",
+             "group": "D"},
+            {"rec": None}, {"rec": None},
+            {"tournament_id": "TG", "match": "R1M1"}, 0.5, evo, rl,
+            1.0, lambda: "tourney T match", csr, pops, {}, None)
+        body = json.loads(sock2.sent["data"].decode("utf-8"))
+        self.assertEqual(body["status"], "group_banked")
+        self.assertEqual(body["fighters"], 4)
+        self.assertFalse(os.path.exists(self.srv._pending_group_path()))
+        self.assertEqual(self.srv._group_pinned["brains"], {})
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["key"]["battle_id"], "GRP-1")
+        mtimes = {}
+        for r in (ra, rb, rc, rd):
+            mtimes[r["id"]] = os.path.getmtime(
+                vault_pkg.package_path(r))
+        self.srv._handle_group_report(
+            sock2, ("127.0.0.1", 1),
+            {"group_nonce": "GRP-1", "tournament_id": "TG",
+             "group": "D"},
+            {"rec": None}, {"rec": None},
+            {"tournament_id": "TG", "match": "R1M1"}, 0.5, evo, rl,
+            1.0, lambda: "tourney T match", csr, pops, {}, None)
+        for r in (ra, rb, rc, rd):
+            self.assertEqual(mtimes[r["id"]],
+                             os.path.getmtime(vault_pkg.package_path(r)))
+        self._group_reset()
+
+    def test_handle_group_rebuild_after_restart(self):
+        # Restart mid-group (session wiped, journal survives): the next
+        # round rebuilds deterministically, then processes normally; a
+        # stale pre-restart round resends stored instead of replaying.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb, rc, rd = self._round_fighters(
+            ["GrpM", "GrpN", "GrpO", "GrpP"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        mk = lambda: [self._group_match("M1", "alpha", ra, rb),
+                      self._group_match("M2", "beta", rc, rd)]
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        # Simulated restart: RAM session gone, files persist.
+        self.srv._group_pinned.clear()
+        self.srv._group_pinned.update({"tournament_id": "", "brains": {}})
+        body = self._group_round(
+            self.srv, sock, rl, evo, csr, pops, "RND-G2", "TG", "R2M1",
+            mk())
+        self.assertEqual(body["status"], "round_banked")
+        la, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la["record"]["battles"], 2)
+        self._group_round(self.srv, sock, rl, evo, csr, pops,
+                          "RND-G1", "TG", "R1M1", mk())
+        la2, _ = vault_pkg.load_brain(ra["id"])
+        self.assertEqual(la2["record"]["battles"], 2)
+        self._group_reset()
+
+    def test_group_matches_round_banking(self):
+        # Equivalence: pinned group banking == per-round banking.
+        # Same scripted rounds, same initial weights, REAL dopamine +
+        # ELO: final weights identical per fighter, records identical.
+        from dopamine_learning import DopamineReinforcement
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ga, gb, gc, gd = self._round_fighters(
+            ["EqA", "EqB", "EqC", "EqD"], wbasis)
+        ca, cb, cc, cd = self._round_fighters(
+            ["EqW", "EqX", "EqY", "EqZ"], wbasis)
+        sock, _, evo = self._group_fakes()
+        note = lambda: "tourney T match"
+        rl_g = DopamineReinforcement(pops)
+
+        def _run(nonce, tid, match, pairs, rl, group):
+            msg = {"round_nonce": nonce, "tournament_id": tid,
+                   "match": match, "matches": [
+                       self._group_match(mid, w, ra, rb)
+                       for mid, w, ra, rb in pairs]}
+            if group:
+                msg["group"] = True
+            self.srv._handle_round_report(
+                sock, ("127.0.0.1", 1), msg, {"rec": None},
+                {"rec": None}, {"tournament_id": tid, "match": match},
+                0.5, True, evo, rl, 1.0, note, csr, pops, {}, None)
+            return json.loads(sock.sent["data"].decode("utf-8"))
+
+        pairs_g = [("M1", "alpha", ga, gb), ("M2", "beta", gc, gd)]
+        pairs_c = [("M1", "alpha", ca, cb), ("M2", "beta", cc, cd)]
+        for nonce, match in (("RND-G1", "R1M1"), ("RND-G2", "R2M1")):
+            b = _run(nonce, "TG", match, pairs_g, rl_g, True)
+            self.assertEqual(b["status"], "round_banked")
+        # Group path saved nothing mid-group: weight files untouched.
+        for r in (ga, gb, gc, gd):
+            la, wa = vault_pkg.load_brain(r["id"])
+            np.testing.assert_array_equal(
+                wa, np.ascontiguousarray(np.asarray(wbasis, dtype=np.float32)))
+        rl_c = DopamineReinforcement(pops)
+        for nonce, match in (("RND-C1", "R1M1"), ("RND-C2", "R2M1")):
+            b = _run(nonce, "TC", match, pairs_c, rl_c, False)
+            self.assertEqual(b["status"], "round_banked")
+
+        class _S2:
+            def __init__(self):
+                self.sent = {}
+            def sendto(self, data, addr):
+                self.sent["data"] = data
+        s2 = _S2()
+        self.srv._handle_group_report(
+            s2, ("127.0.0.1", 1),
+            {"group_nonce": "GRP-1", "tournament_id": "TG", "group": "D"},
+            {"rec": None}, {"rec": None},
+            {"tournament_id": "TG", "match": "R2M1"}, 0.5, evo, rl_g,
+            1.0, note, csr, pops, {}, None)
+        gbod = json.loads(s2.sent["data"].decode("utf-8"))
+        self.assertEqual(gbod["status"], "group_banked")
+        for rg, rc in ((ga, ca), (gb, cb), (gc, cc), (gd, cd)):
+            lg, wg = vault_pkg.load_brain(rg["id"])
+            lc, wc = vault_pkg.load_brain(rc["id"])
+            np.testing.assert_array_equal(wg, wc)
+            for f in ("battles", "wins", "losses", "matches",
+                      "matches_won", "matches_lost", "elo", "ko"):
+                self.assertEqual(lg["record"][f], lc["record"][f],
+                                 (rg["name"], f))
+        self._group_reset()
+
+    def test_handle_group_pin_cap(self):
+        # Oversized groups refuse to pin (loud error, nothing banked)
+        # instead of eating unbounded RAM.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        self._group_isolate()
+        ra, rb = self._round_fighters(["CapA", "CapB"], wbasis)
+        sock, rl, evo = self._group_fakes()
+        old = self.srv.GROUP_PIN_MAX
+        self.srv.GROUP_PIN_MAX = 1
+        try:
+            body = self._group_round(
+                self.srv, sock, rl, evo, csr, pops, "RND-G1", "TG",
+                "R1M1", [self._group_match("M1", "alpha", ra, rb)])
+            self.assertEqual(body["status"], "error")
+            self.assertIn("pin cap", body["error"])
+        finally:
+            self.srv.GROUP_PIN_MAX = old
+        self._group_reset()
+
+    def test_handle_round_report_partial(self):
+        # Quit-flush: a pending match banks battles only, no match
+        # counters; decided matches bank fully in the same report.
+        from experimental_wiring import experiment_arrays
+        csr, pops = _round_csr_pops()
+        _ind, _idx, wbasis = experiment_arrays(
+            "lplc2_contra_dn", csr, pops)
+        _rec_a, _rec_b = self._round_fighters(
+            ["RndP", "RndQ"], wbasis)
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        class _FakeRL:
+            def begin_episode(self, brain):
+                pass
+            def apply_plasticity(self, brain, sens, ctrl, sig, schemes=()):
+                pass
+            def pin_gains(self, brain, legacy=False):
+                pass
+
+        class _FakeEvo:
+            def evaluate_match(self, stats_a, stats_b, rec_a=None, rec_b=None):
+                return ("beta", 5.0, 4.0)
+
+        msg = {"round_nonce": "RND-P", "tournament_id": "T", "match": "MP",
+               "matches": [
+                   {"match_id": "MP1", "match_winner": "pending",
+                    "alpha_id": _rec_a["id"], "beta_id": _rec_b["id"],
+                    "alpha_path": vault_pkg.package_path(_rec_a),
+                    "beta_path": vault_pkg.package_path(_rec_b),
+                    "battles": [
+                        {"battle_id": "MP1-B1", "draw": False,
+                         "draw_penalty": False, "end_reason": "time",
+                         "verdict": {"winner_slot": "beta", "dmg_a": 80.0,
+                                     "dmg_b": 90.0},
+                         "stats_a": {"kills": 0}, "stats_b": {"kills": 0},
+                         "sens_a": {}, "sens_b": {},
+                         "ctrl_a": {}, "ctrl_b": {}}]}]}
+        self.srv._handle_round_report(
+            _FakeSock(), ("127.0.0.1", 1), msg, {"rec": None},
+            {"rec": None}, {"tournament_id": "T", "match": "MP"},
+            0.5, True, _FakeEvo(), _FakeRL(), 1.0, lambda: "tourney T match MP",
+            csr, pops, {})
+        la, _ = vault_pkg.load_brain(_rec_a["id"])
+        self.assertEqual((la["record"]["battles"], la["record"]["losses"]), (1, 1))
+        self.assertEqual(la["record"]["matches"], 0)
 
     def test_handle_draw_records_draws_without_sessions(self):
         _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
@@ -3139,19 +7250,582 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(stored["key"], key)
         self.assertEqual(stored["result"]["battle_winner"], "draw")
 
+    def test_slim_journal_falls_back_to_prebattle_weights(self):
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "win")
+        vault_pkg.record_battle_result(rb, "loss")
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "SL1", "draw": False}
+        resp = {"status": "tournament_battle", "battle_winner": "alpha",
+                "fitness_alpha": 3.0, "fitness_beta": 2.0,
+                "battle_id": "SL1"}
+        # New handler protocol: records-only journal, no weight payload.
+        self.srv._write_pending_battle(
+            key, resp,
+            [{"side": "alpha", "record": ra, "weights_unchanged": True},
+             {"side": "beta", "record": rb, "weights_unchanged": True}],
+            {})
+        self.assertLess(
+            os.path.getsize(self.srv._pending_battle_path()), 65536)
+        # Crash before the live weight save: records replay exactly
+        # once, weights stay at pre-battle values.
+        self.srv._recover_pending_battle((sta, stb))
+        la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        lb, wb2 = vault_pkg.load_brain(rec_b["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        np.testing.assert_array_equal(wa2, wa)
+        np.testing.assert_array_equal(wb2, wb)
+        self.assertFalse(os.path.exists(self.srv._pending_battle_path()))
+
+    def test_battle_elo_banked(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BE", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), {"arena_draw": False},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BE", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        self.assertAlmostEqual(la["record"]["elo"], 1205.0)
+        self.assertAlmostEqual(lb["record"]["elo"], 1195.0)
+
+    def test_battle_ko_banks_career(self):
+        # Career KO wins: a ko verdict banks winner ko+1 (loser
+        # untouched); time-decided wins bank none; retries and old
+        # key-less records stay exact.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BKO", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "ko"},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BKO", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["ko"], 1)
+        self.assertEqual(lb["record"]["ko"], 0)
+        # Time decision banks no KO (same pair, new battle id).
+        key2 = {"tournament_id": "T", "match": "M",
+                "battle_id": "BKO2", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "time"},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BKO2", battle_key=key2)
+        la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual(la2["record"]["ko"], 1)
+        # Old record without the key starts at 0 via .get discipline.
+        _ra3, _rb3, _wa3, _wb3, sta3, stb3 = self._two_fighters()
+        del sta3["rec"]["record"]["ko"]
+        key3 = {"tournament_id": "T", "match": "M",
+                "battle_id": "BKO3", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "ko"},
+            "alpha", 5.0, 4.0, sta3, stb3,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BKO3", battle_key=key3)
+        la3, _w3 = vault_pkg.load_brain(sta3["rec"]["id"])
+        self.assertEqual(la3["record"]["ko"], 1)
+
+    def test_battle_wander_banks_over_threshold(self):
+        # Career wander: a DNF battle with drift past the mark banks
+        # wander+1 per side; below-threshold drift and decisive
+        # battles bank nothing. Old key-less records start at 0.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        def _draw(key_id, drift_a, drift_b):
+            key = {"tournament_id": "T", "match": "M",
+                   "battle_id": key_id, "draw": True}
+            self.srv._handle_tournament_round_over(
+                _FakeSock(), ("127.0.0.1", 1),
+                {"arena_draw": True,
+                 "stats_alpha": {"center_drift": drift_a},
+                 "stats_beta": {"center_drift": drift_b}},
+                "draw", 5.0, 5.0, sta, stb,
+                {"tournament_id": "T", "match": "M"},
+                0.5, 0.5, lambda: "tourney T match M",
+                battle_id=key_id, battle_key=key)
+
+        _draw("BW1", 6.0, 1.0)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["wander"], 1)
+        self.assertEqual(lb["record"].get("wander", 0), 0)
+        _draw("BW2", 1.0, 1.0)
+        la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
+        self.assertEqual(la2["record"]["wander"], 1)
+
+    def test_battle_time_health_win(self):
+        # Arena-decided timeout: verdict.winner_slot banks over fitness
+        # (beta-friendly stats, alpha declared) — the server records
+        # and trains, it does not re-decide.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        msg = {"arena_draw": False, "end_reason": "time",
+               "verdict": {"winner_slot": "alpha", "loser_slot": "beta",
+                           "end_reason": "time", "dmg_a": 0.0,
+                           "dmg_b": 80.0},
+               "stats_alpha": {"kills": 0, "damage_dealt": 0.0,
+                               "damage_taken": 80.0,
+                               "tracking_time_s": 20.0},
+               "stats_beta": {"kills": 0, "damage_dealt": 80.0,
+                              "damage_taken": 0.0,
+                              "tracking_time_s": 20.0}}
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BT", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), msg,
+            "beta", 4.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BT", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((la["record"]["wins"], la["record"]["battles"]), (1, 1))
+        self.assertEqual((lb["record"]["losses"], lb["record"]["battles"]), (1, 1))
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["battle_winner"], "alpha")
+        self.assertIn("wins on health", body["report"])
+
+    def test_battle_time_legacy_fitness(self):
+        # No winner_slot (old client): timeout still falls back to the
+        # fitness verdict.
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        msg = {"arena_draw": False, "end_reason": "time",
+               "stats_alpha": {"kills": 0, "damage_dealt": 0.0,
+                               "damage_taken": 80.0,
+                               "tracking_time_s": 20.0},
+               "stats_beta": {"kills": 0, "damage_dealt": 80.0,
+                              "damage_taken": 0.0,
+                              "tracking_time_s": 20.0}}
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BL", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), msg,
+            "beta", 4.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BL", battle_key=key)
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual((lb["record"]["wins"], lb["record"]["battles"]), (1, 1))
+
+    def test_battle_draw_penalty(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                pass
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BD3", "draw": True}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": True, "draw_penalty": True},
+            "alpha", 5.0, 5.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BD3", battle_key=key)
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["draws"], 1)
+        # Normal draw moves nothing between equals; penalty docks both.
+        self.assertAlmostEqual(la["record"]["elo"], 1200.0 - 25.0)
+        self.assertAlmostEqual(lb["record"]["elo"], 1200.0 - 25.0)
+
+    def test_match_elo_banked(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        self.assertTrue(self.srv._bank_match_result(sta, stb, "alpha"))
+        la, _wla = vault_pkg.load_brain(sta["rec"]["id"])
+        lb, _wlb = vault_pkg.load_brain(stb["rec"]["id"])
+        self.assertEqual(la["record"]["matches_won"], 1)
+        self.assertEqual(lb["record"]["matches_lost"], 1)
+        self.assertAlmostEqual(la["record"]["elo"], 1215.0)
+        self.assertAlmostEqual(lb["record"]["elo"], 1185.0)
+
+    def test_battle_verdict_echoed(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        sent = {}
+
+        class _FakeSock:
+            def sendto(self, data, addr):
+                sent["data"] = data
+
+        key = {"tournament_id": "T", "match": "M",
+               "battle_id": "BV", "draw": False}
+        verdict = {"end_reason": "ko", "winner_slot": "alpha",
+                   "loser_slot": "beta", "blow_source": "thorax_puncture",
+                   "blow_amount": 0.0, "dmg_a": 80.0, "dmg_b": 25.0,
+                   "line": "A WINS by KO"}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1),
+            {"arena_draw": False, "end_reason": "ko", "verdict": verdict},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BV", battle_key=key)
+        body = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body["battle_winner"], "alpha")
+        self.assertEqual(body["end_reason"], "ko")
+        self.assertEqual(body["verdict"], verdict)
+        self.assertIn("thorax_puncture", body["report"])
+        self.assertIn("alpha wins", body["report"])
+        # Stored verdict resend carries the report too (idempotent).
+        stored = self.srv._read_last_verdict()
+        self.assertEqual(stored["result"]["report"], body["report"])
+        # Legacy clients without verdict keys still bank + report.
+        key2 = {"tournament_id": "T", "match": "M",
+                "battle_id": "BV2", "draw": False}
+        self.srv._handle_tournament_round_over(
+            _FakeSock(), ("127.0.0.1", 1), {"arena_draw": False},
+            "alpha", 5.0, 4.0, sta, stb,
+            {"tournament_id": "T", "match": "M"},
+            0.5, 0.5, lambda: "tourney T match M",
+            battle_id="BV2", battle_key=key2)
+        body2 = json.loads(sent["data"].decode("utf-8"))
+        self.assertEqual(body2["end_reason"], "")
+        self.assertEqual(body2["verdict"], {})
+        self.assertIn("alpha wins", body2["report"])
+
+    def test_free_duplicate_no_readvance(self):
+        import shutil
+        import tempfile
+        from evolution_engine import EvolutionManager
+        self.srv._last_free_verdict = {"key": None, "result": None}
+
+        class _FakeSock:
+            def __init__(self):
+                self.sent = []
+            def sendto(self, data, addr):
+                self.sent.append(json.loads(data.decode("utf-8")))
+
+        class _FakeBrain:
+            def __init__(self, w):
+                self.weights = w
+            def reset_state(self):
+                pass
+            def mutate_weights(self, idx, mutation_rate=0.08, sigma=0.15):
+                self.weights = self.weights + 1.0
+
+        ckdir = tempfile.mkdtemp(prefix="free_evo_")
+        try:
+            evo = EvolutionManager(checkpoints_dir=ckdir)
+            ba = _FakeBrain(np.arange(8, dtype=np.float32))
+            bb = _FakeBrain(-np.arange(8, dtype=np.float32))
+            sock = _FakeSock()
+            r1 = self.srv._handle_free_round_over(
+                sock, ("127.0.0.1", 1), {}, evo, ba, bb,
+                "alpha", 5.0, 4.0, "FREE-1", [])
+            self.assertEqual(r1["status"], "generation_advanced")
+            self.assertEqual(r1["new_generation"], 2)
+            self.assertEqual(evo.generation, 2)
+            wb = bb.weights.copy()
+            # Watchdog retry, same id: resend, no second advance.
+            r2 = self.srv._handle_free_round_over(
+                sock, ("127.0.0.1", 1), {}, evo, ba, bb,
+                "alpha", 5.0, 4.0, "FREE-1", [])
+            self.assertEqual(evo.generation, 2)
+            self.assertEqual(r2, r1)
+            np.testing.assert_array_equal(bb.weights, wb)
+            # Next battle, new id: advances exactly once.
+            r3 = self.srv._handle_free_round_over(
+                sock, ("127.0.0.1", 1), {}, evo, ba, bb,
+                "beta", 4.0, 6.0, "FREE-2", [])
+            self.assertEqual(r3["new_generation"], 3)
+            self.assertEqual(len(sock.sent), 3)
+        finally:
+            shutil.rmtree(ckdir, ignore_errors=True)
+            self.srv._last_free_verdict = {"key": None, "result": None}
+
+    def test_title_banking_idempotent(self):
+        _rec_a, _rec_b, wa, wb, sta, stb = self._two_fighters()
+        self.srv._last_title_banked = {"key": None}
+        try:
+            self.assertTrue(
+                self.srv._bank_title(sta, "alpha", key=("T9", "alpha")))
+            la, _w = vault_pkg.load_brain(sta["rec"]["id"])
+            self.assertEqual(la["record"]["tournaments_won"], 1)
+            # Duplicate crown: no second title.
+            self.assertFalse(
+                self.srv._bank_title(sta, "alpha", key=("T9", "alpha")))
+            la2, _w2 = vault_pkg.load_brain(sta["rec"]["id"])
+            self.assertEqual(la2["record"]["tournaments_won"], 1)
+            # No record bound: nothing banked, no crash.
+            self.assertFalse(
+                self.srv._bank_title({"rec": None}, "beta",
+                                     key=("T9", "beta")))
+        finally:
+            self.srv._last_title_banked = {"key": None}
+
     def test_corrupt_journal_quarantined(self):
         p = self.srv._pending_battle_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(b"not a zip at all")
-        with self.assertRaises(Exception):
-            self.srv._recover_pending_battle()
+        # Auto-reconcile: quarantine + serve on, never raise into the
+        # message loop (a raise here wedged every later message).
+        self.srv._recover_pending_battle()
         self.assertFalse(os.path.exists(p))
         quarantined = [f for f in os.listdir(os.path.dirname(p))
                        if f.startswith("_pending_battle.npz.corrupt-")]
         self.assertTrue(quarantined)
         for f in quarantined:
             os.remove(os.path.join(os.path.dirname(p), f))
+
+    def test_missing_package_journal_quarantined(self):
+        # Regression: a records-only journal whose packages were deleted
+        # (test litter, wiped vault) can never complete - recovery must
+        # quarantine it instead of failing every message with battle
+        # recovery errors. Weight-bearing journals still restore.
+        import copy
+        rec_a, rec_b, wa, wb, sta, stb = self._two_fighters()
+        ra = copy.deepcopy(rec_a)
+        rb = copy.deepcopy(rec_b)
+        vault_pkg.record_battle_result(ra, "win")
+        vault_pkg.record_battle_result(rb, "loss")
+        # 1. Weight-bearing journal + wiped packages: replay RESTORES.
+        self.srv._write_pending_battle(
+            {"tournament_id": "T", "match": "M",
+             "battle_id": "MG0", "draw": False},
+            {"status": "tournament_battle", "battle_winner": "alpha",
+             "battle_id": "MG0"},
+            [{"side": "alpha", "record": ra},
+             {"side": "beta", "record": rb}],
+            {"alpha": wa, "beta": wb})
+        os.remove(vault_pkg.package_path(rec_a))
+        self.srv._recover_pending_battle((sta, stb))
+        _la, wa2 = vault_pkg.load_brain(rec_a["id"])
+        np.testing.assert_array_equal(wa2, wa)
+        # 2. Records-only journal + wiped packages: quarantine, never a
+        # battle-recovery error loop on every message.
+        self.srv._write_pending_battle(
+            {"tournament_id": "T", "match": "M",
+             "battle_id": "MG1", "draw": False},
+            {"status": "tournament_battle", "battle_winner": "alpha",
+             "battle_id": "MG1"},
+            [{"side": "alpha", "record": ra, "weights_unchanged": True},
+             {"side": "beta", "record": rb, "weights_unchanged": True}],
+            {})
+        p = self.srv._pending_battle_path()
+        os.remove(vault_pkg.package_path(rec_a))
+        os.remove(vault_pkg.package_path(rec_b))
+        # Auto-reconcile: quarantine + serve on, never raise into the
+        # message loop (a raise here wedged every later message).
+        self.srv._recover_pending_battle()
+        self.assertFalse(os.path.exists(p))
+        quarantined = [f for f in os.listdir(os.path.dirname(p))
+                       if f.startswith("_pending_battle.npz.corrupt-")]
+        self.assertTrue(quarantined)
+        for f in quarantined:
+            os.remove(os.path.join(os.path.dirname(p), f))
+
+
+class TestSeizureDetection(unittest.TestCase):
+    def _fly(self, yaw_rate=0.0):
+        import types
+        return types.SimpleNamespace(
+            yaw_rate=yaw_rate, seizure_time=0.0, seizure_clear=0.0,
+            seizing=False, seizure_events=0)
+
+    def test_quiet_flight_never_triggers(self):
+        from train_homing import update_seizure
+        f = self._fly(yaw_rate=0.3)
+        for _ in range(100):  # 5 s of moderate steering
+            seizing, onset = update_seizure(f, 0.5, dt=0.05)
+            self.assertFalse(seizing)
+            self.assertFalse(onset)
+        self.assertEqual(f.seizure_events, 0)
+
+    def test_saturated_but_stuck_is_not_seizure(self):
+        # Firewall yaw against a tree: command pinned, body not turning.
+        from train_homing import update_seizure
+        f = self._fly(yaw_rate=0.0)
+        for _ in range(100):
+            seizing, _onset = update_seizure(f, 1.0, dt=0.05)
+            self.assertFalse(seizing)
+        self.assertEqual(f.seizure_events, 0)
+
+    def test_sustained_spin_triggers_with_onset_once(self):
+        from train_homing import update_seizure, SEIZURE_WINDOW
+        f = self._fly(yaw_rate=3.0)
+        steps = int(SEIZURE_WINDOW / 0.05)
+        for _ in range(steps - 1):
+            seizing, _onset = update_seizure(f, 1.0, dt=0.05)
+            self.assertFalse(seizing)
+        seizing, onset = update_seizure(f, 1.0, dt=0.05)
+        self.assertTrue(seizing)
+        self.assertTrue(onset)
+        self.assertEqual(f.seizure_events, 1)
+        seizing, onset = update_seizure(f, 1.0, dt=0.05)
+        self.assertTrue(seizing)
+        self.assertFalse(onset)
+        self.assertEqual(f.seizure_events, 1)
+
+    def test_hysteresis_and_recovery(self):
+        from train_homing import update_seizure, SEIZURE_RECOVER
+        f = self._fly(yaw_rate=3.0)
+        for _ in range(40):  # 2 s spin -> seizing
+            update_seizure(f, 1.0, dt=0.05)
+        self.assertTrue(f.seizing)
+        f.yaw_rate = 0.0  # brief pause under the recover window
+        for _ in range(int(SEIZURE_RECOVER / 0.05) - 4):
+            seizing, _onset = update_seizure(f, 0.0, dt=0.05)
+            self.assertTrue(seizing)
+        for _ in range(4):  # full clear second resets the accumulator
+            seizing, _onset = update_seizure(f, 0.0, dt=0.05)
+        self.assertFalse(seizing)
+        self.assertEqual(f.seizure_time, 0.0)
+
+    def test_drain_is_a_slow_bleed(self):
+        from train_homing import SEIZURE_DRAIN
+        self.assertLessEqual(SEIZURE_DRAIN, 5.0)
+        # Full health survives 10 s of continuous seizure.
+        self.assertGreater(100.0 - SEIZURE_DRAIN * 10.0, 0.0)
+
+
+class TestReportIdentity(unittest.TestCase):
+    """Report-id uniqueness + resume-replay dedup: group A and group C
+    must never share an id string, and a fresh-nonce replay of an
+    already-banked battle slot must match the stored verdict."""
+    def test_report_base_strips_nonce(self):
+        import brain_server as bs
+        self.assertEqual(bs._report_base("R1M1-B7-1728001234-5678"), "R1M1-B7")
+        self.assertEqual(bs._report_base("R1M1-B7"), "R1M1-B7")
+        self.assertEqual(bs._report_base("FREE-123456"), "FREE-123456")
+        self.assertEqual(bs._report_base(""), "")
+
+    def test_same_slot_replay_matches(self):
+        import brain_server as bs
+        stored = {"tournament_id": "TC", "match": "R1M1",
+                  "battle_id": "R1M1-B7-100-200", "draw": False}
+        replay = {"tournament_id": "TC", "match": "R1M1",
+                  "battle_id": "R1M1-B7-999-111", "draw": False}
+        self.assertTrue(bs._same_battle_slot(stored, replay))
+        other_group = dict(replay, tournament_id="TA")
+        self.assertFalse(bs._same_battle_slot(stored, other_group))
+        other_battle = dict(replay, battle_id="R1M1-B8-999-111")
+        self.assertFalse(bs._same_battle_slot(stored, other_battle))
+        other_match = dict(replay, match="R1M2")
+        self.assertFalse(bs._same_battle_slot(stored, other_match))
+        flipped_draw = dict(replay, draw=True)
+        self.assertFalse(bs._same_battle_slot(stored, flipped_draw))
+        self.assertFalse(bs._same_battle_slot(None, replay))
+        self.assertFalse(bs._same_battle_slot(stored, None))
+
+
+class TestPrepareSlot(unittest.TestCase):
+    """Preload-slot + zero-activity gates: the prepare slot activates in
+    O(1) for the exact match, and a tournament reset with no loaded
+    brains fails loud instead of running a boot-brain round."""
+    def test_wiring_cache_keys(self):
+        import brain_server as bs
+        rec = {"id": "k1", "name": "K1",
+               "generator_params": {"experiment": None, "mapping": None,
+                                    "yaw_bias": None}}
+        skey, ckey = bs._wiring_cache_keys(rec)
+        self.assertEqual(skey, bs._norm_experiment(None))
+        self.assertEqual(len(ckey), 4)
+        again = bs._wiring_cache_keys(rec)
+        self.assertEqual((skey, ckey), again)
+        bad = {"id": "k9", "name": "K9",
+               "generator_params": {"experiment": "no-such-wiring-ever",
+                                    "mapping": None}}
+        with self.assertRaises(ValueError):
+            bs._wiring_cache_keys(bad)
+
+    def test_prepared_slot_matches(self):
+        import brain_server as bs
+        import os
+        anchor = os.path.abspath(__file__)
+        mt = os.path.getmtime(anchor)
+        pa = {"brain": object(), "path": anchor, "mtime": mt}
+        pb = {"brain": object(), "path": anchor, "mtime": mt}
+        tag = {"tournament_id": "T1", "match": "R1M1"}
+        msg = {"tournament_id": "T1", "match": "R1M1",
+               "alpha_path": anchor, "beta_path": anchor}
+        self.assertTrue(bs._prepared_slot_matches(pa, pb, tag, msg))
+        # Stale stamp (a bank landed after the prepare) falls through
+        # to a fresh load instead of fighting on old weights.
+        self.assertFalse(bs._prepared_slot_matches(
+            dict(pa, mtime=mt - 1.0), pb, tag, msg))
+        # Missing file never matches, even unstamped.
+        gone = {"brain": object(), "path": "gone.flybrain", "mtime": None}
+        gmsg = dict(msg, alpha_path="gone.flybrain")
+        self.assertFalse(bs._prepared_slot_matches(gone, pb, tag, gmsg))
+        self.assertFalse(bs._prepared_slot_matches(
+            {"brain": None, "path": anchor}, pb, tag, msg))
+        self.assertTrue(bs._prepared_slot_matches(pa, pb, tag, msg))
+        self.assertFalse(bs._prepared_slot_matches(
+            {"brain": None, "path": "a.flybrain"}, pb, tag, msg))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, match="R1M2")))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, tournament_id="T2")))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, alpha_path="c.flybrain")))
+        self.assertFalse(bs._prepared_slot_matches(
+            pa, pb, tag, dict(msg, beta_path="c.flybrain")))
+
+    def test_match_reset_error_contract(self):
+        # Stable contract: the arena matches this prefix to trigger its
+        # mid-match auto-reload. Rewording the head breaks tournament
+        # self-healing.
+        import brain_server as bs
+        self.assertTrue(bs.MATCH_RESET_NO_BRAINS_ERROR.startswith(
+            "match_reset: no tournament brains loaded"))
+
+    def test_reset_needs_brains(self):
+        import brain_server as bs
+        msg = {"match": "R1M1"}
+        self.assertFalse(bs._reset_needs_brains(msg, True, object(), object()))
+        self.assertTrue(bs._reset_needs_brains(msg, False, object(), object()))
+        self.assertTrue(bs._reset_needs_brains(msg, True, None, object()))
+        self.assertTrue(bs._reset_needs_brains(msg, True, object(), None))
+        # Non-tournament reset (menu/free): never gated.
+        self.assertFalse(bs._reset_needs_brains({}, True, None, None))
 
 
 if __name__ == "__main__":

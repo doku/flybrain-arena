@@ -222,8 +222,8 @@ func test_tba_templates() -> void:
 	_check((D.tourney["rounds"] as Array).size() == before,
 		"TBA synthesis does not mutate tourney rounds")
 	# Full template, compact metrics (4 cols > 3): 3 main cols + champion.
-	# width = SIDE_PAD + 3*(120+22) + 120 + SIDE_PAD = 570.
-	_check(absf(R.custom_minimum_size.x - 570.0) < 0.01,
+	# width = SIDE_PAD + 3*(108+16) + 108 + SIDE_PAD = 504.
+	_check(absf(R.custom_minimum_size.x - 504.0) < 0.01,
 		"size-8 fresh bracket renders full 3-round template, compact")
 	R.queue_free()
 
@@ -261,9 +261,9 @@ func test_focus_losers() -> void:
 	var lf := int(D.tourney.get("losers_start_round", -1))
 	R.render_bracket(D.tourney, lf, 0)
 	# Losers-only (2 cols + final) at normal metrics (3 cols, 2 rows):
-	# 12 + 2*(210+52) + 210 + 12 = 758.
-	_check(absf(R.custom_minimum_size.x - 758.0) < 0.01,
-		"focus mode renders losers-only at 758px")
+	# 12 + 2*(190+40) + 190 + 12 = 674.
+	_check(absf(R.custom_minimum_size.x - 674.0) < 0.01,
+		"focus mode renders losers-only at 674px")
 	var seen_losers := false
 	var seen_main := false
 	var bad := ["ROUND 1", "ROUND 2", "SEMIFINAL", "FINAL", "CHAMPION"]
@@ -275,6 +275,130 @@ func test_focus_losers() -> void:
 				seen_main = true
 	_check(seen_losers, "focus mode shows losers headers")
 	_check(not seen_main, "focus mode hides main-bracket headers")
+	R.queue_free()
+
+
+func test_bracket_views() -> void:
+	var R = load("res://scripts/TournamentBracket.gd").new()
+	var D = _new_director()
+	var brains := _fakes(8)
+	D.build_bracket(_ids(brains), 8, 1, 0.5, 40.0, false, brains, false, true)
+	# Fresh size-8 main page: compact pitch fits round 0 outright.
+	R.render_bracket(D.tourney, 0, 0, 1)
+	_check(absf(R.custom_minimum_size.y - 324.0) < 0.01,
+		"compact size-8 main view is 324px tall (no vertical scroll)")
+	_check(absf(R.custom_minimum_size.x - 504.0) < 0.01,
+		"main-only view keeps 3 cols + champion")
+	# No consolation rounds yet: placeholder, not a crash.
+	R.render_bracket(D.tourney, 0, 0, 2)
+	_check(R.custom_minimum_size.x == 200.0,
+		"losers view without consolation shows placeholder")
+	_check(_run_to_consolation(D), "consolation starts for view test")
+	var lf := int(D.tourney.get("losers_start_round", -1))
+	R.render_bracket(D.tourney, lf, 0, 1)
+	var seen_losers := false
+	var seen_champ := false
+	for c in R.get_children():
+		if c is Label:
+			if str(c.text).begins_with("LOSERS"):
+				seen_losers = true
+			if str(c.text) == "CHAMPION":
+				seen_champ = true
+	_check(not seen_losers, "main-only view hides losers columns")
+	_check(seen_champ, "main-only view keeps champion column")
+	# Losers page at review time: forced focus, not just while live.
+	_run_to_end(D)
+	R.render_bracket(D.tourney, -1, -1, 2)
+	var seen_losers2 := false
+	var seen_last := false
+	var seen_main := false
+	var bad := ["ROUND 1", "ROUND 2", "SEMIFINAL", "FINAL", "CHAMPION"]
+	for c in R.get_children():
+		if c is Label:
+			if str(c.text).begins_with("LOSERS"):
+				seen_losers2 = true
+			if str(c.text) == "LAST PLACE":
+				seen_last = true
+			if str(c.text) in bad:
+				seen_main = true
+	_check(seen_losers2, "losers page shows losers headers at review")
+	_check(seen_last, "losers page ends in LAST PLACE")
+	_check(not seen_main, "losers page hides main-bracket headers")
+	R.queue_free()
+
+
+func test_review_shows_main_only() -> void:
+	# End-of-tournament review (status complete): auto view shows the
+	# winners' bracket only - no appended losers columns. Losers stay
+	# one toggle away (view 2).
+	var R = load("res://scripts/TournamentBracket.gd").new()
+	var D = _new_director()
+	var brains := _fakes(8)
+	D.build_bracket(_ids(brains), 8, 1, 0.5, 40.0, false, brains, false, true)
+	_run_to_end(D)
+	_check(str(D.tourney.get("status", "")) == "complete",
+		"review fixture finished the tournament")
+	R.render_bracket(D.tourney,
+		int(D.tourney.get("current_round", 0)),
+		int(D.tourney.get("current_match", 0)))
+	var seen_losers := false
+	var seen_champ := false
+	for c in R.get_children():
+		if c is Label:
+			if str(c.text).begins_with("LOSERS"):
+				seen_losers = true
+			if str(c.text) == "CHAMPION":
+				seen_champ = true
+	_check(not seen_losers, "review auto view hides losers columns")
+	_check(seen_champ, "review auto view ends in CHAMPION")
+	R.queue_free()
+
+
+func test_champ_name_card_bounded() -> void:
+	# Long champion names must read prefix-first inside the card:
+	# left-aligned in a card-bounded rect (centered text overdraws the
+	# card edge and clips away both ends of the name).
+	var R = load("res://scripts/TournamentBracket.gd").new()
+	var D = _new_director()
+	var brains := [_fake("f-long-champion-name-that-overflows-the-card"),
+		_fake("f2"), _fake("f3"), _fake("f4")]
+	D.build_bracket(_ids(brains), 4, 1, 0.5, 40.0, false, brains)
+	# Rig the long name to the title: whoever holds its slot wins.
+	var guard := 0
+	while guard < 20:
+		guard += 1
+		var m: Dictionary = D.current_match()
+		if m.is_empty():
+			break
+		if str(m.get("winner_id", "")) == "" \
+				and not bool(m.get("bye", false)) \
+				and not bool(m.get("vacant", false)):
+			var slot := "alpha" if str(m.get("a_id", "")) == "f-long-champion-name-that-overflows-the-card" else "beta"
+			_fight_current(D, slot)
+		var adv = D.advance_after_match()
+		if str((adv as Dictionary).get("action", "")) == "tournament_end":
+			break
+	_check(str(D.tourney.get("champion_id", "")) == "f-long-champion-name-that-overflows-the-card",
+		"rigged final crowns the long name")
+	R.render_bracket(D.tourney, -1, -1)
+	var found := false
+	for c in R.get_children():
+		if not (c is PanelContainer):
+			continue
+		var vb = (c as PanelContainer).get_child(0)
+		var labels: Array = []
+		for k in vb.get_children():
+			if k is Label:
+				labels.append(k)
+		if labels.size() == 2 and str((labels[0] as Label).text) == "CHAMPION":
+			found = true
+			var nm := labels[1] as Label
+			_check((nm as Label).horizontal_alignment == HORIZONTAL_ALIGNMENT_LEFT,
+				"champion name left-aligned (prefix survives)")
+			_check((nm as Label).clip_text, "champion name clips inside the card")
+			_check((nm as Label).custom_minimum_size.x <= R.CARD_W - 16.0 + 0.01,
+				"champion name rect fits the card width")
+	_check(found, "champion card present in review render")
 	R.queue_free()
 
 
@@ -306,6 +430,9 @@ func _initialize() -> void:
 	test_skip(d4)
 	test_tba_templates()
 	test_focus_losers()
+	test_bracket_views()
+	test_review_shows_main_only()
+	test_champ_name_card_bounded()
 	_cleanup()
 	if failures == 0:
 		print("ALL CONSOLATION TESTS PASSED")

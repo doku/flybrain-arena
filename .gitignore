@@ -19,6 +19,9 @@
 /brains/
 *.flybrain
 *.npz
+# Nested runtime caches (e.g. brain_engine/checkpoints/ from CWD-relative
+# default dirs in tests and tools) - same rule, any depth.
+brain_engine/checkpoints/
 
 # Runtime state: tournament brackets, training jobs, logs
 /tournaments/
@@ -29,3 +32,11 @@ server_log.txt
 # Godot editor import cache + engine binaries (170+ MB)
 /tools/
 arena/.godot/
+# Godot 4.4+ script UID sidecars (regenerable editor metadata)
+*.uid
+# Owner's personal task list (never commit)
+/todo.txt
+# Vault backup snapshots + package sidecars/backups (user data, GBs)
+brains-backup-*/
+*.bak
+*.record.json

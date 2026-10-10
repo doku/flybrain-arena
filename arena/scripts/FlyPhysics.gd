@@ -7,17 +7,45 @@ signal landed_strike(target_part: String)
 
 @export var fly_id: String = "alpha" # "alpha" or "beta"
 @export var is_disabled: bool = false
+# Killing-blow ledger: every health subtraction routes through
+# take_damage so the battle report can name the final blow.
+var last_damage_source := ""
+var last_damage_amount := 0.0
+var last_damage_t := 0.0
+
+
+# Combat gate: damage, tears and KOs only count inside a live round.
+# Between rounds (battle-load, landing ceremony, review) the flies keep
+# simulating where the last round left them - tangled in a clinch or
+# sliding into bark - and ungated hits bled into the next round's bars.
+# The manager opens/closes this around _reset_round/_end_round.
+var combat_enabled := false
+
+
+func take_damage(amount: float, source: String) -> void:
+	if not combat_enabled:
+		return
+	if is_disabled:
+		return
+	health -= amount
+	last_damage_source = source
+	last_damage_amount = amount
+	last_damage_t = fly_time
 @export var health: float = 100.0
 
 # Flight aerodynamics constants (fruit-fly agile: hover-capable, snap turns).
-# Tuned for watchable jousts: cruise ~5 m/s, full thrust 12 m/s.
+# Activation-driven flight (no base cruise): motor activation maps to
+# speed on a log curve - easy meters to ~4 m/s, saturating toward 12.
+# DRIVE_LOG_K is fitted so drive_speed(0.15) ~= 4.0. Mirrors the Python
+# drive_speed() in sensory_motor.py - keep the two in sync.
 # Thrust gain is calibrated so cruise equilibrium EQUALS target speed:
 # per-tick add = target*gain*dt vs drag multiply drag_coeff^(60dt);
 # v* = target*gain/(60*(1-drag_coeff)) = target*1.8/1.8 = target.
 # (The old gain 5.0 converged to 2.78x target: full thrust flew 33 m/s
 # and ram 46 m/s while max_speed claimed 12 - the G2-wild zoom bug.)
-@export var base_speed: float = 3.0
 @export var max_speed: float = 12.0
+const DRIVE_LOG_K: float = 6.0
+const RAM_EXTRA: float = 6.0
 @export var turn_rate: float = 8.0
 @export var pitch_rate: float = 2.5
 @export var roll_rate: float = 3.0
@@ -34,6 +62,35 @@ var capped_time: float = 0.0
 var fly_time: float = 0.0
 var peak_speed: float = 0.0
 var speed_exploit: bool = false
+# Seizure watch (behavioral, motor-output level): a saturated yaw command
+# that keeps spinning the body, sustained over SEIZURE_WINDOW, latches
+# `seizing` and drains health in small increments until SEIZURE_RECOVER
+# of clear flight. Punishment flows through the existing KO path
+# (health -> 0 disables, rival credited). Thresholds mirror
+# train_homing.update_seizure - keep the two in sync.
+const SEIZURE_YAW_CMD := 0.85
+const SEIZURE_YAW_RATE := 2.0
+const SEIZURE_WINDOW := 1.5
+const SEIZURE_RECOVER := 1.0
+const SEIZURE_DRAIN := 3.0
+var seizure_time := 0.0
+var seizure_clear := 0.0
+var seizing := false
+var seizure_events := 0
+
+
+func seizure_tick(yaw_cmd: float, yaw_rate: float, delta: float) -> bool:
+	# State machine only (no scene reads): headless-testable. Returns
+	# the latched seizing flag; onset counted by the caller.
+	if absf(yaw_cmd) > SEIZURE_YAW_CMD and absf(yaw_rate) > SEIZURE_YAW_RATE:
+		seizure_time += delta
+		seizure_clear = 0.0
+	else:
+		seizure_clear += delta
+		if seizure_clear >= SEIZURE_RECOVER:
+			seizure_time = 0.0
+	seizing = seizure_time >= SEIZURE_WINDOW and seizure_clear < SEIZURE_RECOVER
+	return seizing
 
 # Hard altitude limits: a tipped/crippled fly can otherwise convert its huge
 # forward speed into an endless vertical climb the soft trim can't catch.
@@ -49,7 +106,41 @@ var current_yaw_torque: float = 0.0
 var current_pitch_torque: float = 0.0
 var current_roll_torque: float = 0.0
 var is_ram_burst: bool = false
+var ram_drive: float = 0.0
 var is_emergency_evade: bool = false
+# Ram charge refractory (mirrors the lunge cooldown): sustained DNpe017
+# drive latches ONE charge window, then a refractory beat disarms the
+# next charge so a pressed pool can't machine-gun the headroom.
+const RAM_TIME: float = 0.8
+const RAM_COOLDOWN: float = 3.0
+var ram_t: float = 0.0
+var ram_cooldown: float = 0.0
+var ram_latched: float = 0.0
+var ram_charges: int = 0
+
+
+func _ram_charge_tick(delta: float, drive: float) -> float:
+	# Effective ram headroom this tick: the latched charge rate during
+	# the window, 0 in the refractory. Pure (timer state only), so the
+	# headless drive test can exercise the window timing.
+	ram_cooldown = maxf(0.0, ram_cooldown - delta)
+	if ram_t > 0.0:
+		ram_t = maxf(0.0, ram_t - delta)
+		return ram_latched
+	if drive > 0.0 and ram_cooldown <= 0.0:
+		ram_t = RAM_TIME
+		ram_cooldown = RAM_COOLDOWN
+		ram_latched = clampf(drive, 0.0, 1.0)
+		ram_charges += 1
+		return ram_latched
+	return 0.0
+
+
+func drive_speed(activation: float) -> float:
+	# Shared log curve (mirrors Python drive_speed): hover at zero,
+	# ~4 m/s at low-moderate drive, saturating at max_speed.
+	var a := clampf(activation, 0.0, 1.0)
+	return max_speed * log(1.0 + DRIVE_LOG_K * a) / log(1.0 + DRIVE_LOG_K)
 # Command-hold age: the brain answers every few hundred ms (dual-LIF
 # step budget), so each torque command would otherwise hold at FULL
 # value across many physics frames (~1 rad per yaw command) while flying
@@ -61,6 +152,35 @@ var is_emergency_evade: bool = false
 # 0.15 s is the full-speed default.
 var cmd_age: float = 0.0
 var hold_tau: float = 0.15
+# Stale-command hover: the brain answers every few hundred ms, so a
+# command older than CMD_STALE_SECS means the link is dead (CONTROL
+# LINK SLOW holding under laptop throttle) or the round is over
+# (steps stop with it). Dead commands read as ZERO - the fly brakes
+# to a hover instead of drifting on the last order into trees and
+# circling. 1.0 s never bites live flight (replies land far faster)
+# but freezes a dead link fast. Pure (unit-tested).
+const CMD_STALE_SECS: float = 1.0
+
+
+func commands_live() -> bool:
+	return cmd_age <= CMD_STALE_SECS
+
+
+func neutralize() -> void:
+	# Freeze NOW: zero every brain command plus the velocity, so the
+	# fly hangs in place instead of drifting. cmd_age parks past
+	# stale so the hover gate holds until a fresh reply lands (which
+	# resets it via apply_brain_controls - never wedges).
+	current_thrust = 0.0
+	current_yaw_torque = 0.0
+	current_pitch_torque = 0.0
+	current_roll_torque = 0.0
+	is_ram_burst = false
+	ram_drive = 0.0
+	is_emergency_evade = false
+	spear_thrust_cmd = 0.0
+	cmd_age = CMD_STALE_SECS + 1.0
+	velocity = Vector3.ZERO
 
 var left_wing_intact: bool = true
 var right_wing_intact: bool = true
@@ -72,7 +192,7 @@ var wing_flutter_time: float = 0.0
 # further hits. reset_fly clears it.
 var landing_mode: int = 0
 const LAND_POS_Y: float = 0.62
-const LOSER_SINK_RATE: float = 3.0
+const LOSER_SINK_RATE: float = 5.5
 const WINNER_SINK_RATE: float = 1.4
 
 # Spear lunge attack (mouth-motor driven): a short forward impulse plus
@@ -82,6 +202,7 @@ var lunge_cooldown: float = 0.0
 var lunge_t: float = 0.0
 var lunge_count: int = 0
 var spear_root: Node3D = null
+var spear_pierce := false
 const LUNGE_COOLDOWN: float = 1.2
 const LUNGE_TIME: float = 0.35
 const LUNGE_DIST: float = 0.35
@@ -95,6 +216,24 @@ var rival: FlyPhysics = null
 
 # Scent and visual tracking
 var prev_rival_dist: float = 50.0
+# Scent dynamics (rival-detection channel): smoothed total for surge,
+# lost-timer for search behavior, free-running cast phase. The gradient
+# floor never dies (lost flies must re-acquire), so "lost" is defined
+# floor-relative: total at/below LOST_THRESH with nothing visible.
+const LOST_THRESH: float = 0.12
+const LOST_CAST_RATE: float = 0.8
+# Scent falloff (log with a floor): steep near field for distance
+# definition, fat tail that never hits zero so a separated fly always
+# keeps a trail. Same log-curve family as drive_speed. Floor 0.06
+# keeps nose-on at the 55 m edge found (total ~0.3 > LOST_THRESH)
+# while facing-away reads lost. Mirrored cell-for-cell in
+# brain_engine/train_homing.py - change both together.
+const SCENT_FLOOR: float = 0.06
+const SCENT_LOG_K: float = 0.5
+const SCENT_RANGE_M: float = 80.0
+var scent_prev_smooth: float = -1.0
+var scent_lost_time: float = 0.0
+var scent_cast_phase: float = 0.0
 
 # Antennal-gyro tracking: previous attitude for per-tick angular rates.
 # Synced on reset; re-syncs automatically on the first sensory read.
@@ -111,6 +250,14 @@ const TREE_RAY_LEFT_ANGLE: float = deg_to_rad(35.0)
 # frame while the trigger Areas stay overlapped.
 var clash_cooldown: float = 0.0
 const CLASH_COOLDOWN: float = 0.9
+# Wing-exchange stamp: the physics frame of the last wing resolution
+# this fly took part in (as reporter OR victim). A second wing report
+# involving this fly in the same frame drops - one tear per exchange.
+# Frame numbers are monotonic, so no reset is ever needed. Unlike the
+# clash/joust instance-id rule this is order-independent: a sole
+# reporter resolves regardless of id, and a mutual exchange still
+# resolves exactly once (the first report stamps both participants).
+var _wing_exchange_frame: int = -1
 
 @onready var front_spike_area: Area3D = $FrontSpikeArea
 @onready var thorax_hurtbox: Area3D = $ThoraxHurtbox
@@ -123,25 +270,53 @@ func _ready() -> void:
 	_build_visual_model()
 	front_spike_area.area_entered.connect(_on_spike_hit_area)
 
+# Beauty-pass material refs: eyes + wing membranes are per-fly
+# ShaderMaterials; the thorax is a plain team-colored StandardMaterial.
+# The manager pushes team colors + hit flashes here (see
+# set_team_color / flash_hit). Shared scan meshes are untouched, so
+# both rivals keep their own materials.
+var eye_mat: ShaderMaterial
+var membrane_mat: ShaderMaterial
+var body_std_mat: StandardMaterial3D
+var spear_glow: MeshInstance3D
+var spear_glow_mat: StandardMaterial3D
+var flash_energy := 0.0
+
 func set_team_color(color: Color) -> void:
-	# Per-instance body tint (material_override, so the shared scene material
-	# stays untouched and the two rivals keep their own colors).
+	# Plain team coloration on the thorax (flat StandardMaterial, no
+	# shader): what you pick is what you get, no sheen, no fresnel.
 	var body_mesh = $VisualModel/BodyMesh as MeshInstance3D
 	if is_instance_valid(body_mesh):
-		var mat := StandardMaterial3D.new()
-		mat.albedo_color = color
-		mat.metallic = 0.4
-		mat.roughness = 0.6
-		body_mesh.material_override = mat
+		body_std_mat = StandardMaterial3D.new()
+		body_std_mat.albedo_color = color
+		body_std_mat.metallic = 0.4
+		body_std_mat.roughness = 0.6
+		body_mesh.material_override = body_std_mat
+	if spear_glow_mat != null:
+		spear_glow_mat.albedo_color = Color(color.r, color.g, color.b, 0.0)
+	if membrane_mat != null:
+		# Rivals shimmer out of sync; membranes keep a pearly white.
+		var phase := 0.0 if fly_id != "beta" else PI
+		membrane_mat.set_shader_parameter("phase", phase)
+
+func flash_hit(strength: float = 1.0) -> void:
+	flash_energy = maxf(flash_energy, strength)
+
+
+func set_combat_enabled(on: bool) -> void:
+	combat_enabled = on
 
 func apply_brain_controls(ctrl: Dictionary) -> void:
-	if is_disabled:
+	if is_disabled or landing_mode > 0:
 		return
 	current_thrust = ctrl.get("thrust", 0.2)
 	current_yaw_torque = ctrl.get("yaw_torque", 0.0)
 	current_pitch_torque = ctrl.get("pitch_torque", 0.0)
 	current_roll_torque = ctrl.get("roll_torque", 0.0)
 	is_ram_burst = ctrl.get("ram_burst", false)
+	ram_drive = clampf(float(ctrl.get("ram_drive", 0.0)), 0.0, 1.0)
+	if ram_drive <= 0.0 and is_ram_burst:
+		ram_drive = 1.0
 	is_emergency_evade = ctrl.get("emergency_evade", false)
 	spear_thrust_cmd = clampf(float(ctrl.get("spear_thrust", 0.0)), 0.0, 1.0)
 	cmd_age = 0.0
@@ -151,6 +326,9 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 		return {
 			"pheromone_conc_left": 0.0,
 			"pheromone_conc_right": 0.0,
+			"scent_lost": 0.0,
+			"scent_cast": 0.0,
+			"scent_surge": 0.0,
 			"visual_target_azimuth": 0.0,
 			"visual_target_elevation": 0.0,
 			"visual_target_visible": false,
@@ -215,16 +393,17 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	var right_dir = global_transform.basis.x
 	var to_rival_dir = to_rival.normalized()
 
-	# Scent never dies with distance: linear falloff over 150m (effectively
-	# infinite inside the play area) with a constant gradient slope, so a
-	# separated fly always has a trail to follow and keeps pursuit.
-	# Directional smelling: strength follows where the nose points
-	# (nose-on-target = full scent, facing away = faint trace), so the
-	# odor gradient leads the fly toward the rival instead of surrounding
-	# it equally from all sides.
+	# Scent falls off log with distance: close meters discriminate
+	# sharply (log slope ~1/d) while the fat tail plus the floor
+	# never reaches zero, so a separated fly always has a trail to
+	# follow and keeps pursuit. Directional smelling: strength follows
+	# where the nose points (nose-on-target = full scent, facing away
+	# = faint trace), so the odor gradient leads the fly toward the
+	# rival instead of surrounding it equally from all sides.
 	var nose_dot = forward.dot(to_rival_dir)
 	var face = 0.15 + 0.85 * clampf((nose_dot + 0.2) / 1.2, 0.0, 1.0)
-	var c_base = clampf((1.0 - dist / 150.0) * face, 0.0, 1.0)
+	var c_base = clampf((SCENT_FLOOR + (1.0 - SCENT_FLOOR) \
+		* (1.0 - log(1.0 + SCENT_LOG_K * dist) / log(1.0 + SCENT_LOG_K * SCENT_RANGE_M))) * face, 0.0, 1.0)
 
 	# Directional antenna orientations (+/- 45 degrees forward-lateral)
 	var ant_dir_left = (forward - right_dir * 0.7).normalized()
@@ -256,6 +435,23 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	var rival_local = rival.global_transform.basis.inverse() * to_self_from_rival
 	var behind_rival = rival_local.z > 0.15
 	var tail_chase = 1.0 if (behind_rival and is_visible and absf(azimuth_deg) < 35.0) else 0.0
+
+	# 2b. Scent dynamics: surge (rising total = closing), lost timer and
+	# cast bias for search. Smoothed total (0.5 s tau) so per-frame noise
+	# never fires the surge; sentinel snaps on first read (no spawn kick).
+	var scent_total = c_left + c_right
+	var dt := maxf(frame_delta, 0.001)
+	if scent_prev_smooth < 0.0:
+		scent_prev_smooth = scent_total
+	var scent_smooth = scent_prev_smooth + (scent_total - scent_prev_smooth) * minf(1.0, dt * 2.0)
+	var scent_surge = clampf((scent_smooth - scent_prev_smooth) / dt * 3.0, 0.0, 1.0)
+	scent_prev_smooth = scent_smooth
+	if scent_total > LOST_THRESH or is_visible:
+		scent_lost_time = 0.0
+	else:
+		scent_lost_time += dt
+	scent_cast_phase += dt * LOST_CAST_RATE
+	var scent_cast = sin(scent_cast_phase)
 
 	# 5. Panoramic sector grid (retina scheme): 7 azimuth columns over the
 	# full circle x 3 elevation bands = 21 cells. Rival occupies exactly
@@ -302,6 +498,9 @@ func get_sensory_data(frame_delta: float = 0.05) -> Dictionary:
 	return {
 		"pheromone_conc_left": c_left,
 		"pheromone_conc_right": c_right,
+		"scent_lost": scent_lost_time,
+		"scent_cast": scent_cast,
+		"scent_surge": scent_surge,
 		"visual_target_azimuth": azimuth_deg,
 		"visual_target_elevation": elevation_deg,
 		"visual_target_visible": is_visible,
@@ -412,6 +611,18 @@ func _landing_step(delta: float) -> void:
 
 func _physics_process(delta: float) -> void:
 	clash_cooldown = maxf(0.0, clash_cooldown - delta)
+	# Hit-flash decay (visual only, never touches sim state).
+	if flash_energy > 0.0:
+		flash_energy = maxf(0.0, flash_energy - delta * 2.5)
+		if body_std_mat != null:
+			if flash_energy <= 0.0:
+				body_std_mat.emission_enabled = false
+			else:
+				body_std_mat.emission_enabled = true
+				body_std_mat.emission = Color(1.0, 0.96, 0.88)
+				body_std_mat.emission_energy_multiplier = flash_energy * 3.0
+		if eye_mat != null:
+			eye_mat.set_shader_parameter("flash_energy", flash_energy * 0.7)
 	if landing_mode > 0:
 		_landing_step(delta)
 		return
@@ -435,19 +646,33 @@ func _physics_process(delta: float) -> void:
 		right_wing_mesh.rotation.z = -flap
 
 	# Leaky command hold (see cmd_age): stale torque commands decay so a
-	# slow brain steers bounded arcs instead of winding up spins.
+	# slow brain steers bounded arcs instead of winding up spins. Past
+	# CMD_STALE_SECS the commands are DEAD (link holding / round over)
+	# and read as zero, so the fly hovers instead of drifting.
 	cmd_age += delta
+	var live := commands_live()
 	var hold := exp(-cmd_age / hold_tau)
-	var yaw_cmd := current_yaw_torque * hold
-	var pitch_cmd := current_pitch_torque * hold
-	var roll_cmd := current_roll_torque * hold
+	var yaw_cmd := current_yaw_torque * hold if live else 0.0
+	var pitch_cmd := current_pitch_torque * hold if live else 0.0
+	var roll_cmd := current_roll_torque * hold if live else 0.0
 
-	# Flight speed and thrust
-	var speed_multiplier = 1.5 if is_ram_burst else 1.0
-	var target_speed = base_speed + (max_speed - base_speed) * current_thrust * speed_multiplier
+	# Flight speed from motor activation (no base cruise: zero drive
+	# hovers) on the shared log curve, plus the ram charge headroom
+	# scaled by DNpe017 rate (never a programmed multiplier). The ram
+	# charge is refractory: one charge per window (mirrors the lunge).
+	# Dead commands mean zero drive AND zero ram headroom (a latched
+	# window must not outlive the link that charged it).
+	var thrust_in := current_thrust if live else 0.0
+	var eff_ram := _ram_charge_tick(delta, ram_drive if live else 0.0)
+	if not live:
+		eff_ram = 0.0
+	var target_speed = drive_speed(thrust_in) + RAM_EXTRA * eff_ram
 	var forward_vec = -global_transform.basis.z
 
-	# Yaw rotation
+	# Yaw rotation (snapshot basis first: the seizure watch measures the
+	# actual turn that results, so a saturated command against a tree
+	# reads as stuck, not seizing).
+	var _pre_yaw_basis := global_transform.basis
 	rotate_y(-yaw_cmd * turn_rate * delta)
 
 	# Pitch rotation (nose up positive). Previously nothing ever commanded
@@ -455,18 +680,33 @@ func _physics_process(delta: float) -> void:
 	# nose pointed until it hit the ceiling.
 	rotate_x(pitch_cmd * pitch_rate * delta)
 
-	# Roll rotation (bank right positive). The brain commands the bank and
-	# a gentle auto-level mops up residual drift. During an emergency
-	# evade the reflex owns the roll axis outright (full auto-level, no
-	# brain command) so the two can never fight each other. With no roll
-	# command (base scheme) the full legacy leveling rate applies, so
-	# uncommanded flight is exactly as stable as before.
-	if is_emergency_evade:
-		_auto_level_roll(delta)
-	else:
-		rotate_z(-roll_cmd * roll_rate * delta)
-		var lvl := 2.5 if absf(roll_cmd) < 0.01 else 1.0
-		_auto_level_roll(delta, lvl)
+	# Roll rotation (bank right positive). The brain commands the bank
+	# through the haltere roll-motor readout and a gentle auto-level
+	# mops up residual drift - rolls are learned, never scripted. The
+	# emergency dive below never touches this axis. With no roll
+	# command (unwired brains) the full legacy leveling rate applies,
+	# so uncommanded flight is exactly as stable as before.
+	rotate_z(-roll_cmd * roll_rate * delta)
+	var lvl := 2.5 if absf(roll_cmd) < 0.01 else 1.0
+	_auto_level_roll(delta, lvl)
+
+	# Seizure watch: measured yaw rate over this tick vs the applied
+	# (hold-decayed) command. Onset logs once; the drain ticks down in
+	# small increments until clear flight or knockout.
+	var yaw_rate_now := 0.0
+	if delta > 0.0:
+		var _yaw_e := (_pre_yaw_basis.inverse() * global_transform.basis).get_euler()
+		yaw_rate_now = clampf(-_yaw_e.y / delta, -8.0, 8.0)
+	var _was_seizing := seizing
+	seizure_tick(yaw_cmd, yaw_rate_now, delta)
+	if seizing and not _was_seizing:
+		seizure_events += 1
+		print(fly_id, " SEIZURE detected - draining health.")
+	if seizing:
+		take_damage(SEIZURE_DRAIN * delta, "seizure")
+		if health <= 0.0 and not is_disabled:
+			inflict_lethal_strike()
+			print(fly_id, " seized out of the sky!")
 
 	# Pitch & altitude auto-trim (stay within 2m to 12m fly combat ceiling)
 	var alt = global_position.y
@@ -477,28 +717,42 @@ func _physics_process(delta: float) -> void:
 	else:
 		velocity.y *= pow(0.9, delta * 60.0)
 
-	# Emergency evade reflex (Giant Fiber)
-	if is_emergency_evade:
-		rotate_z(8.0 * delta)
+	# Emergency evade dive (Giant Fiber): pure vertical escape. Roll
+	# used to snap here by script (rotate_z) - now banks are brain-
+	# commanded through the roll readout, so this stays hands-off.
+	# Dead with stale commands (no escape orders from a dead link).
+	if live and is_emergency_evade:
 		velocity.y -= 25.0 * delta
 
 	# Spear lunge attack (mouth-motor driven): a forward impulse plus a
-	# visible spear thrust, one discrete strike per cooldown.
+	# visible spear thrust, one discrete strike per cooldown. Dead
+	# commands never trigger a lunge.
 	lunge_cooldown = maxf(0.0, lunge_cooldown - delta)
-	if spear_thrust_cmd > 0.4 and lunge_cooldown <= 0.0:
+	if live and spear_thrust_cmd > 0.4 and lunge_cooldown <= 0.0:
 		velocity += (-global_transform.basis.z).normalized() * LUNGE_KICK * spear_thrust_cmd
 		lunge_cooldown = LUNGE_COOLDOWN
 		lunge_t = LUNGE_TIME
 		lunge_count += 1
-	if lunge_t > 0.0:
-		lunge_t = maxf(0.0, lunge_t - delta)
-		var ext := LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
+	_check_pierce_hold()
+	if lunge_t > 0.0 or spear_pierce:
+		if lunge_t > 0.0:
+			lunge_t = maxf(0.0, lunge_t - delta)
+		var ext := _spear_extension()
 		if is_instance_valid(spear_root):
 			spear_root.position.z = -ext
 		front_spike_area.position = SPIKE_BASE_POS + Vector3(0, 0, -ext)
+		# Streak sheath swells with extension (visual only).
+		if is_instance_valid(spear_glow) and spear_glow_mat != null:
+			spear_glow.visible = true
+			var glow_a := 0.55 * clampf(ext / LUNGE_DIST, 0.0, 1.0)
+			var gc := spear_glow_mat.albedo_color
+			gc.a = glow_a
+			spear_glow_mat.albedo_color = gc
 	elif is_instance_valid(spear_root) and spear_root.position.z != 0.0:
 		spear_root.position.z = 0.0
 		front_spike_area.position = SPIKE_BASE_POS
+		if is_instance_valid(spear_glow):
+			spear_glow.visible = false
 
 	# Forward motion with frame-rate-independent damping. The old per-frame
 	# *= drag made the fly's glide depend on fps (heavy/oily below 60),
@@ -508,7 +762,7 @@ func _physics_process(delta: float) -> void:
 	var pre_move_speed = velocity.length()
 	velocity += forward_vec * target_speed * delta * THRUST_GAIN
 	velocity *= pow(drag_coeff, delta * 60.0)
-	if current_thrust < 0.25:
+	if thrust_in < 0.25:
 		velocity *= pow(0.85, delta * 60.0)
 	# Hard speed cap: lunge/clash/ram transients may spike, but nothing
 	# sustains above max_speed*SPEED_CAP_MULT. Time spent pinned at the
@@ -568,6 +822,10 @@ func _handle_obstacle_impacts(impact_speed: float, delta: float) -> void:
 	# Tree trunk collisions cost chitin: fast hits tear wings, hard hits cost
 	# health, zero health augers the fly in (knockout, rival credited).
 	# Cooldown stops a single slide from shredding the fly frame by frame.
+	# Outside live rounds (intermission clinches, ceremony slides) impacts
+	# are ignored entirely - no damage, no prints, no cooldown burn.
+	if not combat_enabled:
+		return
 	obstacle_hit_cooldown = maxf(0.0, obstacle_hit_cooldown - delta)
 	if obstacle_hit_cooldown > 0.0:
 		return
@@ -579,14 +837,14 @@ func _handle_obstacle_impacts(impact_speed: float, delta: float) -> void:
 			continue
 		# Tiers sit above cruise (~5-8 m/s: safe) and at/below full
 		# thrust (12 m/s: lethal), so cruising the forest is safe and
-		# only hot flight into bark is punished.
+		# only hot flight into bark is punished. Trees HURT but never
+		# tear: wing tears come strictly from the spear point.
 		if impact_speed > 11.0:
-			tear_wing("left" if randf() < 0.5 else "right")
-			health -= 50.0
+			take_damage(50.0, "tree_slam")
 			obstacle_hit_cooldown = 1.5
-			print(fly_id, " SLAMMED a tree at ", snappedf(impact_speed, 0.1), " m/s! Wing torn.")
+			print(fly_id, " SLAMMED a tree at ", snappedf(impact_speed, 0.1), " m/s!")
 		elif impact_speed > 6.5:
-			health -= 15.0
+			take_damage(15.0, "tree_clip")
 			obstacle_hit_cooldown = 1.0
 			print(fly_id, " clipped a tree at ", snappedf(impact_speed, 0.1), " m/s.")
 		else:
@@ -628,10 +886,72 @@ func _facing_victim(victim: FlyPhysics) -> bool:
 	var local = global_transform.basis.inverse() * to_v.normalized()
 	return -local.z > 0.3
 
+func _note_pierce_if_lethal(victim: FlyPhysics) -> bool:
+	# Pierce-through arms only on a killing blow: the victim went down
+	# from this strike (tear-forfeit, puncture, bleed-out). Glancing
+	# hits never hold the spear. Returns the held state for tests.
+	if victim.is_disabled:
+		spear_pierce = true
+		return true
+	return false
+
+
+func _check_pierce_hold() -> void:
+	# Release when real time resumes (slow-mo finish over): the retract
+	# branch below re-centers on the next ticks. Self-contained so no
+	# manager coupling can leave it stuck.
+	if spear_pierce and Engine.time_scale >= 1.0:
+		spear_pierce = false
+
+
+func _spear_extension() -> float:
+	# Full reach while pierced; the sine strike-and-return otherwise.
+	if spear_pierce:
+		return LUNGE_DIST
+	return LUNGE_DIST * sin(PI * (1.0 - lunge_t / LUNGE_TIME))
+
+
+# Thorax flesh radius: the r=0.45 sphere plus the same 0.1 tick
+# epsilon the wing boxes carry. Pure (unit-tested).
+const THORAX_FLESH_R: float = 0.55
+
+
+func _tip_in_thorax(victim: FlyPhysics) -> bool:
+	var tip: Vector3 = victim.global_transform.affine_inverse() \
+		* front_spike_area.global_position
+	return tip.length() <= THORAX_FLESH_R
+
+
+func _tip_in_wing(victim: FlyPhysics) -> bool:
+	# Either wing box by the same point rule as _tip_in_wing_box
+	# (node refs, so pure-script flies without a scene read false).
+	for wing in ["LeftWingHurtbox", "RightWingHurtbox"]:
+		var area := victim.get_node_or_null(wing) as Area3D
+		if area != null and _tip_in_wing_box(victim, area):
+			return true
+	return false
+
+
+func _tip_in_wing_box(victim: FlyPhysics, area: Area3D) -> bool:	# True spear-POINT test: the steel tip (the spike area's global
+	# center - the cone tip coincides with it) must sit inside the
+	# wing hurtbox volume (+ a small tick epsilon). The r=0.35 sphere
+	# overlap alone admits sideswipes up to a body-width away from
+	# the point; those graze, never tear.
+	var local: Vector3 = victim.global_transform.affine_inverse() \
+		* front_spike_area.global_position
+	var cx := 0.9
+	if area.name == "LeftWingHurtbox":
+		cx = -0.9
+	var half := Vector3(0.6, 0.05, 0.4) + Vector3(0.1, 0.1, 0.1)
+	return absf(local.x - cx) <= half.x \
+		and absf(local.y - 0.1) <= half.y \
+		and absf(local.z + 0.1) <= half.z
+
+
 func _on_spike_hit_area(area: Area3D) -> void:
-	if is_disabled:
+	if is_disabled or not combat_enabled:
 		return
-	
+
 	var victim = area.get_parent()
 	if victim == self or not (victim is FlyPhysics):
 		return
@@ -642,8 +962,26 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		if rel_vel < 4.0:
 			# Too slow to pierce chitin
 			return
+		# Spear POINT only: the sphere overlap alone admits
+		# sideswipes; the tip must actually be inside the wing box.
+		if not _tip_in_wing_box(victim, area):
+			return
+		# One tear per exchange: if this fly already took part in a
+		# wing resolution this frame (as reporter or victim), a second
+		# report drops. The resolver stamps both participants, so a
+		# mutual exchange resolves exactly once regardless of report
+		# order - and a sole reporter always resolves (no id bias).
+		var fr := Engine.get_physics_frames()
+		if _wing_exchange_frame == fr:
+			return
+		_wing_exchange_frame = fr
+		victim._wing_exchange_frame = fr
 		victim.tear_wing("left" if area.name == "LeftWingHurtbox" else "right")
 		_spike_wound(victim)
+		# Momentum knockback: the impalement shoves the victim along the
+		# attacker's momentum; the attacker bleeds a share.
+		_apply_knockback(victim, velocity, minf(rel_vel * 0.35, 6.0))
+		_note_pierce_if_lethal(victim)
 		landed_strike.emit("wing")
 		print(fly_id, " impaled ", victim.fly_id, "'s ", area.name, "! (Rel Speed: ", rel_vel, ")")
 	elif area.name == "ThoraxHurtbox":
@@ -655,15 +993,55 @@ func _on_spike_hit_area(area: Area3D) -> void:
 		if not victim.is_disabled and _attacker_in_victim_front_arc(victim):
 			_resolve_joust(victim)
 		else:
+			victim.last_damage_source = "thorax_puncture"
+			victim.last_damage_amount = 0.0
+			victim.last_damage_t = victim.fly_time
 			victim.inflict_lethal_strike()
+			_apply_knockback(victim, velocity, minf(rel_vel * 0.4, 8.0))
+			_note_pierce_if_lethal(victim)
 			landed_strike.emit("thorax")
 			print(fly_id, " landed rear-aspect THORAX PUNCTURE on ", victim.fly_id, "!")
 	elif area.name == "FrontSpikeArea":
 		# Spike-to-spike head-on joust: resolved once (deduped), both take a
 		# body spike wound, and one side randomly gives so the pair breaks
 		# apart instead of self-cancelling into a permanent ram.
+		# Striker exception: a tip already in flesh is a STRIKE, not a
+		# mutual clash - the wing/thorax branch owns that exchange, and
+		# clashing too wounds the striker for their own hit (area
+		# callback order decided who bled). Skipped only where the
+		# strike will actually resolve (wing needs its rel_vel gate;
+		# thorax always resolves) so slow pressed grazes still unstick
+		# through the clash below.
 		if not victim.is_disabled and (rel_vel >= 2.0 or _facing_victim(victim)):
+			if _tip_in_thorax(victim) \
+					or (_tip_in_wing(victim) and rel_vel >= 4.0):
+				return
 			_resolve_spike_clash(victim)
+
+func _apply_knockback(victim: FlyPhysics, dir: Vector3, mag: float) -> void:
+	# Momentum exchange for strike contact: the victim is shoved along
+	# the attacker's momentum, the attacker bleeds a share (conservation
+	# flavor; equal masses). Never used for clash pairs (those exchange
+	# elastically via _exchange_momentum).
+	if dir.length() < 0.001:
+		return
+	dir = dir.normalized()
+	victim.velocity += dir * mag
+	velocity -= dir * mag * 0.6
+
+
+func _exchange_momentum(a: FlyPhysics, b: FlyPhysics, axis: Vector3,
+		restitution: float) -> void:
+	# Elastic exchange along the contact axis (equal masses): axial
+	# components swap proportionally to restitution; perpendicular
+	# components ride through. No energy created beyond restitution.
+	var v1a := a.velocity.dot(axis)
+	var v2a := b.velocity.dot(axis)
+	var c1 := ((1.0 - restitution) * v1a + (1.0 + restitution) * v2a) * 0.5
+	var c2 := ((1.0 + restitution) * v1a + (1.0 - restitution) * v2a) * 0.5
+	a.velocity += axis * (c1 - v1a)
+	b.velocity += axis * (c2 - v2a)
+
 
 func _resolve_spike_clash(victim: FlyPhysics) -> void:
 	if clash_cooldown > 0.0 or victim.clash_cooldown > 0.0:
@@ -679,23 +1057,24 @@ func _resolve_spike_clash(victim: FlyPhysics) -> void:
 	# Both sinks a spike into the other's body on the way apart.
 	for f in [self, victim]:
 		if not f.is_disabled:
-			f.health -= 25.0
+			f.take_damage(25.0, "spike_clash")
 			if f.health <= 0.0:
 				f.inflict_lethal_strike()
 				print(f.fly_id, " bled out in a spike clash!")
 	# Positional give along the contact axis so the capsules stop
-	# interpenetrating; knock the giver back hard, deflect the other.
+	# interpenetrating; the giver takes the bigger positional share.
 	var axis := (gives_away.global_position - braces.global_position)
 	if axis.length() < 0.001:
 		axis = Vector3(0, 0, 1)
 	axis = axis.normalized()
 	gives_away.global_position += axis * 0.6
 	braces.global_position -= axis * 0.6
-	# Elastic deflection (1.0x): separates the pair and reverses the
-	# giver without CREATING energy. The old 1.6x multiplier injected
-	# speed every clash - chained head-ons ran away to zoom velocities.
-	gives_away.velocity = -gives_away.velocity * 1.0 + Vector3.UP * 2.5
-	braces.velocity = braces.velocity * 0.4 + Vector3.UP * 1.5
+	# Momentum exchange (depends on both momentums, not programmed
+	# factors): elastic along the contact axis with mild restitution,
+	# plus a small up-bias so the pair separates instead of grinding.
+	_exchange_momentum(gives_away, braces, axis, 0.4)
+	gives_away.velocity += Vector3.UP * 2.5
+	braces.velocity += Vector3.UP * 1.5
 	clash_cooldown = CLASH_COOLDOWN
 	victim.clash_cooldown = CLASH_COOLDOWN
 	landed_strike.emit("spike_clash")
@@ -717,8 +1096,11 @@ func _resolve_joust(victim: FlyPhysics) -> void:
 	axis = axis.normalized()
 	global_position -= axis * 0.4
 	victim.global_position += axis * 0.4
-	velocity = -velocity * 0.8 + Vector3.UP * 1.5
-	victim.velocity = -victim.velocity * 0.8 + Vector3.UP * 1.5
+	# Momentum exchange (both momentums, not fixed negations): the
+	# head-on parry rebounds each side off the other's guard.
+	_exchange_momentum(self, victim, axis, 0.6)
+	velocity += Vector3.UP * 1.5
+	victim.velocity += Vector3.UP * 1.5
 	print(fly_id, " CLASHED head-on with ", victim.fly_id, "'s guard! (Parried - no puncture!)")
 
 func _spike_wound(victim: FlyPhysics) -> void:
@@ -726,12 +1108,14 @@ func _spike_wound(victim: FlyPhysics) -> void:
 	# so hits register even without a kill and bleed-outs can finish.
 	if victim.is_disabled:
 		return
-	victim.health -= 15.0
+	victim.take_damage(15.0, "spike_wound")
 	if victim.health <= 0.0:
 		victim.inflict_lethal_strike()
 		print(victim.fly_id, " bled out from spike wounds!")
 
 func tear_wing(side: String) -> void:
+	if not combat_enabled:
+		return
 	if not left_wing_intact and not right_wing_intact:
 		return
 	if side == "left":
@@ -746,10 +1130,15 @@ func tear_wing(side: String) -> void:
 	# A torn wing forfeits the fight: the fly can no longer maneuver, so the
 	# round ends immediately and the rival is credited with the knockout.
 	if not is_disabled:
+		last_damage_source = "wing_tear"
+		last_damage_amount = 0.0
+		last_damage_t = fly_time
 		is_disabled = true
 		knocked_out.emit()
 
 func inflict_lethal_strike() -> void:
+	if not combat_enabled:
+		return
 	health = 0.0
 	is_disabled = true
 	knocked_out.emit()
@@ -773,6 +1162,7 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	is_emergency_evade = false
 	spear_thrust_cmd = 0.0
 	lunge_cooldown = 0.0
+	spear_pierce = false
 	lunge_t = 0.0
 	lunge_count = 0
 	cmd_age = 0.0
@@ -781,12 +1171,26 @@ func reset_fly(spawn_pos: Vector3, spawn_rot_y: float) -> void:
 	front_spike_area.position = SPIKE_BASE_POS
 	obstacle_hit_cooldown = 0.0
 	clash_cooldown = 0.0
+	ram_t = 0.0
+	ram_cooldown = 0.0
+	ram_latched = 0.0
+	ram_charges = 0
 	capped_time = 0.0
 	fly_time = 0.0
 	peak_speed = 0.0
 	speed_exploit = false
+	seizure_time = 0.0
+	seizure_clear = 0.0
+	seizing = false
+	seizure_events = 0
+	last_damage_source = ""
+	last_damage_amount = 0.0
+	last_damage_t = 0.0
 	basis_init = false
 	prev_rival_dist = spawn_pos.distance_to(rival.global_position) if is_instance_valid(rival) else 28.0
+	scent_prev_smooth = -1.0
+	scent_lost_time = 0.0
+	scent_cast_phase = 0.0
 	if is_instance_valid(left_wing_mesh):
 		left_wing_mesh.visible = true
 	if is_instance_valid(right_wing_mesh):
@@ -849,12 +1253,23 @@ func _build_visual_model() -> void:
 	# walking pose, wrong for a flying fighter, so legs stay procedural.
 	# The cuticle carries tergite banding as vertex colors (albedo comes
 	# from the mesh, not the material).
-	var cuticle_mat := _vmat(Color(1, 1, 1), 0.62, 0.05)
+	# Warm mid-brown cuticle: vertex banding survives, but the torso
+	# can never wash white under the bright sun + sky ambient.
+	var cuticle_mat := _vmat(Color(0.6, 0.55, 0.5), 0.62, 0.05)
 	cuticle_mat.vertex_color_use_as_albedo = true
 	_scan_part(vm, "TorsoCuticle", "cuticle", cuticle_mat)
 	_scan_part(vm, "TorsoBristles", "dark", _vmat(Color(0.11, 0.08, 0.06), 0.60, 0.0))
+	# Plain tan thorax (team color arrives later via set_team_color)
+	# plus glossy crimson eyes.
 	_scan_part(vm, "BodyMesh", "thorax", _vmat(Color(0.55, 0.45, 0.30), 0.55, 0.10))
-	_scan_part(vm, "EyeMesh", "eyes", _vmat(Color(0.62, 0.12, 0.10), 0.15, 0.25))
+	eye_mat = ShaderMaterial.new()
+	eye_mat.shader = preload("res://scripts/chitin.gdshader")
+	eye_mat.set_shader_parameter("team_tint", Vector3(0.62, 0.12, 0.10))
+	eye_mat.set_shader_parameter("rim_strength", 1.6)
+	eye_mat.set_shader_parameter("roughness_lo", 0.25)
+	eye_mat.set_shader_parameter("specular_amt", 0.6)
+	eye_mat.set_shader_parameter("iridescence", 0.0)
+	_scan_part(vm, "EyeMesh", "eyes", eye_mat)
 	_scan_part(vm, "HaltereMesh", "halteres", _vmat(Color(0.70, 0.64, 0.48), 0.50, 0.10))
 	# Six jointed legs in a tucked flight pose.
 	var hip_z := [-0.28, -0.02, 0.24]
@@ -903,11 +1318,31 @@ func _spear(vm: Node3D) -> void:
 	_cone(spear_root, grip + Vector3(0, 0, -1.05), Vector3(0, 0, -1), 0.05, 0.30, steel)
 	# Crossguard bar just behind the tip cone.
 	_segment(spear_root, grip + Vector3(-0.12, 0, -1.00), grip + Vector3(0.12, 0, -1.00), 0.022, brass)
+	# Lunge streak: additive energy sheath along the shaft, visible only
+	# while the spear extends (driven in _physics_process). Team tint
+	# arrives via set_team_color; alpha is animated per-frame.
+	spear_glow_mat = StandardMaterial3D.new()
+	spear_glow_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	spear_glow_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	spear_glow_mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	spear_glow_mat.albedo_color = Color(1.0, 0.9, 0.7, 0.0)
+	spear_glow = MeshInstance3D.new()
+	spear_glow.name = "SpearGlow"
+	var gm := CylinderMesh.new()
+	gm.top_radius = 0.07
+	gm.bottom_radius = 0.07
+	gm.height = 1.7
+	gm.radial_segments = 8
+	gm.material = spear_glow_mat
+	spear_glow.mesh = gm
+	spear_glow.rotation_degrees.x = 90.0
+	spear_glow.position = grip + Vector3(0, 0, -0.35)
+	spear_glow.visible = false
+	spear_root.add_child(spear_glow)
 	# Real wing membranes + veins hung under the gameplay pivots; pivots
 	# move to the scan hinge positions from the manifest.
-	var membrane_mat := _vmat(Color(0.90, 0.93, 1.0, 0.42), 0.08, 0.15)
-	membrane_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	membrane_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	membrane_mat = ShaderMaterial.new()
+	membrane_mat.shader = preload("res://scripts/wing.gdshader")
 	var vein_mat := _vmat(Color(0.25, 0.18, 0.12), 0.50, 0.10)
 	_hang_scan_wing("Left", "wingL_membrane", "wingL_veins", membrane_mat, vein_mat)
 	_hang_scan_wing("Right", "wingR_membrane", "wingR_veins", membrane_mat, vein_mat)

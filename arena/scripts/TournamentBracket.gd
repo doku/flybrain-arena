@@ -12,6 +12,9 @@ var CARD_W := 210.0
 var CARD_H := 92.0
 var GAP_X := 52.0
 var ROW_GAP := 16.0
+var CARD_PAD := 6.0
+var CARD_SEP := 2
+var ROW_H := 24.0
 const TOP_PAD := 32.0
 const SIDE_PAD := 12.0
 # Font sizes paired with the metrics above.
@@ -28,21 +31,54 @@ const COL_TBD := Color(0.55, 0.55, 0.6)
 const COL_CHAMP := Color(1.0, 0.85, 0.35)
 const COL_LOSER := Color(1.0, 0.35, 0.3)
 const COL_LOSER_DIM := Color(0.75, 0.3, 0.28, 0.85)
+const COL_SHOWCASE := Color(0.35, 0.85, 1.0)
+# Gallery marker: red asterisk beside the showcased fighter's name.
+# Gold (COL_LIVE) is reserved for the live/current-match card only.
+const COL_MARKER := Color(1.0, 0.38, 0.3)
 
 var segments: Array = []
 # View-relative losers start for _round_name (0 in losers-focus mode).
 var _lf_view := -1
+# Gallery spotlight (waiting-room preview): bracket key (fighter id or
+# "offspring:<kind>" placeholder) -> its round-0 card. Orthogonal to the
+# live/decided borders; cleared on every re-render.
+var spotlight_key := ""
+# Live result preview (report-wait only): {round, match, winner_slot}
+# stamped by the arena at report time so the just-decided battle reads
+# on its card before the server reply banks it. Arena-owned (set at
+# report, cleared on reply/load); never mutated here, never persisted.
+var live_preview: Dictionary = {}
+var _spot_cards := {}
+const SPOT_PREFIX := "offspring:"
+# Gallery showcase (waiting-room preview): fighter id (or
+# "offspring:<kind>" placeholder) -> every name Label spelling it, in
+# all views. Painted cyan; base colors restore from label meta.
+var showcase_key := ""
+var _show_rows := {}
+var _show_kids: Array = []
 
 
-func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1) -> void:
+## View modes: 0 = auto (focus-swap while live losers run, main
+## bracket only at review - the appended losers rounds jumble the
+## single-elim layout), 1 = main bracket only, 2 = losers bracket
+## only (forced focus rendering, works at review time too), 3 = group
+## fixture (round-robin rounds as plain columns: no TBD synthesis, no
+## connectors, no champion node, plain ROUND headers).
+func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -1, view: int = 0) -> void:
 	for c in get_children():
 		remove_child(c)
 		c.queue_free()
 	segments.clear()
+	_spot_cards.clear()
+	spotlight_key = ""
+	_show_rows.clear()
+	showcase_key = ""
+	_show_kids.clear()
 	var rounds: Array = tourney.get("rounds", [])
-	if rounds.is_empty():
+	var losers_from := int(tourney.get("losers_start_round", -1))
+	if rounds.is_empty() or (view == 2 and (losers_from < 0 or losers_from >= rounds.size())):
 		var ph := Label.new()
-		ph.text = "No tournament."
+		ph.text = "No losers bracket." if view == 2 else "No tournament."
 		ph.position = Vector2(SIDE_PAD, SIDE_PAD)
 		add_child(ph)
 		custom_minimum_size = Vector2(200, 60)
@@ -52,20 +88,44 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Focus mode: while live losers rounds are playing (and the
 	# tournament is still running), the losers bracket REPLACES the main
 	# one - 2-3 narrow columns instead of 6+, so it fits on screen.
-	# At review time (complete) the full bracket comes back.
-	var losers_from := int(tourney.get("losers_start_round", -1))
+	# At review time (complete) the full bracket comes back (auto view).
 	var focus := losers_from > 0 and cur_round >= losers_from \
 		and str(tourney.get("status", "")) == "running"
 	var shown: Array = rounds.duplicate()
+	if view == 0 and str(tourney.get("status", "")) != "running":
+		# Review time: auto view shows the winners' bracket only.
+		view = 1
+	if view == 1 and losers_from > 0:
+		# Main page: losers live on their own view, never appended here
+		# (and never focus-swapped in, even while consolation is live).
+		shown = shown.slice(0, losers_from)
+		losers_from = -1
+		focus = false
+	elif view == 2:
+		# Losers page: force focus rendering at any status.
+		focus = true
 	if focus:
 		shown = shown.slice(losers_from)
 		cur_round = cur_round - losers_from
 		losers_from = 0
+	if shown.is_empty():
+		var ph2 := Label.new()
+		ph2.text = "No tournament."
+		ph2.position = Vector2(SIDE_PAD, SIDE_PAD)
+		add_child(ph2)
+		custom_minimum_size = Vector2(200, 60)
+		size = custom_minimum_size
+		queue_redraw()
+		return
 	_lf_view = losers_from
+	var group_mode := view == 3
 	# TBA templates (display-only, never written back): synthesize future
 	# main rounds from tournament size, and future losers rounds by
 	# halving, so the whole bracket is visible before matches resolve.
-	if focus:
+	# Group fixtures are complete schedules: nothing is synthesized.
+	if group_mode:
+		pass
+	elif focus:
 		while (shown[shown.size() - 1] as Array).size() > 1:
 			var _prev2: Array = shown[shown.size() - 1]
 			shown.append(_tbd_round(maxi(1, int(ceil(float(_prev2.size()) / 2.0)))))
@@ -86,8 +146,8 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 				shown.append(_tbd_round(maxi(1, int(ceil(float(_prev3.size()) / 2.0)))))
 	rounds = shown
 	var n_rounds: int = rounds.size()
-	var cols: int = n_rounds + 1  # + champion/last-place column
-	_apply_metrics(cols, (rounds[0] as Array).size())
+	var cols: int = n_rounds if group_mode else n_rounds + 1
+	_apply_metrics(cols, (rounds[0] as Array).size(), group_mode)
 	# Column x positions.
 	var xs: Array = []
 	for i in range(cols):
@@ -95,13 +155,15 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Round header labels. Focus mode's final column is LAST PLACE.
 	for i in range(n_rounds):
 		add_child(_make_header(str(xs[i]), _round_name(i, n_rounds, tourney)))
-	add_child(_make_header(str(xs[n_rounds]), "LAST PLACE" if focus else "CHAMPION"))
-	# Card tops per round for feeder-centering.
+	if not group_mode:
+		add_child(_make_header(str(xs[n_rounds]), "LAST PLACE" if focus else "CHAMPION"))
+	# Card tops per round for feeder-centering (group fixtures stack
+	# every round straight: columns are fixtures, not progression).
 	var tops: Array = []
 	for r in range(n_rounds):
 		var rtops: Array = []
 		var rms: Array = rounds[r]
-		if r == 0:
+		if r == 0 or group_mode:
 			for mi in range(rms.size()):
 				rtops.append(TOP_PAD + mi * (CARD_H + ROW_GAP))
 		else:
@@ -124,9 +186,15 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 			var card := _make_match_card(m, r, mi, live, loser_adv)
 			card.position = Vector2(float(xs[r]), float(tops[r][mi]))
 			add_child(card)
+			if r == 0:
+				_register_spot(m, "a", card)
+				_register_spot(m, "b", card)
 	# Connectors from feeders into each later-round match. Edges
 	# landing in losers rounds draw muted red (distinct consolation).
+	# Group fixtures imply no progression, so they draw none.
 	for r in range(1, n_rounds):
+		if group_mode:
+			break
 		var rms3: Array = rounds[r]
 		var prev2: Array = tops[r - 1]
 		var loser_edge := losers_from >= 0 and r >= losers_from
@@ -146,8 +214,10 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Champion node centered on the main final; with consolation, a
 	# LAST PLACE node hangs off the losers final in red. Focus mode
 	# skips the champion (main bracket hidden) and the final column
-	# carries LAST PLACE alone.
-	if focus:
+	# carries LAST PLACE alone. Group fixtures crown nobody.
+	if group_mode:
+		pass
+	elif focus:
 		var f_tops: Array = tops[n_rounds - 1]
 		var f_mid: float = float(f_tops[f_tops.size() - 1]) + CARD_H * 0.5
 		var flast := _make_last_place_card(_last_place_name(tourney), tourney)
@@ -184,9 +254,242 @@ func render_bracket(tourney: Dictionary, cur_round: int = -1, cur_match: int = -
 	# Size for scroll containers.
 	var n0: Array = rounds[0]
 	var height: float = TOP_PAD + n0.size() * (CARD_H + ROW_GAP) + SIDE_PAD
-	custom_minimum_size = Vector2(float(xs[n_rounds]) + CARD_W + SIDE_PAD, height)
+	var last_x: float = float(xs[n_rounds - 1]) if group_mode else float(xs[n_rounds])
+	custom_minimum_size = Vector2(last_x + CARD_W + SIDE_PAD, height)
 	size = custom_minimum_size
 	queue_redraw()
+
+
+func _register_spot(m: Dictionary, slot: String, card: PanelContainer) -> void:
+	# Round-0 slots register under fighter id or placeholder key so the
+	# gallery can spotlight them later. TBD/vacant slots have no key.
+	var key := str(m.get("a_id" if slot == "a" else "b_id", ""))
+	var nm := str(m.get("a_name" if slot == "a" else "b_name", ""))
+	if key == "" or nm == "" or nm == "TBD":
+		return
+	_spot_cards[key] = card
+
+
+func set_spotlight(key: String) -> void:
+	# Tracks the gallery's showcased fighter key (round-0 card holder);
+	# no-op for unknown keys. Re-callers re-render first, which clears.
+	# Deliberately paints NOTHING: gold (COL_LIVE) is reserved for the
+	# live/current-match card, and the showcase asterisk (set_showcase)
+	# is the gallery marker.
+	if key == spotlight_key:
+		return
+	clear_spotlight()
+	if key == "" or not _spot_cards.has(key):
+		return
+	spotlight_key = key
+
+
+func clear_spotlight() -> void:
+	if spotlight_key != "" and _spot_cards.has(spotlight_key):
+		var card: PanelContainer = _spot_cards[spotlight_key]
+		var base: Color = card.get_meta("base_border")
+		_paint_card(card, base, int(card.get_meta("base_bw")))
+	spotlight_key = ""
+
+
+func spotlight_applied() -> String:
+	return spotlight_key
+
+
+func _register_show(key: String, nm: Label) -> void:
+	# Every name Label spelling a fighter id (all rounds, all views),
+	# so the gallery's showcased fighter lights up everywhere at once.
+	# Base color rides label meta for restore (spotlight-border pattern).
+	if key == "":
+		return
+	nm.set_meta("base_color", nm.get_theme_color("font_color"))
+	if not _show_rows.has(key):
+		_show_rows[key] = []
+	(_show_rows[key] as Array).append(nm)
+
+
+func set_showcase(key: String) -> void:
+	# Paints the showcased fighter's every name cyan (gallery sync) and
+	# shows its red asterisk marker; no-op for unknown keys. Recurses
+	# into fixture sub-brackets. Re-callers re-render first, which
+	# clears.
+	if key == showcase_key:
+		return
+	clear_showcase()
+	if key == "" or not _show_rows.has(key):
+		return
+	showcase_key = key
+	for nm in (_show_rows[key] as Array):
+		# Standings-table rows register for the cyan name paint but
+		# carry no asterisk marker (fixture rows own those Labels):
+		# has_meta first, because get_meta on a missing key errors on
+		# some builds despite the default arg. Same guard as
+		# clear_showcase below; freed rows from a prior render are
+		# skipped the same way.
+		var lbl := nm as Label
+		if not is_instance_valid(lbl):
+			continue
+		lbl.add_theme_color_override("font_color", COL_SHOWCASE)
+		if not lbl.has_meta("asterisk"):
+			continue
+		var st = lbl.get_meta("asterisk")
+		if st is Label and is_instance_valid(st):
+			(st as Label).visible = true
+	for kid in _show_kids:
+		kid.set_showcase(key)
+
+
+func clear_showcase() -> void:
+	if showcase_key != "" and _show_rows.has(showcase_key):
+		for nm in (_show_rows[showcase_key] as Array):
+			var lbl := nm as Label
+			if is_instance_valid(lbl) and lbl.has_meta("base_color"):
+				lbl.add_theme_color_override("font_color",
+					lbl.get_meta("base_color"))
+			if is_instance_valid(lbl) and lbl.has_meta("asterisk"):
+				var st = lbl.get_meta("asterisk")
+				if st is Label and is_instance_valid(st):
+					(st as Label).visible = false
+	showcase_key = ""
+	for kid in _show_kids:
+		kid.clear_showcase()
+
+
+func showcase_applied() -> String:
+	return showcase_key
+
+
+func _paint_card(card: PanelContainer, border: Color, bw: int) -> void:
+	# Mutates the card's own StyleBoxFlat (each card gets a fresh one
+	# in _card_panel, so neighbors are untouched).
+	var sb := card.get_theme_stylebox("panel") as StyleBoxFlat
+	if sb == null:
+		return
+	sb.border_color = border
+	sb.set_border_width_all(bw)
+
+
+func render_event_groups(data: Dictionary, current: String = "") -> void:
+	# 2x2 event overview: A|B over C|D. Each quadrant shows its group
+	# header, standings rows (W-L, KO, top-2 starred) and pairing rows
+	# with battle scores. The live pairing is gold-framed, the current
+	# group gold-bordered; finished groups dim. Display-only.
+	for c in get_children():
+		remove_child(c)
+		c.queue_free()
+	segments.clear()
+	_spot_cards.clear()
+	spotlight_key = ""
+	_show_rows.clear()
+	showcase_key = ""
+	_show_kids.clear()
+	_apply_metrics(4, 4)
+	var groups: Array = data.get("groups", [])
+	if groups.size() != 4:
+		var ph := Label.new()
+		ph.text = "No event."
+		ph.position = Vector2(SIDE_PAD, SIDE_PAD)
+		add_child(ph)
+		custom_minimum_size = Vector2(200, 60)
+		size = custom_minimum_size
+		queue_redraw()
+		return
+	var grid := VBoxContainer.new()
+	grid.add_theme_constant_override("separation", 8)
+	grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	add_child(grid)
+	for r in range(2):
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 8)
+		row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		grid.add_child(row)
+		for k in range(2):
+			row.add_child(_make_group_panel(groups[r * 2 + k], current))
+	custom_minimum_size = Vector2(760, 560)
+	size = custom_minimum_size
+	queue_redraw()
+
+
+func _make_group_panel(cell: Dictionary, current: String) -> PanelContainer:
+	var letter := str(cell.get("letter", "?"))
+	var is_current := letter == current
+	var is_done := bool(cell.get("is_done", false))
+	var border := Color(0.3, 0.3, 0.36)
+	var bw := 1
+	if is_current:
+		border = COL_LIVE
+		bw = 3
+	var card := _card_panel(border, bw)
+	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	card.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", CARD_SEP)
+	card.add_child(vb)
+	var head := Label.new()
+	var htxt := "GROUP %s" % letter
+	if is_current:
+		htxt += "  •  LIVE"
+	elif is_done:
+		htxt += "  •  FINAL"
+	head.text = htxt
+	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	head.add_theme_font_size_override("font_size", FS_CARD_HEAD + 2)
+	head.add_theme_color_override("font_color",
+		COL_LIVE if is_current else (Color(0.55, 0.55, 0.6) if is_done else Color(0.75, 0.75, 0.8)))
+	vb.add_child(head)
+	# Leader tags (ties share): most wins and most knockouts, only
+	# once somebody actually banked them (a fresh 0-0 table tags no
+	# one). Expanded words, not shorthand: "Wins: 2, Losses: 1".
+	var top_w := -1.0
+	var top_k := -1
+	for srow in (cell.get("standings", []) as Array):
+		var rd := srow as Dictionary
+		top_w = maxf(top_w, float(rd.get("wins", 0)))
+		top_k = maxi(top_k, int(rd.get("kos", 0)))
+	var i := 0
+	for srow in (cell.get("standings", []) as Array):
+		i += 1
+		var rd := srow as Dictionary
+		var sw := float(rd.get("wins", 0))
+		var sk := int(rd.get("kos", 0))
+		var tags := ""
+		if sw >= top_w and top_w > 0.0:
+			tags += "  •  WINS LEADER"
+		if sk >= top_k and top_k > 0:
+			tags += "  •  KO LEADER"
+		var sl := Label.new()
+		sl.text = "%s%d. %s  —  Wins: %s, Losses: %s, Knockouts: %d%s" % [
+			"★" if i <= 2 else "  ", i, str(rd.get("name", "?")),
+			_fmt_wins(sw), _fmt_wins(float(rd.get("matches", 0)) - sw),
+			sk, tags]
+		sl.add_theme_font_size_override("font_size", FS_ROW)
+		sl.clip_text = true
+		sl.add_theme_color_override("font_color",
+			Color(0.5, 0.5, 0.55) if (is_done and i > 2) else Color(0.92, 0.92, 0.94))
+		# Showcase registry (gallery sync): quadrant table rows too.
+		var show_id := str(rd.get("id", ""))
+		if show_id != "":
+			_register_show(show_id, sl)
+		vb.add_child(sl)
+	# Fixture cards: the group's own rounds in group view mode (real
+	# versus cards with live/result coloring, no finals, no champion).
+	var mini := {"rounds": cell.get("rounds", []),
+		"players": cell.get("players", []), "size": 4, "format": "groups",
+		"status": "running", "quick": false}
+	# Self-instantiation (class_name is unresolvable inside its own
+	# script at compile time): load the script resource instead.
+	var sub = load("res://scripts/TournamentBracket.gd").new()
+	sub.render_bracket(mini, int(cell.get("cur_round", -1)),
+		int(cell.get("cur_match", -1)), 3)
+	sub.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sub.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vb.add_child(sub)
+	# Showcase forwarding (gallery sync): fixture rows paint with us.
+	_show_kids.append(sub)
+	sub.set_showcase(showcase_key)
+	return card
 
 
 func _draw() -> void:
@@ -198,6 +501,8 @@ func _draw() -> void:
 
 
 func _round_name(r: int, n_rounds: int, tourney: Dictionary) -> String:
+	if str(tourney.get("format", "")) == "groups":
+		return "ROUND %d" % (r + 1)
 	var losers_from := _lf_view
 	if losers_from >= 0 and r >= losers_from:
 		if r == n_rounds - 1:
@@ -237,8 +542,13 @@ func _make_last_place_card(last_name: String, tourney: Dictionary) -> PanelConta
 	vb.add_child(head)
 	var nm := Label.new()
 	nm.text = last_name
-	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	# Left-aligned in a card-bounded rect: long names clip the tail
+	# (prefix survives, like match rows). Centered text would overdraw
+	# the card edge on both sides and lose both ends of the name.
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	nm.clip_text = true
+	nm.custom_minimum_size = Vector2(CARD_W - 16.0, 0.0)
+	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nm.add_theme_font_size_override("font_size", FS_BIG_NAME)
 	nm.add_theme_color_override("font_color", COL_LOSER if decided else COL_TBD)
 	vb.add_child(nm)
@@ -270,39 +580,48 @@ func _make_header(x: String, text: String) -> Label:
 func _card_panel(border: Color, border_w: int) -> PanelContainer:
 	var pc := PanelContainer.new()
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.08, 0.08, 0.11, 0.96)
+	sb.bg_color = Color(0.08, 0.08, 0.11, 0.88)
 	sb.border_color = border
 	sb.set_border_width_all(border_w)
 	sb.set_corner_radius_all(6)
 	sb.content_margin_left = 8.0
 	sb.content_margin_right = 8.0
-	sb.content_margin_top = 6.0
-	sb.content_margin_bottom = 6.0
+	sb.content_margin_top = CARD_PAD
+	sb.content_margin_bottom = CARD_PAD
 	pc.add_theme_stylebox_override("panel", sb)
 	pc.custom_minimum_size = Vector2(CARD_W, CARD_H)
 	pc.size = Vector2(CARD_W, CARD_H)
 	return pc
 
 
-func _apply_metrics(cols: int, rows0: int) -> void:
-	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond
-	# (size-8 fresh = 4 cols fits at 690px). CARD_H must clear the card
-	# content (~78px: margins + header + two 24px rows) or text spills
-	# into the neighbor card.
-	if cols > 3 or rows0 > 3:
-		CARD_W = 120.0
-		CARD_H = 84.0
-		GAP_X = 22.0
-		ROW_GAP = 8.0
+func _apply_metrics(cols: int, rows0: int, group_mode: bool = false) -> void:
+	# Normal metrics up to 3 columns / 3 rows (size 4); compact beyond.
+	# Group fixtures render 3 columns inside event-overview quadrants,
+	# so they take the compact set to fit 2-up.
+	# Compact CARD_H must clear the card content (~56px: 3+3 margins +
+	# header + separation + two 18px rows) or text spills into the
+	# neighbor card. Compact pitch is 70px/card, so a size-8 first
+	# round (4 cards) fits in 324px without scrolling.
+	if cols > 3 or rows0 > 3 or group_mode:
+		CARD_W = 108.0
+		CARD_H = 64.0
+		GAP_X = 16.0
+		ROW_GAP = 6.0
+		CARD_PAD = 3.0
+		CARD_SEP = 1
+		ROW_H = 18.0
 		FS_COL_HEAD = 12
 		FS_CARD_HEAD = 10
-		FS_ROW = 12
+		FS_ROW = 10
 		FS_BIG_NAME = 14
 	else:
-		CARD_W = 210.0
-		CARD_H = 92.0
-		GAP_X = 52.0
+		CARD_W = 190.0
+		CARD_H = 88.0
+		GAP_X = 40.0
 		ROW_GAP = 16.0
+		CARD_PAD = 5.0
+		CARD_SEP = 2
+		ROW_H = 24.0
 		FS_COL_HEAD = 15
 		FS_CARD_HEAD = 12
 		FS_ROW = 15
@@ -332,8 +651,10 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 	elif decided:
 		border = Color(0.35, 0.55, 0.38)
 	var card := _card_panel(border, bw)
+	card.set_meta("base_border", border)
+	card.set_meta("base_bw", bw)
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 2)
+	vb.add_theme_constant_override("separation", CARD_SEP)
 	card.add_child(vb)
 	var head := Label.new()
 	var htxt := "R%d · M%d" % [r + 1, mi + 1]
@@ -343,32 +664,66 @@ func _make_match_card(m: Dictionary, r: int, mi: int, live: bool, loser_adv: boo
 		htxt += "  •  BYE"
 	elif vacant:
 		htxt += "  •  VACANT"
+	elif bool(m.get("skipped", false)):
+		htxt += "  •  SKIP"
+	elif bool(m.get("drawn", false)):
+		htxt += "  •  DRAW SPLIT"
+	elif bool(m.get("decided_by_draw", false)):
+		htxt += "  •  DRAW-BREAK"
 	elif loser_adv:
 		htxt += "  •  LOSER ADV"
 	head.text = htxt
 	head.add_theme_font_size_override("font_size", FS_CARD_HEAD)
 	head.add_theme_color_override("font_color", COL_LIVE if live else Color(0.6, 0.6, 0.65))
 	vb.add_child(head)
-	var wa: int = int(m.get("wins_a", 0))
-	var wb: int = int(m.get("wins_b", 0))
-	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided, loser_adv))
-	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided, loser_adv))
+	var wa: float = float(m.get("wins_a", 0))
+	var wb: float = float(m.get("wins_b", 0))
+	# Report-wait preview: tint +1 the just-decided winner before the
+	# server reply banks it. Row text untouched (fixed card budget).
+	var pv_a := false
+	var pv_b := false
+	if live and not live_preview.is_empty() \
+			and int(live_preview.get("round", -999)) == r \
+			and int(live_preview.get("match", -999)) == mi:
+		if str(live_preview.get("winner_slot", "")) == "alpha":
+			wa += 1.0
+			pv_a = true
+		elif str(live_preview.get("winner_slot", "")) == "beta":
+			wb += 1.0
+			pv_b = true
+	vb.add_child(_make_row(str(m.get("a_name", "TBD")), wa, m, "a", live, decided, loser_adv, pv_a))
+	vb.add_child(_make_row(str(m.get("b_name", "TBD")), wb, m, "b", live, decided, loser_adv, pv_b))
 	return card
 
 
-func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false) -> HBoxContainer:
+func _fmt_wins(v: float) -> String:
+	# Fractional match wins (0.5 splits) print trimmed ("2.5"), ints
+	# stay ints ("3").
+	return "%d" % int(v) if absf(v - float(int(v))) < 0.01 else "%.1f" % v
+
+
+func _make_row(pname: String, score: float, m: Dictionary, slot: String, live: bool, decided: bool, loser_adv: bool = false, preview_win: bool = false) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	var nm := Label.new()
 	var vacant: bool = bool(m.get("vacant", false))
-	nm.text = "-" if vacant else (pname if pname != "" else "TBD")
+	# Unbred offspring ride synthetic "offspring:<kind>" ids (preview
+	# only): dim TRAINING rows that can never read as banked fighters.
+	var training: bool = str(m.get("a_id" if slot == "a" else "b_id", "")) \
+		.begins_with(SPOT_PREFIX)
+	var label := "-" if vacant else (pname if pname != "" else "TBD")
+	if training and not vacant:
+		label += " · TRAINING"
+	nm.text = label
 	nm.clip_text = true
-	nm.custom_minimum_size = Vector2(CARD_W - 60.0, 24.0)
+	nm.custom_minimum_size = Vector2(CARD_W - 60.0, ROW_H)
 	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nm.add_theme_font_size_override("font_size", FS_ROW)
 	var col := Color(0.92, 0.92, 0.94)
 	if vacant:
 		col = Color(0.28, 0.28, 0.32)
+	elif training:
+		col = Color(0.78, 0.72, 0.55)
 	elif pname == "" or pname == "TBD":
 		col = COL_TBD
 	elif decided:
@@ -377,10 +732,30 @@ func _make_row(pname: String, score: int, m: Dictionary, slot: String, live: boo
 			col = COL_LOSE if won else COL_WIN
 		else:
 			col = COL_WIN if won else COL_LOSE
+	elif preview_win:
+		col = COL_WIN
 	nm.add_theme_color_override("font_color", col)
+	# Showcase registry (gallery sync): every spelled name, all views.
+	var show_key := str(m.get("a_id" if slot == "a" else "b_id", ""))
+	if show_key != "" and not vacant and label != "TBD":
+		_register_show(show_key, nm)
 	row.add_child(nm)
+	# Gallery marker: red asterisk after the name, before the score.
+	# A separate Label (not a text suffix) so the star stays red while
+	# the name keeps its state color, and it never clips away with the
+	# name text.
+	var st := Label.new()
+	st.text = "*"
+	st.clip_text = false
+	st.custom_minimum_size = Vector2(10.0, ROW_H)
+	st.add_theme_font_size_override("font_size", FS_ROW)
+	st.add_theme_color_override("font_color", COL_MARKER)
+	st.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	st.visible = false
+	row.add_child(st)
+	nm.set_meta("asterisk", st)
 	var sc := Label.new()
-	sc.text = str(score)
+	sc.text = _fmt_wins(score) if not training else "…"
 	sc.add_theme_font_size_override("font_size", FS_ROW)
 	sc.add_theme_color_override("font_color", col)
 	row.add_child(sc)
@@ -402,8 +777,12 @@ func _make_champ_card(champ_name: String, tourney: Dictionary) -> PanelContainer
 	vb.add_child(head)
 	var nm := Label.new()
 	nm.text = champ_name
-	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	# Same card-bounded left-aligned rule as the last-place card:
+	# centered long names overdraw the border and read clipped.
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	nm.clip_text = true
+	nm.custom_minimum_size = Vector2(CARD_W - 16.0, 0.0)
+	nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nm.add_theme_font_size_override("font_size", FS_BIG_NAME)
 	nm.add_theme_color_override("font_color", COL_CHAMP if decided else COL_TBD)
 	vb.add_child(nm)
