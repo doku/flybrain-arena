@@ -99,8 +99,37 @@ def main():
     log_thread.start()
     print(f"[*] Server log: {server_log}")
 
-    # Wait for server ready message
-    time.sleep(2.5)
+    # Wait for the real ready line, not a fixed sleep: on throttled
+    # machines the base-graph load takes 15s+ (cold: far more), and
+    # Godot must never boot into a dead link - first loads then fail
+    # for minutes with no visible reason. Deadline-based so a wedged
+    # server can't hold the launcher forever; only content appended
+    # after our launch counts (old runs left stale ready lines).
+    try:
+        ready_mark = os.path.getsize(server_log)
+    except OSError:
+        ready_mark = 0
+    t0 = time.time()
+    server_up = False
+    while time.time() - t0 < 240.0:
+        if server_proc.poll() is not None:
+            print(f"[FATAL] Server exited during boot (code "
+                  f"{server_proc.returncode}). See {server_log}. Aborting.")
+            sys.exit(3)
+        try:
+            with open(server_log, "r", encoding="utf-8") as f:
+                f.seek(max(0, ready_mark))
+                if "UDP Listening" in f.read():
+                    server_up = True
+                    break
+        except OSError:
+            pass
+        time.sleep(1.0)
+    if server_up:
+        print(f"[*] Server ready in {time.time() - t0:.0f}s - launching Godot.")
+    else:
+        print("[WARN] Server not answering after 240s - launching anyway "
+              "(watch the link status line in the arena).")
 
     # 2. Launch Godot 4 (main scene = vault menu, unless --direct)
     print("[2/2] Launching Godot 4...")

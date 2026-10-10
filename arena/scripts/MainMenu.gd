@@ -1930,6 +1930,10 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 	if not bool(beg.get("ok", false)):
 		bracket_status.text = "Cannot start: %s" % str(beg.get("error", "?"))
 		return
+	# Staged progress: each step paints before the next runs (the menu
+	# used to freeze silently through all of this on slow machines).
+	bracket_status.text = "EVENT %s manifest ready - pre-warming brains on the server..." % str(beg.get("event_id", ""))
+	await get_tree().process_frame
 	# Bind pre-warm for the whole roster (fire-and-forget): genome
 	# compiles land under the group builds + tip-off, not post-ack.
 	var warmer = load("res://scripts/BrainClient.gd").new()
@@ -1951,6 +1955,8 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 	if not bool(gres.get("ok", false)):
 		bracket_status.text = "Cannot start: %s" % str(gres.get("error", "?"))
 		return
+	bracket_status.text = "EVENT %s group A built - building B/C/D..." % eid
+	await get_tree().process_frame
 	var evo1 := {"active": true, "generation": 1, "episodes": 50,
 		"mutate_traits": int(settings.get("mutate_traits", 1)),
 		"pending": [], "done": {}}
