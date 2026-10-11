@@ -35,8 +35,62 @@ func test_prefill_num_null_falls_back() -> void:
 	m.queue_free()
 
 
+func _write_resume_json(path: String, data: Dictionary) -> void:
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(JSON.stringify(data))
+	f.close()
+
+
+func test_find_resume_file() -> void:
+	# Resume takes the newest RUNNING tournament: pointer files
+	# (_last_battle_verdict), event ledgers (E*) and finished
+	# brackets never qualify, whatever their mtimes. The director
+	# global is reached as the autoload singleton (the -s runner
+	# compiles before autoload names exist, so the bare identifier
+	# will not compile here).
+	var scr = load("res://scripts/MainMenu.gd")
+	_check(scr != null and scr.can_instantiate(), "menu script loads")
+	if scr == null:
+		return
+	var TD = root.get_node_or_null("TournamentDirector")
+	_check(TD != null, "director singleton live")
+	if TD == null:
+		return
+	var m = scr.new()
+	m._build_layout()
+	var old_dir: String = TD.tournament_dir
+	TD.tournament_dir = "user://test_resume"
+	DirAccess.make_dir_recursive_absolute("user://test_resume")
+	var td: String = TD.tournament_dir
+	_write_resume_json(td.path_join("Tdead.json"),
+		{"id": "DEAD", "status": "complete", "rounds": [[]]})
+	_write_resume_json(td.path_join("Trun.json"),
+		{"id": "RUN", "status": "running", "rounds": [[]]})
+	_write_resume_json(td.path_join("_last_battle_verdict.json"),
+		{"key": "x", "result": {}})
+	_write_resume_json(td.path_join("Eev.json"),
+		{"id": "E", "status": "running", "rounds": [[]]})
+	_check(m._find_resume_file().ends_with("Trun.json"),
+		"resume picks the running bracket")
+	# Nothing runnable: empty, and _on_resume says so instead of
+	# opening a stranger.
+	DirAccess.remove_absolute(td.path_join("Trun.json"))
+	_check(m._find_resume_file() == "", "no running bracket finds none")
+	TD.tourney = {}
+	m._on_resume()
+	_check(str(m.bracket_status.text).begins_with("No running bracket"),
+		"empty resume names the next step")
+	m.queue_free()
+	TD.tournament_dir = old_dir
+	if DirAccess.dir_exists_absolute("user://test_resume"):
+		for f in DirAccess.get_files_at("user://test_resume"):
+			DirAccess.remove_absolute("user://test_resume".path_join(f))
+		DirAccess.remove_absolute("user://test_resume")
+
+
 func _initialize() -> void:
 	test_prefill_num_null_falls_back()
+	test_find_resume_file()
 	if failures == 0:
 		print("ALL MENU-PREFILL TESTS PASSED")
 	else:

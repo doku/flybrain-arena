@@ -933,7 +933,9 @@ func _build_tourney_column() -> HBoxContainer:
 	tourney_size = OptionButton.new()
 	for s in TournamentDirector.size_options():
 		tourney_size.add_item(str(s))
-	tourney_size.selected = 1
+	# Default 16: the grouped continuous event is the main game;
+	# smaller single-elim sizes stay one click away.
+	tourney_size.selected = 2
 	c.add_child(tourney_size)
 	tourney_bestof = OptionButton.new()
 	for b in TournamentDirector.best_of_options():
@@ -2032,29 +2034,52 @@ func _refresh_resume() -> void:
 		bracket_status.text = "No live tournament."
 
 
+func _find_resume_file() -> String:
+	# Newest RUNNING tournament under tournaments/. Event manifests
+	# (E*.json) are chain ledgers and pointer files
+	# (_last_battle_verdict.json) are not brackets - both are skipped,
+	# and each candidate must parse as a running tournament, so a
+	# stale/dead file can never strand the button silently or open a
+	# bracket-shaped stranger. Pure readout (never mutates tourney).
+	var dir := DirAccess.open(TournamentDirector.tournament_dir)
+	if dir == null:
+		return ""
+	var cands: Array = []
+	for f in dir.get_files():
+		if not f.ends_with(".json") or f.begins_with("E") \
+				or f == "_last_battle_verdict.json":
+			continue
+		cands.append(TournamentDirector.tournament_dir.path_join(f))
+	cands.sort_custom(func(a, b):
+		return FileAccess.get_modified_time(a) > FileAccess.get_modified_time(b))
+	for p in cands:
+		var q := FileAccess.open(p, FileAccess.READ)
+		if q == null:
+			continue
+		var parsed = JSON.parse_string(q.get_as_text())
+		q.close()
+		if parsed is Dictionary and not (parsed as Dictionary).is_empty() \
+				and str((parsed as Dictionary).get("status", "")) == "running" \
+				and (parsed as Dictionary).has("rounds"):
+			return p
+	return ""
+
+
 func _on_resume() -> void:
 	if TournamentDirector.tournament_active():
 		get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
 		return
-	# File resume: latest running state under tournaments/ (event
-	# manifests E*.json are chain ledgers, never brackets - skip them).
-	var dir := DirAccess.open(TournamentDirector.tournament_dir)
-	if dir == null:
-		return
-	var latest := ""
-	var latest_mtime := 0
-	for f in dir.get_files():
-		if f.ends_with(".json") and not f.begins_with("E"):
-			var p: String = TournamentDirector.tournament_dir.path_join(f)
-			if FileAccess.get_modified_time(p) > latest_mtime:
-				latest_mtime = FileAccess.get_modified_time(p)
-				latest = p
+	# File resume: newest running bracket (see _find_resume_file).
+	var latest := _find_resume_file()
 	if latest != "" and TournamentDirector.load_state_file(latest):
 		if TournamentDirector.tournament_active():
 			get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
-		else:
-			bracket_status.text = "Loaded saved bracket."
-			_render_bracket()
+			return
+	# Nothing runnable: say so (the old code fell through silently
+	# when the newest file failed to load).
+	_refresh_resume()
+	bracket_status.text = "No running bracket to resume - start one above."
+	_render_bracket()
 
 
 func _process(delta: float) -> void:

@@ -38,6 +38,11 @@ func _is_on_page(node: Control, page_idx: int) -> bool:
 func _process(_delta: float) -> bool:
 	_check(menu._menu_pages.size() == 3, "three pages")
 	_check(menu._page_buttons.size() == 3, "three tab buttons")
+	# Continuous defaults to the grouped size-16 event (smaller
+	# single-elim sizes stay one click away).
+	_check(menu.tourney_size.selected == 2
+		and menu.tourney_size.get_item_text(2) == "16",
+		"continuous defaults to size 16")
 	_check((menu._menu_pages[0] as Control).visible
 		and not (menu._menu_pages[1] as Control).visible
 		and not (menu._menu_pages[2] as Control).visible,
