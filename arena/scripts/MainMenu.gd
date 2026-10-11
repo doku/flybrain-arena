@@ -1914,15 +1914,15 @@ func _fresh_short_message(found: int, schooled: int, floor: float) -> String:
 
 func _draw_fresh_roster() -> Array:
 	# Green-weighted full draw for fresh-roster mode (menu parity with
-	# the handoff draw): schooled gate 50 + evo ELO cutoff over the
-	# whole vault. Empty (with status set) when the bench is short.
+	# the handoff draw): schooled gate 50 over the whole vault. No ELO
+	# floor - the cutoff archives at generation end, it never benches
+	# fighters. Empty (with status set) when the bench is short.
 	var cards: Dictionary = TournamentDirector._event_live_cards()
 	var roster: Array = TournamentDirector.list_brains_cached()
-	var floor := float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 0.0
-	var qualified: Array = TournamentDirector.schooled_ids(roster, cards, 50, floor)
+	var qualified: Array = TournamentDirector.schooled_ids(roster, cards, 50, 0.0)
 	if qualified.size() < 16:
 		var schooled: Array = TournamentDirector.schooled_ids(roster, cards, 50, 0.0)
-		bracket_status.text = _fresh_short_message(qualified.size(), schooled.size(), floor)
+		bracket_status.text = _fresh_short_message(qualified.size(), schooled.size(), 0.0)
 		return []
 	return TournamentDirector.draw_green_picks(qualified, cards, 16)
 

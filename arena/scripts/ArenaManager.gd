@@ -6579,9 +6579,10 @@ func _event_maintain_pool() -> void:
 		return
 	var evo: Dictionary = director.tourney.get("evo", {})
 	var gen := int(evo.get("generation", 1))
-	var st: Dictionary = ev.get("settings", {})
+	# Bodies, not cutoff survivors: the ELO line archives at
+	# generation end, it never benches fighters.
 	var q: Dictionary = director.event_pool_qualified(eid, POOL_MIN_TRAIN,
-		float(st.get("elo_cutoff", 0.0)))
+		0.0)
 	var busy := (q.get("qualified", []) as Array).size()
 	for spec in _evo_pending():
 		var sk := str((spec as Dictionary).get("kind", ""))
@@ -7051,37 +7052,36 @@ func _event_group_done(res: Dictionary) -> void:
 
 
 func _event_pool_ready_count(include_current: bool = false) -> int:
-	# Promotion-ready brains vault-wide (schooled + above the demotion
-	# line, outside the current event): the draw pool, not the bench.
-	# Redraw mode counts the current roster too (nobody is excluded
-	# from a fresh draw).
+	# Promotion-ready brains vault-wide (schooled, outside the current
+	# event): the draw pool, not the bench. No ELO floor - the cutoff
+	# archives at generation end, it never benches fighters. Redraw
+	# mode counts the current roster too (nobody is excluded from a
+	# fresh draw).
 	var director := _director()
 	if director == null:
 		return 0
 	var ev: Dictionary = director.event_load(_event_id())
 	if ev.is_empty():
 		return 0
-	var st: Dictionary = ev.get("settings", {})
 	var q: Dictionary = director.event_draw_candidates(_event_id(),
-		POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)), {}, [], include_current)
+		POOL_MIN_TRAIN, 0.0, {}, [], include_current)
 	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
 
 
 func _event_body_count(redraw: bool) -> int:
-	# Vault BODIES for the next draw regardless of schooling: the ELO
-	# floor and the participant exclusion still apply, only the
-	# episode bar drops to 0. The handoff waits on breeding only when
-	# even bodies run short; an unqualified bench fields green
-	# debutants now (backfill) while school runs in parallel.
+	# Vault BODIES for the next draw regardless of schooling or ELO:
+	# only the participant exclusion still applies. The handoff waits
+	# on breeding only when even bodies run short; an unqualified
+	# bench fields green debutants now (backfill) while school runs
+	# in parallel.
 	var director := _director()
 	if director == null:
 		return 0
 	var ev: Dictionary = director.event_load(_event_id())
 	if ev.is_empty():
 		return 0
-	var st: Dictionary = ev.get("settings", {})
 	var q: Dictionary = director.event_draw_candidates(_event_id(), 0,
-		float(st.get("elo_cutoff", 0.0)), {}, [], redraw)
+		0.0, {}, [], redraw)
 	return (q.get("qualified", []) as Array).size() if bool(q.get("ok", false)) else 0
 
 
@@ -7350,13 +7350,13 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 		# NOW (school tops picks up in parallel); only a true empty
 		# vault aborts here.
 		var full: Dictionary = director.event_draw_roster(eid, 16,
-			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+			POOL_MIN_TRAIN, 0.0)
 		if bool(full.get("ok", false)) \
 				and (full.get("drawn", []) as Array).size() == 16:
 			roster = full.get("drawn", [])
 		else:
 			var back: Dictionary = director.event_draw_backfill(eid, 16,
-				float(st.get("elo_cutoff", 0.0)), [], true)
+				0.0, [], true)
 			roster = back.get("drawn", [])
 			if roster.size() != 16:
 				_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
@@ -7384,7 +7384,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 			director.quit_to_menu()
 			return
 		var draw: Dictionary = director.event_draw_pool(eid, need,
-			POOL_MIN_TRAIN, float(st.get("elo_cutoff", 0.0)))
+			POOL_MIN_TRAIN, 0.0)
 		var picked: Array = []
 		if bool(draw.get("ok", false)) \
 				and (draw.get("drawn", []) as Array).size() == need:
@@ -7394,7 +7394,7 @@ func _event_start_next(ev_old: Dictionary, gone: Array) -> void:
 			# greenest vault bodies now (school tops them up in
 			# parallel); only a true empty vault aborts here.
 			var back: Dictionary = director.event_draw_backfill(eid, need,
-				float(st.get("elo_cutoff", 0.0)), [], false)
+				0.0, [], false)
 			picked = back.get("drawn", [])
 			if picked.size() != need:
 				_show_handoff_failure("FINAL REVIEW - EVENT %s" % eid,
