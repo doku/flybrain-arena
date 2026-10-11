@@ -88,9 +88,25 @@ func test_find_resume_file() -> void:
 		DirAccess.remove_absolute("user://test_resume")
 
 
+func test_fresh_short_message() -> void:
+	# Short-bench honesty: the message names BOTH filters, so a low
+	# count reads as the ELO cutoff doing its job - never as lost
+	# training records.
+	var scr = load("res://scripts/MainMenu.gd")
+	if scr == null:
+		return
+	var m = scr.new()
+	_check(m._fresh_short_message(10, 44, 1300.0) == "Fresh roster needs 16 schooled brains (found 10 above ELO 1300; 44 schooled at any ELO) - lower the cutoff or school the bench.",
+		"cutoff message names both filters")
+	_check(m._fresh_short_message(9, 44, 0.0) == "Fresh roster needs 16 schooled brains (found 9) - school the bench first.",
+		"no-cutoff message stays short")
+	m.queue_free()
+
+
 func _initialize() -> void:
 	test_prefill_num_null_falls_back()
 	test_find_resume_file()
+	test_fresh_short_message()
 	if failures == 0:
 		print("ALL MENU-PREFILL TESTS PASSED")
 	else:

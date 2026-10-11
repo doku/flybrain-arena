@@ -1903,6 +1903,15 @@ func _on_start_evolution() -> void:
 	get_tree().change_scene_to_file("res://scenes/ArenaGlade.tscn")
 
 
+func _fresh_short_message(found: int, schooled: int, floor: float) -> String:
+	# Diagnostic short-bench message: names BOTH filters so a low
+	# count reads as the ELO cutoff doing its job, not missing
+	# training records. Pure (unit-tested).
+	if floor <= 0.0:
+		return "Fresh roster needs 16 schooled brains (found %d) - school the bench first." % found
+	return "Fresh roster needs 16 schooled brains (found %d above ELO %d; %d schooled at any ELO) - lower the cutoff or school the bench." % [found, int(floor), schooled]
+
+
 func _draw_fresh_roster() -> Array:
 	# Green-weighted full draw for fresh-roster mode (menu parity with
 	# the handoff draw): schooled gate 50 + evo ELO cutoff over the
@@ -1912,7 +1921,8 @@ func _draw_fresh_roster() -> Array:
 	var floor := float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 0.0
 	var qualified: Array = TournamentDirector.schooled_ids(roster, cards, 50, floor)
 	if qualified.size() < 16:
-		bracket_status.text = "Fresh roster needs 16 schooled brains (found %d) - school the bench first." % qualified.size()
+		var schooled: Array = TournamentDirector.schooled_ids(roster, cards, 50, 0.0)
+		bracket_status.text = _fresh_short_message(qualified.size(), schooled.size(), floor)
 		return []
 	return TournamentDirector.draw_green_picks(qualified, cards, 16)
 
