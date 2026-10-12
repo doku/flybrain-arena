@@ -2,7 +2,7 @@ import numpy as np
 
 
 KNOWN_MAPPINGS = ("base", "muscles_up", "gyro_flow", "mbon", "retina",
-                  "flow_trans")
+                  "flow_trans", "ambush")
 
 # Schemes that add encoder/decoder behavior. "base" is the absence of all
 # schemes. Mappings stack: a brain may declare any combination, e.g.
@@ -99,6 +99,10 @@ RAM_TIME = 0.8
 RAM_COOLDOWN = 3.0
 # DNpe017 spikes for a full ram charge (threshold 2 starts it).
 RAM_FULL_SCALE = 6.0
+# Ambush poise (DNa readout): spikes for a full freeze vote, and the
+# thrust fraction it removes at full poise. Mirrors the ram scale.
+AMBUSH_FULL_SCALE = 6.0
+AMBUSH_THRUST_CUT = 0.5
 # Hard cap mirror (FlyPhysics SPEED_CAP_MULT * max_speed): cruise speed
 # never exceeds this in the trainer either.
 SPEED_CAP = 19.2
@@ -129,7 +133,7 @@ BLEND_DEFAULTS = {
 # so reflex-only control can never slip in silently again.
 CONTROL_CHANNELS = {
     "thrust": {"pools": ["motor_thrust_dnp09", "descending_all",
-                         "motor_flight_thrust"],
+                         "motor_flight_thrust", "motor_ambush_dna"],
                "reflex": [], "gate": []},
     "yaw_torque": {"pools": ["motor_turn_dnp20", "descending_all",
                              "motor_steer", "visual_lc11"],
@@ -600,6 +604,11 @@ class MotorDecoder:
         # wiring are unaffected by this readout existing.
         mouth = populations.get("motor_mouth", {})
         self.mouth_ids = set(mouth.get("all", []))
+        # Ambush readout (DNa partition; stale-cache safe). Silent
+        # pools read 0 = no poise, so brains without ambush wiring
+        # are unaffected by this readout existing.
+        ambush = populations.get("motor_ambush_dna", {})
+        self.ambush_ids = set(ambush.get("all", []))
         # Retina feature readout pools (stale-cache safe like the rest).
         lc11 = populations.get("visual_lc11", {})
         self.lc11_left = set(lc11.get("left", []))
@@ -726,6 +735,14 @@ class MotorDecoder:
             # up to +0.25 extra thrust on it. Absent key reads 0.
             surge = float(np.clip(sensory_hint.get("scent_surge", 0.0), 0.0, 1.0))
             thrust = float(np.clip(thrust + surge * 0.25, 0.0, 1.0))
+        if "ambush" in self.schemes and not self.legacy:
+            # Ambush poise (DNa readout): a charged ambush layer holds
+            # still - the freeze half of the strike. Silent pools read
+            # 0 = full thrust, so unwired brains fly exactly as before
+            # (and the scheme gate keeps base behavior bit-identical).
+            ambush_spikes = sum(counts.get(s, 0) for s in self.ambush_ids)
+            ambush_hold = float(np.clip(ambush_spikes / AMBUSH_FULL_SCALE, 0.0, 1.0))
+            thrust = float(np.clip(thrust * (1.0 - AMBUSH_THRUST_CUT * ambush_hold), 0.0, 1.0))
 
         # 2. Steering / Yaw Torque: normalized DN population vector + DNp20.
         # Normalized (tanh) so small lateral diffs still steer and total

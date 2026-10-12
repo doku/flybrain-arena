@@ -315,6 +315,37 @@ class TestSensoryMotor(unittest.TestCase):
                                   climb, sensory_hint=dict(hint))["pitch_torque"]
         self.assertGreater(neural, 0.0)
 
+    def test_ambush_pool_present(self):
+        # Trapper readout layer: DNa01-09, clean bilateral 9/9.
+        a = self.pops.get("motor_ambush_dna", {})
+        self.assertEqual(len(a.get("left", [])), 9)
+        self.assertEqual(len(a.get("right", [])), 9)
+        self.assertEqual(len(a.get("all", [])), 18)
+
+    def test_ambush_hold_trims_thrust(self):
+        # Ambush-gated freeze: a charged DNa volley halves thrust
+        # under the ambush scheme; the readout binds on every brain
+        # but only the scheme pays it.
+        spikes = list(self.pops["motor_ambush_dna"]["all"])
+        self.assertGreater(len(spikes), 0)
+        wired = MotorDecoder(self.pops, mapping="ambush")
+        hold = wired.decode(spikes, sensory_hint={})["thrust"]
+        free = wired.decode([], sensory_hint={})["thrust"]
+        self.assertLess(hold, free)
+        self.assertEqual(len(MotorDecoder(self.pops).ambush_ids), 18)
+        # Stale cache without the pool: binds empty, and the scheme
+        # adds nothing (DNa spikes still read through descending_all,
+        # exactly like base - no crash, no extra cut).
+        thin = {k: v for k, v in self.pops.items()
+                if k != "motor_ambush_dna"}
+        thin_dec = MotorDecoder(thin, mapping="ambush")
+        self.assertEqual(len(thin_dec.ambush_ids), 0)
+        self.assertAlmostEqual(
+            thin_dec.decode(spikes, sensory_hint={})["thrust"],
+            MotorDecoder(self.pops).decode(spikes,
+                                           sensory_hint={})["thrust"],
+            places=9)
+
     def test_flow_cruise_reads_spikes(self):
         # Same ventral hint: silent T4a falls back to the hint trim
         # (legacy), a full T4a volley reads fast and trims thrust down.
@@ -2997,6 +3028,13 @@ class TestWiringGenome(unittest.TestCase):
         self.assertEqual(
             ew.derive_mapping({"name": None, "rules": [t4rule, mnrule]}),
             ("flow_trans", "muscles_up", "retina"))
+        # Ambush layer: rules targeting the DNa readout derive the
+        # ambush scheme (Trapper wiring lights it automatically).
+        amrule = dict(t4rule, source="visual_lc15",
+                      target="motor_ambush_dna", stream="v")
+        self.assertEqual(
+            ew.derive_mapping({"name": None, "rules": [amrule]}),
+            ("ambush", "retina"))
         # Scent pools have no scheme: DA1 wiring derives base ().
         da1 = dict(t4rule, source="pheromone_da1", stream="v")
         self.assertEqual(
@@ -3127,8 +3165,10 @@ class TestWiringGenome(unittest.TestCase):
         self.assertEqual(code, 0)
         payload = json.loads(buf.getvalue().strip().splitlines()[-1])
         self.assertTrue(payload.get("ok", False))
-        self.assertEqual(payload["genome_id"], "0e5f52b8c9")
-        self.assertEqual(payload["mapping"], ["muscles_up"])
+        # Golden for seed-42 3-rule draw (registry-dependent: adding a
+        # pool legitimately redraws the seeded genome).
+        self.assertEqual(payload["genome_id"], "6ac9e9de97")
+        self.assertEqual(payload["mapping"], ["ambush", "muscles_up"])
         self.assertEqual(payload["n_rules"], 3)
 
     def test_validator_coerces_godot_floats(self):

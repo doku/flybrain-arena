@@ -171,6 +171,12 @@ def load_or_extract_populations(force_regen=False):
     # Anchored: only MNhl* rows match. Silent without wiring (read 0 =
     # wings level), so unwired brains fly exactly as before.
     motor_roll_mnhl = get_indices(types.str.match(r"^MNhl", na=False))
+    # Ambush readout partition (Trapper layer): DNa01-09 descending
+    # neurons, clean bilateral 9L/9R like the mouth readout precedent.
+    # A reserve descending channel only ambush-wired brains drive; the
+    # decoder reads it for poise (freeze) and it stays silent (0 votes)
+    # for everyone else. Anchored: only DNa01-09 rows match.
+    motor_ambush_dna = get_indices(types.str.match(r"^DNa0[1-9]$", na=False))
 
     # --- Dopaminergic Reinforcement & Mushroom Body ---
     dopamine_pam = get_indices(types.str.contains("PAM", na=False))
@@ -225,6 +231,8 @@ def load_or_extract_populations(force_regen=False):
         "motor_ram_dnpe017": motor_ram_dnpe017,
         # Mouthpart motor readout (spear lunge)
         "motor_mouth": motor_mouth,
+        # Ambush readout partition (Trapper poise layer)
+        "motor_ambush_dna": motor_ambush_dna,
         # Haltere roll-motor readout (learned banks)
         "motor_roll_mnhl": motor_roll_mnhl,
         # Reinforcement
@@ -253,6 +261,7 @@ def load_or_extract_populations(force_regen=False):
           f"VS/HS: {len(pops['flow_vs']['all'])}/{len(pops['flow_hs']['all'])}, "
           f"MBON app/av: {len(pops['mbon_app']['all'])}/{len(pops['mbon_av']['all'])}, "
           f"MN-mouth: {len(pops['motor_mouth']['all'])}, "
+          f"MN-ambush: {len(pops['motor_ambush_dna']['all'])}, "
           f"T4a/b/c/d: {len(pops['visual_t4a']['all'])}/"
           f"{len(pops['visual_t4b']['all'])}/"
           f"{len(pops['visual_t4c']['all'])}/{len(pops['visual_t4d']['all'])}, "

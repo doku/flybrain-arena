@@ -798,6 +798,7 @@ SCHEME_TARGETS = {
     "muscles_up": ("motor_flight_thrust", "motor_steer"),
     "gyro_flow": ("flow_vs", "flow_hs"),
     "mbon": ("mbon_app", "mbon_av"),
+    "ambush": ("motor_ambush_dna",),
 }
 
 
