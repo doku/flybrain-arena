@@ -126,14 +126,141 @@ def lif_integrate_sparse(
     return np.array(spike_record, dtype=np.int32)
 
 
+@njit(fastmath=True)
+def lif_adaptive_sparse(
+    V, Isyn, refractory, is_active,
+    active_buffer,
+    indptr, indices, data,
+    stim_indices,
+    next_buffer,
+    current_spikes,
+    adapt,
+    steps=100,
+    dt=0.5,
+    tau_m=20.0,
+    tau_s=5.0,
+    v_rest=-52.0,
+    v_th=-45.0,
+    v_reset=-52.0,
+    ref_steps=4,
+    syn_gain=0.008,
+    unit_syn_mv=0.275,
+    max_isyn=2.0,
+    adapt_jump=2.0,
+    adapt_decay=0.995,
+    adapt_max=8.0
+):
+    """
+    Adaptive-threshold LIF: same sparse engine as lif_integrate_sparse,
+    but each spike raises its cell's threshold by adapt_jump (capped at
+    adapt_max) and every active step decays it by adapt_decay. Driven
+    cells fatigue (rates fall under sustained input); quiet cells
+    recover to the legacy threshold. Per-instance params ride FlyBrain;
+    legacy brains never call this kernel (bit-identical behavior).
+    """
+    alpha_m = np.exp(-dt / tau_m)
+    alpha_s = np.exp(-dt / tau_s)
+    weight_scale = unit_syn_mv * syn_gain
+    max_buf_len = len(active_buffer)
+
+    n_active = 0
+    # Same continuity contract as the legacy kernel: flagged cells
+    # rejoin first, then fresh stim.
+    for i in range(len(is_active)):
+        if is_active[i]:
+            active_buffer[n_active] = np.int32(i)
+            n_active += 1
+    for s in range(len(stim_indices)):
+        idx = stim_indices[s]
+        V[idx] = v_th + adapt[idx] + 0.5
+        if not is_active[idx]:
+            is_active[idx] = True
+            active_buffer[n_active] = idx
+            n_active += 1
+
+    next_count = 0
+    spike_count = 0
+    spike_record = []
+
+    for step in range(steps):
+        next_count = 0
+        spike_count = 0
+
+        for a in range(n_active):
+            idx = active_buffer[a]
+            adapt[idx] *= adapt_decay
+            if refractory[idx] > 0:
+                refractory[idx] -= 1
+                V[idx] = v_reset
+                Isyn[idx] *= alpha_s
+                next_buffer[next_count] = idx
+                next_count += 1
+            else:
+                Isyn[idx] *= alpha_s
+                V[idx] = v_rest + (V[idx] - v_rest) * alpha_m + Isyn[idx]
+
+                if V[idx] >= v_th + adapt[idx]:
+                    V[idx] = v_reset
+                    Isyn[idx] = 0.0 # Potassium reset
+                    refractory[idx] = ref_steps
+                    adapt[idx] = adapt_max if adapt[idx] + adapt_jump > adapt_max else adapt[idx] + adapt_jump
+                    current_spikes[spike_count] = idx
+                    spike_count += 1
+                    spike_record.append(idx)
+                    next_buffer[next_count] = idx
+                    next_count += 1
+                elif abs(V[idx] - v_rest) > 0.05 or abs(Isyn[idx]) > 0.001:
+                    next_buffer[next_count] = idx
+                    next_count += 1
+                else:
+                    V[idx] = v_rest
+                    Isyn[idx] = 0.0
+                    adapt[idx] = 0.0
+                    is_active[idx] = False
+
+        for s in range(spike_count):
+            pre = current_spikes[s]
+            start = indptr[pre]
+            end = indptr[pre + 1]
+            for c in range(start, end):
+                post = indices[c]
+                w = data[c]
+                new_i = Isyn[post] + w * weight_scale
+                if new_i > max_isyn:
+                    new_i = max_isyn
+                elif new_i < -max_isyn:
+                    new_i = -max_isyn
+                Isyn[post] = new_i
+
+                if not is_active[post] and next_count < max_buf_len:
+                    is_active[post] = True
+                    next_buffer[next_count] = post
+                    next_count += 1
+
+        n_active = next_count
+        for i in range(n_active):
+            active_buffer[i] = next_buffer[i]
+
+    return np.array(spike_record, dtype=np.int32)
+
+
 class FlyBrain:
     """
     Independent Leaky Integrate-and-Fire brain instance for a single fly.
     Uses sparse active-set tracking with physiological potassium reset.
     """
-    def __init__(self, indptr, indices, data, num_neurons=166700, dt=0.5):
+    def __init__(self, indptr, indices, data, num_neurons=166700, dt=0.5,
+                 model="lif", adapt_jump=2.0, adapt_decay=0.995, adapt_max=8.0):
         self.num_neurons = num_neurons
         self.dt = dt
+        # Neuron model: "lif" runs the legacy kernel bit-identically
+        # (old records carry no model key); "adaptive" runs the
+        # threshold-adapting kernel. Per-instance, so hetero battles
+        # (legacy vs adaptive) are legal - each brain owns its state.
+        self.model = model
+        self.adapt_jump = adapt_jump
+        self.adapt_decay = adapt_decay
+        self.adapt_max = adapt_max
 
         # Synaptic connections (independent in-memory copy for evolution)
         self.indptr = np.ascontiguousarray(indptr, dtype=np.int32)
@@ -150,6 +277,9 @@ class FlyBrain:
         # per-call np.empty of 2 x num_neurons was churn per 50 ms tick).
         self.next_buffer = np.zeros(num_neurons, dtype=np.int32)
         self.current_spikes = np.zeros(num_neurons, dtype=np.int32)
+        # Adaptation state (adaptive kernel only; zeros leave the
+        # legacy path untouched even if misdispatched).
+        self.adapt = np.zeros(num_neurons, dtype=np.float32)
 
     def reset_state(self):
         """Reset membrane states back to rest."""
@@ -157,9 +287,24 @@ class FlyBrain:
         self.Isyn.fill(0.0)
         self.refractory.fill(0)
         self.is_active.fill(False)
+        self.adapt.fill(0.0)
 
     def integrate_50ms(self, stim_indices):
         """Integrates 50 ms of brain activity (100 steps * 0.5 ms)."""
+        if self.model == "adaptive":
+            return lif_adaptive_sparse(
+                self.V, self.Isyn, self.refractory, self.is_active,
+                self.active_buffer,
+                self.indptr, self.indices, self.weights,
+                stim_indices,
+                self.next_buffer, self.current_spikes,
+                self.adapt,
+                steps=int(50.0 / self.dt),
+                dt=self.dt,
+                adapt_jump=self.adapt_jump,
+                adapt_decay=self.adapt_decay,
+                adapt_max=self.adapt_max
+            )
         return lif_integrate_sparse(
             self.V, self.Isyn, self.refractory, self.is_active,
             self.active_buffer,

@@ -1303,7 +1303,16 @@ def _bind_brain(rec, weights, csr, pops, struct_cache):
     if not np.any(w):
         raise ValueError(
             f"brain '{rec.get('name')}' weights are all zero; file corrupt")
-    return FlyBrain(indptr, indices, np.ascontiguousarray(weights, dtype=np.float32).copy())
+    # Neuron model: "lif" (default, legacy kernel, bit-identical) or
+    # "adaptive" (threshold-adapting kernel). Unknown names refuse
+    # loudly - a mislabeled model must never silently run legacy.
+    model = str(gp.get("neuron_model", "lif"))
+    if model not in ("lif", "adaptive"):
+        raise ValueError(
+            f"brain '{rec.get('name')}' declares unknown neuron model "
+            f"'{model}'; file corrupt or mislabeled")
+    return FlyBrain(indptr, indices, np.ascontiguousarray(weights, dtype=np.float32).copy(),
+                    model=model)
 
 
 def _bind_codecs(rec, pops, codec_cache):

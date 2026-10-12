@@ -126,6 +126,43 @@ class TestFlyBrainLIF(unittest.TestCase):
                     changed_count += 1
         self.assertGreater(changed_count, 0, "Targeted pathway weights must be mutated")
 
+    def test_adaptive_fatigues_and_recovers(self):
+        # Adaptive threshold: sustained drive grows the adder (rates
+        # fall vs legacy on identical input); quiet ticks decay it;
+        # reset clears it.
+        stim = np.array(self.pops["pheromone_da1"]["left"][:20]
+                        + self.pops["visual_lc10"]["left"][:15],
+                        dtype=np.int32)
+        legacy = FlyBrain(self.csr.indptr, self.csr.indices,
+                          self.csr.data.copy())
+        adap = FlyBrain(self.csr.indptr, self.csr.indices,
+                        self.csr.data.copy(), model="adaptive")
+        sl = legacy.integrate_50ms(stim)
+        sa = adap.integrate_50ms(stim)
+        self.assertGreater(len(sl), 0)
+        self.assertGreater(float(adap.adapt.max()), 0.0)
+        self.assertLessEqual(len(sa), len(sl))
+        before = float(adap.adapt.max())
+        adap.integrate_50ms(np.empty(0, dtype=np.int32))
+        self.assertLess(float(adap.adapt.max()), before)
+        adap.reset_state()
+        self.assertFalse(np.any(adap.adapt))
+
+    def test_adaptive_jump0_matches_legacy(self):
+        # Zero jump + unit decay disables adaptation: outputs must
+        # equal the legacy kernel exactly (hetero battles stay honest).
+        stim = np.array(self.pops["pheromone_da1"]["left"][:20]
+                        + self.pops["visual_lc10"]["left"][:15],
+                        dtype=np.int32)
+        legacy = FlyBrain(self.csr.indptr, self.csr.indices,
+                          self.csr.data.copy())
+        flat = FlyBrain(self.csr.indptr, self.csr.indices,
+                        self.csr.data.copy(), model="adaptive",
+                        adapt_jump=0.0, adapt_decay=1.0)
+        sl = legacy.integrate_50ms(stim)
+        sf = flat.integrate_50ms(stim)
+        np.testing.assert_array_equal(np.sort(sf), np.sort(sl))
+
 
 class TestSensoryMotor(unittest.TestCase):
     """Verifies sensory encoding and motor decoding mappings."""
@@ -950,6 +987,30 @@ class TestSensoryMotor(unittest.TestCase):
         rec3 = {"name": "Y", "generator_params": {"yaw_bias": "port"}}
         with self.assertRaises(ValueError):
             bs._bind_codecs(rec3, self.pops, {})
+
+    def test_bind_neuron_model(self):
+        # Neuron model rides the record: absent = legacy lif,
+        # adaptive dispatches the second kernel, unknown refuses
+        # loudly (never silently runs legacy). Minimal synthetic
+        # structure (arity 1) - only the dispatch is under test.
+        import brain_server as bs
+        import numpy as np
+        indptr = np.array([0, 1], dtype=np.int32)
+        indices = np.array([0], dtype=np.int32)
+        weights = np.array([1.0], dtype=np.float32)
+        cache = {None: (indptr, indices)}
+        base = bs._bind_brain({"name": "M", "generator_params": {}},
+                              weights, None, self.pops, cache)
+        self.assertEqual(base.model, "lif")
+        adap = bs._bind_brain(
+            {"name": "M", "generator_params": {"neuron_model": "adaptive"}},
+            weights, None, self.pops, cache)
+        self.assertEqual(adap.model, "adaptive")
+        with self.assertRaises(ValueError):
+            bs._bind_brain(
+                {"name": "M",
+                 "generator_params": {"neuron_model": "quantum"}},
+                weights, None, self.pops, cache)
 
     def test_brainview_stream_keys_and_detail(self):
         # Brain-view stream: legacy HUD keys intact, per-pool dict

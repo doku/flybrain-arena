@@ -43,6 +43,7 @@ DEFAULT_GENERATOR_PARAMS = {
     "genome_id": None,
     "mapping": None,
     "yaw_bias": None,
+    "neuron_model": "lif",
     "explore_mode": "legacy",
     # Reflex authority (heritable control traits; defaults reproduce the
     # legacy operating point — see sensory_motor.BLEND_DEFAULTS).
