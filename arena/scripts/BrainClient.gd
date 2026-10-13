@@ -34,6 +34,26 @@ static var test_mute := false
 var udp := PacketPeerUDP.new()
 var is_connected_server: bool = false
 var last_sent_time: float = 0.0
+# Send reporting: _send_dict records the last outcome here so bank
+# paths can escalate a persistently unsendable payload (oversize
+# datagrams fail identically on every socket - reconnecting never
+# heals them) instead of retrying silently forever.
+var last_send_ok := true
+var last_send_err := 0
+# Datagram ceiling: Godot put_packet hard-fails past ~62KB (measured
+# err=1 from 64KB up, clean below 60KB). Parts stay under 50KB with
+# margin; the server reassembles round_report_part messages.
+const MAX_PART_BYTES := 50000
+# Plasticity-read keys: the ONLY battle sens/ctrl fields the server's
+# dopamine replay reads (apply_plasticity). Everything else in the
+# per-battle sensory/motor dicts is dead wire weight - a 48-battle
+# round ships ~300KB whole and can never send.
+const BANK_SENS_KEYS := ["pheromone_conc_left", "pheromone_conc_right",
+	"visual_target_azimuth", "visual_target_visible",
+	"visual_tree_left_looming", "visual_tree_right_looming",
+	"angular_roll_rate", "visual_flow_ventral", "visual_flow_lateral",
+	"visual_flow_expansion", "visual_flow_climb"]
+const BANK_CTRL_KEYS := ["yaw_torque", "roll_torque", "spear_thrust"]
 var tick_interval: float = 0.05 # 50 ms (20 Hz)
 
 func _ready() -> void:
@@ -57,17 +77,134 @@ func reconnect() -> bool:
 	return is_connected_server
 
 
-func _send_dict(payload: Dictionary) -> void:
+func _send_dict(payload: Dictionary) -> bool:
 	if test_mute:
-		return
+		last_send_ok = true
+		return true
 	if not is_connected_server:
-		return
+		last_send_ok = true
+		return true
 	var json_data = JSON.stringify(payload).to_utf8_buffer()
-	if udp.put_packet(json_data) != OK:
-		print("[BrainClient] Send failed - reconnecting once and resending.")
+	var err: int = udp.put_packet(json_data)
+	last_send_err = err
+	if err != OK:
+		print("[BrainClient] Send failed (err=%d, %d bytes) - reconnecting once and resending." % [err, json_data.size()])
 		if reconnect():
-			if udp.put_packet(json_data) != OK:
-				printerr("[BrainClient] Resend failed after reconnect.")
+			err = udp.put_packet(json_data)
+			last_send_err = err
+			if err != OK:
+				printerr("[BrainClient] Resend failed after reconnect (err=%d)." % err)
+				last_send_ok = false
+				return false
+		else:
+			last_send_ok = false
+			return false
+	last_send_ok = true
+	return true
+
+
+static func slim_battle_for_bank(b: Dictionary) -> Dictionary:
+	# Plasticity snapshot of one banked battle: ids, outcome, stats,
+	# verdict plus exactly the sens/ctrl fields dopamine replays.
+	# Pure (unit-tested). Applied at compose time (first send AND
+	# resends) so already-stored fat reports slim on the way out.
+	var out := {
+		"battle_id": str(b.get("battle_id", "")),
+		"draw": bool(b.get("draw", false)),
+		"draw_penalty": bool(b.get("draw_penalty", false)),
+		"end_reason": str(b.get("end_reason", "")),
+		"verdict": {},
+		"stats_a": {},
+		"stats_b": {},
+		"sens_a": {},
+		"sens_b": {},
+		"ctrl_a": {},
+		"ctrl_b": {},
+	}
+	for k in ["verdict", "stats_a", "stats_b"]:
+		if b.get(k) is Dictionary:
+			out[k] = (b[k] as Dictionary).duplicate()
+	var keys := {"sens_a": BANK_SENS_KEYS, "sens_b": BANK_SENS_KEYS,
+		"ctrl_a": BANK_CTRL_KEYS, "ctrl_b": BANK_CTRL_KEYS}
+	for k in keys:
+		var src: Dictionary = b.get(k, {}) if b.get(k) is Dictionary else {}
+		var dst := {}
+		for f in (keys[k] as Array):
+			if src.has(f):
+				dst[f] = src[f]
+		out[k] = dst
+	return out
+
+
+static func split_report_parts(base: Dictionary, matches: Array, budget: int = MAX_PART_BYTES) -> Array:
+	# Split a round report into datagram-safe parts: slim every battle,
+	# pack whole matches greedily, slice an oversize single match by
+	# battles (at least one per slice, never an empty part). The
+	# single-part fast path returns the whole message unwrapped (the
+	# server handles it with zero new code). Pure (unit-tested).
+	var slimmed: Array = []
+	for m in matches:
+		if not (m is Dictionary):
+			continue
+		var mm := (m as Dictionary).duplicate()
+		var battles: Array = []
+		for b in (mm.get("battles", []) as Array):
+			battles.append(slim_battle_for_bank(b) if b is Dictionary else b)
+		mm["battles"] = battles
+		slimmed.append(mm)
+	var whole := (base as Dictionary).duplicate()
+	whole["matches"] = slimmed
+	if JSON.stringify(whole).length() <= budget:
+		return [whole]
+	var match_lists: Array = []
+	var cur: Array = []
+	var cur_len := JSON.stringify(base).length()
+	for mm in slimmed:
+		var mlen := JSON.stringify(mm).length()
+		if mlen + JSON.stringify(base).length() > budget:
+			# Oversize single: slice its battles across parts.
+			if not cur.is_empty():
+				match_lists.append(cur)
+				cur = []
+				cur_len = JSON.stringify(base).length()
+			var env := (mm as Dictionary).duplicate()
+			env.erase("battles")
+			var slice: Array = []
+			var slice_len := JSON.stringify(base).length() + JSON.stringify(env).length()
+			for b in (mm.get("battles", []) as Array):
+				var blen := JSON.stringify(b).length()
+				if not slice.is_empty() and slice_len + blen > budget:
+					var pm := env.duplicate()
+					pm["battles"] = slice
+					match_lists.append([pm])
+					slice = []
+					slice_len = JSON.stringify(base).length() + JSON.stringify(env).length()
+				slice.append(b)
+				slice_len += blen
+			if not slice.is_empty() or (mm.get("battles", []) as Array).is_empty():
+				var pm := env.duplicate()
+				pm["battles"] = slice
+				match_lists.append([pm])
+			cur_len = JSON.stringify(base).length()
+		elif cur_len + mlen > budget:
+			match_lists.append(cur)
+			cur = [mm]
+			cur_len = JSON.stringify(base).length() + mlen
+		else:
+			cur.append(mm)
+			cur_len += mlen
+	if not cur.is_empty():
+		match_lists.append(cur)
+	var parts: Array = []
+	for i in range(match_lists.size()):
+		var p := (base as Dictionary).duplicate()
+		p["matches"] = match_lists[i]
+		if match_lists.size() > 1:
+			p["type"] = "round_report_part"
+			p["part_idx"] = i
+			p["part_count"] = match_lists.size()
+		parts.append(p)
+	return parts
 
 func _process(_delta: float) -> void:
 	# Poll incoming packets from brain server
@@ -131,6 +268,11 @@ func request_match_report(match_winner: String, tournament_id: String,
 	# match result stays undecided.
 	if not is_connected_server:
 		return
+	# Slimmed at compose time like round battles: a draw-marathon
+	# match is the same oversize death at smaller scale.
+	var slim: Array = []
+	for b in battles:
+		slim.append(slim_battle_for_bank(b) if b is Dictionary else b)
 	_send_dict({
 		"type": "match_report",
 		"match_winner": match_winner,
@@ -141,7 +283,7 @@ func request_match_report(match_winner: String, tournament_id: String,
 		"beta_id": beta_id,
 		"alpha_path": alpha_path,
 		"beta_path": beta_path,
-		"battles": battles,
+		"battles": slim,
 		"partial": partial
 	})
 
@@ -203,14 +345,20 @@ func request_round_report(round_nonce: String, tournament_id: String,
 	# journals without saving; the group bank lands separately.
 	if not is_connected_server:
 		return
-	_send_dict({
+	# Split-safe: slimmed battles packed into datagram-sized parts
+	# (one oversize round wedged banks forever at try 190+).
+	var base := {
 		"type": "round_report",
 		"round_nonce": round_nonce,
 		"tournament_id": tournament_id,
 		"match": match_label,
-		"matches": matches,
 		"group": group
-	})
+	}
+	last_send_ok = true
+	for part in split_report_parts(base, matches):
+		if not _send_dict(part):
+			last_send_ok = false
+			return
 
 
 func request_group_report(group_nonce: String, tournament_id: String,

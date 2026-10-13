@@ -6020,7 +6020,6 @@ func _match_bank_send(stored: Dictionary, reason: String) -> bool:
 	if not _bank_link_alive():
 		return _bank_link_fails < BANK_LINK_FAIL_LOUD
 	var entry: Dictionary = stored.get("entry", {})
-	_bank_link_fails = 0
 	brain_client.request_match_report(
 		str(entry.get("match_winner", "pending")), str(stored.get("tournament_id", "")),
 		str(stored.get("match", "")), nonce,
@@ -6028,6 +6027,14 @@ func _match_bank_send(stored: Dictionary, reason: String) -> bool:
 		str(entry.get("alpha_id", "")), str(entry.get("beta_id", "")),
 		str(entry.get("alpha_path", "")), str(entry.get("beta_path", "")),
 		str(entry.get("match_winner", "")) == "pending")
+	if not brain_client.last_send_ok:
+		_bank_link_fails += 1
+		print("[Arena] Match resend unsendable (err=%d) %d/%d." % [
+			brain_client.last_send_err, _bank_link_fails, BANK_LINK_FAIL_LOUD])
+		_arena_log("match resend unsendable err=%d %d/%d" % [
+			brain_client.last_send_err, _bank_link_fails, BANK_LINK_FAIL_LOUD])
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	_bank_link_fails = 0
 	_match_bank_retries[nonce] = int(_match_bank_retries.get(nonce, 0)) + 1
 	stored["last_send"] = Time.get_ticks_msec()
 	_match_banks_pending[nonce] = stored
@@ -6138,10 +6145,20 @@ func _bank_resend_round(reason: String, announce: bool = true) -> bool:
 	var mr := _seq_last_round_report
 	_seq_round_id = str(mr.get("round_nonce", ""))
 	_tourney_awaiting_roundbank = true
-	_bank_link_fails = 0
 	brain_client.request_round_report(_seq_round_id,
 		str(mr.get("tournament_id", "")), str(mr.get("match", "")),
 		(mr.get("matches", []) as Array), bool(mr.get("group", false)))
+	if not brain_client.last_send_ok:
+		# Unsendable payload (an oversize datagram fails identically
+		# on every socket): count it like a dead link so the tick
+		# parks loud at the cap instead of retrying silently forever.
+		_bank_link_fails += 1
+		print("[Arena] Round resend unsendable (err=%d) %d/%d." % [
+			brain_client.last_send_err, _bank_link_fails, BANK_LINK_FAIL_LOUD])
+		_arena_log("round resend unsendable err=%d %d/%d" % [
+			brain_client.last_send_err, _bank_link_fails, BANK_LINK_FAIL_LOUD])
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	_bank_link_fails = 0
 	_bank_last_send_msec = Time.get_ticks_msec()
 	_bank_retries += 1
 	_arm_seq("roundbank")
@@ -6162,9 +6179,16 @@ func _bank_resend_group(reason: String, announce: bool = true) -> bool:
 	var gr := _seq_last_group_report
 	_seq_group_id = str(gr.get("group_nonce", ""))
 	_tourney_awaiting_groupbank = true
-	_bank_link_fails = 0
 	brain_client.request_group_report(_seq_group_id,
 		str(gr.get("tournament_id", "")), str(gr.get("match", "")))
+	if not brain_client.last_send_ok:
+		_bank_link_fails += 1
+		print("[Arena] Group resend unsendable (err=%d) %d/%d." % [
+			brain_client.last_send_err, _bank_link_fails, BANK_LINK_FAIL_LOUD])
+		_arena_log("group resend unsendable err=%d %d/%d" % [
+			brain_client.last_send_err, _bank_link_fails, BANK_LINK_FAIL_LOUD])
+		return _bank_link_fails < BANK_LINK_FAIL_LOUD
+	_bank_link_fails = 0
 	_bank_last_send_msec = Time.get_ticks_msec()
 	_bank_retries += 1
 	_arm_seq("groupbank")

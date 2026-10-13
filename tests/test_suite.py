@@ -1012,6 +1012,35 @@ class TestSensoryMotor(unittest.TestCase):
                  "generator_params": {"neuron_model": "quantum"}},
                 weights, None, self.pops, cache)
 
+    def test_assemble_round_parts(self):
+        # Oversize banks arrive as indexed parts and process whole
+        # exactly once: match order follows first-seen parts, a match
+        # split across parts concatenates its slices, duplicates are
+        # idempotent, incomplete stays None.
+        import brain_server as bs
+        b = lambda i: {"battle_id": "B%d" % i, "draw": False}
+        p0 = {"matches": [{"match_id": "M0", "match_winner": "alpha",
+                           "battles": [b(0), b(1)]}]}
+        p1 = {"matches": [{"match_id": "M0", "match_winner": "alpha",
+                           "battles": [b(2)]},
+                          {"match_id": "M1", "match_winner": "beta",
+                           "battles": [b(3)]}]}
+        entry = {"count": 2, "parts": {1: p1}, "first_seen": 0.0}
+        self.assertIsNone(bs._assemble_round_parts("N", entry))
+        entry["parts"][0] = p0
+        out = bs._assemble_round_parts("N", entry)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["type"], "round_report")
+        self.assertEqual(out["round_nonce"], "N")
+        self.assertEqual([m["match_id"] for m in out["matches"]],
+                         ["M0", "M1"])
+        self.assertEqual([x["battle_id"] for x in out["matches"][0]["battles"]],
+                         ["B0", "B1", "B2"])
+        entry["parts"][1] = dict(p1)
+        out2 = bs._assemble_round_parts("N", entry)
+        self.assertEqual([x["battle_id"] for x in out2["matches"][0]["battles"]],
+                         ["B0", "B1", "B2"])
+
     def test_brainview_stream_keys_and_detail(self):
         # Brain-view stream: legacy HUD keys intact, per-pool dict
         # present, spike ids gated on detail with truncation guard.

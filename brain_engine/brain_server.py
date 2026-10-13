@@ -60,6 +60,43 @@ def _pool_index(pops):
 
 
 RASTER_CAP = 128
+# Multi-part round-report reassembly: oversize banks arrive as
+# round_report_part messages (same nonce, part_idx/part_count) and
+# process EXACTLY once, whole, through the normal handler - atomicity
+# and the nonce contract are untouched. Bounded so a hostile or
+# wedged client cannot grow memory: oldest incomplete nonce drops.
+_ROUND_PART_STASH = {}
+_ROUND_PART_STASH_MAX = 8
+
+
+def _assemble_round_parts(nonce, entry):
+    """Rebuild one round_report from completed parts, or None while
+    incomplete. Match order follows first-seen parts; a match split
+    across parts concatenates its battle slices in part order.
+    Pure (unit-tested)."""
+    parts = entry.get("parts", {})
+    if not parts or len(parts) != entry.get("count", 0):
+        return None
+    first = parts[min(parts)]
+    out_matches = []
+    seen = {}
+    for i in sorted(parts):
+        for m in parts[i].get("matches", []):
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("match_id", "") or ("#%d" % len(seen)))
+            if mid in seen:
+                seen[mid]["battles"].extend(m.get("battles", []))
+            else:
+                nm = dict(m)
+                nm["battles"] = list(m.get("battles", []))
+                seen[mid] = nm
+                out_matches.append(nm)
+    return {"type": "round_report", "round_nonce": nonce,
+            "tournament_id": str(first.get("tournament_id", "")),
+            "match": str(first.get("match", "")),
+            "group": bool(first.get("group", False)),
+            "matches": out_matches}
 
 
 def _run_side_integrate(dec, brain, stim, sens, pops, pool_idx, detail):
@@ -2537,6 +2574,45 @@ def run_brain_server(host="127.0.0.1", port=9999):
                     "tournament_id": tourney_tag.get("tournament_id", ""),
                     "match": tourney_tag.get("match", ""),
                 }).encode("utf-8"), client_addr)
+
+            elif msg_type == "round_report_part":
+                # One slice of an oversize bank (see BrainClient
+                # split_report_parts): stash by nonce, process whole
+                # once complete. Retried slices overwrite the same
+                # index (idempotent); the stash is bounded.
+                _pnonce = str(msg.get("round_nonce", ""))
+                try:
+                    _pidx, _pcount = int(msg.get("part_idx", -1)), int(msg.get("part_count", 0))
+                except (TypeError, ValueError):
+                    _pidx, _pcount = -1, 0
+                if _pnonce and 0 <= _pidx < _pcount:
+                    _pent = _ROUND_PART_STASH.get(_pnonce)
+                    if _pent is None:
+                        if len(_ROUND_PART_STASH) >= _ROUND_PART_STASH_MAX:
+                            _oldest = min(_ROUND_PART_STASH,
+                                          key=lambda k: _ROUND_PART_STASH[k].get("first_seen", 0.0))
+                            del _ROUND_PART_STASH[_oldest]
+                        _pent = {"count": _pcount, "parts": {},
+                                 "first_seen": time.monotonic()}
+                        _ROUND_PART_STASH[_pnonce] = _pent
+                    elif _pent.get("count", 0) != _pcount:
+                        _pent["count"] = _pcount
+                        _pent["parts"] = {}
+                    _pent["parts"][_pidx] = msg
+                    _whole = _assemble_round_parts(_pnonce, _pent)
+                    if _whole is not None:
+                        del _ROUND_PART_STASH[_pnonce]
+                        print(f"[Server] Round report reassembled: "
+                              f"{_pnonce} ({_pcount} parts).", flush=True)
+                        _handle_round_report(
+                            sock, client_addr, _whole, tourney_a, tourney_b,
+                            tourney_tag, tournament_lr_scale, tournament_mode,
+                            evo_mgr, dopamine_rl, base_lr, tourney_note,
+                            csr, pops, struct_cache, codec_cache)
+                else:
+                    print(f"[Server] round_report_part: bad index "
+                          f"for nonce={_pnonce}.", flush=True)
+                continue
 
             elif msg_type == "round_report":
                 # ONE bank per round: matches replay in order (per-match
