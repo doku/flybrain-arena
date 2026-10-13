@@ -1356,6 +1356,54 @@ func test_eliminate_career_gate() -> void:
 	D.free()
 
 
+func test_evo_demotion_gate() -> void:
+	# Continuous-loop demotion: placement nominates, the EVO gate
+	# vetoes. Last place above the ELO line is spared (next-worst
+	# qualifier moves up); green brains and the champion are never
+	# nominated even when their numbers would qualify.
+	var D = load("res://scripts/TournamentDirector.gd").new()
+	var old_tourney: Dictionary = D.tourney
+	D.tourney = {"id": "TE", "status": "finished",
+		"players": [{"id": "champ"}, {"id": "last"}, {"id": "mid"}, {"id": "weak"}],
+		"rounds": [
+			[{"a_id": "last", "b_id": "weak", "winner_id": "weak",
+				"wins_a": 0, "wins_b": 4},
+			{"a_id": "mid", "b_id": "champ", "winner_id": "champ",
+				"wins_a": 1, "wins_b": 4}],
+			[{"a_id": "last", "b_id": "mid", "winner_id": "mid",
+				"wins_a": 2, "wins_b": 4}]],
+		"champion_id": "champ", "last_place_id": "last",
+		"losers_start_round": 1}
+	var present := ["champ", "last", "mid", "weak"]
+	# Last place is experienced but above the line: vetoed. The
+	# consolation winner is green: vetoed. Next-worst moves up.
+	var cards := {
+		"champ": {"elo": 800.0, "train": 80, "matches": 50},
+		"last": {"elo": 1300.0, "train": 80, "matches": 30},
+		"mid": {"elo": 1400.0, "train": 80, "matches": 2},
+		"weak": {"elo": 1100.0, "train": 80, "matches": 25}}
+	var dem: Dictionary = D.call("evo_demotion_candidates",
+		20, 1250.0, cards, present)
+	_check(bool(dem.get("ok", false)), "demotion candidates resolve")
+	_check((dem.get("candidates", []) as Array) == ["weak"],
+		"vetoed last yields to next-worst qualifier")
+	# Both consolation finalists qualify: worst-first, champion
+	# still excluded despite the lowest ELO on the board.
+	cards["last"] = {"elo": 1000.0, "train": 80, "matches": 30}
+	cards["mid"] = {"elo": 1050.0, "train": 80, "matches": 30}
+	var dem2: Dictionary = D.call("evo_demotion_candidates",
+		20, 1250.0, cards, present)
+	_check((dem2.get("candidates", []) as Array) == ["last", "mid", "weak"],
+		"qualifiers worst-first, champion excluded")
+	# Empty placement (nobody present): no candidates, never a crash.
+	var dem3: Dictionary = D.call("evo_demotion_candidates",
+		20, 1250.0, cards, [])
+	# Real vault behind the empty override: just requires ok shape.
+	_check(bool(dem3.get("ok", false)), "empty override still resolves")
+	D.tourney = old_tourney
+	D.free()
+
+
 func test_backfill_greenest_first() -> void:
 	# Draw-first backfill: the strict schooled draw's leftovers ordered
 	# greenest-first (fewest career matches, then most episodes). ELO
@@ -1703,6 +1751,7 @@ func _initialize() -> void:
 	test_arena_session_log()
 	test_arena_session_log_skips_live_file()
 	test_eliminate_career_gate()
+	test_evo_demotion_gate()
 	test_backfill_greenest_first()
 	test_draw_backfill_consumes()
 	test_vault_draw_excludes_participants()

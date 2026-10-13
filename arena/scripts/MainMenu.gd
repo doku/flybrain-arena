@@ -1013,10 +1013,10 @@ func _build_tourney_column() -> HBoxContainer:
 	tourney_redraw.tooltip_text = "Size-16 continuous only: every iteration draws all 16 from the vault green-weighted (debutants surface first) instead of carrying 14 survivors. Needs 16 schooled brains."
 	tourney_redraw.button_pressed = false
 	r.add_child(tourney_redraw)
-	evo_min_matches = _spin("Evo demote: min matches", r, 1.0, 50.0, 1.0, 10.0,
-		"Career ring experience required before a brain can be demoted to archives: only fighters with at least this many vault-record matches AND below the ELO line are evaluated at generation end. Green brains are never demoted.")
-	evo_elo_cutoff = _spin("Evo demote: ELO below", r, 0.0, 2000.0, 25.0, 0.0,
-		"Demotion line: among experienced fighters, only those rated below this ELO are archived (0 = off, lowest-ELO pair goes regardless).")
+	evo_min_matches = _spin("Evo demote: min matches", r, 1.0, 50.0, 1.0, 20.0,
+		"Career ring experience required before a brain can be demoted to archives: only fighters with at least this many vault-record matches AND below the ELO line are evaluated at generation end, in group events and the continuous loop alike. Green brains are never demoted.")
+	evo_elo_cutoff = _spin("Evo demote: ELO below", r, 0.0, 2000.0, 25.0, 1250.0,
+		"Demotion line: among experienced fighters, only those rated below this ELO are archived (0 = off, lowest-ELO pair goes regardless). Gates group-event elimination and continuous-loop demotion alike.")
 	bracket_status = Label.new()
 	bracket_status.add_theme_font_size_override("font_size", 13)
 	bracket_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1893,6 +1893,8 @@ func _on_start_evolution() -> void:
 		return
 	TournamentDirector.tourney["evo"] = {"active": true, "generation": 1,
 		"episodes": 50,
+		"min_matches": int(evo_min_matches.value) if is_instance_valid(evo_min_matches) else 20,
+		"elo_cutoff": float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 1250.0,
 		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
 			and evo_mutate_traits.button_pressed else 0,
 		"pool_threshold": int(evo_pool_threshold.value) if is_instance_valid(evo_pool_threshold) else 25}
@@ -1936,8 +1938,8 @@ func _start_event_evolution(ids: Array, bestof: int) -> void:
 		"mutate_traits": 1 if is_instance_valid(evo_mutate_traits)
 			and evo_mutate_traits.button_pressed else 0,
 		"episodes": 50,
-		"min_matches": int(evo_min_matches.value) if is_instance_valid(evo_min_matches) else 10,
-		"elo_cutoff": float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 0.0}
+		"min_matches": int(evo_min_matches.value) if is_instance_valid(evo_min_matches) else 20,
+		"elo_cutoff": float(evo_elo_cutoff.value) if is_instance_valid(evo_elo_cutoff) else 1250.0}
 	var beg: Dictionary = TournamentDirector.event_begin(ids, settings, 1)
 	if not bool(beg.get("ok", false)):
 		bracket_status.text = "Cannot start: %s" % str(beg.get("error", "?"))

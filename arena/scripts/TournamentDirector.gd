@@ -1195,6 +1195,44 @@ func evo_bottom_two() -> Dictionary:
 			"via": "ranking" if ranked.size() > 1 else "none"}}
 
 
+func evo_demotion_candidates(min_matches: int = 20, elo_cutoff: float = 1250.0, live_override: Dictionary = {}, present_override: Array = []) -> Dictionary:
+	# Continuous-loop demotion: placement nominates, the EVO gate
+	# vetoes. Worst-first ids (consolation last, consolation
+	# second, then earliest-exit ranking) that ALSO carry career
+	# matches >= min_matches and live ELO below elo_cutoff. The
+	# champion is never nominated; green brains (< min_matches)
+	# and above-the-line fighters survive any placement, and the
+	# next-worst qualifier moves up in their stead. Pure (no
+	# archiving) so the rule is unit-testable; _evo_advance
+	# archives the first two.
+	var present: Array = present_override if not present_override.is_empty() else evo_vault_ids()
+	var champ := str(tourney.get("champion_id", ""))
+	var order: Array = []
+	var last := str(tourney.get("last_place_id", ""))
+	if last != "" and last != champ and last in present:
+		order.append(last)
+		if int(tourney.get("losers_start_round", -1)) >= 0:
+			var rounds: Array = tourney.get("rounds", [])
+			if not rounds.is_empty() and not (rounds[rounds.size() - 1] as Array).is_empty():
+				var fin: Dictionary = (rounds[rounds.size() - 1] as Array)[0]
+				var w := str(fin.get("winner_id", ""))
+				if w != "" and w != last and w != champ and w in present \
+						and not (w in order):
+					order.append(w)
+	for pid in evo_ranking():
+		if str(pid) != champ and str(pid) in present and not (str(pid) in order):
+			order.append(str(pid))
+	var cards := _event_live_cards(live_override)
+	var out: Array = []
+	for pid in order:
+		if not cards.has(pid):
+			continue
+		if int((cards[pid] as Dictionary).get("matches", 0)) >= min_matches \
+				and float((cards[pid] as Dictionary).get("elo", 0.0)) < elo_cutoff:
+			out.append(pid)
+	return {"ok": true, "candidates": out}
+
+
 func evo_archive(brain_id: String, reason: String) -> Dictionary:
 	# Blocking: local file move, milliseconds. Membership change:
 	# the roster cache must refresh (a same-minute draw off a stale

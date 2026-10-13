@@ -412,7 +412,7 @@ var _event_gallery_active := false
 var _event_gallery_key := ""
 var _event_gallery_moved := false
 var bracket_row: HBoxContainer
-const EVENT_MIN_MATCHES := 10
+const EVENT_MIN_MATCHES := 20
 const EVENT_POOL_TARGET := 2
 const POOL_TRAIN_TARGET := 50
 const EVENT_TOPUP_EVERY := 30.0
@@ -7307,7 +7307,7 @@ func _run_event_handoff() -> void:
 			eid, str(boost.get("queued", []))])
 	var elim: Dictionary = director.event_eliminate(eid,
 		int(st0.get("min_matches", EVENT_MIN_MATCHES)),
-		float(st0.get("elo_cutoff", 0.0)))
+		float(st0.get("elo_cutoff", 1250.0)))
 	# Green-roster tolerance: fewer than 2 career-eligible brains means
 	# nobody has the matches to demote, so elimination is WAIVED this
 	# generation (the green-protection promise holds; the event simply
@@ -8295,35 +8295,46 @@ func _run_evo_generation() -> void:
 		Color(1.0, 0.85, 0.3), "BREEDING NEXT GENERATION", "", false)
 	_announce_clip("generation_champion")
 	_show_evo_phase("CONTINUOUS GENERATION %d" % [gen + 1],
-		"Champion %s - ranking bottom two..." % champ_name)
+		"Champion %s - EVO demotion gate..." % champ_name)
 	if is_instance_valid(status_label):
-		status_label.text = "CONTINUOUS gen %d champion %s - ranking bottom two..." % [gen, champ_name]
-	# --- Archive bottom two ---
-	var bottom: Dictionary = director.evo_bottom_two()
-	var last_id := str((bottom.get("last", {}) as Dictionary).get("id", ""))
-	var second_id := str((bottom.get("second", {}) as Dictionary).get("id", ""))
-	var via := str((bottom.get("last", {}) as Dictionary).get("via", "ranking"))
-	if via == "ranking" and is_instance_valid(status_label):
-		status_label.text = "CONTINUOUS gen %d: no consolation ran - bottom two by ranking fallback." % gen
-	if last_id == "":
-		_evo_abort("no loser found - bracket empty?")
-		return
-	for pair in [[last_id, "biggest loser"], [second_id, "second-last"]]:
-		if str(pair[0]) == "":
-			continue
-		var ares: Dictionary = director.evo_archive(
-			str(pair[0]), "continuous gen %d %s (%s)" % [gen, str(pair[1]), via])
-		if not bool(ares.get("ok", false)):
-			_evo_abort("archive failed: %s" % str(ares.get("error", "?")))
-			return
-		print("[Arena] CONTINUOUS gen %d: archived %s %s" % [gen, str(pair[1]), str(pair[0])])
+		status_label.text = "CONTINUOUS gen %d champion %s - applying EVO demotion gate..." % [gen, champ_name]
+	# --- Gated demotion: placement nominates, experience + ELO veto ---
+	# The EVO gate (career matches + ELO line, same spinners as the
+	# group-event elimination) decides who actually leaves: green
+	# brains and above-the-line fighters survive any placement, and
+	# only as many replacements breed as brains demoted. An empty
+	# gate waives the generation loudly (roster refights, no fresh
+	# blood) instead of aborting the loop.
+	var evo_cfg: Dictionary = director.tourney.get("evo", {})
+	var gate_min := int(evo_cfg.get("min_matches", 20))
+	var gate_elo := float(evo_cfg.get("elo_cutoff", 1250.0))
+	var dem: Dictionary = director.evo_demotion_candidates(gate_min, gate_elo)
+	var gone_ids: Array = (dem.get("candidates", []) as Array).slice(0, 2)
+	var cards: Dictionary = director._event_live_cards()
+	if gone_ids.is_empty():
+		var waive := "CONTINUOUS gen %d: EVO GATE WAIVED - nobody below ELO %d with %d+ matches (roster refights, no fresh blood)" % [gen, int(gate_elo), gate_min]
+		print("[Arena] ", waive)
+		if is_instance_valid(status_label):
+			status_label.text = waive
+	else:
+		var labels := ["biggest loser", "second-last"]
+		for i in range(gone_ids.size()):
+			var pid := str(gone_ids[i])
+			var card: Dictionary = cards.get(pid, {})
+			var ares: Dictionary = director.evo_archive(pid,
+				"continuous gen %d %s (ELO %.0f, %d matches)" % [gen, labels[i],
+					float(card.get("elo", 0.0)), int(card.get("matches", 0))])
+			if not bool(ares.get("ok", false)):
+				_evo_abort("archive failed: %s" % str(ares.get("error", "?")))
+				return
+			print("[Arena] CONTINUOUS gen %d: archived %s %s" % [gen, labels[i], pid])
 	# --- Next-gen waiting room: preview bracket + gallery + strip ---
 	# Survivor context is frozen here; offspring cards refresh live as
 	# breeds adopt (synthetic "training" names until then).
 	var target_gen := gen + 1
 	nextgen_gen = target_gen
 	nextgen_size = int(director.tourney.get("size", 8))
-	nextgen_gone = [last_id, second_id]
+	nextgen_gone = gone_ids.duplicate()
 	nextgen_survivors = []
 	for p in director.tourney.get("players", []):
 		var pid := str((p as Dictionary).get("id", ""))
@@ -8347,13 +8358,20 @@ func _run_evo_generation() -> void:
 	# entirely and the bracket refills from established fighters.
 	# _evo_queue_* no-op internally when the gate is shut.
 	var want_breed := _evo_breeding_wanted()
+	# Replacements match demotions one-for-one: a waived (or single)
+	# gate breeds nothing (or only the clone). A shut pool gate
+	# still skips breeding entirely.
+	var want_clone := want_breed and gone_ids.size() >= 1
+	var want_wild := want_breed and gone_ids.size() >= 2
 	if not want_breed:
 		print("[Arena] Pool %d/%d - generation %d breeds no replacements." % [
 			_evo_pool_size(), _evo_pool_threshold(), target_gen])
-	if id1 == "" and not _evo_has_kind("clone"):
+	elif gone_ids.is_empty():
+		print("[Arena] EVO gate waived generation %d - no demotion, no replacements." % target_gen)
+	if id1 == "" and want_clone and not _evo_has_kind("clone"):
 		_evo_queue_clone(target_gen, champ_id, champ_name,
 			_evo_clone_parent2(target_gen, champ_id))
-	if id2 == "" and not _evo_has_kind("wild"):
+	if id2 == "" and want_wild and not _evo_has_kind("wild"):
 		_evo_queue_wild(target_gen)
 	# Tournament is over: show whatever is left in training before
 	# blocking on stragglers (names for the done, ep counts for the
@@ -8365,7 +8383,7 @@ func _run_evo_generation() -> void:
 	# Await any still-pending specs one by one via the shared slot.
 	# done is re-read between awaits: the watcher may bank the wild
 	# breed while the clone await is in flight.
-	if id1 == "" and _evo_has_kind("clone"):
+	if id1 == "" and want_clone and _evo_has_kind("clone"):
 		id1 = await _evo_await_queued("clone")
 		if id1 == "":
 			# Last-chance rescue: a verdict adopted by a concurrent
@@ -8378,7 +8396,7 @@ func _run_evo_generation() -> void:
 		_refresh_nextgen_preview()
 	if id2 == "":
 		id2 = _evo_done_id("wild")
-	if id2 == "" and _evo_has_kind("wild"):
+	if id2 == "" and want_wild and _evo_has_kind("wild"):
 		id2 = await _evo_await_queued("wild")
 		if id2 == "":
 			_evo_adopt_finished(true)
@@ -8398,22 +8416,36 @@ func _run_evo_generation() -> void:
 	# Offspring required only when the gate bred (or found) them: a
 	# full pool plays on without replacements instead of aborting on
 	# young it never asked for.
-	if want_breed and (id1 == "" or id2 == ""):
-		_evo_abort("missing offspring - refusing a short bracket")
+	if want_clone and id1 == "":
+		_evo_abort("missing clone offspring - refusing a short bracket")
+		return
+	if want_wild and id2 == "":
+		_evo_abort("missing random offspring - refusing a short bracket")
 		return
 	# --- Rebuild bracket at constant roster size ---
 	# Survivors plus adopted offspring (if the gate bred any); a full
 	# pool completes from established fighters by ranking instead of
 	# breeding newcomers for the slot.
 	var size := int(director.tourney.get("size", 8))
-	var gone := [last_id, second_id]
+	var gone := gone_ids.duplicate()
 	var present: Array = director.evo_vault_ids()
 	var roster: Array = []
 	for p in director.tourney.get("players", []):
 		var pid := str((p as Dictionary).get("id", ""))
 		if pid != "" and not (pid in gone) and pid in present:
 			roster.append(pid)
-	for oid in [id1, id2]:
+	# A shut pool gate keeps the legacy path (adopt pipeline young,
+	# trim back by ranking); a gated generation adopts only the
+	# replacements it demoted room for.
+	var want_oids: Array = []
+	if not want_breed:
+		want_oids = [id1, id2]
+	else:
+		if gone_ids.size() >= 1 and str(id1) != "":
+			want_oids.append(str(id1))
+		if gone_ids.size() >= 2 and str(id2) != "":
+			want_oids.append(str(id2))
+	for oid in want_oids:
 		if str(oid) != "" and not (str(oid) in roster):
 			roster.append(str(oid))
 	roster = _evo_pool_fill(roster, gone, size)
@@ -8459,11 +8491,14 @@ func _run_evo_generation() -> void:
 		_evo_abort("next bracket failed: %s" % str(res.get("error", "?")))
 		return
 	# The evo dict rebuilds from scratch each generation: carry the
-	# pool threshold forward or the gate silently resets to default.
+	# pool threshold AND the demotion gate forward or they silently
+	# reset to defaults mid-loop.
 	var carried := director.tourney.get("evo", {}) as Dictionary
 	director.tourney["evo"] = {"active": true, "generation": gen + 1,
 		"episodes": EVO_EPISODES,
 		"pool_threshold": int(carried.get("pool_threshold", 25)),
+		"min_matches": int(carried.get("min_matches", 20)),
+		"elo_cutoff": float(carried.get("elo_cutoff", 1250.0)),
 		"mutate_traits": int(carried.get("mutate_traits", 1))}
 	director.save_state()
 	# Pipeline: kick off the next generation's wild breed immediately
