@@ -412,7 +412,6 @@ var _event_gallery_active := false
 var _event_gallery_key := ""
 var _event_gallery_moved := false
 var bracket_row: HBoxContainer
-const EVENT_MIN_MATCHES := 20
 const EVENT_POOL_TARGET := 2
 const POOL_TRAIN_TARGET := 50
 const EVENT_TOPUP_EVERY := 30.0
@@ -7306,8 +7305,8 @@ func _run_event_handoff() -> void:
 		print("[Arena] Event %s booster schooling queued: %s" % [
 			eid, str(boost.get("queued", []))])
 	var elim: Dictionary = director.event_eliminate(eid,
-		int(st0.get("min_matches", EVENT_MIN_MATCHES)),
-		float(st0.get("elo_cutoff", 1250.0)))
+		int(st0.get("min_matches", director.EVO_DEMOTE_MIN_MATCHES)),
+		float(st0.get("elo_cutoff", director.EVO_DEMOTE_ELO_CUTOFF)))
 	# Green-roster tolerance: fewer than 2 career-eligible brains means
 	# nobody has the matches to demote, so elimination is WAIVED this
 	# generation (the green-protection promise holds; the event simply
@@ -8306,8 +8305,8 @@ func _run_evo_generation() -> void:
 	# gate waives the generation loudly (roster refights, no fresh
 	# blood) instead of aborting the loop.
 	var evo_cfg: Dictionary = director.tourney.get("evo", {})
-	var gate_min := int(evo_cfg.get("min_matches", 20))
-	var gate_elo := float(evo_cfg.get("elo_cutoff", 1250.0))
+	var gate_min := int(evo_cfg.get("min_matches", director.EVO_DEMOTE_MIN_MATCHES))
+	var gate_elo := float(evo_cfg.get("elo_cutoff", director.EVO_DEMOTE_ELO_CUTOFF))
 	var dem: Dictionary = director.evo_demotion_candidates(gate_min, gate_elo)
 	var gone_ids: Array = (dem.get("candidates", []) as Array).slice(0, 2)
 	var cards: Dictionary = director._event_live_cards()
@@ -8497,8 +8496,8 @@ func _run_evo_generation() -> void:
 	director.tourney["evo"] = {"active": true, "generation": gen + 1,
 		"episodes": EVO_EPISODES,
 		"pool_threshold": int(carried.get("pool_threshold", 25)),
-		"min_matches": int(carried.get("min_matches", 20)),
-		"elo_cutoff": float(carried.get("elo_cutoff", 1250.0)),
+		"min_matches": int(carried.get("min_matches", director.EVO_DEMOTE_MIN_MATCHES)),
+		"elo_cutoff": float(carried.get("elo_cutoff", director.EVO_DEMOTE_ELO_CUTOFF)),
 		"mutate_traits": int(carried.get("mutate_traits", 1))}
 	director.save_state()
 	# Pipeline: kick off the next generation's wild breed immediately

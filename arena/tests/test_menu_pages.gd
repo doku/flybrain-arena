@@ -94,6 +94,16 @@ func _process(_delta: float) -> bool:
 	_check(srow.get_combined_minimum_size().x <= 900.0,
 		"SOUND row stays bounded without voice names")
 	_check(menu.evo_pool_threshold != null, "pool threshold spin exists")
+	# The demote spinners default to the canonical gate (single
+	# source: the director consts), so a fresh menu and every
+	# fallback agree on the line without duplicating numbers.
+	var gate = load("res://scripts/TournamentDirector.gd")
+	_check(menu.evo_min_matches != null
+		and menu.evo_min_matches.value == float(gate.EVO_DEMOTE_MIN_MATCHES),
+		"demote min-matches defaults to canonical gate")
+	_check(menu.evo_elo_cutoff != null
+		and menu.evo_elo_cutoff.value == float(gate.EVO_DEMOTE_ELO_CUTOFF),
+		"demote ELO line defaults to canonical gate")
 	_check(_is_on_page(menu.queue_up_btn, 1), "queue UP on training page")
 	_check(_is_on_page(menu.queue_down_btn, 1), "queue DOWN on training page")
 	_check(_is_on_page(menu.queue_top_btn, 1), "queue TOP on training page")

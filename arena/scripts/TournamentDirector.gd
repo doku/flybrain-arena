@@ -7,6 +7,15 @@ const TOURNAMENT_DIRNAME := "tournaments"
 const JOB_DIRNAME := "jobs"
 const WIN_RATE_FALLBACK := 0.5
 
+# Canonical EVO demotion gate: the menu spinners' defaults AND the
+# fallback whenever a running tournament/event predates stored gate
+# settings. Runtime code never hardcodes gate numbers elsewhere: the
+# arena reads them from tourney/event settings (written from the
+# spinners at start), falling back to these two. Keep every
+# .get("min_matches") / .get("elo_cutoff") fallback pointed here.
+const EVO_DEMOTE_MIN_MATCHES := 20
+const EVO_DEMOTE_ELO_CUTOFF := 1250.0
+
 var python_exe: String = "python"
 var python_extra_args: Array = []
 var python_ready: bool = false
@@ -1195,7 +1204,7 @@ func evo_bottom_two() -> Dictionary:
 			"via": "ranking" if ranked.size() > 1 else "none"}}
 
 
-func evo_demotion_candidates(min_matches: int = 20, elo_cutoff: float = 1250.0, live_override: Dictionary = {}, present_override: Array = []) -> Dictionary:
+func evo_demotion_candidates(min_matches: int = EVO_DEMOTE_MIN_MATCHES, elo_cutoff: float = EVO_DEMOTE_ELO_CUTOFF, live_override: Dictionary = {}, present_override: Array = []) -> Dictionary:
 	# Continuous-loop demotion: placement nominates, the EVO gate
 	# vetoes. Worst-first ids (consolation last, consolation
 	# second, then earliest-exit ranking) that ALSO carry career
