@@ -71,6 +71,23 @@ def main():
     print(f"[*] Arena:  {ARENA_DIR}")
     print(f"[*] Mode:   {'direct battle' if args.direct else 'vault menu'}")
 
+    # 0. First-start: fetch connectome data + build caches if missing
+    malecns_dir = os.path.join(PROJECT_ROOT, "connectome_data", "malecns_v1")
+    csr_cache = os.path.join(PROJECT_ROOT, "malecns_csr_base.npz")
+    tables_present = all(
+        os.path.exists(os.path.join(malecns_dir, f))
+        for f in ("annotations.feather", "neurotransmitters.feather", "edges.feather")
+    )
+    if not (tables_present and os.path.exists(csr_cache)):
+        print("\n[0/2] First-start setup: connectome data missing - running setup.py...")
+        setup_script = os.path.join(PROJECT_ROOT, "setup.py")
+        rc = subprocess.run([PYTHON_EXE, setup_script]).returncode
+        if rc != 0:
+            print("[FATAL] setup.py failed - cannot start without the connectome. "
+                  "Re-run 'python setup.py' manually to retry. Aborting.")
+            sys.exit(4)
+        print("[*] Setup complete.\n")
+
     # 1. Start the Dual-Brain Connectome Server
     print("\n[1/2] Starting Connectome Neuro-Server (MaleCNS v1.0)...")
     if port_in_use(SERVER_PORT):

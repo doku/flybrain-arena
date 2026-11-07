@@ -15,10 +15,18 @@ Godot 4 arena (arena/)  <-- UDP 127.0.0.1:9999 -->  Python neuro-server (brain_e
 ## Quickstart
 
 ```bat
-:: Windows — boots the neuro-server, then the Godot arena at the vault menu
+:: Windows — first run auto-downloads the ~1.2 GB MaleCNS connectome data
+:: (runs setup.py), then boots the neuro-server + Godot arena
 launch_battle.bat
 :: or
 python launch_battle.py
+```
+
+To fetch the connectome data ahead of time (or on a headless machine):
+
+```bash
+python setup.py          # download ~1.2 GB of feather tables + build caches
+python setup.py --check  # verify downloads only
 ```
 
 On first launch the server builds `malecns_csr_base.npz` from the feather tables
@@ -78,7 +86,7 @@ protocol (see `DOCUMENTATION.md` §11), or simply use the Godot menu above.
 |---|---|---|
 | Python | 3.10+ | `numpy`, `scipy`, `pandas`, `pyarrow`, `numba` |
 | Godot | 4.7.2 | Windows binaries bundled in `tools/godot/` (gitignored; download from godotengine.org for other platforms) |
-| Connectome data | MaleCNS v1.0 | ~1.1 GB of feather tables, see below |
+| Connectome data | MaleCNS v1.0 | ~1.2 GB, auto-downloaded by `python setup.py` on first start |
 | RAM / CPU | ~8+ GB RAM | a dual-brain tick costs ~140-210 ms on reference hardware |
 
 ```bash
@@ -88,20 +96,23 @@ pip install numpy scipy pandas pyarrow numba
 ## Connectome data (not in this repo)
 
 The brain is built from the **MaleCNS v1.0** connectome (Berg et al., *Cell* 2026;
-166,700 neurons, 25.6M edges). Download the flat-connectome tables and place them in
-`connectome_data/malecns_v1/`:
+166,700 neurons, 25.6M edges, CC-BY). **You do not need to download anything
+manually** — `python setup.py` (also run automatically by `launch_battle.py` on
+first start) fetches the three feather tables into `connectome_data/malecns_v1/`:
 
 ```
 connectome_data/malecns_v1/
-  annotations.feather        # cell type, side, ROI per neuron
-  neurotransmitters.feather  # consensus neurotransmitter per neuron
-  edges.feather              # synaptic edges (pre, post, weight)
+  annotations.feather        # 14 MB,  sha256-verified
+  neurotransmitters.feather  # 43 MB
+  edges.feather              # 1.05 GB (the full connection graph)
 ```
 
-Sources:
-- https://male-cns.janelia.org/download (primary, `gs://flyem-male-cns/v1.0/connectome-data/flat-connectome/`)
-- https://github.com/flyconnectome/2025malecns (derived data for the paper)
-- Interactive: https://neuprint.janelia.org (dataset `male-cns:v1.0`)
+Direct URLs (same files, if you prefer curl/wget):
+- `https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome/body-annotations-male-cns-v1.0-minconf-0.5.feather`
+- `.../body-neurotransmitters-male-cns-v1.0.feather`
+- `.../connectome-weights-male-cns-v1.0-minconf-0.5.feather`
+
+Project page: https://male-cns.janelia.org/download · Interactive: https://neuprint.janelia.org (dataset `male-cns:v1.0`)
 
 On first run the loader builds a cached CSR matrix (`malecns_csr_base.npz`, ~83 MB,
 gitignored) and the derived `populations_mapped.json` (tracked, regenerable).
@@ -114,7 +125,8 @@ brain_engine/     Python neuro-server: LIF kernel, connectome loader, sensory/mo
                   codecs, dopamine learning, evolution, vault (.flybrain packages)
 tests/            Python test suite (tests/test_suite.py)
 docs/             Neuron survey + post-mortems
-launch_battle.py  One-command launcher (server + arena)
+setup.py          First-start: downloads MaleCNS v1.0 tables + builds caches
+launch_battle.py  One-command launcher (runs setup.py if data missing, then server + arena)
 DOCUMENTATION.md  Full architecture, protocol, and neuron-pool reference
 ```
 
