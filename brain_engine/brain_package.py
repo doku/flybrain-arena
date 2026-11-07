@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import time
@@ -60,7 +61,20 @@ def _utcnow():
 
 
 def _new_id():
-    return "%08x" % (int(time.time() * 1000) & 0xFFFFFFFF)
+    """16 hex chars, used verbatim as the package filename suffix
+    ({name}_{id}.flybrain): 8 hex of creation millisecond + 8 random hex.
+
+    Ids used to be a bare 32-bit millisecond timestamp, so two brains
+    minted in the same millisecond - parallel breed workers, or the 32-bit
+    wrap every ~49 days - shared an id AND a filename, and the second save
+    silently overwrote the first brain's package. The timestamp prefix is
+    kept because ids double as a creation-order tiebreak (created_utc is
+    only second-resolution, see vault_cli normalize-names); the 32 random
+    bits behind it make a collision vanishingly rare even for a burst of
+    thousands minted inside one millisecond. Ids are otherwise opaque
+    strings - nothing parses them beyond that sort."""
+    return "%08x%08x" % (int(time.time() * 1000) & 0xFFFFFFFF,
+                         secrets.randbelow(0x100000000))
 
 
 def _sanitize_name(name):
@@ -283,7 +297,17 @@ def scan_vault(silent=False):
                 rec = side
             rec["filename"] = fname
             records.append(rec)
-        except Exception as e:
+        except PermissionError as e:
+            # A package we could not even OPEN is not a corrupt package:
+            # another reader, an editor, or the AV holds a transient lock.
+            # Quarantining here renames a valid ~100 MB brain out of the
+            # roster (on POSIX the rename succeeds while the file is open).
+            # Leave it alone - the next scan (or the drop-aware rescan in
+            # read_vault) picks it up once the lock clears.
+            if not silent:
+                print(f"[Vault] Skipped locked package {fname}: {e}")
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError,
+                KeyError, EOFError, OSError) as e:
             bad = path + ".corrupt"
             try:
                 os.replace(path, bad)
@@ -585,7 +609,9 @@ def archive_brain(path_or_id, reason=""):
     non-recursively, so archived files drop out of the roster with no
     code changes). Appends to the archive log; refreshes the index.
     Returns the log entry."""
-    rec, _w = load_brain(path_or_id)  # validates the package first
+    # Record-only validation (~KB): a full load_brain would decode a
+    # ~100 MB weight array we are about to move anyway.
+    rec = load_brain_record(path_or_id)
     src = _resolve(path_or_id)
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
     dst = os.path.join(ARCHIVE_DIR, os.path.basename(src))
@@ -633,7 +659,7 @@ def restore_brain(name_or_id):
     src = os.path.join(ARCHIVE_DIR, fname)
     dst = os.path.join(VAULT_DIR, fname)
     if os.path.exists(dst):
-        raise FileExistsError(f"Vault already holds {cands[0]}")
+        raise FileExistsError(f"Vault already holds {fname}")
     shutil.move(src, dst)
     bak = src + ".bak"
     if os.path.isfile(bak):
@@ -641,7 +667,7 @@ def restore_brain(name_or_id):
     rside = src + SIDECAR_SUFFIX
     if os.path.isfile(rside):
         shutil.move(rside, dst + SIDECAR_SUFFIX)
-    rec, _w = load_brain(dst)
+    rec = load_brain_record(dst)
     update_index_entry(rec)
     # No longer archived: drop the log entry so the Hall of Shame stops
     # listing the restored brain (previously it lingered as "(missing)").

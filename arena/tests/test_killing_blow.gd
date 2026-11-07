@@ -16,7 +16,12 @@ func _check(cond: bool, label: String) -> void:
 
 func _new_fly():
 	# Bare instance: physics never runs, only the ledger is exercised.
-	return load("res://scripts/FlyPhysics.gd").new()
+	# Combat gate (FlyPhysics.combat_enabled) makes take_damage/tear_wing
+	# no-ops outside live rounds, so the ledger only moves once opened -
+	# without this the damage assertions read a fly that ignored the blow.
+	var f = load("res://scripts/FlyPhysics.gd").new()
+	f.set_combat_enabled(true)
+	return f
 
 
 func test_ledger_keeps_last_blow() -> void:

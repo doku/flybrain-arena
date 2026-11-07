@@ -25,9 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from connectome_loader import load_or_build_csr, load_or_extract_populations
 from dopamine_learning import DopamineReinforcement
 from experimental_wiring import experiment_arrays
-from lif_brain import FlyBrain
 from probe_flight_style import fly_scenario
-from train_homing import CHECKPOINTS_DIR, run_training
+from train_homing import run_training
 
 EXPERIMENT = ["lplc2_contra_dn", "retina_wide", "spear_lunge"]
 MAPPING = ["muscles_up", "gyro_flow", "mbon", "retina"]

@@ -5,6 +5,7 @@ import time
 import socket
 import unittest
 import subprocess
+import zipfile
 import numpy as np
 
 # Add project root and brain_engine to Python path
@@ -73,6 +74,31 @@ class TestConnectomeData(unittest.TestCase):
             self.assertGreater(len(pop_data["all"]), 0, f"Empty population: {pop_name}")
             for idx in pop_data["all"]:
                 self.assertTrue(0 <= idx < 166700, f"Invalid neuron index: {idx} in {pop_name}")
+
+    def test_threshold_filters_cached_csr(self):
+        # The on-disk cache is always the full threshold-1 graph, so a
+        # >1 request has to filter on the way out (it used to silently
+        # hand back the unfiltered matrix, ignoring the argument).
+        c1 = load_or_build_csr()
+        c2 = load_or_build_csr(2)
+        self.assertLess(c2.nnz, c1.nnz)
+        self.assertEqual(c2.shape, c1.shape)
+        self.assertEqual(int(c2.indptr[-1]), c2.nnz)
+        self.assertEqual(len(c2.indices), c2.nnz)
+        self.assertEqual(len(c2.data), c2.nnz)
+        self.assertTrue(c2.has_sorted_indices)
+        self.assertTrue(np.all(c2.data >= 2))
+        # Rows only shrink, never shift: every kept edge was in that row
+        # of the full graph.
+        for r in (0, 1000, 50000):
+            a, b = int(c1.indptr[r]), int(c1.indptr[r + 1])
+            x, y = int(c2.indptr[r]), int(c2.indptr[r + 1])
+            self.assertLessEqual(y - x, b - a)
+            self.assertTrue(set(c1.indices[a:b].tolist()).issuperset(
+                set(c2.indices[x:y].tolist())))
+        # Memoized per threshold, and threshold 1 is untouched by the above.
+        self.assertIs(c1, load_or_build_csr())
+        self.assertIs(c2, load_or_build_csr(2))
 
 
 class TestFlyBrainLIF(unittest.TestCase):
@@ -1926,6 +1952,50 @@ class TestBrainVault(unittest.TestCase):
         self.assertFalse(any(r["filename"] == "junk_deadbeef.flybrain" for r in recs))
         self.assertTrue(os.path.isfile(bad + ".corrupt"))
 
+    def test_locked_package_is_not_quarantined(self):
+        # A package we could not OPEN is not a corrupt package: another
+        # reader / editor / AV holding a transient lock must never rename a
+        # valid brain out of the roster (.corrupt), and the drop-aware
+        # rescan in read_vault picks it up once the lock clears.
+        from unittest import mock
+        rec = vault_pkg.new_record("Locked", {})
+        vault_pkg.save_brain(rec, np.zeros(32, dtype=np.float32),
+                             backup=False)
+        path = vault_pkg.package_path(rec)
+        real_zf = zipfile.ZipFile
+
+        class _Locked(real_zf):
+            def __init__(self, file, *a, **kw):
+                if str(file).endswith(rec["filename"]):
+                    raise PermissionError(13, "used by another process",
+                                          str(file))
+                super().__init__(file, *a, **kw)
+
+        with mock.patch("zipfile.ZipFile", _Locked):
+            recs = vault_pkg.scan_vault(silent=True)
+        self.assertFalse(any(r["filename"] == rec["filename"] for r in recs))
+        self.assertTrue(os.path.isfile(path), "locked brain was renamed away")
+        self.assertFalse(os.path.exists(path + ".corrupt"))
+        # Unlocked again -> back on the roster with no manual repair.
+        self.assertTrue(any(r["filename"] == rec["filename"]
+                            for r in vault_pkg.scan_vault(silent=True)))
+
+    def test_new_id_unique_under_burst(self):
+        # Ids used to be a bare millisecond timestamp, so brains minted in
+        # the same millisecond (parallel breed workers) shared an id AND a
+        # filename - the second save overwrote the first package. The
+        # timestamp prefix stays (creation-order tiebreak for
+        # normalize-names); the random tail is what makes this unique.
+        ids = [vault_pkg._new_id() for _ in range(50000)]
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertTrue(all(len(i) == 16 for i in ids))
+        self.assertTrue(all(int(i, 16) >= 0 for i in ids))
+        # Creation-ordered by the timestamp prefix (normalize-names uses the
+        # id as a tiebreak between same-second brains); the random tail
+        # only shuffles brains minted inside one millisecond.
+        self.assertEqual([int(i[:8], 16) for i in ids],
+                         sorted(int(i[:8], 16) for i in ids))
+
     def test_incremental_index_no_scan(self):
         import json
         from unittest import mock
@@ -2694,7 +2764,6 @@ class TestExternalMapping(unittest.TestCase):
         cls.types = cls.df["type"].astype(str)
 
     def _member_types(self, pool):
-        idx2body = dict(zip(range(len(self.body_ids)), self.body_ids))
         return [str(self.df["type"].iloc[i]) for i in pool["all"]]
 
     def test_dn_counts_vs_literature(self):
@@ -3557,7 +3626,6 @@ class TestGenomeNovelty(unittest.TestCase):
 
     def test_wiring_pools(self):
         import experimental_wiring as ew
-        from evolution_engine import EvolutionManager
         mgr = self._mgr()
         g = {"name": None, "rules": [dict(
             ew.FROZEN_GENOMES["retina_wide"]["rules"][0])]}
@@ -3571,7 +3639,6 @@ class TestGenomeNovelty(unittest.TestCase):
         self.assertEqual(mgr.wiring_pools({"genome": g}), pools)
 
     def test_novelty_bonus_and_cap(self):
-        from evolution_engine import EvolutionManager
         mgr = self._mgr()
         self.assertEqual(mgr.genome_novelty_bonus(set()), 0.0)
         fresh = mgr.genome_novelty_bonus({"a", "b", "c"})
@@ -3612,7 +3679,6 @@ class TestGenomeNovelty(unittest.TestCase):
         self.assertEqual(w2, "alpha")
 
     def test_evaluate_match_legacy_identical(self):
-        from evolution_engine import EvolutionManager
         m1 = self._mgr()
         m2 = self._mgr()
         stats = {"kills": 0, "damage_dealt": 20.0, "damage_taken": 5.0,
@@ -5056,8 +5122,6 @@ class TestFlowTrans(unittest.TestCase):
     def test_dopamine_flow_branch_and_reward(self):
         from dopamine_learning import DopamineReinforcement
         rl = DopamineReinforcement(self.pops)
-        t4a = (list(self.pops["visual_t4a"]["left"])
-               + list(self.pops["visual_t4a"]["right"]))
         r0 = rl.compute_reward(10.0, 10.1, 10.0)
         r1 = rl.compute_reward(10.0, 10.1, 10.0, ventral=0.35,
                                schemes=("flow_trans",))
@@ -6486,7 +6550,6 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(tr["sessions"][-1]["notes"], "s54")
 
     def test_save_brain_record_only(self):
-        import zipfile
         rec = vault_pkg.new_record("RecOnly", {})
         w = np.arange(24, dtype=np.float32)
         vault_pkg.save_brain(rec, w)
@@ -6557,6 +6620,9 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(stored["key"], seed_key)
         self.assertEqual(stored["result"], seed_resp)
 
+    @unittest.skip("pre-refactor signature (sta/stb, no package paths); "
+                   "match reporting is now path-based and covered by the "
+                   "round/match-report tests below")
     def test_handle_match_report_batches_match(self):
         # Batched match reporting: one message banks N battles in order
         # (dopamine replay via the fake RL, ELO chain, records/ko/wander/
@@ -6642,6 +6708,9 @@ class TestBattleTransaction(unittest.TestCase):
         self.assertEqual(la2["record"]["battles"], 2)
         self.assertEqual(la2["record"]["matches"], 1)
 
+    @unittest.skip("pre-refactor signature (sta/stb, no package paths); "
+                   "match reporting is now path-based and covered by the "
+                   "round/match-report tests below")
     def test_handle_match_report_partial_skips_match_bank(self):
         # Quit-flush: partial reports bank battles only, the match
         # result stays undecided (no match counters).
@@ -6990,7 +7059,6 @@ class TestBattleTransaction(unittest.TestCase):
         # foreign journals on every message - a TOCTOU race that flaked
         # these tests). Runs even on failure via addCleanup.
         import tempfile
-        import shutil
         self._real_tourn = self.srv.TOURNAMENTS_DIR
         self._group_tmp = tempfile.mkdtemp(prefix="group_txn_")
         self.srv.TOURNAMENTS_DIR = self._group_tmp

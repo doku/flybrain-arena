@@ -292,6 +292,31 @@ def load_or_build_csr(min_synapse_threshold=1):
             shape=loader["shape"]
         )
         loader.close()
+        # The cache is always written at threshold 1, so a >1 request has
+        # to filter here - returning the unfiltered matrix silently ignored
+        # the caller's threshold (it used to, unnoticed, because no caller
+        # passed one). Same predicate as the build path below (weights are
+        # signed AFTER the mask there, and the mask runs on raw positive
+        # edge weights, so comparing the signed data is equivalent).
+        if min_synapse_threshold > 1:
+            before = csr.nnz
+            keep = csr.data >= min_synapse_threshold
+            if not np.all(keep):
+                # nnz-level filter, then rebuild indptr: dropping edges
+                # shifts every row boundary, so the old indptr no longer
+                # matches the shortened data/indices arrays.
+                row_sizes = np.diff(csr.indptr)
+                counts = np.zeros(len(row_sizes), dtype=np.int64)
+                np.add.at(counts, np.repeat(
+                    np.arange(len(row_sizes), dtype=np.int64),
+                    row_sizes.astype(np.int64)), keep.astype(np.int64))
+                new_indptr = np.zeros(len(row_sizes) + 1, dtype=np.int64)
+                np.cumsum(counts, out=new_indptr[1:])
+                csr = sparse.csr_matrix(
+                    (csr.data[keep], csr.indices[keep], new_indptr),
+                    shape=csr.shape)
+                print(f"[Loader] threshold {min_synapse_threshold}: "
+                      f"{before:,} -> {csr.nnz:,} synapses")
         print(f"[Loader] CSR matrix ready: {csr.shape[0]} neurons, {csr.nnz:,} synapses.")
         _CSR_MEMO[stamp] = csr
         return csr

@@ -67,9 +67,10 @@ Godot 4 arena (ArenaGlade.tscn)  <--UDP 127.0.0.1:9999-->  Python neuro-server
   long-term memory** and are never reset by match flow.
 - **Connectome:** MaleCNS CSR, 166,700 × 166,700, ~25.6M synapses, signed by
   presynaptic consensus neurotransmitter (GABA/glutamate inhibitory, rest
-  excitatory). Cached at `malecns_csr_base.npz`; populations at
-  `populations_mapped.json` (regenerated from `connectome_data/malecns_v1/`
-  feather tables on demand).
+  excitatory). Cached at `malecns_csr_base.npz` (always the full
+  threshold-1 graph; a `min_synapse_threshold > 1` request filters the
+  cached matrix per call); populations at `populations_mapped.json`
+  (regenerated from `connectome_data/malecns_v1/` feather tables on demand).
 - **Per-brain independence:** each fighter owns full weight/state copies;
   tournament fighters additionally run on their **native wiring** (base or
   experimental overlay), so mixed brackets work with vault files unchanged.
@@ -81,6 +82,8 @@ Side splits use somaSide → instance `_L/_R` → rootSide; leftovers are
 side-unknown and never driven. Cross-checked against FlyWire/MANC publications
 (1314 descending_neuron rows vs 1328 paper DNs; 97 MBONs with full NT coverage;
 166,700 shape matches the whole-CNS count).
+Measured census (live firing + direct-edge anatomy per pool):
+`docs/neuron_survey.md`.
 
 ### 4.1 Sensory input pools
 
@@ -454,6 +457,14 @@ sessions, lineage). Atomic writes (temp + rename, `.bak` kept);
 pre-training snapshots. Fast uncompressed saves for hot per-battle writes,
 compressed for menu operations — both load identically.
 
+Ids are 16 hex chars — millisecond timestamp + 8 random hex — and double as
+the package filename suffix (`{name}_{id}.flybrain`). The random tail exists
+because a bare millisecond id let two brains minted in the same millisecond
+(parallel breed workers, or the 32-bit wrap) collide and overwrite each
+other. The timestamp prefix is kept as a creation-order tiebreak. A locked
+package is skipped by the scan, never quarantined — quarantine means
+unreadable zip/JSON, not "couldn't open it right now".
+
 ## 13. Testing (`tests/test_suite.py`)
 
 Connectome data, LIF dynamics, sensory-motor, all four mapping schemes,
@@ -472,7 +483,9 @@ legacy+scheme inertness, gyro scale), retina vision + wiring, brain-view
 stream (pool keys, detail gating, truncation guard, raster id slices,
 soma-cloud asset schema), subfloor abandonment, evo loop (biggest-loser
 query incl. tie-breaks, archive/restore round-trip, breeder param
-validity), Godot headless scene runs, flight-style probe
+validity), CSR threshold filtering on the cached matrix, vault scan
+(id uniqueness under burst, locked-package skip vs corrupt quarantine),
+Godot headless scene runs, flight-style probe
 (`brain_engine/probe_flight_style.py`: two vault
 brains, real or fresh weights, against climb/level/dive targets —
 separates wiring effects from learned effects), learning verification

@@ -294,7 +294,6 @@ class SensoryEncoder:
         Dicts without angular_* keys drive no JO spikes (trainer/arena-old).
         """
         spikes = []
-        n_steps = int(duration_ms / dt)
 
         # 1. Pheromone Encoding (ORN_DA1 and ORN_VA1v)
         c_left = np.clip(sensory_dict.get("pheromone_conc_left", 0.0), 0.0, 1.0)

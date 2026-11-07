@@ -1,4 +1,3 @@
-import os
 import time
 import numpy as np
 from numba import njit
@@ -365,7 +364,7 @@ if __name__ == "__main__":
 
     avg_a = np.mean(times_a) * 1000.0
     avg_b = np.mean(times_b) * 1000.0
-    print(f"[FlyBrain] Benchmark results with calibrated sparse active-set:")
+    print("[FlyBrain] Benchmark results with calibrated sparse active-set:")
     print(f"  Fly Alpha: {avg_a:.2f} ms per 50 ms brain tick (Target: <50 ms)")
     print(f"  Fly Beta:  {avg_b:.2f} ms per 50 ms brain tick")
     print(f"  Total dual compute: {avg_a + avg_b:.2f} ms")

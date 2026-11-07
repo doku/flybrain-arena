@@ -432,7 +432,6 @@ def breed_clone(parent_id, name, seed, episodes=None, noise=None,
     episodes without episodes2 keeps the single-stage path. Returns
     (record, weights, summary) like train_job (multi-stage summary
     when staged)."""
-    from train_job import train_brain
     from experimental_wiring import (mutate_genome, remap_for_genome,
                                      derive_mapping, attach_genome)
     from connectome_loader import (load_or_extract_populations,
@@ -707,7 +706,9 @@ def breed_crossover(parent_a_id, parent_b_id, name, seed, episodes=None,
     from connectome_loader import (load_or_extract_populations,
                                    load_or_build_csr)
     rec_a, weights_a = vault.load_brain(parent_a_id)
-    rec_b, weights_b = vault.load_brain(parent_b_id)
+    # Record-only: the child's weights are remapped from parent A alone, so
+    # decoding parent B's ~100 MB array here would be pure IO cost.
+    rec_b = vault.load_brain_record(parent_b_id)
     gp_a = dict(rec_a.get("generator_params", {}) or {})
     gp_b = dict(rec_b.get("generator_params", {}) or {})
     ra = ((rec_a.get("lineage", {}) or {}).get("training", {}) or {})

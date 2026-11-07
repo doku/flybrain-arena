@@ -515,7 +515,6 @@ def _handle_match_report(sock, client_addr, msg, tourney_tag,
                                 "error": "match_report: no fighter paths"}
                                ).encode("utf-8"), client_addr)
         return
-    t_start = time.perf_counter()
     ctx = {"evo_mgr": evo_mgr, "dopamine_rl": dopamine_rl,
            "base_lr": base_lr, "tournament_lr_scale": tournament_lr_scale,
            "tourney_note": tourney_note, "sock": sock,
@@ -995,7 +994,6 @@ def _handle_group_round(sock, client_addr, msg, round_id, tid, mlabel,
     session exactly (see _rebuild_group_session); same-nonce resends
     replay nothing (session banked-set + stored resps, journal-backed
     across restarts)."""
-    import brain_package as vault_pkg
     if _group_pinned["tournament_id"] not in ("", tid):
         _group_session_start(tid)
     elif _group_pinned["tournament_id"] == "":
@@ -1575,7 +1573,6 @@ def _group_inputs_write(doc):
     """Atomically replaces the group-inputs journal: pre-group records
     + every banked round's full battle payloads (deterministic replay
     inputs) and ack responses (exact resends). Small (KBs per round)."""
-    import brain_package as _vp
     path = _pending_group_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"

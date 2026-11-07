@@ -1,7 +1,4 @@
 import os
-import sys
-import time
-import json
 import numpy as np
 
 from connectome_loader import load_or_build_csr, load_or_extract_populations
@@ -370,7 +367,6 @@ def compute_agent_senses(agent, target, prev_dist=None):
     """
     to_target = target.pos - agent.pos
     dist = float(np.linalg.norm(to_target))
-    to_target_dir = to_target / max(dist, 1e-4)
     if prev_dist is None:
         rival_looming = 0.0
     else:
@@ -1265,8 +1261,6 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
         lunges = 0
         strikes = 0
 
-        t_ep_start = time.time()
-
         for step in range(max_steps_per_episode):
             # 1. Sense environment
             senses, current_dist = compute_agent_senses(
@@ -1422,7 +1416,6 @@ def run_training(num_episodes=50, max_steps_per_episode=120, variant="A",
                 # (deterministic, no draws). The agent learns the
                 # near-miss; the threat never dodges back.
                 to_a = fly.pos - target.pos
-                hd = float(np.hypot(to_a[0], to_a[2])) + 1e-4
                 target.heading = float(np.arctan2(to_a[2], to_a[0]))
                 spd = float(school_ctx.get("threat_speed", 6.0))
                 thr = float(np.clip(

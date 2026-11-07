@@ -56,8 +56,9 @@ def cmd_list(a):
 
 
 def cmd_info(a):
+    # Record-only read: info never needs the ~100 MB weight array.
     try:
-        rec, _w = vault.load_brain(a.id)
+        rec = vault.load_brain_record(a.id)
     except Exception as e:
         return err(str(e))
     return out({"ok": True, "brain": rec})
@@ -201,7 +202,7 @@ def cmd_train(a):
     except Exception as e:
         return out({"ok": False, "error": str(e)}, a.result_file)
     vault.snapshot_backup(rec, enabled=bool(getattr(a, "snapshot", False)))
-    from train_job import train_brain, train_staged, merge_summaries
+    from train_job import train_staged, merge_summaries
     ep2 = int(getattr(a, "episodes2", 0) or 0)
     try:
         if ep2 > 0:
@@ -278,8 +279,10 @@ def cmd_score(a):
     # a raced train may have saved newer weights/counters — including
     # just before the probe). Staleness probe: a record-only ~KB read
     # compared on key fields (no ~100 MB weight decode); unchanged (the
-    # common case) stamps onto the already-current copy.
-    cur_rec, cur_w = rec, weights
+    # common case) stamps onto the already-current copy. The reload is
+    # record-only too — this path never writes weights, so decoding them
+    # again would cost ~100 MB of IO for nothing.
+    cur_rec = rec
     try:
         live = vault.load_brain_record(probe_path)
         stale = (int(live.get("training", {}).get("episodes", 0))
@@ -289,16 +292,9 @@ def cmd_score(a):
                  or int(live.get("record", {}).get("matches", 0))
                  != int(rec.get("record", {}).get("matches", 0)))
         if stale:
-            cur_rec, cur_w = vault.load_brain(a.id)
+            cur_rec = live
     except Exception:
-        cur_rec, cur_w = rec, weights
-    try:
-        import numpy as _np
-        same_weights = bool(_np.array_equal(
-            _np.asarray(cur_w, dtype=_np.float32),
-            _np.asarray(weights, dtype=_np.float32)))
-    except Exception:
-        same_weights = False
+        cur_rec = rec
     stamp_train_score(cur_rec, {"score": gained, "episodes": eps,
                                 "by_scenario": summary.get("by_scenario",
                                                            {})})
@@ -508,7 +504,7 @@ def cmd_normalize_names(a):
 
 def cmd_export(a):
     try:
-        rec, _w = vault.load_brain(a.id)
+        rec = vault.load_brain_record(a.id)
         src = vault.package_path(rec)
     except Exception as e:
         return err(str(e))

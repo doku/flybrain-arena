@@ -40,7 +40,6 @@ def load_brain_by_name(name):
 
 
 def fly_scenario(rec, weights, csr, pops, scenario, episodes, steps):
-    indptr = indices = None
     struct_cache = {}
     brain = _bind_brain(rec, np.ascontiguousarray(
         np.asarray(weights, dtype=np.float32)), csr, pops, struct_cache)
