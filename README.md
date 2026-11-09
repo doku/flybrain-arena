@@ -18,6 +18,8 @@ Godot 4 arena (arena/)  <-- UDP 127.0.0.1:9999 -->  Python neuro-server (brain_e
 
 <video src="docs/screenshots/battle-clip.mp4" controls width="100%"></video>
 
+[▶ Watch the battle clip (26 s, MP4)](docs/screenshots/battle-clip.mp4) — fallback link if your viewer doesn't render inline video.
+
 *26-second exhibition battle between two vault-trained flies (Darter vs flow2-kin1, elos 1348/1347) in the Arena Glade.*
 
 ## Quickstart
