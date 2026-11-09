@@ -12,6 +12,14 @@ Godot 4 arena (arena/)  <-- UDP 127.0.0.1:9999 -->  Python neuro-server (brain_e
   ArenaManager / TournamentDirector                   dopamine learning + evolution + vault
 ```
 
+## Screenshots & video
+
+![Brain vault menu](docs/screenshots/vault-menu.png)
+
+<video src="docs/screenshots/battle-clip.mp4" controls width="100%"></video>
+
+*26-second exhibition battle between two vault-trained flies (Darter vs flow2-kin1, elos 1348/1347) in the Arena Glade.*
+
 ## Quickstart
 
 ```bat
@@ -142,6 +150,10 @@ python tests/test_suite.py        # connectome, LIF, sensory-motor, mappings,
 ```
 
 Godot-side tests live in `arena/tests/` and run via headless scene runs.
+CI runs the Python suite on every push/PR (`.github/workflows/tests.yml`).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up a dev environment and
+open a PR.
 
 ## Credits & licenses
 
