@@ -3,9 +3,35 @@
 Two fruit flies, each driven by its own **whole-brain spiking neural network** —
 the complete 166,700-neuron, 25,582,938-synapse **MaleCNS v1.0 connectome** of
 *Drosophila melanogaster* — duel in a 3D forest arena. Scent tracking, visual
-pursuit, spike jousting, wing tears, knockouts. After every battle, dopamine
-reinforcement (PAM/PPL1 circuits inside the connectome) rewires the loser's
-synapses, and an evolution loop breeds the next generation.
+pursuit, spike jousting, wing tears, knockouts.
+
+## The idea: evolution on real brain wiring
+
+The connectome itself is the genome. Each fly runs the full MaleCNS connectome
+plus an optional **experimental wiring overlay** (a small set of added synaptic
+edges, e.g. `lplc2_contra_dn`, `retina_wide`, `spear_lunge` — see
+`brain_engine/experimental_wiring.py`). Battles are the fitness test:
+
+1. **Within a battle — dopamine learning.** PAM (reward) and PPL1 (aversive)
+   dopamine neuron populations inside the connectome compute a reward signal
+   from the fight (closing distance, heading alignment, damage traded). That
+   signal gates plasticity: synaptic weights on sensory→motor paths are
+   scaled up/down (`brain_engine/dopamine_learning.py`). The loser's wiring is
+   reshaped by what actually happened.
+2. **Between generations — tournament selection.** Fighters enter single-
+   elimination brackets (best-of-N matches, optional losers bracket). Fitness
+   = kills, damage dealt/taken, tracking and tail time, nectar, minus scraping
+   (`EvolutionManager.calc_fitness`). In **START CONTINUOUS** mode each
+   generation archives the **biggest loser** (earliest exit, then fewest battle
+   wins) to the Hall of Shame and breeds the next roster as **winner-clones
+   (with trait noise) + random wildcards**, holding the population constant.
+   The wiring that wins fights is what gets kept and bred; the rest is
+   eliminated.
+
+So the loop is: *wire → fight → dopamine-rewire → tournament-eliminate → breed
+the survivors*. The vault (`brains/*.flybrain`) stores each brain's wiring
+overlay + trained weight deltas + full record (elo, W/L, lineage), and
+`vault_cli.py breed` / the menu do the cloning and wildcard minting.
 
 ```
 Godot 4 arena (arena/)  <-- UDP 127.0.0.1:9999 -->  Python neuro-server (brain_engine/)
