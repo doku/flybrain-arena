@@ -1,16 +1,21 @@
 # Battle Fly Arena
 
 Two fruit flies, each driven by its own **whole-brain spiking neural network** —
-the complete 166,700-neuron, ~25.6M-synapse **MaleCNS connectome** of *Drosophila
-melanogaster* — duel in a 3D forest arena. Scent tracking, visual pursuit, spike
-jousting, wing tears, knockouts. After every battle, dopamine reinforcement
-rewires the loser's synapses, and an evolution loop breeds the next generation.
+the complete 166,700-neuron, 25,582,938-synapse **MaleCNS v1.0 connectome** of
+*Drosophila melanogaster* — duel in a 3D forest arena. Scent tracking, visual
+pursuit, spike jousting, wing tears, knockouts. After every battle, dopamine
+reinforcement (PAM/PPL1 circuits inside the connectome) rewires the loser's
+synapses, and an evolution loop breeds the next generation.
 
 ```
 Godot 4 arena (arena/)  <-- UDP 127.0.0.1:9999 -->  Python neuro-server (brain_engine/)
-  FlyPhysics x2 (bodies)        20 Hz sensory steps    2x LIF brain (166,700 neurons each)
+  FlyPhysics x2 (bodies)        50 ms sensory steps   2x LIF brain (166,700 neurons each)
   ArenaManager / TournamentDirector                   dopamine learning + evolution + vault
 ```
+
+The brain ticks at **20 Hz (50 ms)**; a dual-brain step costs ~140–210 ms on
+reference hardware, so the server collapses queued steps to newest (control
+messages are never dropped) — effective control rate ≈ 5 Hz per fighter.
 
 ## Screenshots & video
 
@@ -32,6 +37,10 @@ launch_battle.bat
 python launch_battle.py
 ```
 
+Linux/macOS: `python launch_battle.py` works the same; the bundled Godot
+binary is Windows-only (see Requirements), so install Godot 4.7.2 yourself and
+the launcher will find it.
+
 To fetch the connectome data ahead of time (or on a headless machine):
 
 ```bash
@@ -50,7 +59,7 @@ brains are per-user data and are not in git. You create your first fighters here
    ring-ready). The menu shows live progress.
 2. Repeat to mint 2+ brains (different seeds/wirings fight differently).
 3. **QUICK BATTLE (pick 2)** — best-of-1 exhibition between two vault brains.
-   **TOURNAMENT** — pick >= 2 brains, single elimination, best-of-N per match
+   **START TOURNAMENT** — pick >= 2 brains, single elimination, best-of-N per match
    (optional losers bracket). **FREE BATTLE** — classic generational evolution.
    **START CONTINUOUS** — eternal tournaments: each generation archives the
    biggest loser and breeds a winner-clone plus a random wildcard (~15–25 min
@@ -94,19 +103,21 @@ protocol (see `DOCUMENTATION.md` §11), or simply use the Godot menu above.
 
 | Component | Version | Notes |
 |---|---|---|
-| Python | 3.10+ | `numpy`, `scipy`, `pandas`, `pyarrow`, `numba` |
-| Godot | 4.7.2 | Windows binaries bundled in `tools/godot/` (gitignored; download from godotengine.org for other platforms) |
+| Python | 3.10+ | `numpy`, `scipy`, `pandas`, `pyarrow`, `numba` (see `requirements.txt`) |
+| Godot | 4.7.2 | `tools/godot/` is **gitignored** — download the Windows binary from godotengine.org, or any platform's editor build |
 | Connectome data | MaleCNS v1.0 | ~1.2 GB, auto-downloaded by `python setup.py` on first start |
-| RAM / CPU | ~8+ GB RAM | a dual-brain tick costs ~140-210 ms on reference hardware |
+| RAM / CPU | ~8+ GB RAM | a dual-brain tick costs ~140–210 ms on reference hardware |
 
 ```bash
-pip install numpy scipy pandas pyarrow numba
+pip install -r requirements.txt
 ```
 
 ## Connectome data (not in this repo)
 
-The brain is built from the **MaleCNS v1.0** connectome (Berg et al., *Cell* 2026;
-166,700 neurons, 25.6M edges, CC-BY). **You do not need to download anything
+The brain is built from the **MaleCNS v1.0** connectome — Berg et al.,
+"Sexual dimorphism in the complete *Drosophila* male central nervous system
+connectome", *Cell* 189, 5504–5526 (2026), DOI 10.1016/j.cell.2026.08.015,
+CC-BY: 166,700 neurons, 25.6M synapses. **You do not need to download anything
 manually** — `python setup.py` (also run automatically by `launch_battle.py` on
 first start) fetches the three feather tables into `connectome_data/malecns_v1/`:
 
@@ -133,22 +144,23 @@ gitignored) and the derived `populations_mapped.json` (tracked, regenerable).
 arena/            Godot 4 project: scenes, scripts (GDScript), shaders, audio, models
 brain_engine/     Python neuro-server: LIF kernel, connectome loader, sensory/motor
                   codecs, dopamine learning, evolution, vault (.flybrain packages)
-tests/            Python test suite (tests/test_suite.py)
-docs/             Neuron survey + post-mortems
+tests/            Python test suite (tests/test_suite.py, 309 tests)
+docs/             Neuron survey + post-mortems + screenshots
 setup.py          First-start: downloads MaleCNS v1.0 tables + builds caches
 launch_battle.py  One-command launcher (runs setup.py if data missing, then server + arena)
-DOCUMENTATION.md  Full architecture, protocol, and neuron-pool reference
+DOCUMENTATION.md  Full architecture, protocol, and neuron-pool reference (15 sections)
 ```
 
 **Data policy:** git tracks code and config only. Raw connectome data, the CSR
-cache, checkpoints, the brain vault (`brains/`), tournament state, Godot binaries,
-and logs are all gitignored — back them up by copying the folders.
+cache, checkpoints, the brain vault (`brains/`), tournament state, Godot binaries
+(`tools/`), and logs are all gitignored — back them up by copying the folders.
 
 ## Testing
 
 ```bash
-python tests/test_suite.py        # connectome, LIF, sensory-motor, mappings,
-                                  # evolution, UDP integration, vault, trainer contract
+python tests/test_suite.py        # 309 tests: connectome, LIF, sensory-motor,
+                                  # mappings, evolution, UDP integration, vault,
+                                  # trainer contract (takes ~9 min)
 ```
 
 Godot-side tests live in `arena/tests/` and run via headless scene runs.
@@ -159,8 +171,10 @@ open a PR.
 
 ## Credits & licenses
 
-- **Connectome:** Berg et al. 2025, MaleCNS v1.0 — CC-BY (https://male-cns.janelia.org)
+- **Connectome:** Berg et al. 2026, MaleCNS v1.0, *Cell* 189, 5504–5526 —
+  CC-BY 4.0 (https://male-cns.janelia.org, DOI 10.1016/j.cell.2026.08.015)
 - **Fly body meshes:** derived from TuragaLab/flybody, Apache-2.0 — see
   [`arena/models/ATTRIBUTION.md`](arena/models/ATTRIBUTION.md)
-- **Audio:** Kenny.nl SFX pack (CC0) — see `arena/audio/`
-- This project's code: MIT
+- **Audio:** Kenny.nl SFX pack (`kenny_A`/`kenny_B` palettes, CC0) under
+  `arena/audio/sfx/`, plus synthesized battle/voice cues — see `arena/scripts/SfxSynth.gd`
+- This project's code: MIT (see `LICENSE`)
